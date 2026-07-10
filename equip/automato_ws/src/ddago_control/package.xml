@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ddago_control</name>
+  <version>0.1.0</version>
+  <description>DdaGo Control Service — 주행 로봇 제어/텔레메트리 노드</description>
+  <maintainer email="lboyeon1223@gmail.com">boyeon</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>automato_interfaces</depend>
+  <depend>std_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>action_msgs</depend>
+  <depend>nav2_msgs</depend>
+
+  <!-- ddago_bringup.launch.py 전용 런타임 의존(핑키 드라이버, 실제 로봇에만 설치됨).
+       rosdep 로 해소되지 않는 팀 내부 패키지라 hard depend 대신 문서로만 남긴다:
+         pinky_bringup      (odom, joint_states, battery/percent·voltage)
+         pinky_sensor_adc   (us_sensor/range, batt_state)
+         pinky_navigation   (nav2: amcl_pose, navigate_to_pose 액션 상태) -->
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

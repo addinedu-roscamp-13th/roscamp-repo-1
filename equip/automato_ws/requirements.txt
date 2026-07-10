@@ -1,0 +1,9 @@
+# dg_ai_service 실제 YOLO 추론에 필요한 의존성.
+# ROS2 시스템 python 과 별개로 관리하는 automato_ws 전용 venv 용.
+# 설치 가이드: equip/automato_ws/docs/dev_env_setup.md
+ultralytics
+opencv-python
+numpy
+
+# 이 venv 로 pytest 를 돌리고 싶을 때만 필요 (rclpy 필요 없는 테스트용)
+pytest

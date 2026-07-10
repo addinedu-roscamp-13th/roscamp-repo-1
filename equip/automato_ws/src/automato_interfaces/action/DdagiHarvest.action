@@ -1,0 +1,16 @@
+# 시나리오2 : 수확 작업 (수확 목표 목록 전체)
+# dg_control -> Ddagi Control Service (ROS2 Action  /dg_01/ddagi/harvest)
+# ---------- Goal ----------
+int64            task_id
+HarvestTarget[]  targets
+---
+# ---------- Result ----------
+# result_code(0: 성공, 1: 실패, 2: 중단)
+int32   result_code
+string  message
+int32   harvested_count
+---
+# ---------- Feedback ----------
+int32   current_order
+int32   harvested_count
+int32   total_count

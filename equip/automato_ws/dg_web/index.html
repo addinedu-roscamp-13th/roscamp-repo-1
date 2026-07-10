@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DG Control 테스트 대시보드</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0f1115; color: #e6e6e6; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  .sub { color: #8a92a6; font-size: 16px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+  .card { background: #1a1e27; border: 1px solid #2a2f3a; border-radius: 10px; padding: 14px; }
+  .card h3 { margin: 0 0 2px; font-size: 18px; }
+  .card .role { color: #8a92a6; font-size: 14px; min-height: 16px; }
+  .row { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; }
+  .dot { display: inline-flex; align-items: center; gap: 6px; font-size: 16px; font-weight: 600; }
+  .dot i { width: 10px; height: 10px; border-radius: 50%; background: #555; }
+  .up i { background: #2ecc71; } .up { color: #2ecc71; }
+  .down i { background: #e74c3c; } .down { color: #e74c3c; }
+  button { border: 1px solid #3a4150; background: #232936; color: #e6e6e6; border-radius: 7px;
+           padding: 5px 12px; font-size: 16px; cursor: pointer; }
+  button:hover { background: #2c3444; }
+  button.on  { border-color: #2ecc71; }
+  button.off { border-color: #e74c3c; }
+  button:disabled { opacity: .4; cursor: default; }
+  .panel { background: #1a1e27; border: 1px solid #2a2f3a; border-radius: 10px; padding: 16px; margin-top: 22px; max-width: 640px; }
+  .panel h2 { font-size: 19px; margin: 0 0 10px; }
+  .field { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+  .field label { width: 130px; color: #b7bfd0; font-size: 16px; }
+  .field input { flex: 1; background: #10141c; border: 1px solid #2a2f3a; color: #e6e6e6;
+                 border-radius: 6px; padding: 7px 9px; font-size: 16px; }
+  .active-badge { font-size: 14px; padding: 2px 8px; border-radius: 20px; font-weight: 700; }
+  .active-sim  { background: #14361f; color: #46d17e; }
+  .active-real { background: #3a1f14; color: #f0894a; }
+  .note { color: #8a92a6; font-size: 14px; margin-top: 8px; line-height: 1.5; }
+  .save-row { margin-top: 12px; display: flex; align-items: center; gap: 12px; }
+  .toast { color: #46d17e; font-size: 16px; }
+  .log { background: #0a0d13; border: 1px solid #2a2f3a; border-radius: 8px; padding: 12px;
+         font-family: ui-monospace, monospace; font-size: 14px; line-height: 1.5; color: #c7d0e0;
+         max-height: 260px; overflow: auto; white-space: pre-wrap; margin-top: 12px; }
+  .log b { color: #46d17e; }
+  .test-item { border-top: 1px solid #2a2f3a; padding: 12px 0; }
+  .test-item:first-child { border-top: none; }
+  .test-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .result-badge { font-size: 14px; font-weight: 700; padding: 3px 11px; border-radius: 20px;
+                  background: #232936; color: #8a92a6; margin-right: 8px; }
+  .result-badge.pass { background: #14361f; color: #46d17e; }
+  .result-badge.fail { background: #3a1f14; color: #e74c3c; }
+  .topo { width: 100%; max-width: 900px; height: auto; display: block; margin: 0 auto; }
+  .topo text { fill: #cdd5e4; font-family: system-ui, sans-serif; }
+  .topo .nlabel { font-size: 19px; font-weight: 700; }
+  .topo .nsub { font-size: 13px; fill: #8a92a6; }
+  .svc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+  .split { display: flex; gap: 14px; align-items: flex-start; margin-top: 22px; flex-wrap: wrap; }
+  .left-col { flex: 0 0 750px; display: flex; flex-direction: column; gap: 22px; }
+  .left-col > .panel { margin-top: 0; max-width: none; }
+  .split > .msg-panel { flex: 1 1 0; min-width: 340px; max-width: none; margin-top: 0; }
+  @media (max-width: 1120px) { .left-col { flex: 1 1 100%; } .split > .msg-panel { flex-basis: 100%; } }
+  .msg-timeline { max-height: calc(100vh - 210px); min-height: 320px; overflow-y: auto;
+                  border-top: 1px solid #1c2029; padding-top: 4px; margin-top: 4px; }
+  .tl-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding: 3px 0;
+            border-bottom: 1px solid #171b22; font-family: ui-monospace, monospace; font-size: 13px; }
+  .tl-time { color: #5f6b82; flex: 0 0 auto; }
+  .tl-dir { color: #f0894a; font-weight: 700; flex: 0 0 auto; }
+  .tl-iface { color: #cdd5e4; font-weight: 700; flex: 0 0 auto; }
+  .tl-pl { color: #bcd0a0; word-break: break-all; flex: 1 1 100%; padding-left: 2px; }
+  .topo .link-label { font-size: 15px; font-weight: 700; fill: #eaff66; opacity: 0;
+                      paint-order: stroke; stroke: #0f1115; stroke-width: 3px; }
+  .conn-banner { background: #3a1f14; color: #f0894a; border: 1px solid #5a2f1f;
+                 border-radius: 8px; padding: 9px 13px; margin-bottom: 14px; font-size: 16px; font-weight: 600; }
+  .svc-group { border: 1px solid #2a2f3a; border-radius: 8px; padding: 10px 12px; transition: border-color .15s, box-shadow .15s; }
+  .svc-group.flash { border-color: #eaff66; box-shadow: 0 0 0 1px rgba(234,255,102,.25); }
+  .svc-title { font-size: 16px; font-weight: 700; color: #9fb0d0; margin-bottom: 4px; }
+  .msg { padding: 6px 0; border-top: 1px solid #232936; }
+  .msg:first-of-type { border-top: none; }
+  .msg-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 14px; margin-bottom: 3px; }
+  .msg-head b { color: #cdd5e4; }
+  .scen { font-size: 12px; color: #8a92a6; margin-left: auto; }
+  .msg code { font-family: ui-monospace, monospace; font-size: 13px; color: #6f7a90;
+              white-space: pre-wrap; word-break: break-all; display: block; }
+  .msg code.has { color: #bcd0a0; }
+  .wire-hist { max-height: 150px; overflow-y: auto; margin-top: 4px;
+               border-top: 1px solid #1c2029; padding-top: 3px; }
+  .wline { display: flex; gap: 8px; padding: 1px 0; font-family: ui-monospace, monospace; font-size: 12px; }
+  .wline .wt { color: #5f6b82; flex: 0 0 auto; }
+  .wline .wp { color: #bcd0a0; word-break: break-all; }
+  .wempty { color: #5f6b82; font-size: 12px; padding: 3px 0; font-family: ui-monospace, monospace; }
+  .msg-table { width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 10px; }
+  .msg-table th, .msg-table td { border-bottom: 1px solid #232936; padding: 6px 8px; text-align: left; vertical-align: top; }
+  .msg-table th { color: #8a92a6; font-weight: 600; }
+  .msg-table td.svc { color: #9fb0d0; font-weight: 600; }
+  .dir { font-family: ui-monospace, monospace; white-space: nowrap; }
+  .dir .hq { color: #f0894a; font-weight: 700; } .dir .sv { color: #46d17e; font-weight: 700; }
+  .tag { font-size: 12px; padding: 1px 7px; border-radius: 10px; background: #232936; color: #b7bfd0; }
+  .tag.action { color: #f0b45a; } .tag.service { color: #6ab0ff; } .tag.topic { color: #46d17e; } .tag.TCP { color: #d08bff; }
+  .wire-row td { background: #0d1017; padding: 4px 8px 9px; }
+  .wire-row .wlabel { color: #5f6b82; font-size: 12px; }
+  .wire-row code { font-family: ui-monospace, monospace; font-size: 13px; color: #6f7a90;
+                   white-space: pre-wrap; word-break: break-all; }
+  .wire-row code.has { color: #bcd0a0; }
+</style>
+</head>
+<body>
+  <h1>DG Control 테스트 대시보드</h1>
+  <div class="sub">HQ(dg_control) + 시뮬 4종을 개별 on/off. AI TCP 접속대상(실서버/시뮬)을 저장·전환.</div>
+
+  <div id="conn-banner" class="conn-banner" style="display:none">⚠ 제어 서버(web) 연결 끊김 — 응답 없음</div>
+
+  <div class="grid" id="grid"></div>
+
+  <div class="split">
+    <div class="left-col">
+      <div class="panel diagram-panel">
+        <h2>서비스 연동 관계</h2>
+        <div class="note">HQ(본체) 중심 연동. 링크 색: <b style="color:#46d17e">초록=양쪽 UP</b>, 회색=DOWN.
+          메시지가 오갈 때 링크가 <b style="color:#eaff66">깜박이며 메시지명·방향(화살표)</b>이 표시됩니다.</div>
+        <svg class="topo" viewBox="0 0 900 280" role="img" aria-label="서비스 연동 관계도">
+          <defs>
+            <marker id="flash-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+                    markerWidth="11" markerHeight="11" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+              <path d="M0,0 L10,5 L0,10 z" fill="#eaff66"/>
+            </marker>
+          </defs>
+          <g stroke="#3a4356" stroke-width="2.5" fill="none" stroke-linecap="round">
+            <line id="link-acs"   x1="190" y1="140" x2="380" y2="140"/>
+            <line id="link-ddago" x1="520" y1="126" x2="710" y2="67"/>
+            <line id="link-ddagi" x1="520" y1="154" x2="710" y2="213"/>
+            <line id="link-dg_ai" x1="450" y1="170" x2="450" y2="205"/>
+          </g>
+          <g text-anchor="middle">
+            <rect id="node-hq"    x="380" y="110" width="140" height="60" rx="12" fill="#20252f" stroke="#3a4356" stroke-width="2"/>
+            <text class="nlabel" x="450" y="136">HQ</text>
+            <text class="nsub"   x="450" y="154">DG Control · 본체</text>
+
+            <rect id="node-acs"   x="40"  y="110" width="150" height="60" rx="12" fill="#1a1e27" stroke="#3a4356" stroke-width="2"/>
+            <text class="nlabel" x="115" y="136">ACS</text>
+            <text class="nsub"   x="115" y="154">Automato Control</text>
+
+            <rect id="node-ddago" x="710" y="40"  width="150" height="54" rx="12" fill="#1a1e27" stroke="#3a4356" stroke-width="2"/>
+            <text class="nlabel" x="785" y="64">DdaGo</text>
+            <text class="nsub"   x="785" y="81">주행 로봇</text>
+
+            <rect id="node-ddagi" x="710" y="186" width="150" height="54" rx="12" fill="#1a1e27" stroke="#3a4356" stroke-width="2"/>
+            <text class="nlabel" x="785" y="210">Ddagi</text>
+            <text class="nsub"   x="785" y="227">로봇팔</text>
+
+            <rect id="node-dg_ai" x="380" y="205" width="140" height="54" rx="12" fill="#1a1e27" stroke="#3a4356" stroke-width="2"/>
+            <text class="nlabel" id="dgai-name" x="450" y="229">DG AI</text>
+            <text class="nsub"   id="dgai-sub"  x="450" y="246">TCP :9100</text>
+          </g>
+          <g class="link-labels" text-anchor="middle">
+            <text class="link-label" id="lbl-acs"   x="285" y="128"></text>
+            <text class="link-label" id="lbl-ddago" x="632" y="84"></text>
+            <text class="link-label" id="lbl-ddagi" x="632" y="205"></text>
+            <text class="link-label" id="lbl-dg_ai" x="560" y="192"></text>
+          </g>
+        </svg>
+      </div>
+
+      <div class="panel">
+        <h2>테스트 항목 — E0 / E1 / E2</h2>
+        <div class="note">시퀀스 다이어그램의 3개 시나리오를 항목별로 실행·판정합니다.
+          <b>hq · acs · ddago · ddagi · dg_ai</b> 가 모두 UP이어야 합니다.
+          각 항목 <b>실행</b> → PASS/FAIL 과 근거 로그가 표시됩니다.</div>
+        <div id="tests"></div>
+      </div>
+    </div>
+
+    <div class="panel msg-panel">
+      <h2>주고받는 메시지 (DG 시점 시계열)</h2>
+      <div class="note">HQ가 주고받은 모든 메시지를 <b>시각순 하나의 스크롤</b>로 표시(1.5초 갱신, 위=과거/아래=최신).
+        실행 버튼을 누르면 초기화됩니다. 보관
+        <input id="msg-limit" type="number" min="1" max="5000" value="500" style="width:64px"> 건.
+        <button id="copy-btn" onclick="copyMessages()">📋 전체 복사</button>
+        <button id="clear-btn" onclick="clearWireLog()">🗑 지우기</button>
+        <label style="margin-left:8px; user-select:none; cursor:pointer">
+          <input type="checkbox" id="hide-tel" checked onchange="onHideTelChange()"> 텔레메트리 숨김</label>
+        <span class="toast" id="copy-toast"></span></div>
+      <div class="msg-timeline" id="msg-timeline"><div class="wempty">(아직 없음)</div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>DG AI Service 접속 대상 (TCP)</h2>
+    <div class="field">
+      <label>실서버 IP:PORT</label>
+      <input id="real" placeholder="예: 192.168.0.50:9100">
+    </div>
+    <div class="field">
+      <label>시뮬 IP:PORT</label>
+      <input id="sim" placeholder="예: 127.0.0.1:9100">
+    </div>
+    <div class="save-row">
+      <button onclick="saveTarget()">IP 저장</button>
+      <span>현재 접속대상: <span id="active" class="active-badge">-</span></span>
+      <span class="toast" id="toast"></span>
+    </div>
+    <div class="note">
+      · <b>dg_ai 시뮬을 켜면</b> active=<b>sim</b>(시뮬 IP)로, <b>끄면</b> active=<b>real</b>(실서버 IP)로 자동 전환됩니다.<br>
+      · HQ는 이 값을 읽어 다음 분석 요청에서 해당 엔드포인트로 자동 재접속합니다. 실서버 IP는 팀원 서버 주소로 저장해 두세요.
+    </div>
+  </div>
+
+<script>
+const NODES = [
+  { key: 'hq',        name: 'HQ (DG 본체)',   role: '실제 DG Control Service', ctl: true },
+  { key: 'acs',       name: 'ACS 시뮬',       role: 'Patrol클라/SaveDet서버/Fleet구독', ctl: true },
+  { key: 'ddago',     name: 'DdaGo 시뮬',     role: 'DdagoPatrol서버/텔레메트리/분석요청', ctl: true },
+  { key: 'ddagi',     name: 'Ddagi 시뮬',     role: 'DdagiTelemetry', ctl: true },
+  { key: 'dg_ai',     name: 'DG AI 시뮬 (TCP)', role: ':9100, off시 실서버 자동전환', ctl: true },
+  { key: 'rosbridge', name: 'rosbridge',      role: ':9090', ctl: true },
+  { key: 'web',       name: 'web',            role: ':8000 (이 페이지)', ctl: false },
+];
+
+function render(state) {
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  const nodes = state.nodes || {};
+  for (const n of NODES) {
+    const up = nodes[n.key] === 'up';
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <h3>${n.name}</h3>
+      <div class="role">${n.role}</div>
+      <div class="row">
+        <span class="dot ${up ? 'up' : 'down'}"><i></i>${up ? 'UP' : 'DOWN'}</span>
+        <span>
+          ${n.ctl ? `<button class="on"  ${up ? 'disabled' : ''} onclick="ctl('${n.key}','start')">켜기</button>
+                     <button class="off" ${up ? '' : 'disabled'} onclick="ctl('${n.key}','stop')">끄기</button>` : ''}
+        </span>
+      </div>`;
+    grid.appendChild(card);
+  }
+  const t = state.ai_target || {};
+  document.getElementById('real').value = document.getElementById('real').value || t.real || '';
+  document.getElementById('sim').value  = document.getElementById('sim').value  || t.sim  || '';
+  const badge = document.getElementById('active');
+  badge.textContent = (t.active || '-') + (t.active === 'sim' ? '  (' + (t.sim||'') + ')' : t.active === 'real' ? '  (' + (t.real||'') + ')' : '');
+  badge.className = 'active-badge ' + (t.active === 'real' ? 'active-real' : 'active-sim');
+  colorTopo(nodes, t);
+}
+
+function colorTopo(nodes, ai) {
+  const UP = '#2ecc71', DN = '#3a4356', REAL = '#f0894a';
+  // 일반 노드/링크(acs·ddago·ddagi): 양쪽 UP이면 초록
+  for (const k of ['hq', 'acs', 'ddago', 'ddagi']) {
+    const el = document.getElementById('node-' + k);
+    if (el) el.setAttribute('stroke', nodes[k] === 'up' ? UP : DN);
+  }
+  for (const k of ['acs', 'ddago', 'ddagi']) {
+    const el = document.getElementById('link-' + k);
+    if (el) el.setAttribute('stroke', (nodes.hq === 'up' && nodes[k] === 'up') ? UP : DN);
+  }
+  // DG AI: 접속 대상(active)에 따라 시뮬/실서버를 표시
+  const active = (ai && ai.active) || 'sim';
+  const node = document.getElementById('node-dg_ai');
+  const link = document.getElementById('link-dg_ai');
+  const name = document.getElementById('dgai-name');
+  const sub = document.getElementById('dgai-sub');
+  if (active === 'real') {
+    // 시뮬 off → HQ가 실서버 연동. HQ UP이면 주황(실서버 연동 중)으로 표시.
+    const col = (nodes.hq === 'up') ? REAL : DN;
+    if (node) node.setAttribute('stroke', col);
+    if (link) link.setAttribute('stroke', col);
+    if (name) name.textContent = 'DG AI · 실서버';
+    if (sub) sub.textContent = (ai && ai.real) ? ai.real : '실서버';
+  } else {
+    const col = (nodes.hq === 'up' && nodes.dg_ai === 'up') ? UP : DN;
+    if (node) node.setAttribute('stroke', col);
+    if (link) link.setAttribute('stroke', col);
+    if (name) name.textContent = 'DG AI · 시뮬';
+    if (sub) sub.textContent = (ai && ai.sim) ? ai.sim : 'TCP :9100';
+  }
+}
+
+let _lastState = null;
+async function refresh() {
+  try {
+    const r = await fetch('/api/status');
+    if (!r.ok) throw new Error('bad');
+    const s = await r.json();
+    _lastState = s;
+    document.getElementById('conn-banner').style.display = 'none';
+    render(s);
+  } catch (e) {
+    // 제어 서버(web) 도달 불가 → 배너 표시 + web 을 DOWN 으로 표시(스테일 UP 방지)
+    document.getElementById('conn-banner').style.display = 'block';
+    const s = _lastState ? JSON.parse(JSON.stringify(_lastState)) : { nodes: {}, ai_target: {} };
+    s.nodes = s.nodes || {};
+    s.nodes.web = 'down';
+    render(s);
+  }
+}
+async function ctl(name, action) {
+  await fetch(`/api/node/${name}/${action}`, { method: 'POST' });
+  setTimeout(refresh, 600);
+}
+async function saveTarget() {
+  const body = { real: document.getElementById('real').value.trim(),
+                 sim:  document.getElementById('sim').value.trim() };
+  await fetch('/api/ai-target', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  const toast = document.getElementById('toast');
+  toast.textContent = '저장됨';
+  setTimeout(() => toast.textContent = '', 1500);
+  refresh();
+}
+// 서비스 연결 단위(key) + HQ 기준 메시지. dir: 'to_hq'(서비스→HQ) | 'from_hq'(HQ→서비스)
+const SVC_GROUPS = [
+  { key: 'acs',   title: 'Automato Control (ACS) · 시뮬', short: 'ACS' },
+  { key: 'ddago', title: 'DdaGo · 시뮬',                  short: 'DdaGo' },
+  { key: 'ddagi', title: 'Ddagi · 시뮬',                  short: 'Ddagi' },
+  { key: 'dg_ai', title: 'DG AI Service · 시뮬 (TCP)',    short: 'AI' },
+];
+const MSGS = [
+  { key: 'acs',   dir: 'to_hq',   iface: 'Patrol',           type: 'action',  name: '/dg_01/patrol',             scen: 'E1' },
+  { key: 'acs',   dir: 'from_hq', iface: 'Patrol/feedback',  type: 'action',  name: '/dg_01/patrol (feedback)',  scen: 'E1·E2' },
+  { key: 'acs',   dir: 'from_hq', iface: 'Patrol/result',    type: 'action',  name: '/dg_01/patrol (result)',    scen: 'E1·E2' },
+  { key: 'acs',   dir: 'from_hq', iface: 'FleetTelemetry',   type: 'topic',   name: '/automato/telemetry/fleet', scen: 'E0' },
+  { key: 'acs',   dir: 'from_hq', iface: 'SaveDetection',    type: 'service', name: '/automato/save_detection',  scen: 'E2' },
+  { key: 'ddago', dir: 'from_hq', iface: 'DdagoPatrol',      type: 'action',  name: '/dg_01/ddago/patrol',       scen: 'E1·E2' },
+  { key: 'ddago', dir: 'to_hq',   iface: 'DdagoPatrol/feedback', type: 'action', name: '/dg_01/ddago/patrol (feedback)', scen: 'E1·E2' },
+  { key: 'ddago', dir: 'to_hq',   iface: 'DdagoPatrol/result',   type: 'action', name: '/dg_01/ddago/patrol (result)',   scen: 'E1·E2' },
+  { key: 'ddago', dir: 'to_hq',   iface: 'DdagoTelemetry',   type: 'topic',   name: '/dg_01/ddago/telemetry',    scen: 'E0' },
+  { key: 'ddago', dir: 'to_hq',   iface: 'AnalyzeFrame',     type: 'service', name: '/dg/analyze_frame',         scen: 'E2' },
+  { key: 'ddagi', dir: 'to_hq',   iface: 'DdagiTelemetry',   type: 'topic',   name: '/dg_01/ddagi/telemetry',    scen: 'E0' },
+  { key: 'dg_ai', dir: 'from_hq', iface: 'analyze_request',  type: 'TCP',     name: '4B len + JSON',             scen: 'E2' },
+  { key: 'dg_ai', dir: 'to_hq',   iface: 'analyze_response', type: 'TCP',     name: '4B len + JSON',             scen: 'E2' },
+];
+// iface -> {key, type, short}. 방향(dir)은 각 wire 레코드의 값을 사용.
+const IFACE = {};
+for (const m of MSGS) {
+  const g = SVC_GROUPS.find(x => x.key === m.key);
+  IFACE[m.iface] = { key: m.key, type: m.type, short: g ? g.short : m.key };
+}
+let _ifaceTs = {};      // iface -> 마지막으로 본 최신 ts (깜박임 트리거용)
+let _firstWire = true;
+let msgLimit = 500;
+let _lastList = [];     // 마지막으로 받은 시계열(복사용)
+
+function copyMessages() {
+  const lines = applyTelFilter(_lastList).map(e => {
+    const info = IFACE[e.iface] || { short: e.iface };
+    const dir = e.dir === 'to_hq' ? info.short + ' -> HQ' : 'HQ -> ' + info.short;
+    return fmtTime(e.ts) + '  ' + dir + '  ' + e.iface + '  ' + JSON.stringify(e.payload);
+  });
+  const text = lines.join('\n');
+  const toast = document.getElementById('copy-toast');
+  const done = (msg, ok) => { if (toast) { toast.style.color = ok ? '#46d17e' : '#e74c3c'; toast.textContent = msg; setTimeout(() => toast.textContent = '', 1500); } };
+  if (!text) { done('복사할 메시지 없음', false); return; }
+  (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject())
+    .then(() => done(lines.length + '줄 복사됨', true))
+    .catch(() => {
+      // 클립보드 API 실패 시 임시 textarea로 폴백
+      const ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); done(lines.length + '줄 복사됨', true); }
+      catch (e) { done('복사 실패', false); }
+      document.body.removeChild(ta);
+    });
+}
+// 메시지 시계열 지우기: 서버 WIRE_SINCE 갱신(이후 메시지만) + 화면 즉시 클리어
+async function clearWireLog() {   // 🗑 지우기 버튼: 서버 기준시각 갱신(영구) + 화면 클리어
+  const toast = document.getElementById('copy-toast');
+  const done = (msg, ok) => { if (toast) { toast.style.color = ok ? '#46d17e' : '#e74c3c'; toast.textContent = msg; setTimeout(() => toast.textContent = '', 1500); } };
+  try {
+    const r = await fetch('/api/wire/clear', { method: 'POST' });
+    if (!r.ok) throw new Error();
+  } catch (e) { done('지우기 실패', false); return; }
+  _lastList = [];
+  const box = document.getElementById('msg-timeline');
+  if (box) box.innerHTML = '<div class="wempty">(아직 없음)</div>';
+  done('지움', true);
+}
+
+function escapeHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + '.' + p(d.getMilliseconds(), 3);
+}
+// 링크의 HQ 쪽 끝: 'start'=x1, 'end'=x2 (SVG line 정의 방향 기준)
+const HQ_END = { acs: 'end', ddago: 'start', ddagi: 'start', dg_ai: 'start' };
+// 링크 깜박임 + 방향 화살표(링크 위) + 메시지명 라벨
+function flashLink(key, iface, dir) {
+  const el = document.getElementById('link-' + key);
+  if (el) {
+    if (el.animate) {
+      const base = el.getAttribute('stroke') || '#3a4356';
+      el.animate([{ stroke: '#eaff66', strokeWidth: '5px' }, { stroke: base, strokeWidth: '2px' }],
+                 { duration: 1200, easing: 'ease-out' });
+    }
+    // 방향을 깜박이는 링크에 화살표로 표시 (to_hq=HQ쪽 끝, from_hq=서비스쪽 끝)
+    const hqEnd = HQ_END[key] || 'end';
+    const targetEnd = (dir === 'to_hq') ? hqEnd : (hqEnd === 'end' ? 'start' : 'end');
+    el.removeAttribute('marker-start');
+    el.removeAttribute('marker-end');
+    el.setAttribute(targetEnd === 'end' ? 'marker-end' : 'marker-start', 'url(#flash-arrow)');
+    clearTimeout(el._arrowT);
+    el._arrowT = setTimeout(() => {
+      el.removeAttribute('marker-start');
+      el.removeAttribute('marker-end');
+    }, 1300);
+  }
+  // 라벨은 메시지명만 (방향은 링크 화살표로 표시)
+  const lbl = document.getElementById('lbl-' + key);
+  if (lbl) {
+    lbl.textContent = iface;
+    lbl.animate([{ opacity: 1 }, { opacity: 1, offset: 0.6 }, { opacity: 0 }],
+                { duration: 1700, easing: 'ease-out' });
+  }
+}
+// 텔레메트리(1Hz 스트림)는 타임라인을 뒤덮어 clear를 무력화 → 토글로 숨김
+const TEL_IFACES = new Set(['DdagoTelemetry', 'DdagiTelemetry', 'FleetTelemetry']);
+function hideTelOn() { const c = document.getElementById('hide-tel'); return !!(c && c.checked); }
+function applyTelFilter(list) {
+  return hideTelOn() ? (list || []).filter(e => !TEL_IFACES.has(e.iface)) : (list || []);
+}
+function onHideTelChange() { renderTimeline(_lastList || []); }   // 토글 즉시 반영
+// DG(HQ) 시점 전체 시계열을 하나의 스크롤에 렌더
+function renderTimeline(list) {
+  const box = document.getElementById('msg-timeline');
+  if (!box) return;
+  list = applyTelFilter(list);   // 텔레메트리 숨김 토글 반영
+  if (!list.length) { box.innerHTML = '<div class="wempty">(아직 없음)</div>'; return; }
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 50;
+  const prevTop = box.scrollTop;
+  box.innerHTML = list.map(e => {
+    const info = IFACE[e.iface] || { short: e.iface, type: '' };
+    const dir = e.dir === 'to_hq' ? info.short + ' → HQ' : 'HQ → ' + info.short;
+    return '<div class="tl-row">' +
+      `<span class="tl-time">${fmtTime(e.ts)}</span>` +
+      `<span class="tl-dir">${dir}</span>` +
+      `<span class="tl-iface">${e.iface}</span>` +
+      `<span class="tag ${info.type}">${info.type}</span>` +
+      `<span class="tl-pl">${escapeHtml(JSON.stringify(e.payload))}</span></div>`;
+  }).join('');
+  box.scrollTop = nearBottom ? box.scrollHeight : prevTop;   // 맨 아래(최신) 보고 있으면 따라감
+}
+async function refreshWire() {
+  try {
+    const r = await fetch('/api/wire?limit=' + msgLimit);
+    const list = await r.json();   // 평면 시계열: [{ts, dir, iface, payload}]
+    _lastList = list;
+    renderTimeline(list);
+    // 인터페이스별 최신 ts 증가 → 해당 링크 깜박임 + 라벨
+    const newest = {};
+    for (const e of list) {
+      if (!(e.iface in newest) || e.ts > newest[e.iface]) newest[e.iface] = e.ts;
+    }
+    for (const iface in newest) {
+      if (newest[iface] > (_ifaceTs[iface] || 0)) {
+        const info = IFACE[iface];
+        if (!_firstWire && info) {
+          let dir = 'from_hq';
+          for (let i = list.length - 1; i >= 0; i--) {
+            if (list[i].iface === iface) { dir = list[i].dir; break; }
+          }
+          flashLink(info.key, iface, dir);
+        }
+        _ifaceTs[iface] = newest[iface];
+      }
+    }
+    _firstWire = false;
+  } catch (e) {}
+}
+
+const TESTS = [
+  { key: 'e0', name: 'E0 상시 모니터링', desc: '실행 시 시뮬 텔레메트리 상시 발행 → HQ 취합 → ACS FleetTelemetry 수신 (중지 버튼으로 정지)' },
+  { key: 'e1', name: 'E1 순찰 시작',     desc: 'ACS→HQ Patrol 접수 → HQ→DdaGo waypoint 하달' },
+  { key: 'e2', name: 'E2 체크·저장',     desc: 'waypoint별 분석 → SaveDetection 저장 → 순찰 완료(result_code=0)' },
+];
+function renderTests() {
+  const c = document.getElementById('tests');
+  c.innerHTML = '';
+  for (const t of TESTS) {
+    const box = document.createElement('div');
+    box.className = 'test-item';
+    box.innerHTML = `
+      <div class="test-head">
+        <div><b>${t.name}</b><div class="role">${t.desc}</div></div>
+        <div style="white-space:nowrap">
+          <span class="result-badge" id="badge-${t.key}">미실행</span>
+          <button id="btn-${t.key}" onclick="runItem('${t.key}')">실행</button>
+          ${t.key === 'e0' ? `<button id="stop-e0" onclick="stopTelemetry()">중지</button>` : ''}
+        </div>
+      </div>
+      <pre class="log" id="ev-${t.key}" style="display:none"></pre>`;
+    c.appendChild(box);
+  }
+}
+function clearMessages() {
+  const box = document.getElementById('msg-timeline');
+  if (box) box.innerHTML = '<div class="wempty">(아직 없음)</div>';
+  _ifaceTs = {}; _firstWire = true;
+}
+async function stopTelemetry() {
+  const btn = document.getElementById('stop-e0');
+  const badge = document.getElementById('badge-e0');
+  if (btn) btn.disabled = true;
+  if (badge) { badge.textContent = '중지중...'; badge.className = 'result-badge'; }
+  try { await fetch('/api/telemetry/stop', { method: 'POST' }); } catch (e) {}
+  if (badge) { badge.textContent = '중지됨'; badge.className = 'result-badge'; }
+  if (btn) btn.disabled = false;
+}
+async function runItem(key) {
+  const btn = document.getElementById('btn-' + key);
+  const badge = document.getElementById('badge-' + key);
+  const ev = document.getElementById('ev-' + key);
+  btn.disabled = true;
+  clearMessages();   // 실행 시 메시지 전부 초기화하고 시작
+  badge.textContent = '실행중...'; badge.className = 'result-badge';
+  try {
+    const r = await fetch('/api/test/' + key, { method: 'POST' });
+    const j = await r.json();
+    badge.textContent = j.ok ? 'PASS' : 'FAIL';
+    badge.className = 'result-badge ' + (j.ok ? 'pass' : 'fail');
+    ev.style.display = 'block';
+    ev.textContent = (j.evidence || []).join('\n');
+  } catch (e) {
+    badge.textContent = '오류'; badge.className = 'result-badge fail';
+  }
+  btn.disabled = false;
+}
+
+const _limitInput = document.getElementById('msg-limit');
+if (_limitInput) {
+  _limitInput.addEventListener('change', () => {
+    const v = parseInt(_limitInput.value, 10);
+    if (!isNaN(v)) { msgLimit = Math.max(1, Math.min(5000, v)); _limitInput.value = msgLimit; refreshWire(); }
+  });
+}
+renderTests();
+refresh();
+refreshWire();
+setInterval(refresh, 2500);
+setInterval(refreshWire, 1500);
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+# Automato DB — 마이그레이션/연결 도구 (Python 3.12)
+# 설치:  python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+alembic>=1.13
+SQLAlchemy>=2.0
+psycopg[binary]>=3.1
+python-dotenv>=1.0

@@ -1,0 +1,94 @@
+{
+  "info": {
+    "name": "Automato SERVICES (Web / Control)",
+    "description": "이건수 담당 SERVICES 계층 통신 테스트. Sprint 3 인터페이스 통합 테스트 메세지 규격(page 19496961) 기준.\n\n변수:\n- web     = Automato Web Service (기본 http://localhost:8100)\n- control = Automato Control Service (기본 http://localhost:8200)\n원격 테스트 시 web/control 값을 해당 PC IP(예 http://192.168.100.14:8100)로 바꾸세요.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "web", "value": "http://localhost:8100" },
+    { "key": "control", "value": "http://localhost:8200" }
+  ],
+  "item": [
+    {
+      "name": "Web Service",
+      "item": [
+        {
+          "name": "GET /health  (헬스체크)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{web}}/health", "host": ["{{web}}"], "path": ["health"] },
+            "description": "서비스 살아있는지 확인. 200 {\"ok\":true} 기대."
+          }
+        },
+        {
+          "name": "GET /api/v1/operation/status  (운영 상태)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{web}}/api/v1/operation/status",
+              "host": ["{{web}}"], "path": ["api", "v1", "operation", "status"]
+            }
+          }
+        },
+        {
+          "name": "POST /api/v1/operation/start  (#1 운영 시작 → Control 포워딩)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mode\": \"harvest\",\n  \"robot\": \"dg1\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{web}}/api/v1/operation/start",
+              "host": ["{{web}}"], "path": ["api", "v1", "operation", "start"]
+            },
+            "description": "규격 #1. Web 이 Control 로 포워딩하고, Control 의 ACK(#2)를 control_ack 로 되돌려줌.\n성공 시: {\"from\":\"Automato Web Service\",\"forwarded\":{...},\"control_ack\":{\"result\":\"success\"}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Control Service",
+      "item": [
+        {
+          "name": "GET /health  (헬스체크)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{control}}/health", "host": ["{{control}}"], "path": ["health"] }
+          }
+        },
+        {
+          "name": "GET /api/status  (DG 액션/최근 피드백·결과)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{control}}/api/status", "host": ["{{control}}"], "path": ["api", "status"] },
+            "description": "dg_action, last_feedback(count,x,y,yaw), last_result 확인."
+          }
+        },
+        {
+          "name": "POST /api/v1/operation/start  (#1 수신 → DG OpHarvest #3 발행)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mode\": \"harvest\",\n  \"robot\": \"dg1\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{control}}/api/v1/operation/start",
+              "host": ["{{control}}"], "path": ["api", "v1", "operation", "start"]
+            },
+            "description": "Web 을 거치지 않고 Control 을 직접 테스트. Control 이 DG(/dg1/op/harvest, OpHarvest)로 #3 발행 후 #2 ACK 반환.\n성공 시: {\"result\":\"success\"}  (DG 서버가 도메인10에 떠 있어야 함)"
+          }
+        }
+      ]
+    }
+  ]
+}

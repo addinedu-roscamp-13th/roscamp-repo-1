@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""dg_web — DG Control Service(HQ) 테스트용 제어 대시보드 서버.
+
+- 정적 파일(index.html) 제공
+- REST API 로 노드 상태 조회 및 start/stop (dashboard.sh 호출)
+    GET  /api/status                 → {nodes:{hq,acs,...}, ai_target:{real,sim,active}}
+    POST /api/node/<name>/<action>   → dashboard.sh <action> <name>  (action: start|stop)
+- DG AI Service TCP 접속 대상(실서버/시뮬 IP) 저장·조회
+    GET  /api/ai-target              → {real, sim, active}
+    POST /api/ai-target  {real,sim}  → 저장(active 유지)
+- E0/E1/E2 항목별 테스트 실행·판정 (PASS/FAIL + 근거 로그)
+    POST /api/test/e0                → 상시 모니터링(FleetTelemetry 취합) 판정
+    POST /api/test/e1                → 순찰 시작(Patrol 접수→DdaGo 하달) 판정
+    POST /api/test/e2                → 체크·저장(분석→SaveDetection→순찰완료) 판정
+    GET  /api/logs                   → 최근 흐름 로그 추림(참고용)
+
+dg_ai 시뮬을 껐다 켜면 dashboard.sh 가 active 를 real/sim 으로 자동 전환하고,
+HQ 는 dg_ai_target.json 의 active 를 읽어 해당 엔드포인트로 자동 재접속한다.
+
+포트 8000, localhost 전용. rosbridge(9090) 와 별개.
+"""
+import json
+import os
+import re
+import subprocess
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+WEB_DIR = os.path.dirname(os.path.abspath(__file__))       # .../automato_ws/dg_web
+WS_DIR = os.path.dirname(WEB_DIR)                           # .../automato_ws
+DASH = os.path.join(WS_DIR, 'dashboard.sh')
+TARGET = os.path.join(WEB_DIR, 'dg_ai_target.json')
+
+# 제어 가능한 컴포넌트: 이름 → (검사종류, 대상)
+CHECKS = {
+    'hq':        ('proc', 'dg_control/lib/dg_control/hq_node'),
+    'acs':       ('proc', 'dg_sim/lib/dg_sim/acs_sim'),
+    'ddago':     ('proc', 'dg_sim/lib/dg_sim/ddago_sim'),
+    'ddagi':     ('proc', 'dg_sim/lib/dg_sim/ddagi_sim'),
+    'dg_ai':     ('port', '9100'),
+    'rosbridge': ('port', '9090'),
+    'web':       ('port', '8000'),   # 이 서버 자신(상태 표시용). start/stop 버튼은 없음.
+}
+SIMS = ('acs', 'ddago', 'ddagi', 'dg_ai')   # 시뮬 4종
+
+
+def is_up(kind, target):
+    if kind == 'proc':
+        return subprocess.run(['pgrep', '-f', target],
+                              stdout=subprocess.DEVNULL).returncode == 0
+    out = subprocess.run(['ss', '-ltn'], capture_output=True, text=True).stdout
+    return (':' + target + ' ') in out
+
+
+def status():
+    return {k: ('up' if is_up(*v) else 'down') for k, v in CHECKS.items()}
+
+
+def read_target():
+    try:
+        with open(TARGET, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {'real': '', 'sim': '127.0.0.1:9100', 'active': 'sim'}
+
+
+def write_target(data):
+    with open(TARGET, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _tail_filtered(path, keywords, n=12):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = [ln.rstrip('\n') for ln in f if any(k in ln for k in keywords)]
+        return lines[-n:]
+    except OSError:
+        return []
+
+
+def _tail_bytes(path, nbytes=131072):
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            data = f.read()
+        return data.decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return []
+
+
+WIRE_SINCE_FILE = '/tmp/dash_wire_since'   # clear 기준 시각을 파일에 저장(서버 재시작에도 유지)
+
+
+def clear_wire():
+    """메시지 시계열 지우기: 기준 시각을 파일에 기록 → 이후 메시지만 표시.
+    파일 백업이라 web 서버가 재시작돼도, 새 브라우저로 접속해도 지운 상태가 유지된다."""
+    try:
+        with open(WIRE_SINCE_FILE, 'w') as f:
+            f.write(repr(time.time()))
+    except OSError:
+        pass
+
+
+def _wire_since():
+    """clear 기준 시각(파일). 없으면 0.0. read_wire 가 매 요청마다 읽어 필터에 사용."""
+    try:
+        with open(WIRE_SINCE_FILE) as f:
+            return float(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0.0
+
+
+WIRE_MAX = 500   # 시계열 보관 기본 개수(대시보드에서 조정 가능)
+
+
+def read_wire(limit=WIRE_MAX):
+    """HQ 로그의 @@WIRE@@ 라인을 파싱해 DG(HQ) 시점의 '전체 시계열'을 반환.
+    반환: [ {ts, dir, iface, payload}, ... ]  (WIRE_SINCE 이후, 시각 오름차순, 최근 limit건)."""
+    marker = '@@WIRE@@ '
+    since = _wire_since()   # 파일에 저장된 clear 기준 시각
+    out = []
+    for ln in _tail_bytes('/tmp/dash_hq.log', 1048576):
+        i = ln.find(marker)
+        if i < 0:
+            continue
+        try:
+            rec = json.loads(ln[i + len(marker):])
+        except ValueError:
+            continue
+        if rec.get('ts', 0) < since:
+            continue
+        if not rec.get('iface'):
+            continue
+        out.append({'ts': rec.get('ts'), 'dir': rec.get('dir'),
+                    'iface': rec.get('iface'), 'payload': rec.get('payload')})
+    out.sort(key=lambda r: r.get('ts') or 0)
+    return out[-limit:]
+
+
+def read_logs():
+    return {
+        'hq': _tail_filtered('/tmp/dash_hq.log',
+                             ['DdaGo 하달', '분석결과', '순찰 완료', '순찰 시작']),
+        'acs': _tail_filtered('/tmp/dash_acs.log',
+                              ['순찰 발행', '순찰 진행', 'SaveDetection 저장', '순찰 결과', 'Fleet 수신']),
+    }
+
+
+def _trigger_patrol():
+    """acs_sim 의 순찰 트리거(dashboard.sh test) 실행."""
+    subprocess.run(['bash', DASH, 'test'], capture_output=True, text=True, timeout=40)
+
+
+def eval_e0():
+    """E0 상시 모니터링: 실행 시 시뮬 텔레메트리를 트리거하고,
+    DdaGo/Ddagi → HQ → ACS 로 FleetTelemetry(ddago,ddagi 취합)가 흐르는지 확인."""
+    clear_wire()   # 실행 시 메시지 초기화
+    subprocess.run(['bash', DASH, 'telemetry'], capture_output=True, text=True, timeout=30)
+
+    def done():
+        for ln in reversed(_tail_filtered('/tmp/dash_acs.log', ['Fleet 수신'], n=10)):
+            m = re.search(r'ddago=(\d+).*ddagi=(\d+)', ln)
+            if m and int(m.group(1)) >= 1 and int(m.group(2)) >= 1:
+                return True
+        return False
+
+    ok = _wait_until(done, 12)
+    for ln in reversed(_tail_filtered('/tmp/dash_acs.log', ['Fleet 수신'], n=10)):
+        m = re.search(r'ddago=(\d+).*ddagi=(\d+)', ln)
+        if m and int(m.group(1)) >= 1 and int(m.group(2)) >= 1:
+            return ok, [ln]
+    ev = _tail_filtered('/tmp/dash_acs.log', ['Fleet 수신'], n=3)
+    return ok, ev or ['(Fleet 수신 없음 — hq·ddago·ddagi·acs UP 확인)']
+
+
+def _wait_until(check, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if check():
+            return True
+        time.sleep(1.0)
+    return check()
+
+
+def eval_e1():
+    """E1 순찰 시작: ACS→HQ Patrol 접수 후 HQ→DdaGo 로 waypoint 하달까지."""
+    clear_wire()   # 실행 시 메시지 초기화
+    _trigger_patrol()
+
+    def done():
+        hq = _tail_filtered('/tmp/dash_hq.log', ['순찰 시작', 'DdaGo 하달'], n=8)
+        return any('순찰 시작' in l for l in hq) and any('DdaGo 하달' in l for l in hq)
+
+    ok = _wait_until(done, 10)
+    hq = _tail_filtered('/tmp/dash_hq.log', ['순찰 시작', 'DdaGo 하달'], n=6)
+    return ok, hq or ['(HQ 로그 없음 — hq UP 및 acs 트리거 확인)']
+
+
+def eval_e2():
+    """E2 체크·저장: waypoint별 분석→SaveDetection 저장→순찰 완료(result_code=0)까지.
+    시뮬 처리 지연(이동·분석 각 3초)으로 완주에 시간이 걸리므로 완료까지 폴링(최대 45초)."""
+    clear_wire()   # 실행 시 메시지 초기화
+    _trigger_patrol()
+
+    def done():
+        hq = _tail_filtered('/tmp/dash_hq.log', ['순찰 완료'], n=3)
+        acs = _tail_filtered('/tmp/dash_acs.log', ['순찰 결과'], n=3)
+        return any('순찰 완료' in l for l in hq) and any('result_code=0' in l for l in acs)
+
+    ok = _wait_until(done, 45)
+    hq = _tail_filtered('/tmp/dash_hq.log', ['분석결과', '순찰 완료'], n=6)
+    acs = _tail_filtered('/tmp/dash_acs.log', ['SaveDetection 저장', '순찰 결과'], n=6)
+    return ok, hq[-4:] + acs[-4:]
+
+
+EVALS = {'e0': eval_e0, 'e1': eval_e1, 'e2': eval_e2}
+EVAL_NAMES = {'e0': 'E0 상시 모니터링', 'e1': 'E1 순찰 시작', 'e2': 'E2 체크·저장'}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_body(self):
+        length = int(self.headers.get('Content-Length', 0))
+        if not length:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode())
+        except ValueError:
+            return {}
+
+    def do_GET(self):
+        path = self.path.split('?')[0]
+        if path == '/api/status':
+            return self._json({'nodes': status(), 'ai_target': read_target()})
+        if path == '/api/ai-target':
+            return self._json(read_target())
+        if path == '/api/logs':
+            return self._json(read_logs())
+        if path == '/api/wire':
+            limit = WIRE_MAX
+            if '?' in self.path:
+                for kv in self.path.split('?', 1)[1].split('&'):
+                    if kv.startswith('limit='):
+                        try:
+                            limit = max(1, min(5000, int(kv[6:])))
+                        except ValueError:
+                            pass
+            return self._json(read_wire(limit))
+        return self._serve_static()
+
+    def do_POST(self):
+        path = self.path.split('?')[0]
+        # 메시지 시계열 지우기 (WIRE_SINCE 갱신 → 이후 메시지만 표시)
+        if path == '/api/wire/clear':
+            clear_wire()
+            return self._json({'ok': True})
+        # E0 상시 모니터링 중지 (시뮬 텔레메트리 발행 정지)
+        if path == '/api/telemetry/stop':
+            subprocess.run(['bash', DASH, 'telemetry-stop'], capture_output=True,
+                           text=True, timeout=30)
+            return self._json({'ok': True})
+        # E0/E1/E2 항목별 테스트 실행·판정
+        parts = path.strip('/').split('/')
+        if len(parts) == 3 and parts[0] == 'api' and parts[1] == 'test' and parts[2] in EVALS:
+            key = parts[2]
+            ok, evidence = EVALS[key]()
+            return self._json({'item': key, 'name': EVAL_NAMES[key],
+                               'ok': ok, 'evidence': evidence})
+        if path == '/api/ai-target':
+            body = self._read_body()
+            cfg = read_target()
+            if 'real' in body:
+                cfg['real'] = str(body['real']).strip()
+            if 'sim' in body:
+                cfg['sim'] = str(body['sim']).strip()
+            write_target(cfg)
+            return self._json(cfg)
+
+        parts = path.strip('/').split('/')
+        # /api/node/<name>/<action>
+        if len(parts) == 4 and parts[0] == 'api' and parts[1] == 'node':
+            name, action = parts[2], parts[3]
+            if name in CHECKS and action in ('start', 'stop'):
+                subprocess.run(['bash', DASH, action, name], timeout=30)
+                return self._json({'name': name, 'action': action,
+                                   'nodes': status(), 'ai_target': read_target()})
+        return self._json({'error': 'bad request'}, 400)
+
+    def _serve_static(self):
+        path = self.path.split('?')[0]
+        if path == '/':
+            path = '/index.html'
+        fp = os.path.normpath(os.path.join(WEB_DIR, path.lstrip('/')))
+        if not fp.startswith(WEB_DIR) or not os.path.isfile(fp):
+            self.send_error(404)
+            return
+        ctype = 'text/html; charset=utf-8' if fp.endswith('.html') else 'application/octet-stream'
+        with open(fp, 'rb') as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(data)))
+        # 브라우저가 옛 HTML/JS 를 캐시해 대시보드 변경이 안 보이는 문제 방지
+        self.send_header('Cache-Control', 'no-store, must-revalidate')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
+if __name__ == '__main__':
+    print('[dg_web control_server] http://127.0.0.1:8000  (정적 + /api)')
+    ThreadingHTTPServer(('127.0.0.1', 8000), Handler).serve_forever()

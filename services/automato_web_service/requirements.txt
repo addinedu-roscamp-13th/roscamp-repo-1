@@ -1,0 +1,5 @@
+flask>=3.0
+requests
+flask-sock
+simple-websocket
+gunicorn>=21.0

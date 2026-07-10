@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>dg_sim</name>
+  <version>0.1.0</version>
+  <description>DG Control Service(HQ) 테스트용 상대편 시뮬레이터 모음. 팀원들이 개발 중인
+    Automato Control Service / DdaGo / Ddagi / DG AI Service 를 즉시-응답 스텁으로 대역한다.
+    실제 팀원 코드 없이 HQ 를 혼자 end-to-end 테스트하기 위한 것.</description>
+  <maintainer email="finekim67@gmail.com">heeseog</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>automato_interfaces</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

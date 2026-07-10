@@ -1,0 +1,18 @@
+# 시나리오1 E2/E3 : 탐지 결과(익음/부패/병해충 수치) 저장 요청
+# HQ -> Automato Control Service (ROS2 Service  /automato/save_detection)
+# ---------- Request ----------
+int64   task_id
+int32   waypoint_id
+string  robot_id
+int32   ripe_percent
+int32   unripe_percent
+int32   rotten_percent
+int32   disease_percent
+# RP-79(E3): 병해충 레이블 이미지(raw sensor_msgs/Image). AI Service 가 disease_percent >= 5
+#            일 때만 실어 보내고, HQ 가 그대로 ACS 로 전달한다. 미만이면 비어 있음(height==0 &&
+#            width==0, data 길이 0). 파일 저장(JPEG 인코딩)은 ACS 에서만 수행.
+sensor_msgs/Image disease_image  # 레이블된 프레임(bgr8/rgb8). disease_percent<5 면 빈 Image
+---
+# ---------- Response ----------
+bool    success                 # DB 저장 성공 여부(notify/alert 성공 여부는 반영 안 함)
+string  message

@@ -1,0 +1,28 @@
+# Automato DB (시나리오 1: 순찰·관제) — PostgreSQL 16
+# 실행: services/database 에서  `docker compose up -d`
+# 접속정보는 같은 폴더의 .env 에서 주입된다 (.env 는 .gitignore 로 커밋 안 됨).
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: automato-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-automato}
+      POSTGRES_USER: ${POSTGRES_USER:-automato}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-automato}
+      TZ: Asia/Seoul
+    ports:
+      # 호스트 5432 -> 컨테이너 5432 (호스트 포트는 .env 의 POSTGRES_PORT 로 조정 가능)
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # 데이터 영속화 (컨테이너를 지워도 DB 내용 유지)
+      - automato_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # DB가 실제로 연결을 받을 준비가 됐는지 확인 (green 이어야 alembic 실행 가능)
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-automato} -d ${POSTGRES_DB:-automato}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  automato_pgdata:
