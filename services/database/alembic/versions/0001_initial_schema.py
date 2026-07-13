@@ -1,21 +1,24 @@
-"""initial schema — Automato DB (시나리오 1: 순찰·관제)
+"""initial schema — Automato DB (시나리오 1·2: 순찰·관제·수확)
 
-Confluence "DB ERD" (v27) 기준 12개 테이블 + updated_at 트리거 + 인덱스.
+Confluence "DB ERD" (v33) 기준 12개 테이블 + updated_at 트리거 + 인덱스.
 MySQL 표기 -> PostgreSQL 변환:
   - INT AUTO_INCREMENT            -> INTEGER GENERATED ALWAYS AS IDENTITY
   - ENUM('A','B')                 -> VARCHAR + CHECK (팀 결정)
   - TIMESTAMP ON UPDATE ...       -> set_updated_at() 트리거
   - FLOAT                         -> DOUBLE PRECISION
   - TIMESTAMP                     -> TIMESTAMPTZ (UTC 시점 저장, 타임존 버그 예방)
-ERD 오타 정정:
-  - task_paths.point_index 의 DEFAULT FALSE -> DEFAULT 0
-ERD v27 반영:
-  - tasks.status 에 'PARTIAL' 추가
-  - detection_logs.disease_image_path (VARCHAR(255)) 추가
-  - corridors 테이블 신설 (waypoint 간 무방향 간선). 문서의
-    "waypoint_a_id < waypoint_b_id 저장 관례"를 CHECK 제약으로 강제.
-  - waypoints.yaw_coord (DOUBLE PRECISION, NULLABLE) 추가. 순찰점만 방향이
-    필요하고(카메라가 오른쪽에 달려 왼쪽만 촬영) 비순찰점은 NULL.
+ERD v33(시나리오 2 설계) 반영 — RP-88:
+  - task_paths 테이블 폐기(삭제). 경로는 실행 중 재계획되는 휘발성 데이터라
+    ACS 메모리에서 관리하고, DB에는 요청(tasks)과 결과만 영속화한다.
+  - aruco_markers 테이블 신설. 정밀 도킹용 ArUco 마커/도킹 오프셋(task_points 1:1).
+  - robots.charge_point_id (FK -> task_points, NULLABLE) 추가. 로봇별 전용 충전소.
+  - task_points.point_type (ENUM HARVEST/PRECOOL/CHARGE) 추가. 작업 위치 종류.
+  - harvest_batches.failed_count / exit_reason 추가. 수확 성공률·종료 사유.
+  - tasks.status 값을 DONE/PARTIAL -> COMPLETED/COMPLETED_PARTIAL 로 문서와 일치시킴.
+이전(v27)부터 이미 반영된 것:
+  - tasks.status 다상태화, detection_logs.disease_image_path (VARCHAR(255)),
+  - corridors 테이블(waypoint 간 무방향 간선, a<b CHECK + UNIQUE),
+  - waypoints.yaw_coord(NULLABLE, 순찰점만 방향값·비순찰점 NULL).
 
 Revision ID: 0001
 Revises:
@@ -37,26 +40,27 @@ _UPDATED_AT_TABLES = [
     "robots",
     "task_points",
     "tasks",
-    "task_paths",
     "detection_logs",
     "harvest_batches",
     "operation_battery_thresholds",
     "corridors",
+    "aruco_markers",
 ]
 
 # downgrade 시 FK 자식 -> 부모 역순으로 DROP
+# (aruco_markers, robots 모두 task_points 를 참조하므로 task_points 보다 먼저 지운다)
 _DROP_ORDER = [
     "corridors",
+    "aruco_markers",
     "task_assignment_snapshot",
     "event_logs",
     "unload_logs",
     "harvest_batches",
     "detection_logs",
-    "task_paths",
     "operation_battery_thresholds",
     "tasks",
-    "task_points",
     "robots",
+    "task_points",
     "waypoints",
 ]
 
@@ -74,7 +78,8 @@ def upgrade() -> None:
         """
     )
 
-    # 1) 마스터 테이블 (FK 부모, 의존 없음) -----------------------------
+    # 1) 마스터 테이블 -------------------------------------------------
+    #   robots.charge_point_id 가 task_points 를 참조하므로 task_points 를 먼저 만든다.
     op.execute(
         """
         CREATE TABLE waypoints (
@@ -91,23 +96,26 @@ def upgrade() -> None:
     )
     op.execute(
         """
-        CREATE TABLE robots (
-            robot_id   VARCHAR(50) PRIMARY KEY,
-            robot_name VARCHAR(50),
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        """
-    )
-    op.execute(
-        """
         CREATE TABLE task_points (
             task_point_id VARCHAR(50) PRIMARY KEY,
+            point_type    VARCHAR(20) NOT NULL
+                          CHECK (point_type IN ('HARVEST','PRECOOL','CHARGE')),
             x_coord       DOUBLE PRECISION NOT NULL,
             y_coord       DOUBLE PRECISION NOT NULL,
             yaw_coord     DOUBLE PRECISION NOT NULL,
             created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        """
+    )
+    op.execute(
+        """
+        CREATE TABLE robots (
+            robot_id        VARCHAR(50) PRIMARY KEY,
+            robot_name      VARCHAR(50),
+            charge_point_id VARCHAR(50) REFERENCES task_points(task_point_id),
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         """
     )
@@ -120,7 +128,7 @@ def upgrade() -> None:
             task_type         VARCHAR(20) NOT NULL
                               CHECK (task_type IN ('PATROL','HARVEST','TRANSFER')),
             status            VARCHAR(20) NOT NULL DEFAULT 'WAITING'
-                              CHECK (status IN ('WAITING','IN_PROGRESS','DONE','FAILED','PARTIAL')),
+                              CHECK (status IN ('WAITING','IN_PROGRESS','COMPLETED','FAILED','COMPLETED_PARTIAL')),
             priority          INTEGER NOT NULL DEFAULT 0,
             task_point_id     VARCHAR(50) REFERENCES task_points(task_point_id),
             assigned_robot_id VARCHAR(50) REFERENCES robots(robot_id),
@@ -134,19 +142,6 @@ def upgrade() -> None:
     )
 
     # 3) tasks 에 의존하는 자식 테이블들 --------------------------------
-    op.execute(
-        """
-        CREATE TABLE task_paths (
-            task_path_id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            task_id      INTEGER NOT NULL REFERENCES tasks(task_id),
-            waypoint_id  INTEGER NOT NULL REFERENCES waypoints(waypoint_id),
-            point_index  INTEGER NOT NULL DEFAULT 0,
-            is_visited   BOOLEAN,
-            created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-            updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        """
-    )
     op.execute(
         """
         CREATE TABLE detection_logs (
@@ -173,6 +168,9 @@ def upgrade() -> None:
             robot_id      VARCHAR(50) NOT NULL REFERENCES robots(robot_id),
             normal_count  INTEGER NOT NULL DEFAULT 0,
             discard_count INTEGER NOT NULL DEFAULT 0,
+            failed_count  INTEGER NOT NULL DEFAULT 0,
+            exit_reason   VARCHAR(20)
+                          CHECK (exit_reason IN ('DEPLETED','FULL','MAX_ROUNDS_EXCEEDED')),
             created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
         );
@@ -248,6 +246,26 @@ def upgrade() -> None:
         """
     )
 
+    # 4-2) aruco_markers — 정밀 도킹용 마커 (task_points 참조) -----------
+    #   marker_id 는 실제 인쇄된 마커에 새겨진 값(자연키)이라 IDENTITY 를 쓰지 않는다.
+    #   task_point_id UNIQUE — 작업 위치 1곳당 마커 1개.
+    op.execute(
+        """
+        CREATE TABLE aruco_markers (
+            marker_id       INTEGER PRIMARY KEY,
+            task_point_id   VARCHAR(50) NOT NULL UNIQUE
+                            REFERENCES task_points(task_point_id),
+            dictionary      VARCHAR(30) NOT NULL DEFAULT 'DICT_4X4_50',
+            marker_size_m   DOUBLE PRECISION NOT NULL,
+            dock_offset_x   DOUBLE PRECISION NOT NULL,
+            dock_offset_y   DOUBLE PRECISION NOT NULL,
+            dock_offset_yaw DOUBLE PRECISION NOT NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        """
+    )
+
     # 5) updated_at 트리거 부착 ----------------------------------------
     for tbl in _UPDATED_AT_TABLES:
         op.execute(
@@ -271,8 +289,7 @@ def upgrade() -> None:
     op.execute("CREATE INDEX idx_tasks_status ON tasks (status);")
     op.execute("CREATE INDEX idx_tasks_assigned_robot ON tasks (assigned_robot_id);")
     op.execute("CREATE INDEX idx_tasks_task_point ON tasks (task_point_id);")
-    op.execute("CREATE INDEX idx_task_paths_task ON task_paths (task_id);")
-    op.execute("CREATE INDEX idx_task_paths_waypoint ON task_paths (waypoint_id);")
+    op.execute("CREATE INDEX idx_robots_charge_point ON robots (charge_point_id);")
     op.execute("CREATE INDEX idx_detection_logs_task ON detection_logs (task_id);")
     op.execute("CREATE INDEX idx_detection_logs_robot ON detection_logs (robot_id);")
     op.execute("CREATE INDEX idx_detection_logs_waypoint ON detection_logs (waypoint_id);")
