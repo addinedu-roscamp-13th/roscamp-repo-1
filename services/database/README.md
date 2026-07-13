@@ -1,7 +1,7 @@
 # Automato DB
 
-시나리오 1(순찰·관제)용 **PostgreSQL 16 + Alembic 마이그레이션**. (JIRA RP-82)
-Confluence "DB ERD" 문서의 12개 테이블을 PostgreSQL로 구성한다.
+시나리오 1·2(순찰·관제·수확)용 **PostgreSQL 16 + Alembic 마이그레이션**. (JIRA RP-82, RP-88)
+Confluence "DB ERD" 문서(v33)의 12개 테이블을 PostgreSQL로 구성한다.
 
 ## 구성 파일
 
@@ -11,7 +11,7 @@ Confluence "DB ERD" 문서의 12개 테이블을 PostgreSQL로 구성한다.
 | `.env` / `.env.example` | 접속정보 (`.env`는 커밋 안 됨) |
 | `requirements.txt` | 마이그레이션 도구 (alembic, sqlalchemy, psycopg) |
 | `alembic/versions/0001_initial_schema.py` | 12개 테이블 + 트리거 + 인덱스 + 부분 유니크 |
-| `alembic/versions/0002_seed.py` | 시드 (배터리 임계값, 로봇, 더미 순찰 경로) |
+| `alembic/versions/0002_seed.py` | 시드 (배터리 임계값, 로봇, 순찰 지점 waypoints) |
 | `smoke_check.py` | ACS→DB 연결 확인 |
 | `Makefile` | 자주 쓰는 명령 단축 |
 
@@ -54,9 +54,9 @@ python smoke_check.py
 
 ## 스키마 개요 (12개 테이블)
 
-`waypoints` · `robots` · `task_points` · `tasks` · `task_paths` · `detection_logs`
+`waypoints` · `robots` · `task_points` · `tasks` · `detection_logs`
 · `harvest_batches` · `unload_logs` · `event_logs` · `task_assignment_snapshot`
-· `operation_battery_thresholds` · `corridors`
+· `operation_battery_thresholds` · `corridors` · `aruco_markers`
 
 **핵심 규칙**
 - **부분 유니크 인덱스** `ux_tasks_active_robot`: 한 로봇에 활성(`WAITING`/`IN_PROGRESS`) task 중복 배정 차단.
@@ -73,7 +73,14 @@ python smoke_check.py
 | `FLOAT` | `DOUBLE PRECISION` | 좌표 정밀도 |
 | `TIMESTAMP` | `TIMESTAMPTZ` | UTC 시점 저장, 타임존 버그 예방 |
 
-ERD 오타 정정: `task_paths.point_index` 의 `DEFAULT FALSE` → `DEFAULT 0`.
+## 시나리오 2 반영 (ERD v33 · RP-88)
+
+- **`task_paths` 폐기(삭제)**: 경로는 실행 중 재계획되는 휘발성 데이터라 ACS 메모리에서 관리하고, DB엔 요청(`tasks`)과 결과만 남긴다.
+- **`aruco_markers` 신설**: 정밀 도킹용 ArUco 마커/도킹 오프셋. `task_points`와 1:1(`task_point_id` UNIQUE), `marker_id`는 인쇄된 마커 값이라 자연키.
+- **`robots.charge_point_id`** (FK→`task_points`, NULLABLE): 로봇별 전용 충전소.
+- **`task_points.point_type`** (`HARVEST`/`PRECOOL`/`CHARGE`): 작업 위치 종류.
+- **`harvest_batches.failed_count` / `exit_reason`**(`DEPLETED`/`FULL`/`MAX_ROUNDS_EXCEEDED`): 수확 성공률·종료 사유.
+- **`tasks.status`** 값 `DONE`/`PARTIAL` → `COMPLETED`/`COMPLETED_PARTIAL` 로 문서와 일치.
 
 ## 비고
 
