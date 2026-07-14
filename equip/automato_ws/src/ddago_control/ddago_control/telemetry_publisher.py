@@ -14,13 +14,17 @@ DB/메모리/rosbag2 저장 없이 실시간 스트리밍만 수행한다.
   odom                             nav_msgs/Odometry                        위치(amcl 없을 때 fallback)
   battery/percent                  std_msgs/Float32                         배터리 퍼센트(0~100)
   battery/voltage                  std_msgs/Float32                         배터리 전압(V)
-  us_sensor/range                  sensor_msgs/Range                        전방 초음파 거리
   navigate_to_pose/_action/status  action_msgs/GoalStatusArray              Nav2 주행 상태
 
 ※ 배터리: 핑키의 batt_state(BatteryState).percentage 는 NaN, power_supply_status 는
    항상 UNKNOWN 이라 못 쓴다. 실제 값은 pinky_bringup/battery_publisher 가 발행하는
    battery/percent·battery/voltage(Float32)에 있다. 충전 여부(is_charging)는 핑키가
    어느 토픽으로도 제공하지 않아 항상 False 로 발행한다(하드웨어 확인 시 후속 연동).
+
+※ 초음파(us_range_m): 배터리 텔레메트리 안정화를 위해 ADC 노드(pinky_sensor_adc)를
+   기동(ddago_bringup.launch.py)에서 제외하면서 us_sensor/range 발행자가 사라졌다.
+   메시지 필드는 유지하되 항상 0.0 으로 발행한다. ADC 노드를 다시 띄우면 이 파일의
+   us_sensor/range 구독도 되살려야 실제 거리값이 다시 채워진다.
 
 발행:
   ddago/telemetry                  automato_interfaces/DdagoTelemetry       1Hz
@@ -43,11 +47,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
-    qos_profile_sensor_data,
     QoSProfile,
     ReliabilityPolicy,
 )
-from sensor_msgs.msg import Range
 from std_msgs.msg import Float32
 
 
@@ -98,16 +100,12 @@ class TelemetryPublisher(Node):
         self._amcl_stamp = None         # amcl 마지막 수신 시각(rclpy Time)
         self._battery_percent = None    # battery/percent 마지막값(0~100)
         self._battery_voltage = None    # battery/voltage 마지막값(V)
-        self._us_range = None           # 마지막 초음파 거리(m)
         self._nav_status = 'IDLE'       # Nav2 상태 파생 문자열 (기본 대기)
         self._task_id = 0               # E1(순찰 명령) 연동 시 갱신. E0에선 0.
 
         # --- QoS 프로파일 (소스별로 맞춰야 데이터가 들어온다) ---
-        # 초음파: best_effort 로 구독하면 발행자가 reliable/best_effort 어느 쪽이든
-        #   호환된다(구독자 best_effort 는 모든 발행자와 매칭).
         # (배터리 Float32 는 5초 저주기 reliable 발행이라 기본 QoS(reliable, depth 10)로
         #  받아 업데이트를 놓치지 않는다.)
-        sensor_qos = qos_profile_sensor_data
         # Nav2 액션 status: 기본 QoS 가 RELIABLE + TRANSIENT_LOCAL(depth 1).
         #   마지막 상태를 latched 로 받으려면 동일하게 맞춘다.
         status_qos = QoSProfile(
@@ -127,8 +125,6 @@ class TelemetryPublisher(Node):
             Float32, 'battery/percent', self._battery_percent_cb, 10)
         self.create_subscription(
             Float32, 'battery/voltage', self._battery_voltage_cb, 10)
-        self.create_subscription(
-            Range, 'us_sensor/range', self._range_cb, sensor_qos)
         self.create_subscription(
             GoalStatusArray, 'navigate_to_pose/_action/status',
             self._nav_status_cb, status_qos)
@@ -162,9 +158,6 @@ class TelemetryPublisher(Node):
 
     def _battery_voltage_cb(self, msg):
         self._battery_voltage = msg.data
-
-    def _range_cb(self, msg):
-        self._us_range = msg.range
 
     def _nav_status_cb(self, msg):
         if not msg.status_list:
@@ -220,7 +213,9 @@ class TelemetryPublisher(Node):
         #   → E0 에선 항상 False. 하드웨어 충전감지선 확인되면 별도 소스로 연동.
         msg.is_charging = False
 
-        msg.us_range_m = _safe(self._us_range)
+        # 초음파(us_sensor/range) 발행자를 기동에서 제외했다(배터리 안정화).
+        # 인터페이스 필드는 유지하되 항상 0.0 으로 발행한다.
+        msg.us_range_m = 0.0
 
         self._pub.publish(msg)
         self._warn_if_missing()
@@ -232,8 +227,6 @@ class TelemetryPublisher(Node):
             missing.append('위치(odom/amcl_pose)')
         if self._battery_percent is None and self._battery_voltage is None:
             missing.append('battery/percent·voltage')
-        if self._us_range is None:
-            missing.append('us_sensor/range')
         if missing:
             self.get_logger().warn(
                 '아직 수신되지 않은 소스: ' + ', '.join(missing)
