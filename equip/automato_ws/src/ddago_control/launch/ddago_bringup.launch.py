@@ -48,7 +48,7 @@ from launch.actions import (
 )
 from launch.launch_description_sources import AnyLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import PushRosNamespace
+from launch_ros.actions import PushRosNamespace, SetRemap
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -71,6 +71,10 @@ def generate_launch_description():
         GroupAction([
             # 이 그룹 안의 모든 노드/포함 launch 에 /<robot_id> 네임스페이스 주입
             PushRosNamespace(robot_id),
+            # /tf·/tf_static 은 원래 전역 토픽이라 네임스페이스를 안 탄다. 상대명으로
+            # 리맵해 /<robot_id>/tf 로 가둬야 로봇별(dg_01/dg_02) tf 가 안 섞인다.
+            SetRemap(src='/tf', dst='tf'),
+            SetRemap(src='/tf_static', dst='tf_static'),
 
             # 핑키 순정 드라이버 launch (수정 없이 그대로 포함)
             IncludeLaunchDescription(AnyLaunchDescriptionSource(bringup_xml)),

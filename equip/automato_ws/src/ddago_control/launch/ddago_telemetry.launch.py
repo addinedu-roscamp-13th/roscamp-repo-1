@@ -36,6 +36,10 @@ def generate_launch_description():
                 name='telemetry_publisher',
                 output='screen',
                 parameters=[{'robot_id': robot_id}],
+                # /tf·/tf_static 을 상대명으로 리맵 → 네임스페이스 tf(/dg_01/tf)를
+                # 구독한다. bringup 쪽 드라이버 tf 도 같은 네임스페이스에 있으므로
+                # telemetry 가 이 로봇의 map→base_footprint 변환을 읽을 수 있다.
+                remappings=[('/tf', 'tf'), ('/tf_static', 'tf_static')],
             ),
         ]),
     ])

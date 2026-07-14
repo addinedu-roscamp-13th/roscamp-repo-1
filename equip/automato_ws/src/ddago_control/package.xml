@@ -15,6 +15,7 @@
   <depend>geometry_msgs</depend>
   <depend>action_msgs</depend>
   <depend>nav2_msgs</depend>
+  <depend>tf2_ros</depend>
 
   <!-- ddago_bringup.launch.py 전용 런타임 의존(핑키 드라이버, 실제 로봇에만 설치됨).
        rosdep 로 해소되지 않는 팀 내부 패키지라 hard depend 대신 문서로만 남긴다:
