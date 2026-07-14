@@ -14,13 +14,17 @@ DB/메모리/rosbag2 저장 없이 실시간 스트리밍만 수행한다.
   odom                             nav_msgs/Odometry                        위치(amcl 없을 때 fallback)
   battery/percent                  std_msgs/Float32                         배터리 퍼센트(0~100)
   battery/voltage                  std_msgs/Float32                         배터리 전압(V)
-  us_sensor/range                  sensor_msgs/Range                        전방 초음파 거리
   navigate_to_pose/_action/status  action_msgs/GoalStatusArray              Nav2 주행 상태
 
 ※ 배터리: 핑키의 batt_state(BatteryState).percentage 는 NaN, power_supply_status 는
    항상 UNKNOWN 이라 못 쓴다. 실제 값은 pinky_bringup/battery_publisher 가 발행하는
    battery/percent·battery/voltage(Float32)에 있다. 충전 여부(is_charging)는 핑키가
    어느 토픽으로도 제공하지 않아 항상 False 로 발행한다(하드웨어 확인 시 후속 연동).
+
+※ 초음파(us_range_m): 배터리 텔레메트리 안정화를 위해 ADC 노드(pinky_sensor_adc)를
+   기동(ddago_bringup.launch.py)에서 제외하면서 us_sensor/range 발행자가 사라졌다.
+   메시지 필드는 유지하되 항상 0.0 으로 발행한다. ADC 노드를 다시 띄우면 이 파일의
+   us_sensor/range 구독도 되살려야 실제 거리값이 다시 채워진다.
 
 발행:
   ddago/telemetry                  automato_interfaces/DdagoTelemetry       1Hz
@@ -43,12 +47,12 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
-    qos_profile_sensor_data,
     QoSProfile,
     ReliabilityPolicy,
 )
-from sensor_msgs.msg import Range
+from rclpy.time import Time
 from std_msgs.msg import Float32
+from tf2_ros import Buffer, TransformException, TransformListener
 
 
 def _yaw_from_quaternion(q):
@@ -86,11 +90,25 @@ class TelemetryPublisher(Node):
         self.declare_parameter('publish_rate_hz', 1.0)
         self.declare_parameter('amcl_stale_sec', 3.0)
         self.declare_parameter('battery_percent_scale', 1.0)
+        # 위치를 tf 에서 읽을 때 쓰는 프레임 이름. map→base_footprint 변환의
+        # 양 끝 프레임이다. 로봇 URDF/nav2 설정에 따라 base_link 로 바꿀 수도 있다.
+        self.declare_parameter('global_frame_id', 'map')
+        self.declare_parameter('base_frame_id', 'base_footprint')
         self._robot_id = self.get_parameter('robot_id').value
         rate = self.get_parameter('publish_rate_hz').value
         self._amcl_stale_sec = self.get_parameter('amcl_stale_sec').value
         self._battery_percent_scale = \
             self.get_parameter('battery_percent_scale').value
+        self._global_frame = self.get_parameter('global_frame_id').value
+        self._base_frame = self.get_parameter('base_frame_id').value
+
+        # --- tf 리스너 ---
+        # amcl 이 발행하는 map→base_footprint 변환을 백그라운드로 수집한다.
+        # Buffer 가 최근 변환들을 캐시하고, TransformListener 가 /tf·/tf_static 을
+        # 구독해 Buffer 를 채운다. (이 노드는 /tf 를 상대명 tf 로 리맵해 기동하므로
+        # 네임스페이스 tf(/dg_01/tf)를 구독한다 → 로봇별 위치가 안 섞인다.)
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
 
         # --- 캐시 상태 (콜백이 최신값으로 갱신, 타이머가 읽어감) ---
         self._odom_pose = None          # (x, y, yaw)
@@ -98,16 +116,12 @@ class TelemetryPublisher(Node):
         self._amcl_stamp = None         # amcl 마지막 수신 시각(rclpy Time)
         self._battery_percent = None    # battery/percent 마지막값(0~100)
         self._battery_voltage = None    # battery/voltage 마지막값(V)
-        self._us_range = None           # 마지막 초음파 거리(m)
         self._nav_status = 'IDLE'       # Nav2 상태 파생 문자열 (기본 대기)
         self._task_id = 0               # E1(순찰 명령) 연동 시 갱신. E0에선 0.
 
         # --- QoS 프로파일 (소스별로 맞춰야 데이터가 들어온다) ---
-        # 초음파: best_effort 로 구독하면 발행자가 reliable/best_effort 어느 쪽이든
-        #   호환된다(구독자 best_effort 는 모든 발행자와 매칭).
         # (배터리 Float32 는 5초 저주기 reliable 발행이라 기본 QoS(reliable, depth 10)로
         #  받아 업데이트를 놓치지 않는다.)
-        sensor_qos = qos_profile_sensor_data
         # Nav2 액션 status: 기본 QoS 가 RELIABLE + TRANSIENT_LOCAL(depth 1).
         #   마지막 상태를 latched 로 받으려면 동일하게 맞춘다.
         status_qos = QoSProfile(
@@ -127,8 +141,6 @@ class TelemetryPublisher(Node):
             Float32, 'battery/percent', self._battery_percent_cb, 10)
         self.create_subscription(
             Float32, 'battery/voltage', self._battery_voltage_cb, 10)
-        self.create_subscription(
-            Range, 'us_sensor/range', self._range_cb, sensor_qos)
         self.create_subscription(
             GoalStatusArray, 'navigate_to_pose/_action/status',
             self._nav_status_cb, status_qos)
@@ -163,9 +175,6 @@ class TelemetryPublisher(Node):
     def _battery_voltage_cb(self, msg):
         self._battery_voltage = msg.data
 
-    def _range_cb(self, msg):
-        self._us_range = msg.range
-
     def _nav_status_cb(self, msg):
         if not msg.status_list:
             self._nav_status = 'IDLE'
@@ -178,17 +187,51 @@ class TelemetryPublisher(Node):
         self._nav_status = self._STATUS_MAP.get(latest.status, 'IDLE')
 
     # ------------------------------------------------------------------ #
-    # 위치 선택: amcl 우선(신선할 때), 아니면 odom fallback
+    # 위치: map→base_footprint tf 우선 → amcl_pose 토픽 → odom fallback
     # ------------------------------------------------------------------ #
+    def _map_pose_from_tf(self):
+        """map→base_footprint tf 에서 (x, y, yaw) 를 읽는다.
+
+        tf 가 아직 없거나(두 프레임이 연결 안 됨) 너무 오래됐으면(stale) None 을
+        돌려 다음 위치 소스로 넘긴다. lookup_transform 의 시각 인자로 Time()(=0)
+        을 주면 tf2 가 '지금 캐시에 있는 가장 최근 변환'을 반환한다.
+        """
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self._global_frame,   # target 프레임 (map)
+                self._base_frame,     # source 프레임 (base_footprint)
+                Time(),               # 가장 최근에 확보된 변환
+            )
+        except TransformException:
+            # 아직 tf 미수신이거나 map↔base_footprint 경로 없음 → 이 소스는 스킵.
+            return None
+
+        # 신선도 확인: 변환 stamp 나이가 amcl_stale_sec 을 넘으면 버린다
+        # (로봇이 멈춰도 오래된 위치를 최신인 척 발행하지 않도록).
+        stamp = Time.from_msg(tf.header.stamp)
+        age = (self.get_clock().now() - stamp).nanoseconds * 1e-9
+        if age > self._amcl_stale_sec:
+            return None
+
+        t = tf.transform.translation
+        yaw = _yaw_from_quaternion(tf.transform.rotation)
+        return (t.x, t.y, yaw)
+
     def _select_position(self):
+        # 1순위: map→base_footprint tf (가장 신선한 맵 절대좌표).
+        map_pose = self._map_pose_from_tf()
+        if map_pose is not None:
+            return map_pose, 'map'
+        # 2순위: amcl_pose 토픽 (tf 를 못 읽을 때, 신선한 경우만).
         if self._amcl_pose is not None and self._amcl_stamp is not None:
             age = (self.get_clock().now() - self._amcl_stamp).nanoseconds * 1e-9
             if age <= self._amcl_stale_sec:
                 return self._amcl_pose, 'map'
+        # 3순위: odom (맵 정합 전이라 상대좌표지만 위치는 나온다).
         if self._odom_pose is not None:
             return self._odom_pose, 'odom'
+        # 최후: 오래됐어도 amcl 값이라도 있으면 사용.
         if self._amcl_pose is not None:
-            # amcl 이 오래됐지만 odom 도 없으면 그래도 amcl 사용.
             return self._amcl_pose, 'map'
         return (0.0, 0.0, 0.0), ''
 
@@ -220,7 +263,9 @@ class TelemetryPublisher(Node):
         #   → E0 에선 항상 False. 하드웨어 충전감지선 확인되면 별도 소스로 연동.
         msg.is_charging = False
 
-        msg.us_range_m = _safe(self._us_range)
+        # 초음파(us_sensor/range) 발행자를 기동에서 제외했다(배터리 안정화).
+        # 인터페이스 필드는 유지하되 항상 0.0 으로 발행한다.
+        msg.us_range_m = 0.0
 
         self._pub.publish(msg)
         self._warn_if_missing()
@@ -232,8 +277,6 @@ class TelemetryPublisher(Node):
             missing.append('위치(odom/amcl_pose)')
         if self._battery_percent is None and self._battery_voltage is None:
             missing.append('battery/percent·voltage')
-        if self._us_range is None:
-            missing.append('us_sensor/range')
         if missing:
             self.get_logger().warn(
                 '아직 수신되지 않은 소스: ' + ', '.join(missing)
