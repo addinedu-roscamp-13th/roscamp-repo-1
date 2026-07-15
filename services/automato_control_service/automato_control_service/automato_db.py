@@ -120,6 +120,40 @@ def get_availability_snapshot(pool: ConnectionPool) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# RP-90 텔레메트리 방송용 DB 사실 (1Hz 로 호출) — 활성 task 종류 + 배터리 임계값
+# --------------------------------------------------------------------------- #
+def get_telemetry_state(pool: ConnectionPool) -> tuple:
+    """RP-90 방송에 필요한 'DB쪽' 사실을 한 번에 모아 온다.
+
+    반환: (active_types, threshold)
+      active_types : {robot_id: task_type}. 활성(WAITING/IN_PROGRESS) task 가 있는 로봇만.
+                     값이 그 로봇의 진행 중 task 종류(PATROL/HARVEST/TRANSFER)다 →
+                     여기 있으면 ROBOT_BUSY 이고, 그 종류가 그대로 응답 task_type 이 된다.
+                     (부분 유니크 인덱스로 로봇당 활성 task 는 최대 1건이라 dict 로 충분.)
+      threshold    : 배터리 임계값(operation_battery_thresholds, 기본 70). BATTERY_TOO_LOW
+                     기준. 여러 task_type 이 있으나 여기선 PATROL 기준을 '가용 표시용 단일
+                     임계값'으로 쓴다(가용 조회 API 와 동일 관례).
+
+    가벼운 SELECT 두 번뿐이라 1Hz 호출에도 부담이 없다(커넥션 풀 재사용).
+    """
+    with pool.connection() as conn:
+        active_types = {
+            r["assigned_robot_id"]: r["task_type"]
+            for r in conn.execute(
+                "SELECT assigned_robot_id, task_type FROM tasks "
+                "WHERE assigned_robot_id IS NOT NULL "
+                "AND status IN ('WAITING','IN_PROGRESS')"
+            ).fetchall()
+        }
+        row = conn.execute(
+            "SELECT min_battery_percent FROM operation_battery_thresholds "
+            "WHERE task_type = 'PATROL'"
+        ).fetchone()
+        threshold = row["min_battery_percent"] if row else 70
+    return active_types, threshold
+
+
+# --------------------------------------------------------------------------- #
 # 순찰 접수 트랜잭션 (①~④를 하나로 묶음, 예외 시 전체 롤백)
 # --------------------------------------------------------------------------- #
 _INSERT_TASK = (
