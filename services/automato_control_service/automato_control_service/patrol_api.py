@@ -10,7 +10,7 @@
   - 가용 판정(judge_robot): 4개 조건을 AND로 확인
   - 로봇 선정(select_auto): 가용 후보 중 배터리 최고, 동점 시 robot_id 오름차순
 데이터는 두 곳에서 온다:
-  - DB(patrol_db): 활성 task 여부, 배터리 임계값        ← '영속' 상태
+  - DB(automato_db): 활성 task 여부, 배터리 임계값        ← '영속' 상태
   - 노드 캐시(node.cache): 로봇 최신 텔레메트리           ← '순간' 상태
 
 judge_robot / select_auto 는 외부 의존(ROS/DB) 없는 순수 함수라 단위테스트가 쉽다.
@@ -25,7 +25,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from automato_control_service import patrol_db
+from automato_control_service import automato_db
 
 # 텔레메트리가 이 시간(초)보다 오래되면 stale 로 본다(ddago header.stamp 기준).
 STALE_SEC = 3.0
@@ -141,7 +141,7 @@ def create_app(node, pool) -> FastAPI:
     @app.get("/internal/v1/robots/patrol/available")
     def available():
         try:
-            snap = patrol_db.get_availability_snapshot(pool)
+            snap = automato_db.get_availability_snapshot(pool)
         except Exception as exc:  # noqa: BLE001
             return JSONResponse(
                 status_code=503,
@@ -159,7 +159,7 @@ def create_app(node, pool) -> FastAPI:
     @app.post("/internal/v1/tasks/patrol")
     def accept_patrol(req: PatrolRequest):
         try:
-            snap = patrol_db.get_availability_snapshot(pool)
+            snap = automato_db.get_availability_snapshot(pool)
         except Exception as exc:  # noqa: BLE001
             return JSONResponse(
                 status_code=503,
@@ -210,9 +210,9 @@ def create_app(node, pool) -> FastAPI:
 
         # --- DB 트랜잭션 접수(①~④). 중복배정은 유니크 위반 -> 409 ---
         try:
-            task_id, waypoints = patrol_db.accept_patrol_task(
+            task_id, waypoints = automato_db.accept_patrol_task(
                 pool, selected, snapshot_json)
-        except patrol_db.RobotBusyError:
+        except automato_db.RobotBusyError:
             return JSONResponse(
                 status_code=409,
                 content={"status": "REJECTED", "reason": "NO_AVAILABLE_ROBOT",

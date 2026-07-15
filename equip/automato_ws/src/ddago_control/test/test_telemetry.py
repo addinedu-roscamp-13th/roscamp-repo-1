@@ -2,7 +2,7 @@
 """RP-75  E0 텔레메트리 Publisher 단위 테스트.
 
 가짜 소스 토픽(odom/amcl_pose/battery(percent·voltage)/us_sensor·range/navigate
-status)을 발행해 TelemetryPublisher 가 ddago/telemetry 로 취합·발행하는지 검증한다.
+status)을 발행해 TelemetryPublisher 가 telemetry 로 취합·발행하는지 검증한다.
 로봇 없이(가짜 pub) 로직만 확인하는 "1단계 검증"의 자동화판이다.
 
 TESTING.md 규약: SingleThreadedExecutor 로 노드+헬퍼를 한 스레드에서 스핀,
@@ -87,7 +87,7 @@ def _make_source_pubs(helper):
 
 def _subscribe_telemetry(helper, sink):
     helper.create_subscription(
-        DdagoTelemetry, 'ddago/telemetry', lambda m: sink.append(m), 10)
+        DdagoTelemetry, 'telemetry', lambda m: sink.append(m), 10)
 
 
 def _publish_all_sources(pubs, amcl_yaw):

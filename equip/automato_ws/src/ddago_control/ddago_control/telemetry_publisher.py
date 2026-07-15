@@ -27,7 +27,8 @@ DB/메모리/rosbag2 저장 없이 실시간 스트리밍만 수행한다.
    us_sensor/range 구독도 되살려야 실제 거리값이 다시 채워진다.
 
 발행:
-  ddago/telemetry                  automato_interfaces/DdagoTelemetry       1Hz
+  telemetry                        automato_interfaces/DdagoTelemetry       1Hz
+  (네임스페이스가 붙어 최종 /<namespace>/telemetry, 예: /dg_01/ddago/telemetry)
 
 파라미터:
   robot_id               (str)   보고서에 적을 로봇 식별자        기본 'dg_01'
@@ -146,13 +147,13 @@ class TelemetryPublisher(Node):
             self._nav_status_cb, status_qos)
 
         # --- 발행 + 1Hz 타이머 ---
-        self._pub = self.create_publisher(DdagoTelemetry, 'ddago/telemetry', 10)
+        self._pub = self.create_publisher(DdagoTelemetry, 'telemetry', 10)
         period = 1.0 / rate if rate > 0.0 else 1.0
         self._timer = self.create_timer(period, self._publish)
 
         self.get_logger().info(
             f'텔레메트리 Publisher 준비됨: robot_id={self._robot_id}, '
-            f'{rate:.1f}Hz → ddago/telemetry'
+            f'{rate:.1f}Hz → telemetry'
         )
 
     # ------------------------------------------------------------------ #
