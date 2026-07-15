@@ -237,6 +237,13 @@ async def broadcast_loop(manager: ConnectionManager, cache, read_db_state,
         # dict → JSON text frame. ensure_ascii=False 로 한글 등도 그대로 싣는다.
         await manager.broadcast(json.dumps(msg, ensure_ascii=False))
 
+        # 흐름 가시화 로그(캐시 읽기 → WS 발행). 첫 방송 + 5틱(≈5초)마다만 찍어 1Hz 도배 방지.
+        # rclpy 전용 throttle 대신 seq 수동 스로틀 — 이 루프는 std logging 도 허용하기 때문.
+        # '로봇 N대(캐시)'가 캐시 읽은 결과, '클라이언트 M명'이 실제 발행 대상.
+        if logger is not None and (seq == 1 or seq % 5 == 0):
+            logger.info("방송 seq=%d: 로봇 %d대(캐시) → 클라이언트 %d명"
+                        % (seq, len(robots_cache), manager.count()))
+
 
 # --------------------------------------------------------------------------- #
 # FastAPI 앱 팩토리 — WebSocket 라우트 + 1Hz 방송 태스크를 묶는다(patrol create_app 대응).

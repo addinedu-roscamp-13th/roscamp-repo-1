@@ -93,6 +93,8 @@ class TelemetryNode(Node):
     def __init__(self, **kwargs):
         super().__init__("telemetry_ws_node", **kwargs)
         self.cache = FleetCache()
+        # fleet 첫 수신을 딱 1회 INFO 로 알리기 위한 플래그(이후엔 5초 throttle 로만 로그).
+        self._first_fleet_logged = False
         # 1Hz FleetTelemetry 상시 구독. HQ 발행자와 맞춰 기본 QoS(RELIABLE, depth 10).
         self.create_subscription(FleetTelemetry, FLEET_TOPIC, self._on_fleet, 10)
         self.get_logger().info(
@@ -102,6 +104,21 @@ class TelemetryNode(Node):
         # 콜백(백그라운드 spin 스레드)에서 캐시에 쓴다(writer). 방송 루프(메인 스레드)가 읽는다.
         # 두 스레드가 겹치지 않게 FleetCache 내부 threading.Lock 이 보호한다.
         self.cache.update_from_fleet(msg)
+
+        # --- 흐름 가시화 로그 (수신 + 캐시 갱신 확인) ---
+        log = self.get_logger()
+        n = len(msg.ddagos)                        # 이번 메시지에 담긴 ddago 수
+        if not self._first_fleet_logged:           # 첫 수신은 확실히 1회 알림
+            self._first_fleet_logged = True
+            ids = ", ".join(d.robot_id for d in msg.ddagos)
+            log.info("fleet 첫 수신: ddago %d대 [%s] → 캐시 갱신" % (n, ids))
+        else:                                      # 이후엔 5초에 한 번만(1Hz 도배 방지)
+            log.info("fleet 수신 중: ddago %d대 → 캐시 갱신" % n,
+                     throttle_duration_sec=5.0)
+        # 로봇별 상세(값이 실제로 바뀌는지 검증용)는 DEBUG — 평소 숨김, --log-level debug 로만.
+        for d in msg.ddagos:
+            log.debug("  %s nav=%s batt=%.0f pos=(%.2f,%.2f)"
+                      % (d.robot_id, d.nav_status, d.battery_percent, d.x, d.y))
 
 
 # --------------------------------------------------------------------------- #
