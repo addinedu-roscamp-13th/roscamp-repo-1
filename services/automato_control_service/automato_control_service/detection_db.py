@@ -3,7 +3,7 @@
 
 이 파일은 "탐지 1건을 DB에 어떻게 쓰는가"만 담당한다(순수 데이터 계층).
 이미지 파일 저장/순찰 현황 중계(notify)/병해충 알림(alert)은 오케스트레이션
-계층(detection_service.py)이 맡는다. 순찰 접수/조회/종료 SQL은 patrol_db.py 에 있다.
+계층(detection_service.py)이 맡는다. 순찰 접수/조회/종료 SQL은 automato_db.py 에 있다.
 
 핵심(원자성): 탐지 저장은 '하나의 트랜잭션'으로 묶는다.
   ① detection_logs INSERT     → detection_id 확보(ACS 내부용, HQ 로 미반환)
@@ -34,7 +34,7 @@ _INSERT_DETECTION = (
 )
 
 # ② 방문 표시. updated_at 은 set_updated_at() 트리거가 자동 갱신하지만,
-#    patrol_db 관례(명시 갱신)와 맞춰 명시적으로도 NOW() 를 넣는다.
+#    automato_db 관례(명시 갱신)와 맞춰 명시적으로도 NOW() 를 넣는다.
 _MARK_VISITED = (
     "UPDATE task_paths "
     "   SET is_visited = TRUE, updated_at = NOW() "

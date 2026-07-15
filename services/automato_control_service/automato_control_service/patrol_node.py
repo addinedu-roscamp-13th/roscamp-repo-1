@@ -4,7 +4,7 @@
 이 파일은 '동작(로봇과의 실제 통신)'을 담당한다.
   - 구독:  /automato/telemetry/fleet (FleetTelemetry, 1Hz) → 로봇별 최신 상태 캐시
   - 발신:  /{robot_id}/patrol (Patrol 액션) → HQ 경유로 인접 노드 1개씩 하달
-  - 종료:  방문 결과에 따라 tasks 를 DONE/PARTIAL/FAILED 로 마감(patrol_db)
+  - 종료:  방문 결과에 따라 tasks 를 DONE/PARTIAL/FAILED 로 마감(automato_db)
 
 배경 지식 (초보자용) —
   * ROS2 '토픽 구독'은 '요청하면 받아오는' 방식이 아니라, 발행자가 보낼 때마다
@@ -42,7 +42,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from automato_control_service import patrol_db
+from automato_control_service import automato_db
 from automato_control_service.routing_engine import Route, RoutingEngine
 
 FLEET_TOPIC = "/automato/telemetry/fleet"
@@ -200,7 +200,7 @@ class PatrolControlNode(Node):
                 if self._db_pool is None:
                     return None
                 try:
-                    graph = patrol_db.load_graph(self._db_pool)
+                    graph = automato_db.load_graph(self._db_pool)
                 except Exception as exc:  # noqa: BLE001
                     self.get_logger().error(f"라우팅 그래프 로드 실패: {exc}")
                     return None
@@ -272,7 +272,7 @@ class PatrolControlNode(Node):
             status = "FAILED"
         if self._db_pool is not None:
             try:
-                patrol_db.set_task_status(self._db_pool, task_id, status)
+                automato_db.set_task_status(self._db_pool, task_id, status)
                 self.get_logger().info(f"순찰 종료 task={task_id} → {status}")
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().error(f"tasks 종료 갱신 실패 task={task_id}: {exc}")
@@ -450,7 +450,7 @@ def main(args=None) -> None:
     rclpy.init(args=args)
     node = PatrolControlNode()
 
-    pool = patrol_db.create_pool()
+    pool = automato_db.create_pool()
     node.set_db_pool(pool)
 
     # RP-79: 탐지 저장/중계/알림 서비스(/automato/save_detection) 등록.
@@ -465,7 +465,7 @@ def main(args=None) -> None:
     # 알려진 로봇의 Patrol 액션 클라이언트를 spin 시작 전에 미리 만든다(정리·가시성 목적).
     # RP-76 크래시의 실제 원인이던 self._clients 이름 충돌은 __init__ 에서 해결했다.
     try:
-        robot_ids = patrol_db.get_availability_snapshot(pool)["robots"]
+        robot_ids = automato_db.get_availability_snapshot(pool)["robots"]
         node.prewarm_clients(robot_ids)
     except Exception as exc:  # noqa: BLE001
         node.get_logger().warn(

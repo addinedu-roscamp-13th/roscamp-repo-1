@@ -13,7 +13,7 @@ HQ(DG Control Service)로 **순찰 Action**을 하달한다. (시나리오 1 E1 
 |---|---|
 | `automato_control_service/patrol_api.py` | **① API** — FastAPI 엔드포인트 + 가용 판정(4조건) + 로봇 선정 |
 | `automato_control_service/patrol_node.py` | **② ROS2 노드** — 텔레메트리 캐시 + Patrol 액션 클라이언트 + 세그먼트 디스패치 + SaveDetection 서비스 등록 + `main()` |
-| `automato_control_service/patrol_db.py` | **③ DB 저장** — 가용 조회 / 접수 트랜잭션(①~④) / 종료 갱신 / 그래프 로드 (psycopg v3) |
+| `automato_control_service/automato_db.py` | **③ DB 저장** — 가용 조회 / 접수 트랜잭션(①~④) / 종료 갱신 / 그래프 로드 (psycopg v3) |
 | `automato_control_service/routing_engine.py` | **④ 라우팅/예약 엔진** — BFS 경로탐색 + 통로 예약표(독립 모듈, 순찰 외 재사용) |
 | `automato_control_service/detection_service.py` | **(RP-79) 탐지 오케스트레이션** — 이미지 저장/DB/notify/alert 조율 + HTTP(urllib) |
 | `automato_control_service/detection_db.py` | **(RP-79) 탐지 DB 저장** — detection_logs INSERT + task_paths.is_visited (단일 트랜잭션) |

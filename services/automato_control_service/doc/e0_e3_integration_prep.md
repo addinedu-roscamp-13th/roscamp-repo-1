@@ -86,7 +86,7 @@ python smoke_check.py                            # 연결 OK 확인
 > 가 들어간다. `corridors`가 비어 있으면 순찰 이동이 전부 skip될 수 있으니 꼭 적용.
 
 > **task 는 수동으로 만들지 않는다.** 순찰을 ACS 접수 API로 트리거하면 ACS가 `task`와
-> `task_paths`를 **자동 생성**한다([`accept_patrol_task`](../automato_control_service/patrol_db.py):
+> `task_paths`를 **자동 생성**한다([`accept_patrol_task`](../automato_control_service/automato_db.py):
 > tasks INSERT → is_patrol_point 웨이포인트로 task_paths 복사 → snapshot → IN_PROGRESS).
 > task_id는 4절 API 응답에서 받아 DB 확인에 쓴다.
 
