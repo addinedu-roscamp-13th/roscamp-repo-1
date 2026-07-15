@@ -36,33 +36,57 @@ class RobotBusyError(Exception):
 # --------------------------------------------------------------------------- #
 # 접속 정보(DSN) 로딩
 # --------------------------------------------------------------------------- #
-def _load_dsn() -> str:
-    """DATABASE_URL(우선) 또는 POSTGRES_* 조합으로 libpq DSN을 만든다.
+def _find_env_file():
+    """현재 작업 디렉터리(CWD)부터 위로 올라가며 services/database/.env 를 찾는다.
 
-    services/database/.env 를 best-effort 로 읽어온다(같은 값 공유).
-    smoke_check.py 와 동일한 규칙이라 DB 서비스와 접속 설정이 어긋나지 않는다.
+    왜 CWD 기준 상위 탐색인가:
+      과거엔 이 파일(__file__) 기준 상대경로로 .env 를 찾았는데, colcon 이 코드를
+      install/ 트리로 복사하면 그 상대경로가 깨져(.env 없는 곳을 가리켜) 조용히
+      실패했다. 반면 개발자는 보통 리포 안에서 명령을 실행하므로, CWD 에서 위로
+      올라가며 찾으면 소스/설치 트리 어디서 ros2 run 하든 리포 안이기만 하면
+      .env 를 안정적으로 발견한다.
     """
-    try:
-        from dotenv import load_dotenv
+    d = os.getcwd()
+    while True:
+        cand = os.path.join(d, "services", "database", ".env")
+        if os.path.isfile(cand):
+            return cand
+        parent = os.path.dirname(d)
+        if parent == d:          # 파일시스템 루트까지 갔는데 못 찾음
+            return None
+        d = parent
 
-        here = os.path.dirname(__file__)
-        db_env = os.path.normpath(
-            os.path.join(here, "..", "..", "database", ".env"))
-        load_dotenv(db_env)
-    except Exception:  # noqa: BLE001  (dotenv 없거나 파일 없어도 무시)
-        pass
 
+def _load_dsn() -> str:
+    """실행 시 DATABASE_URL 환경변수로 접속한다(12-factor 관례: 설정은 환경에서).
+
+    순서:
+      ① 환경변수 DATABASE_URL 이 있으면 그대로 쓴다(운영/CI/명시 export 우선).
+      ② 없으면 개발 편의로 리포의 services/database/.env 를 찾아 환경에 주입한다.
+      ③ 그래도 없으면 '조용히 틀린 기본값으로 접속'하지 않고 명확한 에러로 죽는다.
+         (과거엔 automato/automato 로 폴백해 엉뚱한 인증 실패의 원인 파악이 어려웠다.)
+
+    SQLAlchemy 표기(postgresql+psycopg://)는 libpq 표기(postgresql://)로 정규화한다.
+    """
     url = os.environ.get("DATABASE_URL")
-    if url:
-        # SQLAlchemy 표기 -> libpq 표기 (psycopg 직접 연결용)
-        return url.replace("postgresql+psycopg://", "postgresql://", 1)
+    if not url:
+        env_file = _find_env_file()
+        if env_file:
+            try:
+                from dotenv import load_dotenv
+                load_dotenv(env_file)
+            except Exception:  # noqa: BLE001  (dotenv 미설치 등은 무시)
+                pass
+        url = os.environ.get("DATABASE_URL")
 
-    user = os.environ.get("POSTGRES_USER", "automato")
-    pw = os.environ.get("POSTGRES_PASSWORD", "automato")
-    host = os.environ.get("POSTGRES_HOST", "localhost")
-    port = os.environ.get("POSTGRES_PORT", "5432")
-    db = os.environ.get("POSTGRES_DB", "automato")
-    return f"postgresql://{user}:{pw}@{host}:{port}/{db}"
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL 환경변수가 필요합니다. 리포 안에서 실행하거나"
+            "(services/database/.env 자동 탐색), 직접 주입하세요: "
+            "set -a; source services/database/.env; set +a")
+
+    # SQLAlchemy 표기 -> libpq 표기 (psycopg 직접 연결용)
+    return url.replace("postgresql+psycopg://", "postgresql://", 1)
 
 
 def create_pool() -> ConnectionPool:
