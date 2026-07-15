@@ -58,9 +58,9 @@ class FakeTelemetry(Node):
         self.declare_parameter("nav_status", "IDLE")       # 'IDLE' 이어야 가용 후보
         self.declare_parameter("battery_percent", 90.0)    # 임계값(기본 70) 이상이면 가용
         self.declare_parameter("battery_voltage", 12.4)
-        self.declare_parameter("x", 0.0)
-        self.declare_parameter("y", 0.0)
-        self.declare_parameter("yaw", 0.0)
+        self.declare_parameter("x", 1.0)
+        self.declare_parameter("y", 1.0)
+        self.declare_parameter("yaw", 0.5)
         self.declare_parameter("us_range_m", 1.5)
         self.declare_parameter("task_id", 0)
         self.declare_parameter("is_charging", False)       # 판정엔 영향 없음(스냅샷용)
