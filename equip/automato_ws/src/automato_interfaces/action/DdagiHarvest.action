@@ -1,5 +1,5 @@
 # 시나리오2 : 수확 작업 (수확 목표 목록 전체)
-# dg_control -> Ddagi Control Service (ROS2 Action  /dg_01/ddagi/harvest)
+# DCS(dg_control) -> Ddagi Control Service (ROS2 Action  /dg_01/ddagi/harvest)
 # ---------- Goal ----------
 int64            task_id
 HarvestTarget[]  targets

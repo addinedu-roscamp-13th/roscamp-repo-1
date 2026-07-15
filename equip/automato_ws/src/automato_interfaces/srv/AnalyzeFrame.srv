@@ -1,5 +1,5 @@
 # 시나리오1 E2 : waypoint 도착 후 RGB 프레임 분석 요청
-# DdaGo Control Service -> HQ (ROS2 Service  /dg/analyze_frame)
+# DdaGo Control Service -> DCS (ROS2 Service  /dg/analyze_frame)
 int64                task_id
 int32                waypoint_id
 sensor_msgs/Image    image

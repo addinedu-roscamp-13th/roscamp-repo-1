@@ -1,6 +1,6 @@
-# 시나리오1 E1/E2 : 단일 waypoint 순찰 (ACS→HQ, HQ→DdaGo 공통 재사용)
-#   ACS -> HQ    : /{robot_id}/patrol
-#   HQ  -> DdaGo : /{robot_id}/ddago/patrol
+# 시나리오1 E1/E2 : 단일 waypoint 순찰 (ACS→DCS, DCS→DdaGo 공통 재사용)
+#   ACS -> DCS    : /{robot_id}/patrol
+#   DCS  -> DdaGo : /{robot_id}/ddago/patrol
 # ACS가 경로의 waypoint를 하나씩 하달하고, 도착·처리 후 다음 waypoint를 보낸다.
 # ---------- Goal ----------
 int64          task_id

@@ -3,7 +3,7 @@
 <package format="3">
   <name>dg_control</name>
   <version>0.1.0</version>
-  <description>DG Control Service (HQ) — 시나리오1 순찰 오케스트레이터 본체. Patrol 액션 서버(ACS←)·클라이언트(→DdaGo, 단일 waypoint), 텔레메트리 취합(FleetTelemetry), AnalyzeFrame 서버, DG AI Service TCP 연동, SaveDetection 클라이언트.</description>
+  <description>DG Control Service (DCS) — 시나리오1 순찰 오케스트레이터 본체. Navigate 액션 서버(ACS←)·클라이언트(→DdaGo, 경로 Waypoint[] 중계), 텔레메트리 취합(FleetTelemetry), AnalyzeFrame 서버, DG AI Service TCP 연동, SaveDetection 클라이언트.</description>
   <maintainer email="finekim67@gmail.com">heeseog</maintainer>
   <license>Apache-2.0</license>
 

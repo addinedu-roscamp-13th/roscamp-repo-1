@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """DG AI Service 시뮬레이터 (TCP 서버).
 
-팀원이 개발 중인 실제 DG AI Service 대역. HQ 가 붙는 지속 TCP 연결을 받아
+팀원이 개발 중인 실제 DG AI Service 대역. DCS 가 붙는 지속 TCP 연결을 받아
 analyze_frame_request 를 받으면 즉시 가짜 분석 결과(analyze_frame_response)를 돌려준다.
+DCS 가 붙는 쪽이다(실서버 대역).
 
 프레이밍(시퀀스 다이어그램 E2-3/4): [4B payload_size(big-endian)][UTF-8 JSON]
 
 가짜 결과 규칙(테스트 재현성): ripe/unripe/rotten/disease percent, 합계 100.
-  disease = 5 if wp%3==0 else 0 (E3 병해충 알림 트리거 확인용), 나머지로 ripe 채움.
+  disease = 5 if wp%3==0 else 0 (E3 트리거 disease>=5 확인용), 나머지로 ripe 채움.
 
 받은 image_data(base64 JPEG)는 디코드해 파일로 저장한다(수신 확인용).
 
@@ -29,10 +30,12 @@ import time
 
 # 분석 처리 시간 시뮬(응답 지연). 환경변수 DG_AI_SIM_DELAY(기본 3.0초). main()에서 설정.
 RESP_DELAY = 3.0
+# E3 병해충 알림 발동 기준(이 값 이상일 때만 라벨 이미지를 실어 보낸다)
+DISEASE_ALERT_PCT = 5
 # 수신 이미지 저장 폴더
 SAVE_DIR = os.environ.get(
     'DG_AI_SIM_SAVE_DIR',
-    '/home/ane/dev_ws/roscamp-sprint4-heeseog/equip/automato_ws/dg_ai_recv')
+    '/home/ane/dev_ws/roscamp-rp108-navigate/equip/automato_ws/dg_ai_recv')
 
 
 def save_received_image(req):
@@ -127,9 +130,9 @@ def handle_conn(conn, addr):
                 'status': 'OK',
                 'result': make_result(wp),
             }
-            # 병충해(disease>0) 검출 시 라벨링 이미지 동봉(실서버 형태 모사: labeled_image+encoding).
-            # 실제 어노테이션 대신 입력 이미지를 에코해 형태만 재현.
-            if resp['result'].get('disease_percent', 0) > 0 and req.get('image_data'):
+            # 병해충 disease_percent >= 5 일 때만 라벨링 이미지 동봉(E3 규격, 실서버 형태 모사:
+            # labeled_image + labeled_image_encoding). 실제 어노테이션 대신 입력 이미지를 에코.
+            if resp['result'].get('disease_percent', 0) >= DISEASE_ALERT_PCT and req.get('image_data'):
                 resp['result']['labeled_image'] = req['image_data']
                 resp['result']['labeled_image_encoding'] = 'jpeg'
             _send_frame(conn, resp)

@@ -1,5 +1,5 @@
 # 시나리오1 E2/E3 : 탐지 결과(익음/부패/병해충 수치) 저장 요청
-# HQ -> Automato Control Service (ROS2 Service  /automato/save_detection)
+# DCS -> Automato Control Service (ROS2 Service  /automato/save_detection)
 # ---------- Request ----------
 int64   task_id
 int32   waypoint_id
