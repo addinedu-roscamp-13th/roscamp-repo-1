@@ -74,9 +74,9 @@ class _Harness:
         self.cam_pub = self.helper.create_publisher(
             Image, 'image_raw', qos_profile_sensor_data)
 
-        # Patrol 액션 client (노드의 서버 ddago/patrol 호출)
+        # Patrol 액션 client (노드의 서버 patrol 호출)
         self.patrol_client = ActionClient(
-            self.helper, Patrol, 'ddago/patrol', callback_group=self.cbg)
+            self.helper, Patrol, 'patrol', callback_group=self.cbg)
 
     # ------- 가짜 Nav2 서버 동작 ------- #
     def _nav_execute(self, goal_handle):

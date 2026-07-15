@@ -126,16 +126,16 @@ class PatrolServer(Node):
         self._analyze_client = self.create_client(
             AnalyzeFrame, analyze_service, callback_group=self._cb)
 
-        # --- Patrol 액션 서버 (상대명 'ddago/patrol' → 네임스페이스로 /dg_01/ddago/patrol) ---
+        # --- Patrol 액션 서버 (상대명 'patrol' → 네임스페이스로 /dg_01/ddago/patrol) ---
         self._server = ActionServer(
-            self, Patrol, 'ddago/patrol',
+            self, Patrol, 'patrol',
             execute_callback=self._execute,
             cancel_callback=lambda _gh: CancelResponse.ACCEPT,
             callback_group=self._cb,
         )
 
         self.get_logger().info(
-            f'Patrol 서버 준비됨: robot_id={self._robot_id} → 서버 ddago/patrol, '
+            f'Patrol 서버 준비됨: robot_id={self._robot_id} → 서버 patrol, '
             f'Nav2={self._nav2_action}, 카메라={camera_topic}, '
             f'분석={analyze_service}')
 
