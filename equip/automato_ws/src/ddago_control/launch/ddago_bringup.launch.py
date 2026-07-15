@@ -45,6 +45,7 @@ from launch.actions import (
     DeclareLaunchArgument,
     GroupAction,
     IncludeLaunchDescription,
+    SetLaunchConfiguration,
 )
 from launch.launch_description_sources import AnyLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -75,6 +76,13 @@ def generate_launch_description():
             # 리맵해 /<namespace>/tf 로 가둬야 로봇별(dg_01/dg_02) tf 가 안 섞인다.
             SetRemap(src='/tf', dst='tf'),
             SetRemap(src='/tf_static', dst='tf_static'),
+
+            # pinky 의 upload_robot.launch.py 는 자체 'namespace' 인자로 robot_state_publisher
+            # 에 네임스페이스+frame_prefix 를 또 적용한다. 명령줄로 준 namespace 값이 include
+            # 를 타고 그 인자로 새어들어가면 /dg_01/ddago 가 두 번 붙는다(RSP 만 이중).
+            # push 로 이미 네임스페이스를 씌웠으니 여기서 'namespace' 를 비워 이중 적용을 막는다.
+            # (frame_prefix 도 비어 프레임이 접두어 없이 나와 nav2 프레임과 일치)
+            SetLaunchConfiguration('namespace', ''),
 
             # 핑키 순정 드라이버 launch (수정 없이 그대로 포함)
             IncludeLaunchDescription(AnyLaunchDescriptionSource(bringup_xml)),
