@@ -19,7 +19,7 @@ setup(
     zip_safe=True,
     maintainer='heeseog',
     maintainer_email='finekim67@gmail.com',
-    description='DG Control Service(HQ) 테스트용 상대편 시뮬레이터 4종',
+    description='DG Control Service(DCS) 테스트용 상대편 시뮬레이터 4종',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={

@@ -2,7 +2,7 @@
 """AiTcpClient 엔드포인트 자동 전환 단위 테스트.
 
 dg_ai_target.json 의 active("sim"->"real")를 바꾸면, 다음 analyze() 에서
-HQ의 AI TCP 클라이언트가 실서버 엔드포인트로 자동 재접속하는지 검증한다.
+DCS의 AI TCP 클라이언트가 실서버 엔드포인트로 자동 재접속하는지 검증한다.
 (대시보드에서 dg_ai 시뮬을 끄면 active 가 real 로 바뀌는 시나리오의 핵심 로직.)
 
 실행:

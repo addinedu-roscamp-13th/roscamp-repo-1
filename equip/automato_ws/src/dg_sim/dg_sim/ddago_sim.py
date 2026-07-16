@@ -3,26 +3,28 @@
 
 팀원이 개발 중인 실제 DdaGo Control Service 대역. 즉시-응답 스텁.
 
-담당(시퀀스 다이어그램):
+담당(시퀀스 다이어그램, 2026-07-14 개정):
   E0    DdagoTelemetry 1Hz 발행                  /{robot_id}/ddago/telemetry
-  E1/E2 Patrol 액션 서버 (HQ ← )            /{robot_id}/ddago/patrol
-        - goal(단일 waypoint) 접수 → feedback → 즉시 도착(result_code=0)
-        - 도착 후: RGB 촬영 흉내 → HQ 로 AnalyzeFrame 분석요청 (E2-2)
-  E2    AnalyzeFrame 서비스 클라이언트 (→ HQ)     /dg/analyze_frame
+  E1/E2 Navigate 액션 서버 (DCS ← )              /{robot_id}/ddago/navigate
+        - goal(Waypoint[] 경로) 접수 → waypoint 마다 feedback(current_waypoint_id,
+          waypoint_index) → 배열 끝까지 주행 → result(result_code=0, last_waypoint_id)
+        - **capture==true 노드에서만** RGB 촬영 흉내 → DCS 로 AnalyzeFrame 분석요청 (E2 3단계)
+        - 취소(cancel) 요청 시 그 자리에서 중단 → result_code=2, 도달한 마지막 노드 반환
+  E2    AnalyzeFrame 서비스 클라이언트 (→ DCS)    /dg/analyze_frame
 """
 import os
 import threading
 import time
 
 import rclpy
-from rclpy.action import ActionServer
+from rclpy.action import ActionServer, CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from std_srvs.srv import Trigger
 
-from automato_interfaces.action import Patrol
+from automato_interfaces.action import Navigate
 from automato_interfaces.msg import DdagoTelemetry
 from automato_interfaces.srv import AnalyzeFrame
 from sensor_msgs.msg import Image
@@ -38,11 +40,11 @@ class DdagoSim(Node):
         # AnalyzeFrame 으로 보낼 RGB 프레임. waypoint별로 image_dir 안의 이미지를 순서대로 사용.
         self.declare_parameter(
             'image_dir',
-            '/home/ane/dev_ws/roscamp-sprint4-heeseog/equip/automato_ws/sample_frames')
+            '/home/ane/dev_ws/test_data/sample_frames')
         # image_dir 이 비었을 때 쓰는 단일 폴백 이미지
         self.declare_parameter(
             'image_path',
-            '/home/ane/dev_ws/roscamp-sprint4-heeseog/equip/automato_ws/sample_frame.jpg')
+            '/home/ane/dev_ws/test_data/sample_frame.jpg')
         self.declare_parameter('image_max_width', 256)   # 원본 축소 최대 폭(px)
         self.robot_id = self.get_parameter('robot_id').value
         self.move_delay = float(self.get_parameter('move_delay').value)
@@ -64,14 +66,16 @@ class DdagoSim(Node):
         self.create_service(Trigger, '/ddago_sim/stop_telemetry', self._on_stop_tel,
                             callback_group=self._cb)
 
-        self._patrol_srv = ActionServer(
-            self, Patrol, '/%s/ddago/patrol' % self.robot_id,
-            execute_callback=self._execute, callback_group=self._cb)
+        self._navigate_srv = ActionServer(
+            self, Navigate, '/%s/ddago/navigate' % self.robot_id,
+            execute_callback=self._execute,
+            cancel_callback=lambda _gh: CancelResponse.ACCEPT,
+            callback_group=self._cb)
 
         self._analyze_cli = self.create_client(
             AnalyzeFrame, '/dg/analyze_frame', callback_group=self._cb)
 
-        self.get_logger().info('DdaGo 시뮬 시작: /%s/ddago/{telemetry,patrol}' % self.robot_id)
+        self.get_logger().info('DdaGo 시뮬 시작: /%s/ddago/{telemetry,navigate}' % self.robot_id)
 
     # ---- E0 텔레메트리 (실행 트리거 시에만) ----
     def _on_start_tel(self, request, response):
@@ -103,46 +107,65 @@ class DdagoSim(Node):
         msg.us_range_m = 0.42
         self._tel_pub.publish(msg)
 
-    # ---- E1/E2 Patrol 액션 서버 ----
+    # ---- E1/E2 Navigate 액션 서버 (경로 배열) ----
     def _execute(self, goal_handle):
         goal = goal_handle.request
-        wp = goal.waypoint
+        wps = list(goal.waypoints)
         self._task_id = goal.task_id
-        self.get_logger().info('DdaGo 이동 시작: task=%d wp=%d (%.2f,%.2f)'
-                               % (goal.task_id, wp.waypoint_id, wp.x, wp.y))
+        self.get_logger().info('DdaGo 구간 주행 시작: task=%d waypoints=%s'
+                               % (goal.task_id, [w.waypoint_id for w in wps]))
 
-        # 이동 흉내: move_delay 동안 feedback 여러 번 발행 후 도착(처리 시간 시뮬)
-        steps = 3
-        per = self.move_delay / steps if self.move_delay > 0 else 0.0
-        for i in range(steps):
-            fb = Patrol.Feedback()
-            fb.current_waypoint_id = wp.waypoint_id
-            fb.current_x = wp.x * (i + 1) / steps
-            fb.current_y = wp.y * (i + 1) / steps
-            fb.current_yaw = 0.0
-            goal_handle.publish_feedback(fb)
-            if per:
-                time.sleep(per)
+        last_wp = wps[0].waypoint_id if wps else -1
+        code = 0
+        for idx, wp in enumerate(wps):
+            if goal_handle.is_cancel_requested:
+                self.get_logger().warn('취소 요청 → 구간 중단 (last_wp=%d)' % last_wp)
+                code = 2
+                break
 
-        # 도착
-        self._x, self._y, self._yaw = wp.x, wp.y, 0.0
-        goal_handle.succeed()
-        result = Patrol.Result()
-        result.result_code = 0
-        result.message = '도착'
+            # 이동 흉내: move_delay 동안 feedback 여러 번 발행 후 도착(처리 시간 시뮬)
+            steps = 3
+            per = self.move_delay / steps if self.move_delay > 0 else 0.0
+            for i in range(steps):
+                fb = Navigate.Feedback()
+                fb.current_waypoint_id = wp.waypoint_id
+                fb.waypoint_index = idx
+                fb.current_x = wp.x * (i + 1) / steps
+                fb.current_y = wp.y * (i + 1) / steps
+                fb.current_yaw = 0.0
+                goal_handle.publish_feedback(fb)
+                if per:
+                    time.sleep(per)
 
-        # 도착 후: Patrol result(반환 시 전송) → 그 다음 RGB 촬영·분석요청(E2-1,2).
-        # 분석요청 스레드는 result가 HQ로 먼저 전달되도록 잠깐 양보 후 발신.
-        threading.Thread(target=self._request_analyze,
-                         args=(goal.task_id, wp.waypoint_id), daemon=True).start()
+            # 도착
+            self._x, self._y, self._yaw = wp.x, wp.y, 0.0
+            last_wp = wp.waypoint_id
+
+            # capture==true 노드에서만 촬영·분석요청(E2 3단계). 나머지는 통과만 한다.
+            # 분석요청은 비동기라 이동을 막지 않는다(fire-and-forget).
+            if wp.capture:
+                threading.Thread(target=self._request_analyze,
+                                 args=(goal.task_id, wp.waypoint_id), daemon=True).start()
+            else:
+                self.get_logger().info('wp=%d 통과(capture=false)' % wp.waypoint_id)
+
+        result = Navigate.Result()
+        result.result_code = code
+        result.last_waypoint_id = int(last_wp)
+        if code == 2:
+            result.message = '중단'
+            goal_handle.canceled()
+        else:
+            result.message = '구간 완주'
+            goal_handle.succeed()
+        self.get_logger().info('DdaGo 구간 종료: task=%d code=%d last_wp=%d'
+                               % (goal.task_id, code, last_wp))
         return result
 
-    # ---- E2 분석 요청 (→ HQ) ----
+    # ---- E2 분석 요청 (→ DCS) ----
     def _request_analyze(self, task_id, waypoint_id):
-        # Patrol result가 HQ로 먼저 전송된 뒤 분석요청을 보낸다.
-        time.sleep(0.2)
         if not self._analyze_cli.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error('HQ AnalyzeFrame 서비스 없음')
+            self.get_logger().error('DCS AnalyzeFrame 서비스 없음')
             return
         req = AnalyzeFrame.Request()
         req.task_id = int(task_id)
@@ -152,7 +175,7 @@ class DdagoSim(Node):
             req.image = img
         else:
             name, req.image = 'dummy', self._dummy_image()
-        self.get_logger().info('HQ로 분석요청: task=%d wp=%d img=%s (%dx%d)'
+        self.get_logger().info('DCS로 분석요청: task=%d wp=%d img=%s (%dx%d)'
                                % (task_id, waypoint_id, name, req.image.width, req.image.height))
         fut = self._analyze_cli.call_async(req)
         fut.add_done_callback(self._on_analyze_ack)

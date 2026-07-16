@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DG Control Service(HQ) → DG AI Service TCP 클라이언트.
+"""DG Control Service(DCS) → DG AI Service TCP 클라이언트.
 
 시퀀스 다이어그램 E2-3/4 규격:
   - 연결: 지속(persistent) TCP. 매 요청마다 새로 열지 않음.

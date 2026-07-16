@@ -91,7 +91,7 @@
   .msg-table th { color: #8a92a6; font-weight: 600; }
   .msg-table td.svc { color: #9fb0d0; font-weight: 600; }
   .dir { font-family: ui-monospace, monospace; white-space: nowrap; }
-  .dir .hq { color: #f0894a; font-weight: 700; } .dir .sv { color: #46d17e; font-weight: 700; }
+  .dir .dcs { color: #f0894a; font-weight: 700; } .dir .sv { color: #46d17e; font-weight: 700; }
   .tag { font-size: 12px; padding: 1px 7px; border-radius: 10px; background: #232936; color: #b7bfd0; }
   .tag.action { color: #f0b45a; } .tag.service { color: #6ab0ff; } .tag.topic { color: #46d17e; } .tag.TCP { color: #d08bff; }
   .wire-row td { background: #0d1017; padding: 4px 8px 9px; }
@@ -103,7 +103,7 @@
 </head>
 <body>
   <h1>DG Control 테스트 대시보드</h1>
-  <div class="sub">HQ(dg_control) + 시뮬 4종을 개별 on/off. AI TCP 접속대상(실서버/시뮬)을 저장·전환.</div>
+  <div class="sub">DCS(본체)와 상대 서비스 시뮬 4종을 켜고 끕니다. AI 연결은 실서버/시뮬을 전환할 수 있습니다.</div>
 
   <div id="conn-banner" class="conn-banner" style="display:none">⚠ 제어 서버(web) 연결 끊김 — 응답 없음</div>
 
@@ -112,10 +112,10 @@
   <div class="split">
     <div class="left-col">
       <div class="panel diagram-panel">
-        <h2>서비스 연동 관계</h2>
-        <div class="note">HQ(본체) 중심 연동. 링크 색: <b style="color:#46d17e">초록=양쪽 UP</b>, 회색=DOWN.
+        <h2>인터페이스 맵 <span id="rid-badge" class="active-badge active-sim">dg_01</span></h2>
+        <div class="note">DCS(본체) 중심 연동. 링크 색: <b style="color:#46d17e">초록=양쪽 UP</b>, 회색=DOWN.
           메시지가 오갈 때 링크가 <b style="color:#eaff66">깜박이며 메시지명·방향(화살표)</b>이 표시됩니다.</div>
-        <svg class="topo" viewBox="0 0 900 280" role="img" aria-label="서비스 연동 관계도">
+        <svg class="topo" viewBox="0 0 900 280" role="img" aria-label="인터페이스 맵">
           <defs>
             <marker id="flash-arrow" viewBox="0 0 10 10" refX="9" refY="5"
                     markerWidth="11" markerHeight="11" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
@@ -129,8 +129,8 @@
             <line id="link-dg_ai" x1="450" y1="170" x2="450" y2="205"/>
           </g>
           <g text-anchor="middle">
-            <rect id="node-hq"    x="380" y="110" width="140" height="60" rx="12" fill="#20252f" stroke="#3a4356" stroke-width="2"/>
-            <text class="nlabel" x="450" y="136">HQ</text>
+            <rect id="node-dcs"   x="380" y="110" width="140" height="60" rx="12" fill="#20252f" stroke="#3a4356" stroke-width="2"/>
+            <text class="nlabel" x="450" y="136">DCS</text>
             <text class="nsub"   x="450" y="154">DG Control · 본체</text>
 
             <rect id="node-acs"   x="40"  y="110" width="150" height="60" rx="12" fill="#1a1e27" stroke="#3a4356" stroke-width="2"/>
@@ -159,21 +159,44 @@
       </div>
 
       <div class="panel">
-        <h2>테스트 항목 — E0 / E1 / E2</h2>
+        <h2>시나리오 테스트 (E0 · E1 · E2)</h2>
         <div class="note">시퀀스 다이어그램의 3개 시나리오를 항목별로 실행·판정합니다.
-          <b>hq · acs · ddago · ddagi · dg_ai</b> 가 모두 UP이어야 합니다.
+          <b>dcs · acs · ddago · ddagi · dg_ai</b> 가 모두 UP이어야 합니다.
           각 항목 <b>실행</b> → PASS/FAIL 과 근거 로그가 표시됩니다.</div>
         <div id="tests"></div>
+      </div>
+
+      <div class="panel">
+        <h2>DG AI Service 연결 (TCP)</h2>
+        <div class="field">
+          <label>실서버 IP:PORT</label>
+          <input id="real" placeholder="예: 192.168.0.50:9100">
+        </div>
+        <div class="field">
+          <label>시뮬 IP:PORT</label>
+          <input id="sim" placeholder="예: 127.0.0.1:9100">
+        </div>
+        <div class="save-row">
+          <button onclick="saveTarget()">IP 저장</button>
+          <span>현재 접속대상: <span id="active" class="active-badge">-</span></span>
+          <span class="toast" id="toast"></span>
+        </div>
+        <div class="note">
+          · <b>dg_ai 시뮬을 켜면</b> active=<b>sim</b>(시뮬 IP)로, <b>끄면</b> active=<b>real</b>(실서버 IP)로 자동 전환됩니다.<br>
+          · DCS는 이 값을 읽어 다음 분석 요청에서 해당 엔드포인트로 자동 재접속합니다. 실서버 IP는 팀원 서버 주소로 저장해 두세요.
+        </div>
       </div>
     </div>
 
     <div class="panel msg-panel">
-      <h2>주고받는 메시지 (DG 시점 시계열)</h2>
-      <div class="note">HQ가 주고받은 모든 메시지를 <b>시각순 하나의 스크롤</b>로 표시(1.5초 갱신, 위=과거/아래=최신).
+      <h2>메시지 로그 (DCS 시점)</h2>
+      <div class="note">DCS가 주고받은 모든 메시지를 <b>시각순 하나의 스크롤</b>로 표시(1.5초 갱신, 위=과거/아래=최신).
         실행 버튼을 누르면 초기화됩니다. 보관
         <input id="msg-limit" type="number" min="1" max="5000" value="500" style="width:64px"> 건.
         <button id="copy-btn" onclick="copyMessages()">📋 전체 복사</button>
         <button id="clear-btn" onclick="clearWireLog()">🗑 지우기</button>
+        <button id="scroll-btn" onclick="toggleScrollLock()">⏸ 스크롤 고정</button>
+        <span class="toast" id="scroll-state" style="color:#f0894a"></span>
         <label style="margin-left:8px; user-select:none; cursor:pointer">
           <input type="checkbox" id="hide-tel" checked onchange="onHideTelChange()"> 텔레메트리 숨김</label>
         <span class="toast" id="copy-toast"></span></div>
@@ -181,32 +204,12 @@
     </div>
   </div>
 
-  <div class="panel">
-    <h2>DG AI Service 접속 대상 (TCP)</h2>
-    <div class="field">
-      <label>실서버 IP:PORT</label>
-      <input id="real" placeholder="예: 192.168.0.50:9100">
-    </div>
-    <div class="field">
-      <label>시뮬 IP:PORT</label>
-      <input id="sim" placeholder="예: 127.0.0.1:9100">
-    </div>
-    <div class="save-row">
-      <button onclick="saveTarget()">IP 저장</button>
-      <span>현재 접속대상: <span id="active" class="active-badge">-</span></span>
-      <span class="toast" id="toast"></span>
-    </div>
-    <div class="note">
-      · <b>dg_ai 시뮬을 켜면</b> active=<b>sim</b>(시뮬 IP)로, <b>끄면</b> active=<b>real</b>(실서버 IP)로 자동 전환됩니다.<br>
-      · HQ는 이 값을 읽어 다음 분석 요청에서 해당 엔드포인트로 자동 재접속합니다. 실서버 IP는 팀원 서버 주소로 저장해 두세요.
-    </div>
-  </div>
 
 <script>
 const NODES = [
-  { key: 'hq',        name: 'HQ (DG 본체)',   role: '실제 DG Control Service', ctl: true },
-  { key: 'acs',       name: 'ACS 시뮬',       role: 'Patrol클라/SaveDet서버/Fleet구독', ctl: true },
-  { key: 'ddago',     name: 'DdaGo 시뮬',     role: 'DdagoPatrol서버/텔레메트리/분석요청', ctl: true },
+  { key: 'dcs',       name: 'DCS (DG 본체)',  role: '실제 DG Control Service', ctl: true },
+  { key: 'acs',       name: 'ACS 시뮬',       role: 'Navigate클라/SaveDet서버/Fleet구독', ctl: true },
+  { key: 'ddago',     name: 'DdaGo 시뮬',     role: 'Navigate서버/텔레메트리/분석요청', ctl: true },
   { key: 'ddagi',     name: 'Ddagi 시뮬',     role: 'DdagiTelemetry', ctl: true },
   { key: 'dg_ai',     name: 'DG AI 시뮬 (TCP)', role: ':9100, off시 실서버 자동전환', ctl: true },
   { key: 'rosbridge', name: 'rosbridge',      role: ':9090', ctl: true },
@@ -233,6 +236,11 @@ function render(state) {
       </div>`;
     grid.appendChild(card);
   }
+  if (state.robot_id) {
+    RID = state.robot_id;
+    const b = document.getElementById('rid-badge');
+    if (b) b.textContent = RID;
+  }
   const t = state.ai_target || {};
   document.getElementById('real').value = document.getElementById('real').value || t.real || '';
   document.getElementById('sim').value  = document.getElementById('sim').value  || t.sim  || '';
@@ -245,13 +253,13 @@ function render(state) {
 function colorTopo(nodes, ai) {
   const UP = '#2ecc71', DN = '#3a4356', REAL = '#f0894a';
   // 일반 노드/링크(acs·ddago·ddagi): 양쪽 UP이면 초록
-  for (const k of ['hq', 'acs', 'ddago', 'ddagi']) {
+  for (const k of ['dcs', 'acs', 'ddago', 'ddagi']) {
     const el = document.getElementById('node-' + k);
     if (el) el.setAttribute('stroke', nodes[k] === 'up' ? UP : DN);
   }
   for (const k of ['acs', 'ddago', 'ddagi']) {
     const el = document.getElementById('link-' + k);
-    if (el) el.setAttribute('stroke', (nodes.hq === 'up' && nodes[k] === 'up') ? UP : DN);
+    if (el) el.setAttribute('stroke', (nodes.dcs === 'up' && nodes[k] === 'up') ? UP : DN);
   }
   // DG AI: 접속 대상(active)에 따라 시뮬/실서버를 표시
   const active = (ai && ai.active) || 'sim';
@@ -260,14 +268,14 @@ function colorTopo(nodes, ai) {
   const name = document.getElementById('dgai-name');
   const sub = document.getElementById('dgai-sub');
   if (active === 'real') {
-    // 시뮬 off → HQ가 실서버 연동. HQ UP이면 주황(실서버 연동 중)으로 표시.
-    const col = (nodes.hq === 'up') ? REAL : DN;
+    // 시뮬 off → DCS가 실서버 연동. DCS UP이면 주황(실서버 연동 중)으로 표시.
+    const col = (nodes.dcs === 'up') ? REAL : DN;
     if (node) node.setAttribute('stroke', col);
     if (link) link.setAttribute('stroke', col);
     if (name) name.textContent = 'DG AI · 실서버';
     if (sub) sub.textContent = (ai && ai.real) ? ai.real : '실서버';
   } else {
-    const col = (nodes.hq === 'up' && nodes.dg_ai === 'up') ? UP : DN;
+    const col = (nodes.dcs === 'up' && nodes.dg_ai === 'up') ? UP : DN;
     if (node) node.setAttribute('stroke', col);
     if (link) link.setAttribute('stroke', col);
     if (name) name.textContent = 'DG AI · 시뮬';
@@ -306,7 +314,7 @@ async function saveTarget() {
   setTimeout(() => toast.textContent = '', 1500);
   refresh();
 }
-// 서비스 연결 단위(key) + HQ 기준 메시지. dir: 'to_hq'(서비스→HQ) | 'from_hq'(HQ→서비스)
+// 서비스 연결 단위(key) + DCS 기준 메시지. dir: 'to_dcs'(상대→DCS) | 'from_dcs'(DCS→상대)
 const SVC_GROUPS = [
   { key: 'acs',   title: 'Automato Control (ACS) · 시뮬', short: 'ACS' },
   { key: 'ddago', title: 'DdaGo · 시뮬',                  short: 'DdaGo' },
@@ -314,25 +322,31 @@ const SVC_GROUPS = [
   { key: 'dg_ai', title: 'DG AI Service · 시뮬 (TCP)',    short: 'AI' },
 ];
 const MSGS = [
-  { key: 'acs',   dir: 'to_hq',   iface: 'Patrol',           type: 'action',  name: '/dg_01/patrol',             scen: 'E1' },
-  { key: 'acs',   dir: 'from_hq', iface: 'Patrol/feedback',  type: 'action',  name: '/dg_01/patrol (feedback)',  scen: 'E1·E2' },
-  { key: 'acs',   dir: 'from_hq', iface: 'Patrol/result',    type: 'action',  name: '/dg_01/patrol (result)',    scen: 'E1·E2' },
-  { key: 'acs',   dir: 'from_hq', iface: 'FleetTelemetry',   type: 'topic',   name: '/automato/telemetry/fleet', scen: 'E0' },
-  { key: 'acs',   dir: 'from_hq', iface: 'SaveDetection',    type: 'service', name: '/automato/save_detection',  scen: 'E2' },
-  { key: 'ddago', dir: 'from_hq', iface: 'DdagoPatrol',      type: 'action',  name: '/dg_01/ddago/patrol',       scen: 'E1·E2' },
-  { key: 'ddago', dir: 'to_hq',   iface: 'DdagoPatrol/feedback', type: 'action', name: '/dg_01/ddago/patrol (feedback)', scen: 'E1·E2' },
-  { key: 'ddago', dir: 'to_hq',   iface: 'DdagoPatrol/result',   type: 'action', name: '/dg_01/ddago/patrol (result)',   scen: 'E1·E2' },
-  { key: 'ddago', dir: 'to_hq',   iface: 'DdagoTelemetry',   type: 'topic',   name: '/dg_01/ddago/telemetry',    scen: 'E0' },
-  { key: 'ddago', dir: 'to_hq',   iface: 'AnalyzeFrame',     type: 'service', name: '/dg/analyze_frame',         scen: 'E2' },
-  { key: 'ddagi', dir: 'to_hq',   iface: 'DdagiTelemetry',   type: 'topic',   name: '/dg_01/ddagi/telemetry',    scen: 'E0' },
-  { key: 'dg_ai', dir: 'from_hq', iface: 'analyze_request',  type: 'TCP',     name: '4B len + JSON',             scen: 'E2' },
-  { key: 'dg_ai', dir: 'to_hq',   iface: 'analyze_response', type: 'TCP',     name: '4B len + JSON',             scen: 'E2' },
+  { key: 'acs',   dir: 'to_dcs',   iface: 'Navigate',           type: 'action',  name: '/{rid}/navigate',            scen: 'E1' },
+  { key: 'acs',   dir: 'from_dcs', iface: 'Navigate/feedback',  type: 'action',  name: '/{rid}/navigate (feedback)', scen: 'E1·E2' },
+  { key: 'acs',   dir: 'from_dcs', iface: 'Navigate/result',    type: 'action',  name: '/{rid}/navigate (result)',   scen: 'E1·E2' },
+  { key: 'acs',   dir: 'from_dcs', iface: 'FleetTelemetry',     type: 'topic',   name: '/automato/telemetry/fleet',  scen: 'E0' },
+  { key: 'acs',   dir: 'from_dcs', iface: 'SaveDetection',      type: 'service', name: '/automato/save_detection',   scen: 'E2·E3' },
+  { key: 'ddago', dir: 'from_dcs', iface: 'Navigate(→DdaGo)',   type: 'action',  name: '/{rid}/ddago/navigate',      scen: 'E1·E2' },
+  { key: 'ddago', dir: 'to_dcs',   iface: 'Navigate(→DdaGo)/feedback', type: 'action', name: '/{rid}/ddago/navigate (feedback)', scen: 'E1·E2' },
+  { key: 'ddago', dir: 'to_dcs',   iface: 'Navigate(→DdaGo)/result',   type: 'action', name: '/{rid}/ddago/navigate (result)',   scen: 'E1·E2' },
+  { key: 'ddago', dir: 'to_dcs',   iface: 'DdagoTelemetry',     type: 'topic',   name: '/{rid}/ddago/telemetry',     scen: 'E0' },
+  { key: 'ddago', dir: 'to_dcs',   iface: 'AnalyzeFrame',       type: 'service', name: '/dg/analyze_frame',          scen: 'E2' },
+  { key: 'ddagi', dir: 'to_dcs',   iface: 'DdagiTelemetry',     type: 'topic',   name: '/{rid}/ddagi/telemetry',     scen: 'E0' },
+  { key: 'dg_ai', dir: 'from_dcs', iface: 'analyze_request',    type: 'TCP',     name: '4B len + JSON',              scen: 'E2' },
+  { key: 'dg_ai', dir: 'to_dcs',   iface: 'analyze_response',   type: 'TCP',     name: '4B len + JSON',              scen: 'E2·E3' },
 ];
-// iface -> {key, type, short}. 방향(dir)은 각 wire 레코드의 값을 사용.
+// iface -> {key, type, short, name}. 방향(dir)은 각 wire 레코드의 값을 사용.
+// name 의 {rid} 는 서버가 알려준 ROBOT_ID 로 치환한다(토픽/액션 실제 이름).
 const IFACE = {};
 for (const m of MSGS) {
   const g = SVC_GROUPS.find(x => x.key === m.key);
-  IFACE[m.iface] = { key: m.key, type: m.type, short: g ? g.short : m.key };
+  IFACE[m.iface] = { key: m.key, type: m.type, short: g ? g.short : m.key, name: m.name, scen: m.scen };
+}
+let RID = 'dg_01';   // 서버(/api/status)의 ROBOT_ID 로 갱신
+function ifaceName(iface) {
+  const i = IFACE[iface];
+  return i ? (i.name || '').replace('{rid}', RID) + (i.scen ? '  [' + i.scen + ']' : '') : '';
 }
 let _ifaceTs = {};      // iface -> 마지막으로 본 최신 ts (깜박임 트리거용)
 let _firstWire = true;
@@ -342,8 +356,8 @@ let _lastList = [];     // 마지막으로 받은 시계열(복사용)
 function copyMessages() {
   const lines = applyTelFilter(_lastList).map(e => {
     const info = IFACE[e.iface] || { short: e.iface };
-    const dir = e.dir === 'to_hq' ? info.short + ' -> HQ' : 'HQ -> ' + info.short;
-    return fmtTime(e.ts) + '  ' + dir + '  ' + e.iface + '  ' + JSON.stringify(e.payload);
+    const dir = e.dir === 'to_dcs' ? info.short + ' -> DCS' : 'DCS -> ' + info.short;
+    return fmtTime(e.ts) + '  ' + dir + '  ' + e.iface + '  ' + plText(e);
   });
   const text = lines.join('\n');
   const toast = document.getElementById('copy-toast');
@@ -375,13 +389,16 @@ async function clearWireLog() {   // 🗑 지우기 버튼: 서버 기준시각 
 }
 
 function escapeHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+// payload 표시 문자열: 서버(파이썬)가 만든 JSON 원문(text)을 그대로 쓴다.
+// JS 로 다시 JSON.stringify 하면 float 0.0 이 0 으로 바뀌어 소수점이 사라진다.
+function plText(e) { return (e.text !== undefined && e.text !== null) ? e.text : JSON.stringify(e.payload); }
 function fmtTime(ts) {
   const d = new Date(ts * 1000);
   const p = (n, w = 2) => String(n).padStart(w, '0');
   return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + '.' + p(d.getMilliseconds(), 3);
 }
-// 링크의 HQ 쪽 끝: 'start'=x1, 'end'=x2 (SVG line 정의 방향 기준)
-const HQ_END = { acs: 'end', ddago: 'start', ddagi: 'start', dg_ai: 'start' };
+// 링크의 DCS 쪽 끝: 'start'=x1, 'end'=x2 (SVG line 정의 방향 기준)
+const DCS_END = { acs: 'end', ddago: 'start', ddagi: 'start', dg_ai: 'start' };
 // 링크 깜박임 + 방향 화살표(링크 위) + 메시지명 라벨
 function flashLink(key, iface, dir) {
   const el = document.getElementById('link-' + key);
@@ -391,9 +408,9 @@ function flashLink(key, iface, dir) {
       el.animate([{ stroke: '#eaff66', strokeWidth: '5px' }, { stroke: base, strokeWidth: '2px' }],
                  { duration: 1200, easing: 'ease-out' });
     }
-    // 방향을 깜박이는 링크에 화살표로 표시 (to_hq=HQ쪽 끝, from_hq=서비스쪽 끝)
-    const hqEnd = HQ_END[key] || 'end';
-    const targetEnd = (dir === 'to_hq') ? hqEnd : (hqEnd === 'end' ? 'start' : 'end');
+    // 방향을 깜박이는 링크에 화살표로 표시 (to_dcs=DCS쪽 끝, from_dcs=상대쪽 끝)
+    const dcsEnd = DCS_END[key] || 'end';
+    const targetEnd = (dir === 'to_dcs') ? dcsEnd : (dcsEnd === 'end' ? 'start' : 'end');
     el.removeAttribute('marker-start');
     el.removeAttribute('marker-end');
     el.setAttribute(targetEnd === 'end' ? 'marker-end' : 'marker-start', 'url(#flash-arrow)');
@@ -417,24 +434,40 @@ function hideTelOn() { const c = document.getElementById('hide-tel'); return !!(
 function applyTelFilter(list) {
   return hideTelOn() ? (list || []).filter(e => !TEL_IFACES.has(e.iface)) : (list || []);
 }
-function onHideTelChange() { renderTimeline(_lastList || []); }   // 토글 즉시 반영
-// DG(HQ) 시점 전체 시계열을 하나의 스크롤에 렌더
+function onHideTelChange() { if (scrollLock) toggleScrollLock(); renderTimeline(_lastList || []); }   // 토글 즉시 반영(고정 중이면 해제)
+// 스크롤 고정: 켜면 타임라인을 **다시 그리지 않는다**(화면 그대로 멈춤).
+// 수신은 계속되므로 고정을 풀면 그동안 쌓인 메시지가 한 번에 반영된다.
+// (위치만 되돌리는 방식은 목록 앞부분이 잘려 나가면 화면이 밀려서 못 쓴다.)
+let scrollLock = false;
+function toggleScrollLock() {
+  scrollLock = !scrollLock;
+  const b = document.getElementById('scroll-btn');
+  if (b) {
+    b.textContent = scrollLock ? '▶ 스크롤 재개' : '⏸ 스크롤 고정';
+    b.classList.toggle('off', scrollLock);
+  }
+  const s = document.getElementById('scroll-state');
+  if (s) s.textContent = scrollLock ? '고정됨 — 수신은 계속됨' : '';
+  if (!scrollLock) renderTimeline(_lastList || []);   // 풀면 그동안 쌓인 것 반영
+}
+// DCS 시점 전체 시계열을 하나의 스크롤에 렌더
 function renderTimeline(list) {
   const box = document.getElementById('msg-timeline');
   if (!box) return;
+  if (scrollLock) return;        // 스크롤 고정 중 — 화면을 건드리지 않는다
   list = applyTelFilter(list);   // 텔레메트리 숨김 토글 반영
   if (!list.length) { box.innerHTML = '<div class="wempty">(아직 없음)</div>'; return; }
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 50;
   const prevTop = box.scrollTop;
   box.innerHTML = list.map(e => {
     const info = IFACE[e.iface] || { short: e.iface, type: '' };
-    const dir = e.dir === 'to_hq' ? info.short + ' → HQ' : 'HQ → ' + info.short;
+    const dir = e.dir === 'to_dcs' ? info.short + ' → DCS' : 'DCS → ' + info.short;
     return '<div class="tl-row">' +
       `<span class="tl-time">${fmtTime(e.ts)}</span>` +
       `<span class="tl-dir">${dir}</span>` +
-      `<span class="tl-iface">${e.iface}</span>` +
+      `<span class="tl-iface" title="${ifaceName(e.iface)}">${e.iface}</span>` +
       `<span class="tag ${info.type}">${info.type}</span>` +
-      `<span class="tl-pl">${escapeHtml(JSON.stringify(e.payload))}</span></div>`;
+      `<span class="tl-pl">${escapeHtml(plText(e))}</span></div>`;
   }).join('');
   box.scrollTop = nearBottom ? box.scrollHeight : prevTop;   // 맨 아래(최신) 보고 있으면 따라감
 }
@@ -453,7 +486,7 @@ async function refreshWire() {
       if (newest[iface] > (_ifaceTs[iface] || 0)) {
         const info = IFACE[iface];
         if (!_firstWire && info) {
-          let dir = 'from_hq';
+          let dir = 'from_dcs';
           for (let i = list.length - 1; i >= 0; i--) {
             if (list[i].iface === iface) { dir = list[i].dir; break; }
           }
@@ -467,9 +500,9 @@ async function refreshWire() {
 }
 
 const TESTS = [
-  { key: 'e0', name: 'E0 상시 모니터링', desc: '실행 시 시뮬 텔레메트리 상시 발행 → HQ 취합 → ACS FleetTelemetry 수신 (중지 버튼으로 정지)' },
-  { key: 'e1', name: 'E1 순찰 시작',     desc: 'ACS→HQ Patrol 접수 → HQ→DdaGo waypoint 하달' },
-  { key: 'e2', name: 'E2 체크·저장',     desc: 'waypoint별 분석 → SaveDetection 저장 → 순찰 완료(result_code=0)' },
+  { key: 'e0', name: 'E0 상시 모니터링', desc: '실행 시 시뮬 텔레메트리 상시 발행 → DCS 취합 → ACS FleetTelemetry 수신 (중지 버튼으로 정지)' },
+  { key: 'e1', name: 'E1 순찰 시작',     desc: 'ACS→DCS 경로(Waypoint[]) 접수 → DCS→DdaGo 구간 하달' },
+  { key: 'e2', name: 'E2 체크·저장',     desc: 'capture 노드 분석 → SaveDetection 저장(병해충 시 이미지 동봉) → 순찰 완료' },
 ];
 function renderTests() {
   const c = document.getElementById('tests');

@@ -15,12 +15,12 @@ setup(
     zip_safe=True,
     maintainer='heeseog',
     maintainer_email='finekim67@gmail.com',
-    description='DG Control Service (HQ) 순찰 오케스트레이터 본체',
+    description='DG Control Service (DCS) 순찰 오케스트레이터 본체',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'hq_node = dg_control.hq_node:main',
+            'dcs_node = dg_control.dcs_node:main',
         ],
     },
 )

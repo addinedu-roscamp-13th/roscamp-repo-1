@@ -1,6 +1,6 @@
-# 시나리오1 E1/E2 : 경로(waypoint 배열) 순찰 — ACS→HQ, HQ→DdaGo 공통 재사용
-#   ACS -> HQ    : /{robot_id}/navigate
-#   HQ  -> DdaGo : /{robot_id}/ddago/navigate
+# 시나리오1 E1/E2 : 경로(waypoint 배열) 순찰 — ACS→DCS, DCS→DdaGo 공통 재사용
+#   ACS -> DCS    : /{robot_id}/navigate
+#   DCS  -> DdaGo : /{robot_id}/ddago/navigate
 # 이전 Patrol(단일 waypoint 하나씩)에서, ACS가 예약 확보된 구간을 배열로 한 번에 하달하는 방식으로 변경.
 # ---------- Goal ----------
 int64        task_id

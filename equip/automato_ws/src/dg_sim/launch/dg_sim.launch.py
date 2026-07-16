@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""dg_sim — HQ 테스트용 상대편 시뮬 4종을 한 번에 기동.
+"""dg_sim — DCS 테스트용 상대편 시뮬 4종을 한 번에 기동.
 
-  acs_sim   : Automato Control Service 대역 (Patrol 클라 / SaveDetection 서버 / Fleet 구독)
-  ddago_sim : DdaGo 대역 (Patrol 서버(단일 waypoint) / DdagoTelemetry / AnalyzeFrame 클라)
+  acs_sim   : Automato Control Service 대역 (Navigate 클라 / SaveDetection 서버 / Fleet 구독)
+  ddago_sim : DdaGo 대역 (Navigate 서버(Waypoint[]) / DdagoTelemetry / AnalyzeFrame 클라)
   ddagi_sim : Ddagi 대역 (DdagiTelemetry)
   dg_ai_sim : DG AI Service 대역 (TCP 9100)
 
@@ -14,7 +14,7 @@
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -22,7 +22,11 @@ def generate_launch_description():
     robot_id = LaunchConfiguration('robot_id')
     auto_start = LaunchConfiguration('auto_start')
     return LaunchDescription([
-        DeclareLaunchArgument('robot_id', default_value='dg_01'),
+        # 로봇 식별자는 환경변수 ROBOT_ID(~/.bashrc) 를 따른다. 인자로 덮어쓸 수 있다:
+        #   ros2 launch dg_sim dg_sim.launch.py robot_id:=dg_02
+        DeclareLaunchArgument(
+            'robot_id',
+            default_value=EnvironmentVariable('ROBOT_ID', default_value='dg_01')),
         DeclareLaunchArgument('auto_start', default_value='true'),
         Node(package='dg_sim', executable='ddagi_sim', name='ddagi_sim',
              parameters=[{'robot_id': robot_id}]),
