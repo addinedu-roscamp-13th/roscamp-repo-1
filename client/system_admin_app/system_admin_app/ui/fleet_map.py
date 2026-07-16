@@ -13,8 +13,9 @@ import os
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QRectF
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
+from PyQt6.QtCore import QRectF, QPointF, Qt
+from PyQt6.QtGui import QPolygonF, QBrush, QColor, QPen
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QGraphicsPolygonItem
 
 from .. import config
 from ..model.state import FleetSnapshot
@@ -23,7 +24,20 @@ from . import style
 # 이미지 배열을 [row, col] = [y, x]로 다루기 위해 row-major 지정
 pg.setConfigOptions(imageAxisOrder="row-major")
 
-HEADING_LEN = 0.4  # 방향 화살표 길이(m)
+# 방향 화살표(삼각형) 치수 — 원 바로 앞에 짧게 (단위 m)
+ARROW_TIP = 0.10    # 중심~팁 거리
+ARROW_BASE = 0.03   # 중심~밑변 거리 (원 바로 앞에서 시작)
+ARROW_HW = 0.035    # 밑변 반폭
+
+
+def _arrow_polygon(x: float, y: float, yaw: float) -> QPolygonF:
+    """(x,y)에서 yaw 방향으로 향하는 짧은 화살촉 삼각형(데이터 좌표)."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    px, py = -s, c  # 진행 방향에 수직
+    tip = QPointF(x + ARROW_TIP * c, y + ARROW_TIP * s)
+    bl = QPointF(x + ARROW_BASE * c + ARROW_HW * px, y + ARROW_BASE * s + ARROW_HW * py)
+    br = QPointF(x + ARROW_BASE * c - ARROW_HW * px, y + ARROW_BASE * s - ARROW_HW * py)
+    return QPolygonF([tip, bl, br])
 
 
 class FleetMap(QWidget):
@@ -59,13 +73,17 @@ class FleetMap(QWidget):
         self.scatter = pg.ScatterPlotItem()
         self.plot.addItem(self.scatter)
 
-        # 로봇별 방향선 + 라벨
-        self.head: dict[str, pg.PlotDataItem] = {}
+        # 로봇별 방향 화살표(삼각형) + 라벨
+        self.head: dict[str, QGraphicsPolygonItem] = {}
         self.label: dict[str, pg.TextItem] = {}
         for rid in config.ROBOT_IDS:
             color = style.ROBOT_COLOR.get(rid, "#555")
-            line = self.plot.plot([], [], pen=pg.mkPen(color, width=2))
-            self.head[rid] = line
+            arrow = QGraphicsPolygonItem()
+            arrow.setPen(QPen(Qt.PenStyle.NoPen))
+            arrow.setBrush(QBrush(QColor(color)))
+            arrow.setZValue(1)                       # 배경 위, 마커와 같은 층
+            self.plot.getViewBox().addItem(arrow)
+            self.head[rid] = arrow
             txt = pg.TextItem(rid.upper(), color=color, anchor=(0.5, 1.4))
             self.plot.addItem(txt)
             self.label[rid] = txt
@@ -110,7 +128,7 @@ class FleetMap(QWidget):
             unit = snap.unit(rid) if snap else None
             d = unit.ddago if unit else None
             if d is None:
-                self.head[rid].setData([], [])
+                self.head[rid].setPolygon(QPolygonF())   # 빈 폴리곤 = 숨김
                 self.label[rid].setText("")
                 continue
             x, y, yaw = d.x, d.y, d.yaw
@@ -126,11 +144,8 @@ class FleetMap(QWidget):
                 "pen": pg.mkPen("#333", width=2 if is_sel else 1),
                 "symbol": "o",
             })
-            self.head[rid].setData(
-                [x, x + HEADING_LEN * math.cos(yaw)],
-                [y, y + HEADING_LEN * math.sin(yaw)],
-            )
-            self.head[rid].setPen(pg.mkPen("#cccccc" if faded else base, width=2))
+            self.head[rid].setPolygon(_arrow_polygon(x, y, yaw))
+            self.head[rid].setBrush(QBrush(QColor("#cccccc" if faded else base)))
             self.label[rid].setPos(x, y)
             self.label[rid].setText(rid.upper())
         self.scatter.setData(spots)
