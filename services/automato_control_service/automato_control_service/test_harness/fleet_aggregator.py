@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """RP-78 테스트 스탠드인 ① — Fleet 텔레메트리 취합 (HQ 취합 대역의 최소 흉내).
 
-⚠️ 실제 DG Control Service 가 아니다. RP-78(ACS)을 실물 로봇으로 돌리려면 로봇별
-   텔레메트리를 FleetTelemetry 로 묶어 발행하는 부품이 필요한데 아직 없어서, 그 최소
-   기능만 흉내내는 '테스트 전용' 노드다. (실제 HQ가 생기면 이 파일은 버린다.)
+⚠️ 실제 DG Control Service(dcs) 가 아니다. 로봇별 텔레메트리를 FleetTelemetry 로 묶어
+   발행하는 최소 기능만 흉내내는 '테스트 전용' 노드다. 실기 dcs 는 로봇을 물리망으로
+   구분해 robot_id 를 스스로 채우지만, 이 테스트 노드는 fake_telemetry 가 payload 에
+   실어주는 msg.robot_id 로 로봇을 가른다(한 머신 테스트라 물리 분리가 없으므로).
 
 하는 일:
-  구독:  /<robot_id>/ddago/telemetry  (DdagoTelemetry)   ← 각 로봇이 이미 발행(RP-75)
-         /<robot_id>/ddagi/telemetry  (DdagiTelemetry)   ← 팔 있는 로봇만(없으면 비어도 정상)
+  구독:  /ddago/telemetry  (DdagoTelemetry)   ← 모든 로봇이 '한 토픽'에 발행, robot_id 로 구분
+         /ddagi/telemetry  (DdagiTelemetry)   ← 팔 있는 로봇만(없으면 비어도 정상)
   발행:  /automato/telemetry/fleet    (FleetTelemetry, 기본 1Hz)
          ddagos[] = 로봇별 최신 DdagoTelemetry, ddagis[] = 로봇별 최신 DdagiTelemetry
 
@@ -19,8 +20,7 @@
   # ACS 패키지가 colcon 빌드/소싱돼 있으면
   ros2 run automato_control_service fleet_aggregator
   # 또는 모듈로 직접 (services/automato_control_service 에서, ROS 소싱 후)
-  python3 -m automato_control_service.test_harness.fleet_aggregator \
-      --ros-args -p robot_ids:="['dg_01','dg_02','dg_03']"
+  python3 -m automato_control_service.test_harness.fleet_aggregator
 """
 from automato_interfaces.msg import DdagiTelemetry, DdagoTelemetry, FleetTelemetry
 import rclpy
@@ -31,10 +31,8 @@ class FleetAggregator(Node):
     def __init__(self, **kwargs):
         super().__init__("fleet_aggregator", **kwargs)
 
-        self.declare_parameter("robot_ids", ["dg_01", "dg_02", "dg_03"])
         self.declare_parameter("publish_rate_hz", 1.0)
         self.declare_parameter("output_topic", "/automato/telemetry/fleet")
-        robot_ids = list(self.get_parameter("robot_ids").value)
         rate = float(self.get_parameter("publish_rate_hz").value)
         out_topic = self.get_parameter("output_topic").value
 
@@ -42,20 +40,20 @@ class FleetAggregator(Node):
         self._ddago = {}   # robot_id -> DdagoTelemetry
         self._ddagi = {}   # robot_id -> DdagiTelemetry
 
-        # 로봇마다 두 소스 토픽 구독. telemetry_publisher 가 기본 QoS(RELIABLE,10) 발행 → 맞춤.
-        for rid in robot_ids:
-            self.create_subscription(
-                DdagoTelemetry, f"/{rid}/ddago/telemetry", self._on_ddago, 10)
-            self.create_subscription(
-                DdagiTelemetry, f"/{rid}/ddagi/telemetry", self._on_ddagi, 10)
+        # 모든 로봇이 한 토픽에 발행(익명) → 각 소스 토픽을 '한 번만' 구독하고 payload
+        # msg.robot_id 로 가른다. telemetry_publisher 가 기본 QoS(RELIABLE,10) 발행 → 맞춤.
+        self.create_subscription(
+            DdagoTelemetry, "/ddago/telemetry", self._on_ddago, 10)
+        self.create_subscription(
+            DdagiTelemetry, "/ddagi/telemetry", self._on_ddagi, 10)
 
         self._pub = self.create_publisher(FleetTelemetry, out_topic, 10)
         period = 1.0 / rate if rate > 0.0 else 1.0
         self.create_timer(period, self._publish)
 
         self.get_logger().info(
-            f"[TEST] Fleet 취합 준비: 로봇 {robot_ids} → {out_topic} "
-            f"({rate:.1f}Hz). ※ 실제 DG Control Service 아님(테스트 스탠드인)")
+            f"[TEST] Fleet 취합 준비: /ddago·/ddagi/telemetry → {out_topic} "
+            f"({rate:.1f}Hz). robot_id(payload)로 로봇 구분. ※ 테스트 스탠드인")
 
     # 수신마다 robot_id 로 덮어씀(원본 보존).
     def _on_ddago(self, msg: DdagoTelemetry) -> None:

@@ -24,24 +24,25 @@
 
 | 실행 대상 | 도는 기기 | 왜 여기서 |
 | --- | --- | --- |
-| 드라이버 wrapper (`ddago_bringup`) | 🤖 **각 로봇 RPi5** | 센서·모터에 직결. 핑키 드라이버가 **그 로봇에만** 설치돼 있어 다른 데선 안 뜸 |
-| nav2 (`pinky_navigation`) | 🤖 **각 로봇 RPi5** | scan/odom/TF 등 **고주기 데이터를 로컬에서 소비**(네트워크 절약). 로봇마다 1세트 필요 |
-| 텔레메트리 노드 (`ddago_telemetry`) | 🤖 **각 로봇 RPi5** | 각 로봇이 **자기 상태를 스스로 발행**. 관제 PC 부하 분산·로봇 확장에 유리 |
-| 확인·명령 (`topic echo/hz`, teleop, goal 전송) | 🖥️ **관제 PC** | 사람이 보고 조작하는 검증·명령은 한 곳(관제 PC)에서 모아서 |
+| 드라이버 (`pinky_bringup`, bare) | 🤖 **각 로봇 RPi5** | 센서·모터에 직결. 핑키 드라이버가 **그 로봇에만** 설치됨. 네임스페이스 없이 bare 로 기동 |
+| nav2 위치추정 (`pinky_navigation`, bare) | 🖥️ **로컬 PC(그 로봇 망)** | 그 로봇 망에서 scan/odom 을 받아 amcl_pose 발행. bare |
+| 텔레메트리 노드 (`ddago_telemetry`) | 🤖 **각 로봇 RPi5** | 각 로봇이 `/ddago/telemetry` 로 발행(익명 — robot_id 는 dcs 가 채움) |
+| 확인·명령 (`topic echo/hz`, teleop, goal 전송) | 🖥️ **그 로봇 망의 PC** | 물리망이 갈려 있어 확인은 **그 로봇 망 안에서**. 전체 취합은 ACS fleet 로 |
 
-> **원칙 한 줄:** *각 로봇은 자기 스택 3종을 자기 RPi5에서 돌린다. 관제 PC는 오직
-> 확인과 명령만 한다.* 로봇이 2대든 3대든 이 원칙을 그대로 복제하면 된다.
+> **원칙 한 줄:** *로봇마다 공유기로 망을 물리 분리한다. 한 로봇 망 안에서는 모두 bare 토픽을
+> 쓰고, 로봇끼리는 망이 갈려 있어 이름이 겹쳐도 안 섞인다.* (예전엔 같은 망에서 네임스페이스로
+> 갈랐지만, 이제 물리 분리라 네임스페이스가 필요 없다.)
 
 ---
 
 ## 0. 사전 준비 (환경 전제)
 
-- **모든 기기가 같은 `ROS_DOMAIN_ID` + 같은 공유기 네트워크** (팀 결정사항).
-  - `ROS_DOMAIN_ID` = 같은 번호를 쓰는 기기끼리만 서로 토픽이 보이는 "채널 번호".
-    로봇 2대 + 관제 PC가 서로 통신하려면 셋 다 같은 번호여야 한다.
-  - 확인: 각 기기(🤖 dg_01, 🤖 dg_02, 🖥️ 관제 PC) 터미널에서 `echo $ROS_DOMAIN_ID`
-    → 세 값이 모두 같아야 함.
-  - 다르면 서로 토픽이 안 보인다. `export ROS_DOMAIN_ID=<번호>` 로 통일.
+- **로봇마다 공유기로 물리망을 분리**(팀 결정사항). `ROS_DOMAIN_ID` 는 같은 번호를 쓰되,
+  로봇 A의 패킷이 로봇 B에 물리적으로 닿지 않아 bare 토픽이 로봇끼리 안 섞인다.
+  - `ROS_DOMAIN_ID` = 같은 번호 + 같은 물리망 안에서만 서로 토픽이 보이는 "채널 번호".
+    한 로봇 망(로봇 RPi + 그 망의 로컬 PC)은 같은 번호여야 서로 통신한다.
+  - 확인: 그 로봇 망의 각 기기 터미널에서 `echo $ROS_DOMAIN_ID` → 값이 같아야 함.
+  - 다르면 같은 망에서도 토픽이 안 보인다. `export ROS_DOMAIN_ID=<번호>` 로 통일.
 - **핑키 드라이버 패키지가 각 로봇에 설치**돼 있어야 함:
   `pinky_bringup`, `pinky_sensor_adc`, `pinky_navigation` (+ 의존 `sllidar_ros2` 등).
   → 🤖 **각 로봇 dg_01, dg_02 양쪽** 모두에 설치돼 있어야 한다.
@@ -92,15 +93,14 @@
 > 각 터미널에서 `source /opt/ros/jazzy/setup.bash && source install/setup.bash` 먼저.
 
 ```bash
-# 🤖 [로봇 dg_01] 터미널 T1 — 드라이버(odom, 배터리, 초음파)를 /dg_01 네임스페이스로
-ros2 launch ddago_control ddago_bringup.launch.py robot_id:=dg_01
+# 🤖 [로봇 dg_01] 터미널 T1 — 드라이버(odom, 배터리, 초음파). bare(네임스페이스 없음).
+ros2 launch pinky_bringup bringup_robot.launch.xml
 
-# 🤖 [로봇 dg_01] 터미널 T2 — nav2 위치추정(amcl_pose). 맵 등 인자는 팀 nav2 실행법에 맞게.
-ros2 launch pinky_navigation localization_launch.xml namespace:=/dg_01
-#   (nav_status/goal 주행까지 볼 거면 T2b 로 navigation_launch.xml namespace:=/dg_01 도)
+# 🖥️ [로컬 PC (dg_01 망)] T2 — nav2 위치추정(amcl_pose). 맵 경로는 환경에 맞게.
+ros2 launch pinky_navigation bringup_launch.xml map:=/home/ane/automato_map.yaml
 
-# 🤖 [로봇 dg_01] 터미널 T3 — 우리 텔레메트리 발행 노드
-ros2 launch ddago_control ddago_telemetry.launch.py robot_id:=dg_01
+# 🤖 [로봇 dg_01] 터미널 T3 — 우리 텔레메트리 발행 노드(/ddago/telemetry, robot_id 인자 없음)
+ros2 launch ddago_control ddago_telemetry.launch.py
 ```
 
 이제 🖥️ **관제 PC** 로 넘어가 아래 2·3장을 확인한다. 1대가 통과하면 2장으로.
@@ -109,75 +109,76 @@ ros2 launch ddago_control ddago_telemetry.launch.py robot_id:=dg_01
 
 ## 2. 로봇 2대(dg_01 + dg_02) 동시 기동
 
-핵심은 간단하다: **1장을 dg_02에도 똑같이 하되 `robot_id:=dg_02` 로만 바꾼다.**
-각 로봇은 자기 RPi5에서 자기 스택을 돌리므로, 두 로봇의 명령은 **서로 다른 SSH 터미널**
-(dg_01용 3개, dg_02용 3개)에서 친다.
+핵심: **각 로봇은 자기 공유기 망에서 1장과 '똑같은' bare 명령을 돌린다.** 로봇마다 인자를
+바꿀 필요도 없다 — 명령이 완전히 동일하다. 두 로봇은 물리망이 갈려 있어 같은 bare 토픽
+이름을 써도 서로 안 보인다.
 
-### 2-1. dg_01 스택 — 🤖 dg_01 RPi5 (SSH 터미널 3개)
+### 2-1. dg_01 스택 — 🤖 dg_01 망 (로봇 RPi + 로컬 PC)
 ```bash
 # 🤖 [로봇 dg_01] T1
-ros2 launch ddago_control ddago_bringup.launch.py robot_id:=dg_01
-# 🤖 [로봇 dg_01] T2
-ros2 launch pinky_navigation localization_launch.xml namespace:=/dg_01
+ros2 launch pinky_bringup bringup_robot.launch.xml
+# 🖥️ [로컬 PC (dg_01 망)] T2
+ros2 launch pinky_navigation bringup_launch.xml map:=/home/ane/automato_map.yaml
 # 🤖 [로봇 dg_01] T3
-ros2 launch ddago_control ddago_telemetry.launch.py robot_id:=dg_01
+ros2 launch ddago_control ddago_telemetry.launch.py
 ```
 
-### 2-2. dg_02 스택 — 🤖 dg_02 RPi5 (SSH 터미널 3개)
+### 2-2. dg_02 스택 — 🤖 dg_02 망 (로봇 RPi + 로컬 PC) — 명령 동일
 ```bash
 # 🤖 [로봇 dg_02] T1
-ros2 launch ddago_control ddago_bringup.launch.py robot_id:=dg_02
-# 🤖 [로봇 dg_02] T2
-ros2 launch pinky_navigation localization_launch.xml namespace:=/dg_02
+ros2 launch pinky_bringup bringup_robot.launch.xml
+# 🖥️ [로컬 PC (dg_02 망)] T2
+ros2 launch pinky_navigation bringup_launch.xml map:=/home/ane/automato_map.yaml
 # 🤖 [로봇 dg_02] T3
-ros2 launch ddago_control ddago_telemetry.launch.py robot_id:=dg_02
+ros2 launch ddago_control ddago_telemetry.launch.py
 ```
 
-> **왜 `robot_id` 만 바꾸면 되나?** `ddago_bringup`·`ddago_telemetry` launch 는
-> `robot_id` 값을 그대로 **네임스페이스 접두어**로 씌운다(`PushRosNamespace`). 그래서
-> dg_01 스택의 모든 토픽은 `/dg_01/...`, dg_02 스택은 `/dg_02/...` 로 자동으로 갈라진다.
-> 같은 도메인·같은 네트워크에 있어도 이름공간이 달라 **섞이지 않는다.**
+> **왜 로봇마다 인자를 안 바꿔도 되나?** 예전엔 같은 망이라 `robot_id` 를 네임스페이스로
+> 씌워(`/dg_01/...`) 갈랐다. 이제는 **공유기로 망 자체를 물리 분리**하므로, 두 로봇이 똑같이
+> bare `/odom`·`/ddago/telemetry` 를 써도 서로 다른 망이라 **섞이지 않는다.** 로봇 구분은
+> 각 로봇 망의 dcs 가 담당한다(텔레메트리 msg.robot_id 를 dcs 가 채워 ACS 로 올림).
 
-### 2-3. 기동 후 두 로봇이 다 보이는지 (🖥️ 관제 PC)
+### 2-3. 기동 후 확인 (각 로봇 망에서)
+물리망이 갈려 있어 한 PC에서 두 로봇을 동시에 못 본다. **각 로봇 망 안에서** 자기 로봇의
+bare 토픽을 확인한다.
 ```bash
-# 🖥️ [관제 PC]
-ros2 topic list | grep ddago/telemetry
-#  /dg_01/ddago/telemetry
-#  /dg_02/ddago/telemetry     ← 둘 다 뜨면 성공
+# 🖥️ [dg_01 망 PC] — dg_01 망에서
+ros2 topic list | grep -E '/ddago/telemetry|/odom'
+#  /ddago/telemetry   /odom     ← 뜨면 성공
 ```
-안 보이는 로봇이 있으면 → 그 로봇의 T1~T3 가 다 떴는지, `ROS_DOMAIN_ID` 가 관제 PC와
-같은지(0장), 3장 네임스페이스 확인으로 내려간다.
+안 보이면 → 그 로봇의 T1~T3 가 다 떴는지, 그 망 안에서 `ROS_DOMAIN_ID` 가 같은지(0장) 확인.
+여러 로봇을 한눈에 보는 건 **ACS 의 fleet 취합**(dcs → `/automato/telemetry/fleet`)으로 한다.
 
-> **로봇 3대(dg_03)로 늘릴 때도 동일:** 🤖 dg_03 RPi5에서 `robot_id:=dg_03` 으로
-> T1~T3 를 한 세트 더 돌리면 끝. 관제 PC는 아무것도 새로 안 띄운다.
+> **로봇 3대(dg_03)로 늘릴 때도 동일:** dg_03 망에서 같은 bare 명령 세트를 한 번 더. 인자 변경 없음.
 
 ---
 
-## 3. ★가장 먼저★ 네임스페이스 확인 (실패의 90%가 여기) — 🖥️ 관제 PC
+## 3. ★가장 먼저★ bare 토픽 확인 (그 로봇 망 안에서)
 
-드라이버 토픽이 정말 `/dg_01/...`(그리고 2대면 `/dg_02/...`)로 올라오는지부터 본다.
+드라이버·Nav2·텔레메트리 토픽이 **bare(네임스페이스 없이)** 로 올라오는지부터 본다.
+(물리망 분리라 네임스페이스를 안 쓴다.)
 
 ```bash
-# 🖥️ [관제 PC]
-ros2 topic list | grep dg_01     # 2대면 grep dg_02 도
+# 🖥️ [그 로봇 망의 PC]
+ros2 topic list
 ```
 
-**기대 결과** (dg_01 기준, 아래가 다 보여야 함):
+**기대 결과** (아래가 다 보여야 함 — 전부 bare):
 ```
-/dg_01/odom
-/dg_01/amcl_pose
-/dg_01/battery/percent
-/dg_01/battery/voltage
-/dg_01/us_sensor/range
-/dg_01/batt_state
-/dg_01/navigate_to_pose/_action/status
-/dg_01/ddago/telemetry            ← 우리가 발행하는 것
+/odom
+/amcl_pose
+/battery/percent
+/battery/voltage
+/us_sensor/range
+/batt_state
+/navigate_to_pose/_action/status
+/ddago/telemetry                  ← 우리가 발행하는 것
 ```
 
-- ❌ 만약 `/odom`, `/battery/percent` 처럼 **`/dg_01` 없이** 전역으로 뜨면
-  → 드라이버가 토픽 이름을 절대경로로 박아둔 것. **아래 [부록 A] 리매핑**으로 대응.
-- ⚠️ `/dg_01/batt_state` 는 있지만 **우리는 안 씀**(percentage가 NaN이라). 배터리는
-  `/dg_01/battery/percent`·`/battery/voltage` 를 쓴다.
+- ✅ 이제는 **bare 가 정상**이다. 예전처럼 `/dg_01/...` 로 뜨면 오히려 네임스페이스가
+  남아있는 것(옛 `ddago_bringup` 잔재) → bare 로 기동했는지 확인.
+- ⚠️ `/batt_state` 는 있지만 **우리는 안 씀**(percentage가 NaN이라). 배터리는
+  `/battery/percent`·`/battery/voltage` 를 쓴다.
 
 ---
 
