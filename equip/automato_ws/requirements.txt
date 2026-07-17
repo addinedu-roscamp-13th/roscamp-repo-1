@@ -5,5 +5,8 @@ ultralytics
 opencv-python
 numpy
 
+# Intel RealSense D435 카메라 스트림용 (camera_stream.py, camera_viewer.py)
+pyrealsense2
+
 # 이 venv 로 pytest 를 돌리고 싶을 때만 필요 (rclpy 필요 없는 테스트용)
 pytest

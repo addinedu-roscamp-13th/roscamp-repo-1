@@ -35,6 +35,17 @@ class TomatoDetector:
         self.model = YOLO(model_path)
         self.conf = conf
 
+    def warmup(self) -> None:
+        """더미 이미지로 최초 1회 추론을 미리 실행.
+
+        ultralytics/torch 는 로딩 후 첫 predict() 호출에서 커널 준비 등
+        추가 비용이 들어(수백ms~수 초) 실제 첫 analyze_frame 요청이 그
+        비용을 고스란히 떠안는다. 서버 기동 직후 백그라운드에서 이걸
+        미리 태워 실제 요청은 항상 빠르게 응답하도록 한다.
+        """
+        dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+        self.model.predict(dummy, conf=self.conf, verbose=False)
+
     def decode_image(self, image_data: str) -> Any:
         try:
             raw = base64.b64decode(image_data, validate=True)
