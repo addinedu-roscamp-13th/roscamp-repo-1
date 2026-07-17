@@ -76,7 +76,43 @@
   프로토콜만 설명하고 실제 사용 중인 `analyze_frame` 프로토콜(퍼센트
   결과 + labeled_image)은 문서화되어 있지 않아 최신화.
 
-## 7. 검증 결과
+## 7. 실제 원격 PC 연동 테스트 및 로깅/워밍업 개선
+
+다른 PC의 실제 `dg_control`(HQ)이 이 PC의 `dg_ai_service`를 호출하는
+end-to-end 연동 테스트를 진행하며 아래 문제들을 실시간으로 진단·수정했다.
+
+**로깅 추가**: 연결 수립/종료, 요청·응답 전체(base64 이미지는
+`<base64 N bytes>`로 축약), 모델 로딩 시점을 콘솔과
+`logs/dg_ai_service.log` 파일에 동시에 기록하도록 `analysis_server.py`에
+`logging` 계측을 추가했다. 원격 PC 문제를 그 PC에 직접 접속하지 않고도
+로그 파일만으로 진단할 수 있게 하기 위함.
+
+**진단 체크리스트 확립**: 실제 연동 중 겪은 증상과 원인을 표로 정리해
+`ai_service_dev_env_setup.md`에 반영했다(연결 안 됨=`--host` 누락/방화벽,
+`MODEL_NOT_READY`=`DG_AI_MODEL_PATH`/venv 미설정, `IMAGE_DECODE_FAILED`
+=보내는 쪽 인코딩 오류 등).
+
+**버그 발견: 첫 `analyze_frame` 요청이 실패/지연됨**
+- 증상: AI 서비스를 새로 띄운 뒤 dg_control이 보낸 첫 번째
+  `analyze_frame` 요청만 실패(또는 크게 지연)하고, 이후 요청은 모두
+  정상.
+- 로그로 근본 원인 특정: `LazyDetector`가 미루는 건 `YOLO(model_path)`
+  객체 생성(약 50ms)뿐인데, 그 이후 **모델의 첫 `predict()` 호출
+  자체가 torch/ultralytics 내부 워밍업 비용으로 1.6~3.5초**가 추가로
+  걸리고 있었다. 이 비용이 첫 실제 요청에 고스란히 실렸고, dg_control
+  쪽 타임아웃보다 길어지면 실패로 보인 것.
+- 조치: `TomatoDetector.warmup()`(더미 이미지로 1회 추론)과
+  `LazyDetector.warmup_async()`(서버가 bind/listen을 마친 직후 백그라운드
+  스레드에서 모델 로딩+워밍업을 미리 수행, 실패해도 서버 기동에는
+  영향 없음)를 추가. 실제 운영 로그에서 서버 기동~첫 waypoint 요청
+  사이 간격이 44~65초였으므로, 수 초짜리 백그라운드 워밍업이 그 안에
+  여유 있게 끝난다.
+- 검증: 워밍업 완료 후 보낸 첫 요청 응답 시간이 기존 1.6~3.5초 →
+  **61ms**로 단축됨을 실측 확인. 서버 시작 직후 곧바로 요청을 보내는
+  경우(워밍업이 끝나기 전에 요청이 도착)에는 `_ensure()`의 락으로
+  중복 로딩만 막고, 그 요청 자체는 기존과 동일하게 대기함.
+
+## 8. 검증 결과
 
 - 신규/기존 pytest 12건 전부 통과 (`test_ai_analysis.py`,
   `test_labeled_image.py`, `test_analyze_frame_client.py`) — fake
@@ -86,8 +122,11 @@
 - Eval_Yolo의 실제 모델(`tomato_4cls_model.pt`)과 `disease_n01.jpg`로
   end-to-end 수동 검증: rotten 93% / disease 7% 정상 검출 및
   바운딩 박스가 그려진 레이블링 이미지 정상 생성 확인.
+- 실제 원격 PC(`192.168.100.2`, `192.168.100.9`, `192.168.100.15`)에서
+  온 `analyze_frame` 요청 다수를 정상 처리 (ripe/unripe/rotten/disease
+  전 케이스, labeled_image 포함/미포함 모두 로그로 확인).
 
-## 8. 향후 과제
+## 9. 향후 과제
 
 - `DdaGo Control Service`가 실제로 `/dg/analyze_frame` ROS2 서비스를
   통해 `dg_control`을 호출하고, `dg_control`이 이를 받아
@@ -95,3 +134,7 @@
   미구현 (현재는 수동 테스트 스크립트로만 검증 가능한 상태).
 - `Automato Control Service`로의 `SaveDetection` 저장 연동(E2 5~8번)
   은 이번 작업 범위 밖.
+- 보내는 쪽(HQ)이 waypoint마다 서로 다른 실제 카메라 프레임을 보내는지
+  확인 필요 — 연동 테스트 중 동일 task 내 여러 waypoint가 완전히 같은
+  이미지(바이트 길이 동일)를 반복 전송하는 사례가 관찰됨. AI 서비스
+  문제는 아니며 HQ/DdaGo 쪽 카메라 캡처 로직 확인 필요.

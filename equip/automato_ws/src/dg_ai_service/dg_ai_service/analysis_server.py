@@ -22,6 +22,8 @@ import argparse
 import logging
 import os
 import socket
+import sys
+import threading
 from typing import Any, Dict, Optional
 
 from dg_ai_service.framing import recv_msg, send_msg
@@ -50,7 +52,7 @@ def configure_logging(log_file: Optional[str] = DEFAULT_LOG_FILE, level: int = l
 
     fmt = logging.Formatter('%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 
-    stream_handler = logging.StreamHandler()
+    stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(fmt)
     LOG.addHandler(stream_handler)
 
@@ -208,23 +210,47 @@ class LazyDetector:
 
     레거시 {"op":"start"} 스텁 경로는 모델이 필요 없으므로, 서버 기동
     시점에 DG_AI_MODEL_PATH/모델 파일이 없어도 죽지 않게 하기 위함.
+    다만 로딩 직후 첫 predict() 호출은 자체적으로 수백ms~수 초가 더
+    걸리므로(torch/ultralytics 워밍업 비용), warmup_async() 로 서버
+    기동 직후 백그라운드에서 미리 태워 실제 첫 요청이 그 비용을
+    떠안지 않게 한다.
     """
 
     def __init__(self, model_path: Optional[str] = None, conf: float = DEFAULT_CONF):
         self._model_path = model_path
         self._conf = conf
         self._detector: Optional[TomatoDetector] = None
+        self._lock = threading.Lock()
 
     def _ensure(self) -> TomatoDetector:
-        if self._detector is None:
-            LOG.info(f'[model] 최초 analyze_frame_request 수신, 모델 로딩 시작 '
-                      f'(model_path={self._model_path or DEFAULT_MODEL_PATH})')
-            self._detector = build_classifier(self._model_path, self._conf)
-            LOG.info('[model] 모델 로딩 완료')
+        if self._detector is not None:
+            return self._detector
+        with self._lock:
+            if self._detector is None:
+                LOG.info(f'[model] 모델 로딩 시작 '
+                          f'(model_path={self._model_path or DEFAULT_MODEL_PATH})')
+                detector = build_classifier(self._model_path, self._conf)
+                detector.warmup()
+                self._detector = detector
+                LOG.info('[model] 모델 로딩 + 워밍업 완료')
         return self._detector
 
     def analyze(self, image_data: str):
         return self._ensure().analyze(image_data)
+
+    def warmup_async(self) -> None:
+        """서버 기동 직후 백그라운드에서 모델 로딩+워밍업을 미리 시도.
+
+        best-effort — 모델이 아직 준비 안 됐으면(DG_AI_MODEL_PATH 미설정
+        등) 조용히 넘어가고, 실제 요청이 오면 그때 다시 시도한다.
+        """
+        def _run():
+            try:
+                self._ensure()
+            except ModelNotReadyError as exc:
+                LOG.warning(f'[model] 사전 워밍업 생략(요청 시 재시도): {exc}')
+
+        threading.Thread(target=_run, daemon=True, name='model-warmup').start()
 
 
 def run_server(
@@ -242,6 +268,10 @@ def run_server(
         srv.bind((host, port))
         srv.listen()
         LOG.info(f'[server] 대기 시작: {host}:{port}')
+        # 첫 실제 요청이 모델 로딩+워밍업 비용을 떠안지 않도록 백그라운드에서 미리 준비.
+        # bind/listen 은 이미 끝났으므로 연결 수락 자체는 지연되지 않는다.
+        if hasattr(detector, 'warmup_async'):
+            detector.warmup_async()
         if ready is not None:
             ready.set()
         while True:
