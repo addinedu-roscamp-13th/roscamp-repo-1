@@ -1,0 +1,17 @@
+repositories:
+  src/easy_handeye2:
+    type: git
+    url: https://github.com/marcoesposito1988/easy_handeye2.git
+    version: 0ad1ddddbbc9a3cc7d3695ad53d04f1a5b82e598
+  src/mycobot_ros2:
+    type: git
+    url: https://github.com/elephantrobotics/mycobot_ros2.git
+    version: 500fc841b57a9956d3c576cbca92141bd239216b
+  src/pymoveit2:
+    type: git
+    url: https://github.com/AndrejOrsula/pymoveit2.git
+    version: b1bcfe35406842dc2f3757a29096ae91de5b6e89
+  src/moveit_calibration:
+    type: git
+    url: https://github.com/moveit/moveit_calibration.git
+    version: 3f9d48ebe843caf1de060bfafe78160585c7c26f

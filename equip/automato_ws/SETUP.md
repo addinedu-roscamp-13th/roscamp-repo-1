@@ -59,6 +59,19 @@ sudo apt install -y ros-jazzy-rosbridge-suite
 - graphviz(dot) 는 pydot 런타임용으로 이미 설치돼 있음.
 - **상태(2026-07-01):** rosbridge 설치·검증 완료. 단 **venv 안에서 실행하려면** 위 표의 `tornado`·`pymongo`·`Pillow`·`cbor2` pip 설치가 필요했다(venv 격리). venv 밖(시스템 python)에서 실행하면 불필요.
 
+## 서드파티 로봇팔 의존성 (`mycobot.repos`)
+
+`mycobot_280_pick`(coord_to_goal_node, MoveIt2 목표 플래닝)이 필요로 하는
+`easy_handeye2`/`mycobot_ros2`/`pymoveit2`는 각자 자체 git 히스토리를 가진
+서드파티 패키지라 이 저장소에 벤더링하지 않는다. `moveit_calibration`도
+동일하게 업스트림만 참조한다. `vcstool`로 별도 clone:
+
+```bash
+pip install vcstool  # 또는 apt install python3-vcstool
+cd equip/automato_ws
+vcs import src < mycobot.repos
+```
+
 ## 빌드 방법
 
 ```bash
@@ -98,3 +111,4 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest src/<pkg>/test/ -v
 | 2026-07-14 | **로봇 ID 단일 출처화**: `~/.bashrc` 에 `export ROBOT_ID=dg_01` 추가(노트북 + 로봇 pinky7/192.168.100.7, `ROS_DOMAIN_ID` 다음 줄). `dashboard.sh` 가 DCS·시뮬에 `-p robot_id:=$ROBOT_ID` 주입, `dg_sim.launch.py` 는 `EnvironmentVariable('ROBOT_ID')` 기본값, 대시보드 `/api/status` 에 robot_id 표시, DCS 는 robot_id 불일치 텔레메트리를 경고 후 무시. 검증: `ROBOT_ID=dg_02 ./dashboard.sh up` → 토픽/액션이 `/dg_02/...` 로 생성되고 순찰 완주 |
 | 2026-07-14 | 시퀀스 다이어그램 개정(**Patrol→Navigate**) 반영. `dg_control` 노드명 `hq_node`→**`dcs_node`**(HQ 표기를 전부 DCS 로 통일), `dg_sim`(acs/ddago/dg_ai) 및 `dg_web`/`dashboard.sh` 동반 수정 — 대시보드 노드 키도 `hq`→`dcs`. 인터페이스는 팀원이 커밋한 `Navigate.action`/`Waypoint.msg`/`SaveDetection.disease_image` 를 그대로 사용(수정 없음). ddago 시뮬 이미지 경로 → `~/dev_ws/test_data/sample_frames`. **새 설치 없음.** 빌드: `colcon build --packages-select automato_interfaces dg_control dg_sim`. 테스트: `src/dg_sim/test/test_e2e.py`, `src/dg_control/test/test_ai_switch.py` (4건 통과) |
 | 2026-07-08 | 참고: 위 통합 테스트는 **`MultiThreadedExecutor`** 사용 가능 — 액션 goal을 **엄격히 1개씩 순차** 발행하고 액션 클라이언트를 전용 콜백그룹에 두면 "Two goals accepted with same ID" 미발생(HQ 오케스트레이션 방식). |
+| 2026-07-18 | `mycobot_280_pick`(coord_to_goal_node, RP-107) 신규 패키지 추가 — `mycobot` 프로젝트에서 검증된 MoveIt2 목표 플래닝 노드를 이관. 원본에 있던 `yolo_d435_detector_node`는 제외(같은 역할을 `dg_ai_service`가 대체). 서드파티 의존성(`easy_handeye2`/`mycobot_ros2`/`pymoveit2`/`moveit_calibration`)은 벤더링 대신 `mycobot.repos`(vcstool)로 관리 |
