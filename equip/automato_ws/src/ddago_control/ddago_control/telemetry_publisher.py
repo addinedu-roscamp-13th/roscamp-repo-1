@@ -9,11 +9,12 @@ DB/메모리/rosbag2 저장 없이 실시간 스트리밍만 수행한다.
 캐시값을 DdagoTelemetry 하나로 취합해 발행한다.
 (배터리처럼 저주기로 오는 값은 새 값이 올 때까지 마지막 수신값을 유지한다.)
 
-구독 소스 (모두 상대 토픽명 — 실행 시 네임스페이스 주입):
+구독 소스 (모두 상대 토픽명 — bare 드라이버/Nav2 토픽과 그대로 매칭):
   amcl_pose                        geometry_msgs/PoseWithCovarianceStamped  위치(맵 절대좌표, 우선)
   odom                             nav_msgs/Odometry                        위치(amcl 없을 때 fallback)
   battery/percent                  std_msgs/Float32                         배터리 퍼센트(0~100)
   battery/voltage                  std_msgs/Float32                         배터리 전압(V)
+  us_sensor/range                  sensor_msgs/Range                        전방 초음파 거리(m)
   navigate_to_pose/_action/status  action_msgs/GoalStatusArray              Nav2 주행 상태
 
 ※ 배터리: 핑키의 batt_state(BatteryState).percentage 는 NaN, power_supply_status 는
@@ -21,17 +22,17 @@ DB/메모리/rosbag2 저장 없이 실시간 스트리밍만 수행한다.
    battery/percent·battery/voltage(Float32)에 있다. 충전 여부(is_charging)는 핑키가
    어느 토픽으로도 제공하지 않아 항상 False 로 발행한다(하드웨어 확인 시 후속 연동).
 
-※ 초음파(us_range_m): 배터리 텔레메트리 안정화를 위해 ADC 노드(pinky_sensor_adc)를
-   기동(ddago_bringup.launch.py)에서 제외하면서 us_sensor/range 발행자가 사라졌다.
-   메시지 필드는 유지하되 항상 0.0 으로 발행한다. ADC 노드를 다시 띄우면 이 파일의
-   us_sensor/range 구독도 되살려야 실제 거리값이 다시 채워진다.
+※ 초음파(us_range_m): 예전 네임스페이스 기동에서 에러가 나 구독을 뺐었으나, 네임스페이스를
+   없애고 bare 로 전환하면서 us_sensor/range 구독을 되살렸다. ADC 노드(pinky_sensor_adc)가
+   발행하면 실제 거리(m)가 채워지고, 아직 발행 전이면 0.0(_safe)으로 나간다.
 
 발행:
-  telemetry                        automato_interfaces/DdagoTelemetry       1Hz
-  (네임스페이스가 붙어 최종 /<namespace>/telemetry, 예: /dg_01/ddago/telemetry)
+  /ddago/telemetry                 automato_interfaces/DdagoTelemetry       1Hz
+  (ddago 는 자기 정체를 모른다 — msg.robot_id 는 비우고, 어느 로봇인지는 dcs 가 채운다.
+   ddago/ddagi 가 같은 망을 공유하므로 /ddago 접두어만 붙여 타입 충돌을 피한다.
+   구독 소스 토픽(odom, amcl_pose ...)은 bare 드라이버/Nav2 에 맞춰 상대명 그대로.)
 
 파라미터:
-  robot_id               (str)   보고서에 적을 로봇 식별자        기본 'dg_01'
   publish_rate_hz        (float) 발행 주기(Hz)                     기본 1.0
   amcl_stale_sec         (float) amcl 를 신선하다고 볼 최대 나이   기본 3.0
   battery_percent_scale  (float) battery/percent 에 곱할 값          기본 1.0
@@ -50,8 +51,10 @@ from rclpy.qos import (
     DurabilityPolicy,
     QoSProfile,
     ReliabilityPolicy,
+    qos_profile_sensor_data,
 )
 from rclpy.time import Time
+from sensor_msgs.msg import Range
 from std_msgs.msg import Float32
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -87,7 +90,8 @@ class TelemetryPublisher(Node):
         super().__init__('telemetry_publisher', **kwargs)
 
         # --- 파라미터 ---
-        self.declare_parameter('robot_id', 'dg_01')
+        # robot_id 는 두지 않는다: 물리망 분리로 이 로봇은 자기 망에 혼자이므로 자기
+        # 정체를 알 필요가 없고, 로봇 구분은 dcs(dg control service)가 담당한다.
         self.declare_parameter('publish_rate_hz', 1.0)
         self.declare_parameter('amcl_stale_sec', 3.0)
         self.declare_parameter('battery_percent_scale', 1.0)
@@ -95,7 +99,6 @@ class TelemetryPublisher(Node):
         # 양 끝 프레임이다. 로봇 URDF/nav2 설정에 따라 base_link 로 바꿀 수도 있다.
         self.declare_parameter('global_frame_id', 'map')
         self.declare_parameter('base_frame_id', 'base_footprint')
-        self._robot_id = self.get_parameter('robot_id').value
         rate = self.get_parameter('publish_rate_hz').value
         self._amcl_stale_sec = self.get_parameter('amcl_stale_sec').value
         self._battery_percent_scale = \
@@ -106,8 +109,8 @@ class TelemetryPublisher(Node):
         # --- tf 리스너 ---
         # amcl 이 발행하는 map→base_footprint 변환을 백그라운드로 수집한다.
         # Buffer 가 최근 변환들을 캐시하고, TransformListener 가 /tf·/tf_static 을
-        # 구독해 Buffer 를 채운다. (이 노드는 /tf 를 상대명 tf 로 리맵해 기동하므로
-        # 네임스페이스 tf(/dg_01/tf)를 구독한다 → 로봇별 위치가 안 섞인다.)
+        # 구독해 Buffer 를 채운다. (드라이버/Nav2 가 bare 로 /tf 를 발행하므로 이 노드도
+        # 리맵 없이 bare /tf 를 그대로 구독한다.)
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
@@ -117,6 +120,7 @@ class TelemetryPublisher(Node):
         self._amcl_stamp = None         # amcl 마지막 수신 시각(rclpy Time)
         self._battery_percent = None    # battery/percent 마지막값(0~100)
         self._battery_voltage = None    # battery/voltage 마지막값(V)
+        self._us_range = None           # us_sensor/range 마지막 초음파 거리(m)
         self._nav_status = 'IDLE'       # Nav2 상태 파생 문자열 (기본 대기)
         self._task_id = 0               # E1(순찰 명령) 연동 시 갱신. E0에선 0.
 
@@ -142,18 +146,25 @@ class TelemetryPublisher(Node):
             Float32, 'battery/percent', self._battery_percent_cb, 10)
         self.create_subscription(
             Float32, 'battery/voltage', self._battery_voltage_cb, 10)
+        # 초음파: 실사 센서가 best_effort 로 쏠 수 있어 sensor QoS(best_effort)로 받는다
+        # (reliable 발행자와도 호환). bare /us_sensor/range 로 매칭.
+        self.create_subscription(
+            Range, 'us_sensor/range', self._range_cb, qos_profile_sensor_data)
         self.create_subscription(
             GoalStatusArray, 'navigate_to_pose/_action/status',
             self._nav_status_cb, status_qos)
 
         # --- 발행 + 1Hz 타이머 ---
-        self._pub = self.create_publisher(DdagoTelemetry, 'telemetry', 10)
+        # 구독(odom·amcl 등)은 상대명이라 네임스페이스 없이 bare 로 뜨는 드라이버/Nav2
+        # 토픽(/odom, /amcl_pose ...)과 그대로 매칭된다. telemetry 발행은 ddago/ddagi 가
+        # 같은 망을 공유하므로 /ddago 접두어로 타입 충돌만 피한다. 로봇 구분은 ddago 가
+        # 아니라 dcs 가 담당하며, 소비자 dcs 도 /ddago/telemetry 를 구독(팀 협의 완료).
+        self._pub = self.create_publisher(DdagoTelemetry, '/ddago/telemetry', 10)
         period = 1.0 / rate if rate > 0.0 else 1.0
         self._timer = self.create_timer(period, self._publish)
 
         self.get_logger().info(
-            f'텔레메트리 Publisher 준비됨: robot_id={self._robot_id}, '
-            f'{rate:.1f}Hz → telemetry'
+            f'텔레메트리 Publisher 준비됨: {rate:.1f}Hz → /ddago/telemetry'
         )
 
     # ------------------------------------------------------------------ #
@@ -175,6 +186,9 @@ class TelemetryPublisher(Node):
 
     def _battery_voltage_cb(self, msg):
         self._battery_voltage = msg.data
+
+    def _range_cb(self, msg):
+        self._us_range = msg.range
 
     def _nav_status_cb(self, msg):
         if not msg.status_list:
@@ -245,7 +259,7 @@ class TelemetryPublisher(Node):
 
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = frame
-        msg.robot_id = self._robot_id
+        # msg.robot_id 는 비워 둔다(기본 ''): 어느 로봇인지는 수신하는 dcs 가 채운다.
         msg.task_id = self._task_id
         msg.nav_status = self._nav_status
 
@@ -264,9 +278,8 @@ class TelemetryPublisher(Node):
         #   → E0 에선 항상 False. 하드웨어 충전감지선 확인되면 별도 소스로 연동.
         msg.is_charging = False
 
-        # 초음파(us_sensor/range) 발행자를 기동에서 제외했다(배터리 안정화).
-        # 인터페이스 필드는 유지하되 항상 0.0 으로 발행한다.
-        msg.us_range_m = 0.0
+        # 초음파: 값을 못 받았으면 _safe 가 0.0 으로 보정.
+        msg.us_range_m = _safe(self._us_range)
 
         self._pub.publish(msg)
         self._warn_if_missing()
@@ -278,6 +291,8 @@ class TelemetryPublisher(Node):
             missing.append('위치(odom/amcl_pose)')
         if self._battery_percent is None and self._battery_voltage is None:
             missing.append('battery/percent·voltage')
+        if self._us_range is None:
+            missing.append('us_sensor/range')
         if missing:
             self.get_logger().warn(
                 '아직 수신되지 않은 소스: ' + ', '.join(missing)

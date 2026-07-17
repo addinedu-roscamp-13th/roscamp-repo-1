@@ -17,7 +17,8 @@
   <depend>nav2_msgs</depend>
   <depend>tf2_ros</depend>
 
-  <!-- ddago_bringup.launch.py 전용 런타임 의존(핑키 드라이버, 실제 로봇에만 설치됨).
+  <!-- 런타임 의존: 핑키 드라이버 스택(실제 로봇에만 설치). bringup wrapper 를 제거한 뒤로는
+       아래 launch 들을 bare(네임스페이스 없이) 로 직접 기동한다.
        rosdep 로 해소되지 않는 팀 내부 패키지라 hard depend 대신 문서로만 남긴다:
          pinky_bringup      (odom, joint_states, battery/percent·voltage)
          pinky_sensor_adc   (us_sensor/range, batt_state)

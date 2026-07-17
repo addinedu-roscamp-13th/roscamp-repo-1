@@ -5,8 +5,8 @@
    실제 DG Control Service가 준비되면 이 폴더는 통째로 걷어내면 된다.
 
 포함:
-  fleet_aggregator : 로봇별 /dg_0x/ddago(·ddagi)/telemetry 를 모아 /automato/telemetry/fleet
-                     (FleetTelemetry) 로 발행 — ACS가 로봇을 '선정'할 수 있게 하는 취합 대역.
+  fleet_aggregator : /ddago(·ddagi)/telemetry 를 구독해 msg.robot_id 로 로봇을 갈라 모아
+                     /automato/telemetry/fleet (FleetTelemetry) 로 발행 — ACS 로봇 '선정' 취합 대역.
   patrol_bridge    : ACS가 보내는 /dg_0x/patrol (Patrol 액션) 을 받아
                      sim(가짜 도착) 또는 nav2(실제 navigate_to_pose 주행) 로 처리하는 주행 대역.
 """

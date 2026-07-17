@@ -14,8 +14,9 @@
    DdagoTelemetry 를 대신 발행해, 물리 로봇 없이 가짜 로봇(dg_02, dg_03 ...)을 만든다.
 
 하는 일 —
-   발행: /<robot_id>/ddago/telemetry  (DdagoTelemetry, 기본 1Hz)
-     * 진짜 로봇과 같은 토픽/타입 → fleet_aggregator 가 구분 없이 취합해 ACS 로 전달.
+   발행: /ddago/telemetry  (DdagoTelemetry, 기본 1Hz) — 진짜 로봇과 '같은 토픽/타입'.
+     * 여러 가짜 로봇이 이 '한 토픽'에 함께 발행하고(다중 발행자 정상), 구분은
+       msg.robot_id(payload)로 한다 → fleet_aggregator 가 robot_id 로 키잉해 취합.
      * header.stamp 를 매번 '지금'(시스템 시각)으로 찍는다 → 계속 신선.
        멈추면(Ctrl+C) 3초 뒤 ACS 에서 자연히 TELEMETRY_STALE 로 뜬다.
    값(배터리·상태·좌표 등)은 파라미터로 주고 매 틱마다 다시 읽어 발행하므로, 실행 중에
@@ -33,10 +34,10 @@
    #   ros2 run automato_control_service fake_telemetry --ros-args -r __ns:=/dg_02
 
 주의 —
-   * fleet_aggregator 의 robot_ids 에 이 가짜 robot_id 가 포함돼야 취합된다
-     (예: 진짜 dg_01 + 가짜 dg_02 → robot_ids:="['dg_01','dg_02']").
-   * 같은 robot_id 를 진짜 로봇과 가짜가 동시에 내면 안 된다(같은 토픽에 두 발행자 → 충돌).
-     진짜 dg_01 + 가짜 dg_02 처럼 서로 다른 id 로 쓴다.
+   * fleet_aggregator 는 /ddago/telemetry 를 구독해 msg.robot_id 로 가르므로, 가짜마다
+     서로 다른 robot_id(=네임스페이스)를 주면 자동 취합된다(사전 목록 불필요).
+   * 여러 가짜가 같은 토픽(/ddago/telemetry)에 함께 발행하는 건 정상(다중 발행자).
+     단 robot_id 는 서로 달라야 한다 — 같으면 aggregator 캐시에서 서로 덮어쓴다.
    * 값을 param set 으로 바꿀 땐 선언된 타입에 맞춰라(소수 파라미터는 65.0 처럼 소수점 포함).
 """
 from automato_interfaces.msg import DdagoTelemetry
@@ -68,15 +69,15 @@ class FakeTelemetry(Node):
 
         rate = float(self.get_parameter("publish_rate_hz").value)
 
-        # 진짜 로봇과 '같은 토픽/타입' 으로 발행 → fleet_aggregator 가 구분 없이 취합.
-        # 절대 토픽으로 만들어, 네임스페이스를 깜빡해도 경로가 어긋나지 않게 한다.
-        self._pub = self.create_publisher(
-            DdagoTelemetry, f"/{rid}/ddago/telemetry", 10)
+        # 진짜 로봇과 '같은 토픽/타입'(/ddago/telemetry) 으로 발행. 여러 가짜 로봇이 이
+        # 한 토픽에 함께 발행하고(다중 발행자), 구분은 msg.robot_id(payload)로 한다.
+        # (실기는 물리망 분리라 익명으로 충분하지만, 테스트는 한 머신이라 id 로 가른다.)
+        self._pub = self.create_publisher(DdagoTelemetry, "/ddago/telemetry", 10)
         self.create_timer(1.0 / rate if rate > 0.0 else 1.0, self._tick)
 
         node_fqn = f"{self.get_namespace().rstrip('/')}/fake_telemetry"
         self.get_logger().info(
-            f"[TEST] 가짜 텔레메트리: robot_id={rid} → /{rid}/ddago/telemetry "
+            f"[TEST] 가짜 텔레메트리: robot_id={rid} → /ddago/telemetry "
             f"({rate:.1f}Hz). ※ 실제 로봇/HQ 아님(테스트 스탠드인). "
             f"값 변경 예) ros2 param set {node_fqn} battery_percent 65.0")
 
