@@ -18,9 +18,3 @@ Automato(방울토마토 재배 로봇) 프로젝트. ROS2(Jazzy) 기반 멀티 
   squash 병합된 브랜치는 `git branch -d`가 거부될 수 있음 → `-D`로 삭제.
 - **PR 전에 반드시 로컬에서 `colcon build` 성공 + 최소 실행 확인.** 리뷰가
   없는 프로젝트라 이게 dev가 깨지는 걸 막는 유일한 안전선.
-
-## 관련 문서
-
-- 시나리오2(수확) 아키텍처(노트북/RPi-5 역할 분리, AI Service 마스킹,
-  pointcloud 필터링 등): [equip/automato_ws/docs/scenario2_harvest_architecture.md](equip/automato_ws/docs/scenario2_harvest_architecture.md)
-- automato_ws 개발 환경 설정: [equip/automato_ws/SETUP.md](equip/automato_ws/SETUP.md)
