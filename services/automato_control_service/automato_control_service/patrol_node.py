@@ -411,6 +411,9 @@ class PatrolControlNode(Node):
                     self.get_logger().info(
                         f"룩어헤드 연장 task={task_id} 위치 {current} 다음 통로={seg[1]}")
                 else:                               # 다음 못 잡음 → 세그먼트 끝에서 정지·대기
+                    self.get_logger().info(
+                        f"세그먼트 끝 대기 task={task_id} 위치 {current} — 다음 통로 "
+                        f"미확보, 정지 후 재시도(통로 {seg_cids[-1]} 유지)")
                     self._release_except(engine, robot_id, held, {seg_cids[-1]})
         finally:
             for cid in list(held):
@@ -578,6 +581,9 @@ class PatrolControlNode(Node):
                 engine, cids, robot_id = heartbeat
                 for cid in cids:
                     engine.heartbeat(cid, robot_id)
+                # 초당 반복이라 debug: 주행 중 예약을 유지하는 통로 목록(룩어헤드로 늘어남)
+                self.get_logger().debug(
+                    f"주행 중 {robot_id} 예약유지 통로={list(cids)}")
             if on_tick is not None:
                 try:
                     on_tick()               # 주행 중 다음 구간 선예약 시도(룩어헤드)
