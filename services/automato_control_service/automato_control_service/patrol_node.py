@@ -3,15 +3,15 @@
 
 이 파일은 '동작(로봇과의 실제 통신)'을 담당한다.
   - 구독:  /automato/telemetry/fleet (FleetTelemetry, 1Hz) → 로봇별 최신 상태 캐시
-  - 발신:  /{robot_id}/navigate (Navigate 액션) → HQ 경유로 경로(배열) 하달
+  - 발신:  /{robot_id}/navigate (Navigate 액션) → DG(DG Control Service) 경유로 경로(배열) 하달
   - 종료:  방문 결과에 따라 tasks 를 DONE/PARTIAL/FAILED 로 마감(automato_db)
 
 배경 지식 (초보자용) —
   * ROS2 '토픽 구독'은 '요청하면 받아오는' 방식이 아니라, 발행자가 보낼 때마다
     콜백이 자동 실행되는 '스트리밍(push)'이다. 순찰 요청과 무관하게 캐시가 1Hz로 계속
     최신화되고, 요청 시점엔 '이미 들어있는 최신값'을 읽어 스냅샷으로 저장한다.
-  * ROS2 '액션'은 시간이 걸리는 작업 요청(Goal/Feedback/Result)이다. 여기선 waypoint
-    1개 이동을 1개의 Goal로 보내고, 도착(Result)까지 기다린 뒤 다음 waypoint로 넘어간다.
+  * ROS2 '액션'은 시간이 걸리는 작업 요청(Goal/Feedback/Result)이다. 여기선 연속 예약된
+    waypoint 여러 개(세그먼트)를 1개의 Goal(Waypoint[] 배열)로 보내고, 도착(Result)까지 기다린다.
 
 실행 구조 (한 프로세스):
   - rclpy 노드는 MultiThreadedExecutor로 '백그라운드 스레드'에서 상시 spin.
@@ -21,9 +21,9 @@
     공유 통로 예약표는 routing_engine 이 락으로 보호한다.
 
 Phase 2 (교통관제):
-  세그먼트(지금 노드→인접 노드, 통로 1개) 단위로 예약→하달→도착→해제를 반복한다.
+  세그먼트(연속으로 예약 가능한 통로 묶음) 단위로 예약→배열 하달→도착→전부 해제를 반복한다.
     - (C) 다른 로봇이 통로 점유 → 예약 대기, 타임아웃 넘으면 순찰(최하위)이 양보(우회/미룸)
-    - (B) 진짜 막힘(로봇이 result_code=1 보고) → 그 통로 N초 블랙리스트 → BFS 우회 →
+    - (B) 진짜 막힘(로봇이 result_code=1 보고) → 그 통로 N초 블랙리스트 → Dijkstra 우회 →
           우회 없으면 그 지점 건너뛰고 다음, 마지막에 1회 재시도
     - (A) 사람·물건 잠깐 막음은 로봇 Nav2가 자체 예산(순찰 2분×3)으로 처리 → ACS는 결과만 기다림
   통로 예약·경로 탐색은 routing_engine(독립 모듈)이 담당하고 여기선 호출만 한다.
@@ -46,7 +46,7 @@ from automato_control_service import automato_db
 from automato_control_service.routing_engine import Route, RoutingEngine
 
 FLEET_TOPIC = "/automato/telemetry/fleet"
-# RP-79: HQ 가 waypoint 마다 탐지 결과를 넘기는 ROS2 Service (ACS 가 서버).
+# RP-79: DG 가 waypoint 마다 탐지 결과를 넘기는 ROS2 Service (ACS 가 서버).
 SAVE_DETECTION_SRV = "/automato/save_detection"
 
 
@@ -301,14 +301,17 @@ class PatrolControlNode(Node):
 
         visited = set()
         # 첫 순찰 지점: 시작 노드를 알 수 없어(위치→노드 매핑은 향후 과제) 통로 예약 없이 직접 접근.
-        if self._dispatch_goal(client, task_id, targets[0]) == 0:
+        # 세그먼트 하달 경로를 재사용하되, waypoint 1개짜리 배열로 보낸다(순찰점이므로 촬영).
+        code, _ = self._dispatch_segment(
+            client, task_id, [targets[0]], capture_on_last=True)
+        if code == 0:
             visited.add(targets[0])
             current = targets[0]
         else:
             self.get_logger().warn(f"첫 순찰 지점 도달 실패 → task {task_id} FAILED")
             return "FAILED"
 
-        # 나머지 지점: 세그먼트(통로 1개) 단위로 이동
+        # 나머지 지점: 세그먼트(연속 통로 묶음) 단위로 이동
         skipped = []
         for target in targets[1:]:
             outcome, current = self._navigate(
@@ -337,54 +340,90 @@ class PatrolControlNode(Node):
         return "PARTIAL"
 
     def _navigate(self, engine, client, task_id, robot_id, current, target):
-        """current→target 까지 세그먼트 단위 이동. 반환: (outcome, 도달한 노드).
+        """current→target 까지 '세그먼트' 단위로 이동. 반환: (outcome, 도달한 노드).
 
-        outcome: 'arrived'(목적 도달) | 'skipped'(우회 불가로 포기) | 'aborted'(중단).
+        한 번의 while 반복 = 연속으로 예약 가능한 만큼을 한 세그먼트로 묶어 Waypoint[]
+        배열로 한 번에 하달 → 도착하면 그 통로들을 전부 해제 → 남았으면 다음 세그먼트.
+        outcome: 'arrived'(목표 도달) | 'skipped'(우회 불가로 포기) | 'aborted'(중단).
         """
         attempt_block = set()   # 이번 target 시도에서 회피할 통로(예약실패/막힘 누적)
-        while True:
+        while current != target:
             route = self._plan_route(engine, current, target, attempt_block)
             if route is None:
                 self.get_logger().warn(
                     f"경로 없음 task={task_id} {current}→{target} → 건너뜀")
                 return "skipped", current
 
-            replan = False
-            for next_wp, cid in route.hops():
-                # 1) 통로 예약(대기 후 재시도). 실패 → 양보: 그 통로 회피하고 재계획
-                if not self._reserve_with_wait(engine, cid, robot_id):
-                    self._blacklist_add(cid)
-                    attempt_block.add(cid)
-                    replan = True
-                    break
+            hops = route.hops()                 # [(다음 노드, 통로 id), ...] (최소 1개)
+            # 1) 첫 통로는 대기하며 예약(코앞이라 이게 없으면 한 발도 못 감).
+            #    끝내 못 잡으면 양보: 그 통로 회피하고 재계획.
+            first_wp, first_cid = hops[0]
+            if not self._reserve_with_wait(engine, first_cid, robot_id):
+                self._blacklist_add(first_cid)
+                attempt_block.add(first_cid)
+                continue
 
-                # 2) 하달 + 도착 대기(대기 중 하트비트로 예약 유지) / 3) 무조건 해제
-                try:
-                    code = self._dispatch_goal(
-                        client, task_id, next_wp,
-                        heartbeat=(engine, cid, robot_id))
-                finally:
+            # 2) 이어지는 통로는 '지금 당장 잡히는 만큼만' 예약해 세그먼트로 묶는다(대기 없음).
+            seg_wps = [first_wp]
+            seg_cids = [first_cid]
+            for next_wp, cid in hops[1:]:
+                if not engine.try_reserve(cid, robot_id):
+                    break                       # 세그먼트 끊김 → 여기까지만 하달
+                seg_wps.append(next_wp)
+                seg_cids.append(cid)
+            reached = (seg_wps[-1] == target)   # 세그먼트 끝이 목표면 마지막에 촬영
+
+            self.get_logger().info(
+                f"세그먼트 하달 task={task_id} {current}→{seg_wps} "
+                f"통로={seg_cids} 촬영={reached}")
+
+            # 3) 세그먼트 배열 하달(대기 중 하트비트로 전부 유지) / 4) 무조건 전부 해제.
+            try:
+                code, last_wp = self._dispatch_segment(
+                    client, task_id, seg_wps, capture_on_last=reached,
+                    heartbeat=(engine, list(seg_cids), robot_id))
+            finally:
+                for cid in seg_cids:
                     engine.release(cid, robot_id)   # 도착/실패/중단/예외 모두 해제
 
-                if code == 0:
-                    current = next_wp
-                    continue
-                if code == 2:
-                    self.get_logger().warn(f"중단 보고 task={task_id} → 순찰 실패")
-                    return "aborted", current
-                # code == 1: 진짜 막힘 → 통로 N초 블랙리스트 후 BFS 우회 재계획
-                self.get_logger().warn(
-                    f"통로 {cid} 막힘 보고 task={task_id} → 블랙리스트 후 우회 시도")
-                self._blacklist_add(cid)
-                attempt_block.add(cid)
-                replan = True
-                break
+            if code == 2:
+                self.get_logger().warn(f"중단 보고 task={task_id} → 순찰 실패")
+                return "aborted", current
+            if code == 0:
+                current = seg_wps[-1]            # 세그먼트 끝까지 도착 → 전진
+                continue
 
-            if not replan:
-                return "arrived", current       # 경로 끝까지 도착
+            # code == 1: 진짜 막힘. 로봇이 실제 도달한 지점(last_wp)까지는 전진하고,
+            # 그 다음 '막힌 통로'만 블랙리스트 후 우회 재계획.
+            current, blocked_cid = self._segment_progress(
+                current, seg_wps, seg_cids, last_wp)
+            if blocked_cid is not None:
+                self.get_logger().warn(
+                    f"세그먼트 막힘 task={task_id} 통로 {blocked_cid} "
+                    f"(로봇 위치 {current}) → 블랙리스트 후 우회")
+                self._blacklist_add(blocked_cid)
+                attempt_block.add(blocked_cid)
+
+        return "arrived", current
+
+    @staticmethod
+    def _segment_progress(current, seg_wps, seg_cids, last_wp):
+        """막힘(code=1) 시 로봇이 실제 도달한 노드와 '막힌 통로'를 추정한다.
+
+        세그먼트 경로:  current -[seg_cids[0]]-> seg_wps[0] -[seg_cids[1]]-> seg_wps[1] ...
+        로봇이 last_wp 까지 갔다면(Result.last_waypoint_id) 그 다음 통로가 막힌 것이다.
+        반환: (새 current, 막힌 corridor_id | None). last_wp 를 못 알아보면 진입 통로로 간주.
+        """
+        path = [current] + list(seg_wps)        # 시작점 포함 노드 나열
+        try:
+            j = path.index(last_wp)             # 로봇이 도달한 위치(인덱스)
+        except ValueError:
+            return current, seg_cids[0]         # 알 수 없음 → 진입 통로가 막힌 것으로 간주
+        blocked = seg_cids[j] if j < len(seg_cids) else None  # path[j]->path[j+1] 통로
+        return path[j], blocked
 
     def _plan_route(self, engine, current, target, attempt_block):
-        """current→target 경로. 정상 순찰은 인접 직행, 막히면 BFS 우회. 없으면 None."""
+        """current→target 경로. 정상 순찰은 인접 직행, 막히면 Dijkstra 우회. 없으면 None."""
         blocked = set(attempt_block) | self._blacklist_active()
         direct = engine.corridor_between(current, target)
         if direct is not None and direct not in blocked:
@@ -403,51 +442,62 @@ class PatrolControlNode(Node):
                 return False
             time.sleep(RESERVE_POLL_SEC)
 
-    # ---------------------------- 단일 hop 하달 ---------------------------- #
-    def _dispatch_goal(self, client, task_id, waypoint_id, heartbeat=None) -> int:
-        """단일 waypoint(인접 노드 1개)를 Navigate Goal(길이 1 배열)로 하달 → 도착까지 대기.
+    # ---------------------------- 세그먼트 하달 ---------------------------- #
+    def _dispatch_segment(self, client, task_id, waypoint_ids,
+                          capture_on_last, heartbeat=None):
+        """확보된 세그먼트(연속 waypoint 목록)를 Navigate Goal(Waypoint[] 배열)로 한 번에 하달.
 
-        지금은 waypoints=[wp] 1개짜리 배열이다(⑤-b에서 예약 확보된 세그먼트 배열로 확장).
-        반환 result_code: 0 성공, 1 실패/막힘, 2 중단. heartbeat=(engine,cid,robot_id)면
-        결과 대기 중 주기적으로 예약을 갱신(오래 걸리는 이동 동안 예약 유지).
+        waypoint_ids: [세그먼트 첫 노드 ... 끝 노드] — 예약을 확보한 통로들을 지나는 경로.
+        capture_on_last: 세그먼트 끝이 순찰 목표면 True → 마지막 waypoint 만 capture=True
+                         (도착·정지 후 촬영). 중간 노드는 통과만 하므로 전부 capture=False.
+        heartbeat=(engine, [cid...], robot_id): 결과 대기 중 세그먼트의 모든 통로 예약을 갱신.
+        반환: (result_code, last_waypoint_id). result_code 0 성공/1 실패·막힘/2 중단.
         """
-        m = self._wp_meta.get(waypoint_id, {})
-        wp = Waypoint(
-            waypoint_id=int(waypoint_id),
-            x=float(m.get("x", 0.0)),
-            y=float(m.get("y", 0.0)),
-            yaw=float(m.get("yaw") or 0.0),          # 비순찰점 yaw=None → 0.0
-            capture=bool(m.get("capture", False)),   # 순찰점에서만 도착 후 촬영
-        )
+        wps = []
+        last_idx = len(waypoint_ids) - 1
+        for i, wid in enumerate(waypoint_ids):
+            m = self._wp_meta.get(wid, {})
+            wps.append(Waypoint(
+                waypoint_id=int(wid),
+                x=float(m.get("x", 0.0)),
+                y=float(m.get("y", 0.0)),
+                yaw=float(m.get("yaw") or 0.0),          # 비순찰점 yaw=None → 0.0
+                capture=bool(capture_on_last if i == last_idx else False),
+            ))
         goal = Navigate.Goal()
         goal.task_id = int(task_id)
-        goal.waypoints = [wp]
+        goal.waypoints = wps
 
         goal_handle = _spin_wait(
             client.send_goal_async(goal), GOAL_ACCEPT_TIMEOUT_SEC)
         if goal_handle is None or not goal_handle.accepted:
             self.get_logger().warn(
-                f"Goal 거부/수락 타임아웃 task={task_id} waypoint={waypoint_id}")
-            return 1
+                f"Goal 거부/수락 타임아웃 task={task_id} waypoints={waypoint_ids}")
+            return 1, None
 
         return self._await_result(goal_handle.get_result_async(), heartbeat)
 
-    def _await_result(self, result_future, heartbeat) -> int:
-        """결과 대기. 대기 중 HEARTBEAT_SEC마다 예약 하트비트를 갱신한다."""
+    def _await_result(self, result_future, heartbeat):
+        """결과 대기. 대기 중 HEARTBEAT_SEC마다 세그먼트의 모든 통로 예약을 갱신한다.
+
+        반환: (result_code, last_waypoint_id). 실패/타임아웃/파싱실패 시 (1, None).
+        """
         done = threading.Event()
         result_future.add_done_callback(lambda _f: done.set())
         deadline = time.monotonic() + SEGMENT_TIMEOUT_SEC
         while not done.wait(HEARTBEAT_SEC):
             if heartbeat is not None:
-                engine, cid, robot_id = heartbeat
-                engine.heartbeat(cid, robot_id)
+                engine, cids, robot_id = heartbeat
+                for cid in cids:
+                    engine.heartbeat(cid, robot_id)
             if time.monotonic() >= deadline:
                 self.get_logger().warn("세그먼트 결과 대기 타임아웃 → 실패 취급")
-                return 1
+                return 1, None
         try:
-            return int(result_future.result().result.result_code)
+            res = result_future.result().result
+            return int(res.result_code), int(res.last_waypoint_id)
         except Exception:  # noqa: BLE001
-            return 1
+            return 1, None
 
 
 # --------------------------------------------------------------------------- #
