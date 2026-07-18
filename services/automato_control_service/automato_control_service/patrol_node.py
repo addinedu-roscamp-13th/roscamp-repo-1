@@ -456,14 +456,28 @@ class PatrolControlNode(Node):
         return engine.find_path(current, target, blocked=blocked)
 
     def _reserve_with_wait(self, engine, corridor_id, robot_id) -> bool:
-        """통로 예약을 대기하며 재시도. RESERVE_WAIT_SEC 넘으면 양보(False)."""
+        """통로 예약을 '확인+획득+대기검사'(reserve_or_wait)로 시도하며 대기. 성공 True.
+
+        - reserved → True.
+        - deadlock(쥔 채 기다리면 대기 사이클) → 즉시 양보 False(호출부가 블랙리스트+우회).
+        - waiting  → RESERVE_POLL_SEC 간격 재시도, RESERVE_WAIT_SEC 넘으면 양보 False.
+        양보(False)로 나갈 땐 대기 그래프에서 이 로봇의 대기를 지운다(end_wait).
+        """
         deadline = time.monotonic() + RESERVE_WAIT_SEC
         while True:
-            if engine.try_reserve(corridor_id, robot_id):
+            outcome = engine.reserve_or_wait(corridor_id, robot_id)
+            if outcome == "reserved":
                 return True
+            if outcome == "deadlock":
+                self.get_logger().warn(
+                    f"통로 {corridor_id} 대기 시 데드락 예상 → 양보(우회)")
+                engine.end_wait(robot_id)
+                return False
+            # outcome == "waiting": 안전하게 대기 중
             if time.monotonic() >= deadline:
                 self.get_logger().warn(
                     f"통로 {corridor_id} 예약 대기 타임아웃 → 순찰 양보")
+                engine.end_wait(robot_id)
                 return False
             time.sleep(RESERVE_POLL_SEC)
 

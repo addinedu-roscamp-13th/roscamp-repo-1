@@ -239,3 +239,50 @@ def test_end_wait_breaks_cycle():
     assert e.would_deadlock("dg_01", 11) is True
     e.end_wait("dg_02")                 # B가 대기를 포기 → 화살표 제거
     assert e.would_deadlock("dg_01", 11) is False
+
+
+# ---------------- 확인+획득+대기검사 원자 처리 (reserve_or_wait) ---------------- #
+def test_reserve_or_wait_takes_free_corridor():
+    e = _engine()
+    assert e.reserve_or_wait(10, "dg_01") == "reserved"
+    assert e.holder_of(10) == "dg_01"
+
+
+def test_reserve_or_wait_own_is_reserved():
+    e = _engine()
+    e.try_reserve(10, "dg_01")
+    assert e.reserve_or_wait(10, "dg_01") == "reserved"     # 내 것 재획득(멱등)
+
+
+def test_reserve_or_wait_waits_when_held_no_cycle():
+    e = _engine()
+    e.try_reserve(10, "dg_01")                 # A 보유. A는 아무것도 안 기다림
+    assert e.reserve_or_wait(10, "dg_02") == "waiting"      # B는 안전하게 대기
+
+
+def test_reserve_or_wait_detects_deadlock():
+    e = _engine()
+    e.try_reserve(10, "dg_01")                 # A 보유 10
+    e.try_reserve(11, "dg_02")                 # B 보유 11
+    assert e.reserve_or_wait(10, "dg_02") == "waiting"      # B가 10 대기(등록)
+    # 이제 A가 11(=B 보유)을 원함 → A→B→A 사이클 → 거절
+    assert e.reserve_or_wait(11, "dg_01") == "deadlock"
+
+
+def test_reserve_or_wait_reclaims_expired():
+    clk = FakeClock()
+    e = _engine(ttl=15.0, clock=clk)
+    e.try_reserve(10, "dg_01")
+    clk.advance(20.0)                          # TTL 초과 → 죽은 예약
+    assert e.reserve_or_wait(10, "dg_02") == "reserved"
+    assert e.holder_of(10) == "dg_02"
+
+
+def test_reserve_or_wait_reserved_clears_prior_wait():
+    e = _engine()
+    e.try_reserve(10, "dg_01")
+    assert e.reserve_or_wait(10, "dg_02") == "waiting"      # B 대기 등록
+    e.release(10, "dg_01")                     # A가 놓음
+    assert e.reserve_or_wait(10, "dg_02") == "reserved"     # B가 잡음
+    # 잡은 뒤 B의 대기가 지워져 있어야 대기 그래프가 오염되지 않는다
+    assert e.would_deadlock("dg_03", 10) is False          # 10=B보유, B는 이제 대기 안 함
