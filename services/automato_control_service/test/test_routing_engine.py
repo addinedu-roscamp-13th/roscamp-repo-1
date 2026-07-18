@@ -186,3 +186,56 @@ def test_reap_expired_releases_dead_holds():
     reaped = e.reap_expired()
     assert set(reaped) == {10, 11}
     assert e.holder_of(10) is None and e.holder_of(11) is None
+
+
+# ------------------------------ 데드락(대기 사이클) 회피 ------------------------------ #
+def test_would_deadlock_two_robot_cycle():
+    # A가 10을 쥐고 11을 기다리고, B가 11을 쥐고 10을 기다리면 서로 물림 → 사이클.
+    e = _engine()
+    e.try_reserve(10, "dg_01")          # A 보유 10
+    e.try_reserve(11, "dg_02")          # B 보유 11
+    e.begin_wait("dg_02", 10)           # B는 10(=A 보유)을 기다리는 중
+    # 이제 A가 11(=B 보유)을 기다리려 함 → A→B→A 사이클
+    assert e.would_deadlock("dg_01", 11) is True
+
+
+def test_would_deadlock_safe_when_holder_not_waiting():
+    # B가 11을 쥐었지만 아무것도 안 기다림 → A가 11을 기다려도 언젠가 풀린다.
+    e = _engine()
+    e.try_reserve(10, "dg_01")
+    e.try_reserve(11, "dg_02")          # B는 대기 안 함
+    assert e.would_deadlock("dg_01", 11) is False
+
+
+def test_would_deadlock_free_corridor_is_safe():
+    e = _engine()
+    e.try_reserve(10, "dg_01")
+    assert e.would_deadlock("dg_01", 12) is False   # 12는 아무도 안 쥠
+
+
+def test_would_deadlock_three_robot_cycle():
+    # A→(11)B→(12)C→(10)A 로 원을 이룸.
+    e = _engine()
+    e.try_reserve(10, "dg_01"); e.begin_wait("dg_01", 11)
+    e.try_reserve(11, "dg_02"); e.begin_wait("dg_02", 12)
+    e.try_reserve(12, "dg_03")          # C가 10을 기다리려 하면 원이 닫힌다
+    assert e.would_deadlock("dg_03", 10) is True
+
+
+def test_would_deadlock_three_robot_no_cycle():
+    # 사슬: 10→A(11대기)→B. 그런데 B는 안 기다림 → 안전.
+    e = _engine()
+    e.try_reserve(10, "dg_01"); e.begin_wait("dg_01", 11)
+    e.try_reserve(11, "dg_02")          # B는 대기 안 함(사슬이 여기서 끊김)
+    assert e.would_deadlock("dg_03", 10) is False
+
+
+def test_end_wait_breaks_cycle():
+    # 사이클 상황을 만든 뒤, 한 로봇이 대기를 풀면 사이클이 사라진다.
+    e = _engine()
+    e.try_reserve(10, "dg_01")
+    e.try_reserve(11, "dg_02")
+    e.begin_wait("dg_02", 10)
+    assert e.would_deadlock("dg_01", 11) is True
+    e.end_wait("dg_02")                 # B가 대기를 포기 → 화살표 제거
+    assert e.would_deadlock("dg_01", 11) is False
