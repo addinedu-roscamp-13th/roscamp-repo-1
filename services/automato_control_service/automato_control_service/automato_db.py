@@ -304,7 +304,9 @@ def load_graph(pool: ConnectionPool) -> dict:
     """토폴로지 그래프(노드=waypoints, 간선=corridors)를 읽어온다.
 
     반환:
-      waypoints: [{"waypoint_id","x","y"}, ...]   (좌표는 하달 WaypointGoal 용)
+      waypoints: [{"waypoint_id","x","y","yaw","is_patrol_point"}, ...]
+                  (하달 Waypoint 용. yaw=지점 방향(rad, 비순찰점은 None),
+                   is_patrol_point → Waypoint.capture 판정에 사용)
       corridors: [{"corridor_id","a","b","length"}, ...]  (무방향 간선; a<b 관례.
                   length = 간선 비용(두 waypoint 유클리드 거리, m). Dijkstra 가 사용)
 
@@ -313,9 +315,11 @@ def load_graph(pool: ConnectionPool) -> dict:
     """
     with pool.connection() as conn:
         waypoints = [
-            {"waypoint_id": r["waypoint_id"], "x": r["x_coord"], "y": r["y_coord"]}
+            {"waypoint_id": r["waypoint_id"], "x": r["x_coord"], "y": r["y_coord"],
+             "yaw": r["yaw_coord"], "is_patrol_point": r["is_patrol_point"]}
             for r in conn.execute(
-                "SELECT waypoint_id, x_coord, y_coord FROM waypoints"
+                "SELECT waypoint_id, x_coord, y_coord, yaw_coord, is_patrol_point "
+                "FROM waypoints"
             ).fetchall()
         ]
         corridors = [

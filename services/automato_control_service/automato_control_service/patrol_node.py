@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""RP-78 ② ROS2 노드 — 텔레메트리 캐시 + Patrol 액션 클라이언트 + 세그먼트 디스패치.
+"""RP-78 ② ROS2 노드 — 텔레메트리 캐시 + Navigate 액션 클라이언트 + 세그먼트 디스패치.
 
 이 파일은 '동작(로봇과의 실제 통신)'을 담당한다.
   - 구독:  /automato/telemetry/fleet (FleetTelemetry, 1Hz) → 로봇별 최신 상태 캐시
-  - 발신:  /{robot_id}/patrol (Patrol 액션) → HQ 경유로 인접 노드 1개씩 하달
+  - 발신:  /{robot_id}/navigate (Navigate 액션) → HQ 경유로 경로(배열) 하달
   - 종료:  방문 결과에 따라 tasks 를 DONE/PARTIAL/FAILED 로 마감(automato_db)
 
 배경 지식 (초보자용) —
@@ -33,8 +33,8 @@ import os
 import threading
 import time
 
-from automato_interfaces.action import Patrol
-from automato_interfaces.msg import FleetTelemetry, WaypointGoal
+from automato_interfaces.action import Navigate
+from automato_interfaces.msg import FleetTelemetry, Waypoint
 from automato_interfaces.srv import SaveDetection
 import rclpy
 from rclpy.action import ActionClient
@@ -161,7 +161,7 @@ class PatrolControlNode(Node):
         super().__init__("patrol_control_node", **kwargs)
         self.cache = TelemetryCache()
         self._db_pool = None                       # main()에서 주입
-        # robot_id -> Patrol ActionClient.
+        # robot_id -> Navigate ActionClient.
         # ⚠️ 이름 주의: rclpy.Node 는 서비스 클라이언트 목록을 self._clients(리스트)로
         # 보관하고 node.clients 프로퍼티로 노출한다. 여기에 self._clients 를 dict 로
         # 덮으면 executor 가 node.clients 를 순회할 때 dict 의 '키(robot_id 문자열)'가
@@ -171,7 +171,7 @@ class PatrolControlNode(Node):
 
         # 라우팅/예약 엔진(공유 단일 인스턴스). 첫 순찰 때 그래프를 로드해 생성한다.
         self._engine = None
-        self._wp_coords = {}                       # waypoint_id -> (x, y)
+        self._wp_meta = {}                         # waypoint_id -> {"x","y","yaw","capture"}
         self._engine_lock = threading.Lock()
 
         # 막힘/양보로 잠시 회피할 통로: corridor_id -> 만료 monotonic 시각
@@ -182,7 +182,7 @@ class PatrolControlNode(Node):
         self.create_subscription(FleetTelemetry, FLEET_TOPIC, self._on_fleet, 10)
 
         self.get_logger().info(
-            f"순찰 제어 노드 준비: 구독 {FLEET_TOPIC}, 하달 /<robot_id>/patrol "
+            f"순찰 제어 노드 준비: 구독 {FLEET_TOPIC}, 하달 /<robot_id>/navigate "
             "(세그먼트 단위 + 통로 예약)")
 
     # ---------------------------- 주입/구독 ---------------------------- #
@@ -207,8 +207,13 @@ class PatrolControlNode(Node):
                 self._engine = RoutingEngine(
                     graph["waypoints"], graph["corridors"],
                     reservation_ttl=RESERVATION_TTL_SEC)
-                self._wp_coords = {
-                    w["waypoint_id"]: (w["x"], w["y"]) for w in graph["waypoints"]}
+                self._wp_meta = {
+                    w["waypoint_id"]: {
+                        "x": w["x"], "y": w["y"],
+                        "yaw": w["yaw"], "capture": w["is_patrol_point"],
+                    }
+                    for w in graph["waypoints"]
+                }
                 self.get_logger().info(
                     f"라우팅 그래프 로드: 노드 {len(graph['waypoints'])} / "
                     f"통로 {len(graph['corridors'])}")
@@ -222,12 +227,12 @@ class PatrolControlNode(Node):
         with self._action_clients_lock:
             client = self._action_clients.get(robot_id)
             if client is None:
-                client = ActionClient(self, Patrol, f"/{robot_id}/patrol")
+                client = ActionClient(self, Navigate, f"/{robot_id}/navigate")
                 self._action_clients[robot_id] = client
             return client
 
     def prewarm_clients(self, robot_ids) -> None:
-        """알려진 로봇의 Patrol 액션 클라이언트를 executor spin 시작 전에 미리 만든다.
+        """알려진 로봇의 Navigate 액션 클라이언트를 executor spin 시작 전에 미리 만든다.
 
         기능상 필수는 아니지만(_client_for 가 필요 시 생성) 정리 목적의 이점이 있다:
           - 시작 시점에 ACS 가 어떤 로봇과 통신할지 로그로 드러난다(가시성).
@@ -239,7 +244,7 @@ class PatrolControlNode(Node):
             self._client_for(rid)
         if robot_ids:
             self.get_logger().info(
-                f"Patrol 액션 클라이언트 프리웜 완료: {list(robot_ids)}")
+                f"Navigate 액션 클라이언트 프리웜 완료: {list(robot_ids)}")
 
     # ---------------------------- 블랙리스트(시간 기반) ---------------------------- #
     def _blacklist_add(self, corridor_id) -> None:
@@ -283,7 +288,7 @@ class PatrolControlNode(Node):
         client = self._client_for(robot_id)
         if not client.wait_for_server(timeout_sec=SERVER_WAIT_SEC):
             self.get_logger().warn(
-                f"{robot_id} Patrol 액션 서버 미기동 → task {task_id} FAILED")
+                f"{robot_id} Navigate 액션 서버 미기동 → task {task_id} FAILED")
             return "FAILED"
 
         engine = self._get_engine()
@@ -400,16 +405,23 @@ class PatrolControlNode(Node):
 
     # ---------------------------- 단일 hop 하달 ---------------------------- #
     def _dispatch_goal(self, client, task_id, waypoint_id, heartbeat=None) -> int:
-        """단일 waypoint(인접 노드 1개) Patrol Goal 하달 → 도착까지 대기.
+        """단일 waypoint(인접 노드 1개)를 Navigate Goal(길이 1 배열)로 하달 → 도착까지 대기.
 
+        지금은 waypoints=[wp] 1개짜리 배열이다(⑤-b에서 예약 확보된 세그먼트 배열로 확장).
         반환 result_code: 0 성공, 1 실패/막힘, 2 중단. heartbeat=(engine,cid,robot_id)면
         결과 대기 중 주기적으로 예약을 갱신(오래 걸리는 이동 동안 예약 유지).
         """
-        x, y = self._wp_coords.get(waypoint_id, (0.0, 0.0))
-        goal = Patrol.Goal()
+        m = self._wp_meta.get(waypoint_id, {})
+        wp = Waypoint(
+            waypoint_id=int(waypoint_id),
+            x=float(m.get("x", 0.0)),
+            y=float(m.get("y", 0.0)),
+            yaw=float(m.get("yaw") or 0.0),          # 비순찰점 yaw=None → 0.0
+            capture=bool(m.get("capture", False)),   # 순찰점에서만 도착 후 촬영
+        )
+        goal = Navigate.Goal()
         goal.task_id = int(task_id)
-        goal.waypoint = WaypointGoal(
-            waypoint_id=int(waypoint_id), x=float(x), y=float(y))
+        goal.waypoints = [wp]
 
         goal_handle = _spin_wait(
             client.send_goal_async(goal), GOAL_ACCEPT_TIMEOUT_SEC)
@@ -462,7 +474,7 @@ def main(args=None) -> None:
         callback_group=ReentrantCallbackGroup())
     node.get_logger().info(f"탐지 저장 서비스 준비: {SAVE_DETECTION_SRV}")
 
-    # 알려진 로봇의 Patrol 액션 클라이언트를 spin 시작 전에 미리 만든다(정리·가시성 목적).
+    # 알려진 로봇의 Navigate 액션 클라이언트를 spin 시작 전에 미리 만든다(정리·가시성 목적).
     # RP-76 크래시의 실제 원인이던 self._clients 이름 충돌은 __init__ 에서 해결했다.
     try:
         robot_ids = automato_db.get_availability_snapshot(pool)["robots"]
