@@ -305,7 +305,8 @@ def load_graph(pool: ConnectionPool) -> dict:
 
     반환:
       waypoints: [{"waypoint_id","x","y"}, ...]   (좌표는 하달 WaypointGoal 용)
-      corridors: [{"corridor_id","a","b"}, ...]   (무방향 간선; a<b 관례로 저장돼 있음)
+      corridors: [{"corridor_id","a","b","length"}, ...]  (무방향 간선; a<b 관례.
+                  length = 간선 비용(두 waypoint 유클리드 거리, m). Dijkstra 가 사용)
 
     RoutingEngine 은 이 두 리스트만으로 그래프를 구성한다(엔진은 DB를 모른다).
     corridors 가 비어 있으면(시드 미보강) 순찰 이동이 모두 skip 될 수 있다.
@@ -319,9 +320,10 @@ def load_graph(pool: ConnectionPool) -> dict:
         ]
         corridors = [
             {"corridor_id": r["corridor_id"],
-             "a": r["waypoint_a_id"], "b": r["waypoint_b_id"]}
+             "a": r["waypoint_a_id"], "b": r["waypoint_b_id"],
+             "length": r["length"]}
             for r in conn.execute(
-                "SELECT corridor_id, waypoint_a_id, waypoint_b_id FROM corridors"
+                "SELECT corridor_id, waypoint_a_id, waypoint_b_id, length FROM corridors"
             ).fetchall()
         ]
     return {"waypoints": waypoints, "corridors": corridors}

@@ -102,6 +102,26 @@ def test_find_path_none_unknown_node():
     assert e.find_path(1, 999) is None
 
 
+def test_find_path_prefers_shorter_distance_over_fewer_hops():
+    """Dijkstra 핵심: 홉 수가 많아도 '누적 거리'가 짧은 길을 고른다.
+
+    1→4 직행(통로20)은 1홉이지만 길이 10, 우회 1-2-3-4는 3홉이지만 길이 3.
+    옛 BFS(홉 최소)라면 직행을 골랐겠지만, length 비용을 쓰는 Dijkstra는 우회를 고른다.
+    """
+    wps = [1, 2, 3, 4]
+    cors = [
+        {"corridor_id": 20, "a": 1, "b": 4, "length": 10.0},  # 직행: 1홉, 멀다
+        {"corridor_id": 21, "a": 1, "b": 2, "length": 1.0},
+        {"corridor_id": 22, "a": 2, "b": 3, "length": 1.0},
+        {"corridor_id": 23, "a": 3, "b": 4, "length": 1.0},   # 우회: 3홉, 짧다
+    ]
+    e = RoutingEngine(wps, cors)
+    r = e.find_path(1, 4)
+    assert r.nodes == (1, 2, 3, 4)        # 홉 많아도 거리 짧은 우회를 선택
+    assert r.corridors == (21, 22, 23)
+    assert 20 not in r.corridors          # 길이 10짜리 직행은 버림
+
+
 # ------------------------------ 통로 예약 ------------------------------ #
 def test_reserve_and_block_second_robot():
     e = _engine()
