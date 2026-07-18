@@ -340,87 +340,112 @@ class PatrolControlNode(Node):
         return "PARTIAL"
 
     def _navigate(self, engine, client, task_id, robot_id, current, target):
-        """current→target 까지 '세그먼트' 단위로 이동. 반환: (outcome, 도달한 노드).
+        """current→target 까지 '세그먼트 + 룩어헤드'로 이동. 반환: (outcome, 도달한 노드).
 
-        한 번의 while 반복 = 연속으로 예약 가능한 만큼을 한 세그먼트로 묶어 Waypoint[]
-        배열로 한 번에 하달 → 도착하면 그 통로들을 전부 해제 → 남았으면 다음 세그먼트.
+        상태 2개로 움직인다:
+          - held: 지금 예약(점유)한 통로들. 하트비트로 유지하며 항상 예약표=현실이 되게 한다.
+          - seg : 다음에 하달할 세그먼트. 룩어헤드가 주행 중 미리 채워두면 재확보 없이 이어 달린다.
+        선획득 후해제: 도착 시 '다음 구간을 먼저 잡았으면' 지나온 통로만 반납, 못 잡았으면
+        '서 있는 통로'만 남기고 반납 → 순간적으로 아무 통로도 예약 안 된 구간이 안 생긴다.
         outcome: 'arrived'(목표 도달) | 'skipped'(우회 불가로 포기) | 'aborted'(중단).
         """
         attempt_block = set()   # 이번 target 시도에서 회피할 통로(예약실패/막힘 누적)
-        while current != target:
-            route = self._plan_route(engine, current, target, attempt_block)
-            if route is None:
-                self.get_logger().warn(
-                    f"경로 없음 task={task_id} {current}→{target} → 건너뜀")
-                return "skipped", current
+        held = []               # 지금 예약(점유)한 통로들 — dispatch 하트비트에 live 로 넘김
+        seg = None              # 다음에 하달할 세그먼트 (룩어헤드가 미리 채웠을 수 있음)
+        try:
+            while current != target:
+                # 1) 하달할 세그먼트 확보(룩어헤드가 미리 잡아놨으면 그걸 사용).
+                if seg is None:
+                    route = self._plan_route(engine, current, target, attempt_block)
+                    if route is None:
+                        self.get_logger().warn(
+                            f"경로 없음 task={task_id} {current}→{target} → 건너뜀")
+                        return "skipped", current
+                    seg = self._acquire_segment(
+                        engine, robot_id, route.hops(), attempt_block)
+                    if seg is None:
+                        continue                    # 첫 통로 못 잡음 → 양보·재계획
+                    held.extend(seg[1])             # 새로 잡은 통로 = 점유 목록에 추가
+                seg_wps, seg_cids = seg
+                seg = None
+                reached = (seg_wps[-1] == target)   # 세그먼트 끝이 목표면 마지막에 촬영
 
-            hops = route.hops()                 # [(다음 노드, 통로 id), ...] (최소 1개)
-            # 1) 첫 통로는 대기하며 예약(코앞이라 이게 없으면 한 발도 못 감).
-            #    끝내 못 잡으면 양보: 그 통로 회피하고 재계획.
-            first_wp, first_cid = hops[0]
-            if not self._reserve_with_wait(engine, first_cid, robot_id):
-                self._blacklist_add(first_cid)
-                attempt_block.add(first_cid)
-                continue
+                # 2) 룩어헤드 훅: 주행 중 매 틱 다음 구간을 '대기 없이' 미리 예약.
+                look = {"seg": None}
 
-            # 2) 이어지는 통로는 '지금 당장 잡히는 만큼만' 예약해 세그먼트로 묶는다(대기 없음).
-            seg_wps = [first_wp]
-            seg_cids = [first_cid]
-            for next_wp, cid in hops[1:]:
-                if not engine.try_reserve(cid, robot_id):
-                    break                       # 세그먼트 끊김 → 여기까지만 하달
-                seg_wps.append(next_wp)
-                seg_cids.append(cid)
-            reached = (seg_wps[-1] == target)   # 세그먼트 끝이 목표면 마지막에 촬영
+                def on_tick(look=look, seg_end=seg_wps[-1]):
+                    if look["seg"] is None:
+                        look["seg"] = self._try_reserve_ahead(
+                            engine, robot_id, seg_end, target,
+                            attempt_block, held)
 
-            self.get_logger().info(
-                f"세그먼트 하달 task={task_id} {current}→{seg_wps} "
-                f"통로={seg_cids} 촬영={reached}")
+                self.get_logger().info(
+                    f"세그먼트 하달 task={task_id} {current}→{seg_wps} "
+                    f"통로={seg_cids} 촬영={reached}")
 
-            # 3) 세그먼트 배열 하달(대기 중 하트비트로 전부 유지) / 4) 무조건 전부 해제.
-            try:
+                # 3) 세그먼트 배열 하달. 하트비트엔 live held 를 넘겨 룩어헤드분도 함께 유지.
                 code, last_wp = self._dispatch_segment(
                     client, task_id, seg_wps, capture_on_last=reached,
-                    heartbeat=(engine, list(seg_cids), robot_id))
-            finally:
-                for cid in seg_cids:
-                    engine.release(cid, robot_id)   # 도착/실패/중단/예외 모두 해제
+                    heartbeat=(engine, held, robot_id), on_tick=on_tick)
 
-            if code == 2:
-                self.get_logger().warn(f"중단 보고 task={task_id} → 순찰 실패")
-                return "aborted", current
-            if code == 0:
-                current = seg_wps[-1]            # 세그먼트 끝까지 도착 → 전진
-                continue
-
-            # code == 1: 진짜 막힘. 로봇이 실제 도달한 지점(last_wp)까지는 전진하고,
-            # 그 다음 '막힌 통로'만 블랙리스트 후 우회 재계획.
-            current, blocked_cid = self._segment_progress(
-                current, seg_wps, seg_cids, last_wp)
-            if blocked_cid is not None:
-                self.get_logger().warn(
-                    f"세그먼트 막힘 task={task_id} 통로 {blocked_cid} "
-                    f"(로봇 위치 {current}) → 블랙리스트 후 우회")
-                self._blacklist_add(blocked_cid)
-                attempt_block.add(blocked_cid)
-
+                # 4) 결과 처리 = 선획득 후해제.
+                if code == 2:
+                    self.get_logger().warn(f"중단 보고 task={task_id} → 순찰 실패")
+                    return "aborted", current
+                if code == 1:                       # 진짜 막힘 → 우회
+                    current, blocked_cid, standing = self._segment_progress(
+                        current, seg_wps, seg_cids, last_wp)
+                    if blocked_cid is not None:
+                        self.get_logger().warn(
+                            f"세그먼트 막힘 task={task_id} 통로 {blocked_cid} "
+                            f"(로봇 위치 {current}) → 블랙리스트 후 우회")
+                        self._blacklist_add(blocked_cid)
+                        attempt_block.add(blocked_cid)
+                    self._release_except(engine, robot_id, held, {standing})
+                    continue
+                # code == 0: 세그먼트 끝 도착.
+                current = seg_wps[-1]
+                if look["seg"] is not None:         # 룩어헤드 성공 → 끊김 없이 연장
+                    seg = look["seg"]
+                    self._release_except(engine, robot_id, held, set(seg[1]))
+                    self.get_logger().info(
+                        f"룩어헤드 연장 task={task_id} 위치 {current} 다음 통로={seg[1]}")
+                else:                               # 다음 못 잡음 → 세그먼트 끝에서 정지·대기
+                    self._release_except(engine, robot_id, held, {seg_cids[-1]})
+        finally:
+            for cid in list(held):
+                engine.release(cid, robot_id)       # 어떻게 나가든 남은 예약 전부 반납
         return "arrived", current
 
     @staticmethod
     def _segment_progress(current, seg_wps, seg_cids, last_wp):
-        """막힘(code=1) 시 로봇이 실제 도달한 노드와 '막힌 통로'를 추정한다.
+        """막힘(code=1) 시 로봇의 실제 도달 노드·'막힌 통로'·'서 있는 통로'를 추정한다.
 
         세그먼트 경로:  current -[seg_cids[0]]-> seg_wps[0] -[seg_cids[1]]-> seg_wps[1] ...
-        로봇이 last_wp 까지 갔다면(Result.last_waypoint_id) 그 다음 통로가 막힌 것이다.
-        반환: (새 current, 막힌 corridor_id | None). last_wp 를 못 알아보면 진입 통로로 간주.
+        로봇이 last_wp(Result.last_waypoint_id)까지 갔다면 그 다음 통로가 막힌 것이고,
+        마지막으로 지나온 통로가 지금 서 있는 통로다.
+        반환: (새 current, 막힌 corridor_id | None, 서 있는 corridor_id).
+        last_wp 를 못 알아보면 세그먼트에 못 들어온 것으로 보고 진입 지점 기준으로 처리.
         """
         path = [current] + list(seg_wps)        # 시작점 포함 노드 나열
         try:
             j = path.index(last_wp)             # 로봇이 도달한 위치(인덱스)
         except ValueError:
-            return current, seg_cids[0]         # 알 수 없음 → 진입 통로가 막힌 것으로 간주
-        blocked = seg_cids[j] if j < len(seg_cids) else None  # path[j]->path[j+1] 통로
-        return path[j], blocked
+            j = 0                               # 알 수 없음 → 진입 지점으로 간주
+        blocked = seg_cids[j] if j < len(seg_cids) else None    # path[j]->path[j+1] 통로
+        standing = seg_cids[j - 1] if j >= 1 else seg_cids[0]   # 마지막으로 점유한 통로
+        return path[j], blocked, standing
+
+    @staticmethod
+    def _release_except(engine, robot_id, held, keep):
+        """held(지금 쥔 통로 리스트)에서 keep 에 없는 통로를 모두 해제하고 held 를 갱신한다.
+
+        선획득 후해제의 '후해제' — 유지할 통로(keep)만 남기고 나머지를 반납한다.
+        """
+        for cid in list(held):
+            if cid not in keep:
+                engine.release(cid, robot_id)
+                held.remove(cid)
 
     def _plan_route(self, engine, current, target, attempt_block):
         """current→target 경로. 정상 순찰은 인접 직행, 막히면 Dijkstra 우회. 없으면 None."""
@@ -442,15 +467,62 @@ class PatrolControlNode(Node):
                 return False
             time.sleep(RESERVE_POLL_SEC)
 
+    def _acquire_segment(self, engine, robot_id, hops, attempt_block):
+        """route.hops() 를 받아 한 세그먼트를 예약한다.
+
+        첫 통로는 대기하며 예약(_reserve_with_wait), 이어지는 통로는 대기 없이(try_reserve)
+        잡히는 만큼 묶는다. 반환: (seg_wps, seg_cids) 또는 None.
+        None(첫 통로 예약 대기 타임아웃=양보)이면 그 통로를 블랙리스트+attempt_block 에 넣어
+        호출부가 우회 재계획하게 한다.
+        """
+        first_wp, first_cid = hops[0]
+        if not self._reserve_with_wait(engine, first_cid, robot_id):
+            self._blacklist_add(first_cid)
+            attempt_block.add(first_cid)
+            return None
+        seg_wps = [first_wp]
+        seg_cids = [first_cid]
+        for next_wp, cid in hops[1:]:
+            if not engine.try_reserve(cid, robot_id):
+                break                       # 세그먼트 끊김 → 여기까지
+            seg_wps.append(next_wp)
+            seg_cids.append(cid)
+        return seg_wps, seg_cids
+
+    def _try_reserve_ahead(self, engine, robot_id, node, target,
+                           attempt_block, held_cids):
+        """룩어헤드: node→target 경로의 다음 구간을 '대기 없이'(try_reserve) 미리 예약.
+
+        주행 중(on_tick) 호출된다. 잡은 통로는 held_cids 에 더해 하트비트로 유지되게 한다.
+        반환: (seg_wps, seg_cids) 또는 None(다음 통로를 아직 못 잡음 / 더 갈 곳 없음).
+        """
+        if node == target:
+            return None                     # 이미 목표 → 미리 잡을 것 없음
+        route = self._plan_route(engine, node, target, attempt_block)
+        if route is None:
+            return None
+        seg_wps = []
+        seg_cids = []
+        for next_wp, cid in route.hops():
+            if cid in held_cids or not engine.try_reserve(cid, robot_id):
+                break                       # 이미 쥠/남이 점유 → 대기 없이 여기서 멈춤
+            seg_wps.append(next_wp)
+            seg_cids.append(cid)
+            held_cids.append(cid)           # 하트비트 대상에 즉시 포함
+        if not seg_cids:
+            return None                     # 한 칸도 못 잡음
+        return seg_wps, seg_cids
+
     # ---------------------------- 세그먼트 하달 ---------------------------- #
     def _dispatch_segment(self, client, task_id, waypoint_ids,
-                          capture_on_last, heartbeat=None):
+                          capture_on_last, heartbeat=None, on_tick=None):
         """확보된 세그먼트(연속 waypoint 목록)를 Navigate Goal(Waypoint[] 배열)로 한 번에 하달.
 
         waypoint_ids: [세그먼트 첫 노드 ... 끝 노드] — 예약을 확보한 통로들을 지나는 경로.
         capture_on_last: 세그먼트 끝이 순찰 목표면 True → 마지막 waypoint 만 capture=True
                          (도착·정지 후 촬영). 중간 노드는 통과만 하므로 전부 capture=False.
         heartbeat=(engine, [cid...], robot_id): 결과 대기 중 세그먼트의 모든 통로 예약을 갱신.
+        on_tick: 결과 대기 중 하트비트 틱마다 호출되는 콜백(룩어헤드 = 다음 구간 선예약용).
         반환: (result_code, last_waypoint_id). result_code 0 성공/1 실패·막힘/2 중단.
         """
         wps = []
@@ -475,10 +547,12 @@ class PatrolControlNode(Node):
                 f"Goal 거부/수락 타임아웃 task={task_id} waypoints={waypoint_ids}")
             return 1, None
 
-        return self._await_result(goal_handle.get_result_async(), heartbeat)
+        return self._await_result(
+            goal_handle.get_result_async(), heartbeat, on_tick)
 
-    def _await_result(self, result_future, heartbeat):
-        """결과 대기. 대기 중 HEARTBEAT_SEC마다 세그먼트의 모든 통로 예약을 갱신한다.
+    def _await_result(self, result_future, heartbeat, on_tick=None):
+        """결과 대기. 대기 중 HEARTBEAT_SEC마다 세그먼트의 모든 통로 예약을 갱신하고,
+        on_tick(있으면)을 호출해 룩어헤드(다음 구간 선예약)를 시도한다.
 
         반환: (result_code, last_waypoint_id). 실패/타임아웃/파싱실패 시 (1, None).
         """
@@ -490,6 +564,11 @@ class PatrolControlNode(Node):
                 engine, cids, robot_id = heartbeat
                 for cid in cids:
                     engine.heartbeat(cid, robot_id)
+            if on_tick is not None:
+                try:
+                    on_tick()               # 주행 중 다음 구간 선예약 시도(룩어헤드)
+                except Exception as exc:  # noqa: BLE001
+                    self.get_logger().warn(f"룩어헤드 tick 예외(무시): {exc}")
             if time.monotonic() >= deadline:
                 self.get_logger().warn("세그먼트 결과 대기 타임아웃 → 실패 취급")
                 return 1, None
