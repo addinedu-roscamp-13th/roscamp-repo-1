@@ -5,10 +5,10 @@
 이미지 파일 저장/순찰 현황 중계(notify)/병해충 알림(alert)은 오케스트레이션
 계층(detection_service.py)이 맡는다. 순찰 접수/조회/종료 SQL은 automato_db.py 에 있다.
 
-핵심(원자성): 탐지 저장은 '하나의 트랜잭션'으로 묶는다.
+핵심: 탐지 저장은 detection_logs INSERT 한 문으로 한다.
   ① detection_logs INSERT     → detection_id 확보(ACS 내부용, HQ 로 미반환)
-  ② task_paths.is_visited=TRUE (해당 task_id + waypoint_id 행)
-  두 문이 한 트랜잭션이라 중간 실패 시 전부 롤백된다(반쯤 기록된 탐지가 안 남음).
+  RP-88: 예전엔 task_paths.is_visited=TRUE 도 같이 찍었으나, task_paths(휘발성 경로)가
+  폐기되어 방문 기록은 detection_logs 행 존재로 대신한다(단문이지만 트랜잭션 블록은 유지).
 
 배경 지식(왜 detected_at 을 파라미터로 받나):
   이슈 요구대로 핸들러 진입 시 시각을 '한 번만' 캡처해서 DB·notify·alert 가
@@ -33,14 +33,6 @@ _INSERT_DETECTION = (
     "RETURNING detection_id"
 )
 
-# ② 방문 표시. updated_at 은 set_updated_at() 트리거가 자동 갱신하지만,
-#    automato_db 관례(명시 갱신)와 맞춰 명시적으로도 NOW() 를 넣는다.
-_MARK_VISITED = (
-    "UPDATE task_paths "
-    "   SET is_visited = TRUE, updated_at = NOW() "
-    " WHERE task_id = %s AND waypoint_id = %s"
-)
-
 
 def save_detection_log(
     pool: ConnectionPool,
@@ -55,14 +47,14 @@ def save_detection_log(
     image_path,           # str | None (루트 제외 상대경로; 이미지 없음/쓰기실패면 None)
     detected_at: datetime,
 ) -> int:
-    """탐지 1건을 단일 트랜잭션으로 저장하고 detection_id 를 반환한다.
+    """탐지 1건을 detection_logs 에 저장하고 detection_id 를 반환한다.
 
     ① detection_logs INSERT (RETURNING detection_id)
-    ② task_paths.is_visited = TRUE (task_id + waypoint_id)
+    RP-88: task_paths 폐기로 방문 표시(is_visited)는 없앴다 — 방문 사실은
+    detection_logs 행 존재로 대신한다.
 
     반환: detection_id (INSERT 로 새로 발급된 PK)
     예외: 실패 시 psycopg 예외를 그대로 올린다(호출부가 잡아 success=false 처리).
-          트랜잭션 블록이라 예외 시 두 문 모두 자동 롤백된다.
     """
     with pool.connection() as conn:
         with conn.transaction():   # BEGIN ~ COMMIT/ROLLBACK 자동 관리
@@ -76,5 +68,4 @@ def save_detection_log(
                 ),
             ).fetchone()
             detection_id = row["detection_id"]
-            conn.execute(_MARK_VISITED, (int(task_id), int(waypoint_id)))
     return detection_id

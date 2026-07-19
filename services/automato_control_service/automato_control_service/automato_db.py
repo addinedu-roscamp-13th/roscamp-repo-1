@@ -14,7 +14,7 @@
   - SQLAlchemy 표기(postgresql+psycopg://)는 libpq 표기(postgresql://)로 정규화해서 쓴다.
   - 커넥션 풀(psycopg_pool)을 써서 요청마다 새 연결을 만드는 비용을 줄인다.
 
-핵심: 순찰 접수(①~④)는 '하나의 트랜잭션'으로 묶는다.
+핵심: 순찰 접수(①~③)는 '하나의 트랜잭션'으로 묶는다.
   중간에 실패하면 전부 롤백돼 '반쯤 만들어진 task'가 남지 않는다(원자성).
 """
 import os
@@ -30,6 +30,16 @@ class RobotBusyError(Exception):
     DB의 부분 유니크 인덱스(ux_tasks_active_robot) 위반을 애플리케이션 예외로
     바꿔 던진다. API 계층이 이걸 잡아 409(NO_AVAILABLE_ROBOT)로 응답한다.
     (GUI가 1차로 막더라도, 처리 시점 상태 변동을 DB 인덱스로 최종 방어)
+    """
+
+
+class PatrolInProgressError(Exception):
+    """이미 활성(WAITING/IN_PROGRESS) PATROL task가 있어 새 순찰을 받을 수 없음.
+
+    순찰은 전역에서 동시에 1건만 허용한다(운영 원칙). DB의 부분 유니크 인덱스
+    (ux_tasks_single_active_patrol) 위반을 애플리케이션 예외로 바꿔 던진다.
+    API 계층이 이걸 잡아 409(PATROL_IN_PROGRESS)로 응답한다. 로봇별 제약
+    (RobotBusyError)과 달리 '어느 로봇이든 순찰이 이미 돌고 있으면' 거부한다.
     """
 
 
@@ -185,17 +195,6 @@ _INSERT_TASK = (
     "VALUES ('PATROL', 'WAITING', %s, NOW(), NOW()) RETURNING task_id"
 )
 
-# point_index 는 patrol_order 순서대로 0부터 '연속' 재부여(ROW_NUMBER-1).
-# patrol_order 값에 구멍(1,2,4,7...)이 있어도 0,1,2,3...으로 촘촘히 채워진다.
-_INSERT_PATHS = (
-    "INSERT INTO task_paths (task_id, waypoint_id, point_index, is_visited, created_at, updated_at) "
-    "SELECT %s, waypoint_id, ROW_NUMBER() OVER (ORDER BY patrol_order) - 1, "
-    "       FALSE, NOW(), NOW() "
-    "  FROM waypoints "
-    " WHERE is_patrol_point = TRUE "
-    " ORDER BY patrol_order"
-)
-
 # robot_state_snapshot: 앱에서 JSON 직렬화한 문자열을 %s로 바인딩 후 ::jsonb 캐스팅.
 _INSERT_SNAPSHOT = (
     "INSERT INTO task_assignment_snapshot (task_id, robot_id, robot_state_snapshot, assigned_at) "
@@ -207,24 +206,28 @@ _UPDATE_INPROGRESS = (
     "WHERE task_id = %s"
 )
 
-# 접수 후 디스패치용으로 순서대로 방문할 waypoint(좌표 포함)를 뽑는다.
-_SELECT_PATH = (
-    "SELECT tp.point_index, tp.waypoint_id, w.x_coord, w.y_coord "
-    "  FROM task_paths tp "
-    "  JOIN waypoints w ON w.waypoint_id = tp.waypoint_id "
-    " WHERE tp.task_id = %s "
-    " ORDER BY tp.point_index"
+# 접수 후 디스패치용으로 순서대로 방문할 순찰 waypoint(좌표 포함)를 뽑는다.
+# RP-88: 경로는 휘발성(실행 중 재계획)이라 task_paths 에 저장하지 않고,
+# 순찰점(is_patrol_point)을 patrol_order 순으로 매번 직접 조회한다.
+# point_index 는 0부터 '연속' 재부여(ROW_NUMBER-1) — patrol_order 에 구멍이 있어도 촘촘히.
+_SELECT_PATROL_WAYPOINTS = (
+    "SELECT ROW_NUMBER() OVER (ORDER BY patrol_order) - 1 AS point_index, "
+    "       waypoint_id, x_coord, y_coord "
+    "  FROM waypoints "
+    " WHERE is_patrol_point = TRUE "
+    " ORDER BY patrol_order"
 )
 
 
 def accept_patrol_task(pool: ConnectionPool, robot_id: str,
                        snapshot_json: str) -> tuple:
-    """순찰 task를 접수한다. ①~④를 하나의 트랜잭션으로 실행.
+    """순찰 task를 접수한다. ①~③을 하나의 트랜잭션으로 실행.
 
     ① tasks INSERT (PATROL/WAITING) -> task_id 확보
-    ② task_paths 복사 (patrol_order 순, point_index 0부터 연속)
-    ③ task_assignment_snapshot INSERT (명령 직전 로봇 상태 전체 JSONB)
-    ④ tasks 를 IN_PROGRESS 로 전환
+    ② task_assignment_snapshot INSERT (명령 직전 로봇 상태 전체 JSONB)
+    ③ tasks 를 IN_PROGRESS 로 전환
+    커밋 후, 방문할 순찰 waypoint 목록을 waypoints 에서 직접 조회해 반환한다
+    (RP-88: 경로는 휘발성이라 task_paths 로 저장하지 않음).
 
     반환: (task_id, waypoints)
       waypoints = [{"point_index", "waypoint_id", "x", "y"}, ...]  (디스패치용)
@@ -237,11 +240,10 @@ def accept_patrol_task(pool: ConnectionPool, robot_id: str,
         with pool.connection() as conn:
             with conn.transaction():   # BEGIN ~ COMMIT/ROLLBACK 자동 관리
                 task_id = conn.execute(_INSERT_TASK, (robot_id,)).fetchone()["task_id"]
-                conn.execute(_INSERT_PATHS, (task_id,))
                 conn.execute(_INSERT_SNAPSHOT, (task_id, robot_id, snapshot_json))
                 conn.execute(_UPDATE_INPROGRESS, (task_id,))
-            # 커밋 후(같은 커넥션의 새 트랜잭션)에서 경로를 읽어 반환
-            rows = conn.execute(_SELECT_PATH, (task_id,)).fetchall()
+            # 커밋 후, 방문할 순찰점을 waypoints 에서 직접 조회(경로는 저장 안 함)
+            rows = conn.execute(_SELECT_PATROL_WAYPOINTS).fetchall()
         waypoints = [
             {
                 "point_index": r["point_index"],
@@ -253,37 +255,25 @@ def accept_patrol_task(pool: ConnectionPool, robot_id: str,
         ]
         return task_id, waypoints
     except psycopg.errors.UniqueViolation as exc:
-        # ①의 INSERT가 ux_tasks_active_robot 을 위반한 경우
+        # ①의 INSERT 가 '어느' 부분 유니크 인덱스를 위반했는지로 사유를 구분한다.
+        #   ux_tasks_single_active_patrol → 이미 순찰 진행 중(전역 1건 제약)
+        #   ux_tasks_active_robot         → 그 로봇이 이미 활성 task 보유
+        # psycopg 는 위반한 인덱스명을 exc.diag.constraint_name 으로 알려준다.
+        if getattr(exc.diag, "constraint_name", None) == "ux_tasks_single_active_patrol":
+            raise PatrolInProgressError(str(exc)) from exc
         raise RobotBusyError(str(exc)) from exc
 
 
 # --------------------------------------------------------------------------- #
 # 순찰 종료 반영
 # --------------------------------------------------------------------------- #
-def finish_patrol_task(pool: ConnectionPool, task_id: int,
-                       result_code: int) -> None:
-    """(Phase 1) Patrol result_code 에 따라 tasks 를 DONE/FAILED 로 마감한다.
-
-    result_code == 0 -> DONE, 그 외(1 실패/막힘, 2 중단) -> FAILED.
-    Phase 2 에서는 건너뜀이 생길 수 있어 set_task_status 로 PARTIAL 도 쓴다.
-    """
-    sql = (
-        "UPDATE tasks "
-        "   SET status = CASE WHEN %s = 0 THEN 'DONE' ELSE 'FAILED' END, "
-        "       ended_at = NOW(), updated_at = NOW() "
-        " WHERE task_id = %s"
-    )
-    with pool.connection() as conn:
-        conn.execute(sql, (int(result_code), int(task_id)))
-
-
-_VALID_END_STATUS = ("DONE", "FAILED", "PARTIAL")
+_VALID_END_STATUS = ("COMPLETED", "FAILED", "COMPLETED_PARTIAL")
 
 
 def set_task_status(pool: ConnectionPool, task_id: int, status: str) -> None:
-    """(Phase 2) tasks 를 명시 상태(DONE/PARTIAL/FAILED)로 마감한다.
+    """(Phase 2) tasks 를 명시 상태(COMPLETED/COMPLETED_PARTIAL/FAILED)로 마감한다.
 
-    순찰 지점 일부만 방문(우회 실패로 건너뜀)한 경우 PARTIAL 을 쓴다.
+    순찰 지점 일부만 방문(우회 실패로 건너뜀)한 경우 COMPLETED_PARTIAL 을 쓴다.
     tasks.status CHECK 제약이 이 세 값을 허용한다(스키마 0001).
     """
     if status not in _VALID_END_STATUS:

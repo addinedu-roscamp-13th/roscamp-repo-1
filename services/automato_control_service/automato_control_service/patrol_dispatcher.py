@@ -22,6 +22,7 @@ from automato_control_service.patrol_config import (
     BLOCK_TTL_SEC,
     GOAL_ACCEPT_TIMEOUT_SEC,
     HEARTBEAT_SEC,
+    PATROL_START_WAYPOINT_ID,
     RESERVE_POLL_SEC,
     RESERVE_WAIT_SEC,
     SEGMENT_TIMEOUT_SEC,
@@ -79,7 +80,7 @@ class PatrolDispatcher:
 
     # ---------------------------- 순찰 본체 ---------------------------- #
     def run_patrol(self, task_id, robot_id, waypoints, engine, client) -> str:
-        """순찰 지점을 순서대로 방문. 반환: 'DONE' | 'PARTIAL' | 'FAILED'.
+        """순찰 지점을 순서대로 방문. 반환: 'COMPLETED' | 'COMPLETED_PARTIAL' | 'FAILED'.
 
         engine/client 는 노드(ROS 표면)가 만들어 넘긴다 — 이 클래스는 rclpy 엔티티를
         생성하지 않고 받은 것만 사용한다.
@@ -91,23 +92,33 @@ class PatrolDispatcher:
 
         targets = [wp["waypoint_id"] for wp in waypoints]
         if not targets:
-            return "DONE"                      # 방문할 지점이 없음
+            return "COMPLETED"                 # 방문할 지점이 없음
 
         visited = set()
-        # 첫 순찰 지점: 시작 노드를 알 수 없어(위치→노드 매핑은 향후 과제) 통로 예약 없이 직접 접근.
-        # 세그먼트 하달 경로를 재사용하되, waypoint 1개짜리 배열로 보낸다(순찰점이므로 촬영).
-        code, _ = self._dispatch_segment(
-            client, task_id, [targets[0]], capture_on_last=True)
-        if code == 0:
+        # 순찰 시작 노드(충전소 위치의 waypoint). 그래프(wp_meta)에 있으면 current 로 두고
+        # 첫 순찰 지점도 _navigate 로 이동해 '첫 구간까지 통로 예약'으로 보호한다.
+        # 미설정/미상이면 옛 동작으로 폴백: 첫 지점만 예약 없이 직행(이 구간은 통로 보호 없음).
+        start = PATROL_START_WAYPOINT_ID
+        if start and start in self.wp_meta:
+            current = start
+            remaining = targets
+            self._log.info(f"순찰 시작 노드 {start} 에서 출발 task={task_id}")
+        else:
+            self._log.warn(
+                f"순찰 시작 waypoint({start}) 미설정/그래프에 없음 → 첫 지점 예약 없이 "
+                f"직행(폴백) task={task_id}")
+            code, _ = self._dispatch_segment(
+                client, task_id, [targets[0]], capture_on_last=True)
+            if code != 0:
+                self._log.warn(f"첫 순찰 지점 도달 실패 → task {task_id} FAILED")
+                return "FAILED"
             visited.add(targets[0])
             current = targets[0]
-        else:
-            self._log.warn(f"첫 순찰 지점 도달 실패 → task {task_id} FAILED")
-            return "FAILED"
+            remaining = targets[1:]
 
-        # 나머지 지점: 세그먼트(연속 통로 묶음) 단위로 이동
+        # 순찰 지점: 세그먼트(연속 통로 묶음) 단위로 이동(시작 노드가 있으면 첫 지점부터)
         skipped = []
-        for target in targets[1:]:
+        for target in remaining:
             outcome, current = self._navigate(
                 engine, client, task_id, robot_id, current, target)
             if outcome == "arrived":
@@ -128,10 +139,10 @@ class PatrolDispatcher:
                 return "FAILED"
 
         if len(visited) == len(targets):
-            return "DONE"
+            return "COMPLETED"
         if len(visited) <= 1:                  # 사실상 첫 지점만 방문
             return "FAILED"
-        return "PARTIAL"
+        return "COMPLETED_PARTIAL"
 
     def _navigate(self, engine, client, task_id, robot_id, current, target):
         """current→target 까지 '세그먼트 + 룩어헤드'로 이동. 반환: (outcome, 도달한 노드).

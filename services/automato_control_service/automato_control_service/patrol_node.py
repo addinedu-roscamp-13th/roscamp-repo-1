@@ -4,7 +4,7 @@
 이 파일은 'ROS 표면(로봇과의 실제 통신)'을 담당한다.
   - 구독:  /automato/telemetry/fleet (FleetTelemetry, 1Hz) → 로봇별 최신 상태 캐시
   - 발신:  /{robot_id}/navigate (Navigate 액션) → DG(DG Control Service) 경유로 경로(배열) 하달
-  - 종료:  방문 결과에 따라 tasks 를 DONE/PARTIAL/FAILED 로 마감(automato_db)
+  - 종료:  방문 결과에 따라 tasks 를 COMPLETED/COMPLETED_PARTIAL/FAILED 로 마감(automato_db)
 
 배경 지식 (초보자용) —
   * ROS2 '토픽 구독'은 '요청하면 받아오는' 방식이 아니라, 발행자가 보낼 때마다

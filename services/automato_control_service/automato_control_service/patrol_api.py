@@ -218,6 +218,12 @@ def create_app(node, pool) -> FastAPI:
                 content={"status": "REJECTED", "reason": "NO_AVAILABLE_ROBOT",
                          "message": f"{selected} 이미 활성 task 보유"},
             )
+        except automato_db.PatrolInProgressError:
+            return JSONResponse(
+                status_code=409,
+                content={"status": "REJECTED", "reason": "PATROL_IN_PROGRESS",
+                         "message": "이미 순찰이 진행 중입니다(동시 1대 제약)"},
+            )
         except Exception as exc:  # noqa: BLE001
             return JSONResponse(
                 status_code=503,

@@ -65,6 +65,14 @@ def _envf(name: str, default: float) -> float:
         return default
 
 
+def _envi(name: str, default: int) -> int:
+    """환경변수를 int 로 읽되, 없거나 이상하면 기본값."""
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 # ── 토픽/서비스 이름 (구조적 상수, .env 대상 아님) ─────────────────────────── #
 FLEET_TOPIC = "/automato/telemetry/fleet"
 # RP-79: DG 가 waypoint 마다 탐지 결과를 넘기는 ROS2 Service (ACS 가 서버).
@@ -84,3 +92,12 @@ BLOCK_TTL_SEC = _envf("ACS_BLOCK_TTL_SEC", 30.0)
 # 이동 대기 중 예약 유지용 하트비트 간격 / 엔진 예약 TTL(하트비트보다 커야 함)
 HEARTBEAT_SEC = _envf("ACS_HEARTBEAT_SEC", 5.0)
 RESERVATION_TTL_SEC = _envf("ACS_RESERVATION_TTL_SEC", 15.0)
+
+# ── 순찰 시작(정적) 노드 ─────────────────────────────────────────────────── #
+# 순찰은 항상 로봇이 충전소에 있을 때 시작한다(시작 위치 고정). 라우터는 waypoint_id 로만
+# 경로를 계산하는데, 충전소(task_points)와 그래프 노드(waypoints)는 FK 로 안 이어져 있어
+# '어느 waypoint 가 시작점인지'를 여기서 정적으로 지정한다. 지금은 순찰이 전역 1대뿐이라
+# 전역 상수 하나로 충분하다. (향후: task_points↔waypoints 연결이 생기면 로봇별
+# charge_point_id 로 시작 노드를 유도하도록 대체 예정.)
+# 이 값이 그래프(wp_meta)에 없으면 디스패처가 옛 동작(첫 지점 예약 없이 직행)으로 폴백한다.
+PATROL_START_WAYPOINT_ID = _envi("ACS_PATROL_START_WAYPOINT_ID", 15)
