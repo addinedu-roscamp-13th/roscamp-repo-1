@@ -102,6 +102,26 @@ def test_find_path_none_unknown_node():
     assert e.find_path(1, 999) is None
 
 
+def test_find_path_prefers_shorter_distance_over_fewer_hops():
+    """Dijkstra 핵심: 홉 수가 많아도 '누적 거리'가 짧은 길을 고른다.
+
+    1→4 직행(통로20)은 1홉이지만 길이 10, 우회 1-2-3-4는 3홉이지만 길이 3.
+    옛 BFS(홉 최소)라면 직행을 골랐겠지만, length 비용을 쓰는 Dijkstra는 우회를 고른다.
+    """
+    wps = [1, 2, 3, 4]
+    cors = [
+        {"corridor_id": 20, "a": 1, "b": 4, "length": 10.0},  # 직행: 1홉, 멀다
+        {"corridor_id": 21, "a": 1, "b": 2, "length": 1.0},
+        {"corridor_id": 22, "a": 2, "b": 3, "length": 1.0},
+        {"corridor_id": 23, "a": 3, "b": 4, "length": 1.0},   # 우회: 3홉, 짧다
+    ]
+    e = RoutingEngine(wps, cors)
+    r = e.find_path(1, 4)
+    assert r.nodes == (1, 2, 3, 4)        # 홉 많아도 거리 짧은 우회를 선택
+    assert r.corridors == (21, 22, 23)
+    assert 20 not in r.corridors          # 길이 10짜리 직행은 버림
+
+
 # ------------------------------ 통로 예약 ------------------------------ #
 def test_reserve_and_block_second_robot():
     e = _engine()
@@ -166,3 +186,103 @@ def test_reap_expired_releases_dead_holds():
     reaped = e.reap_expired()
     assert set(reaped) == {10, 11}
     assert e.holder_of(10) is None and e.holder_of(11) is None
+
+
+# ------------------------------ 데드락(대기 사이클) 회피 ------------------------------ #
+def test_would_deadlock_two_robot_cycle():
+    # A가 10을 쥐고 11을 기다리고, B가 11을 쥐고 10을 기다리면 서로 물림 → 사이클.
+    e = _engine()
+    e.try_reserve(10, "dg_01")          # A 보유 10
+    e.try_reserve(11, "dg_02")          # B 보유 11
+    e.begin_wait("dg_02", 10)           # B는 10(=A 보유)을 기다리는 중
+    # 이제 A가 11(=B 보유)을 기다리려 함 → A→B→A 사이클
+    assert e.would_deadlock("dg_01", 11) is True
+
+
+def test_would_deadlock_safe_when_holder_not_waiting():
+    # B가 11을 쥐었지만 아무것도 안 기다림 → A가 11을 기다려도 언젠가 풀린다.
+    e = _engine()
+    e.try_reserve(10, "dg_01")
+    e.try_reserve(11, "dg_02")          # B는 대기 안 함
+    assert e.would_deadlock("dg_01", 11) is False
+
+
+def test_would_deadlock_free_corridor_is_safe():
+    e = _engine()
+    e.try_reserve(10, "dg_01")
+    assert e.would_deadlock("dg_01", 12) is False   # 12는 아무도 안 쥠
+
+
+def test_would_deadlock_three_robot_cycle():
+    # A→(11)B→(12)C→(10)A 로 원을 이룸.
+    e = _engine()
+    e.try_reserve(10, "dg_01"); e.begin_wait("dg_01", 11)
+    e.try_reserve(11, "dg_02"); e.begin_wait("dg_02", 12)
+    e.try_reserve(12, "dg_03")          # C가 10을 기다리려 하면 원이 닫힌다
+    assert e.would_deadlock("dg_03", 10) is True
+
+
+def test_would_deadlock_three_robot_no_cycle():
+    # 사슬: 10→A(11대기)→B. 그런데 B는 안 기다림 → 안전.
+    e = _engine()
+    e.try_reserve(10, "dg_01"); e.begin_wait("dg_01", 11)
+    e.try_reserve(11, "dg_02")          # B는 대기 안 함(사슬이 여기서 끊김)
+    assert e.would_deadlock("dg_03", 10) is False
+
+
+def test_end_wait_breaks_cycle():
+    # 사이클 상황을 만든 뒤, 한 로봇이 대기를 풀면 사이클이 사라진다.
+    e = _engine()
+    e.try_reserve(10, "dg_01")
+    e.try_reserve(11, "dg_02")
+    e.begin_wait("dg_02", 10)
+    assert e.would_deadlock("dg_01", 11) is True
+    e.end_wait("dg_02")                 # B가 대기를 포기 → 화살표 제거
+    assert e.would_deadlock("dg_01", 11) is False
+
+
+# ---------------- 확인+획득+대기검사 원자 처리 (reserve_or_wait) ---------------- #
+def test_reserve_or_wait_takes_free_corridor():
+    e = _engine()
+    assert e.reserve_or_wait(10, "dg_01") == "reserved"
+    assert e.holder_of(10) == "dg_01"
+
+
+def test_reserve_or_wait_own_is_reserved():
+    e = _engine()
+    e.try_reserve(10, "dg_01")
+    assert e.reserve_or_wait(10, "dg_01") == "reserved"     # 내 것 재획득(멱등)
+
+
+def test_reserve_or_wait_waits_when_held_no_cycle():
+    e = _engine()
+    e.try_reserve(10, "dg_01")                 # A 보유. A는 아무것도 안 기다림
+    assert e.reserve_or_wait(10, "dg_02") == "waiting"      # B는 안전하게 대기
+
+
+def test_reserve_or_wait_detects_deadlock():
+    e = _engine()
+    e.try_reserve(10, "dg_01")                 # A 보유 10
+    e.try_reserve(11, "dg_02")                 # B 보유 11
+    assert e.reserve_or_wait(10, "dg_02") == "waiting"      # B가 10 대기(등록)
+    # 이제 A가 11(=B 보유)을 원함 → A→B→A 사이클 → 거절
+    assert e.reserve_or_wait(11, "dg_01") == "deadlock"
+
+
+def test_reserve_or_wait_reclaims_expired():
+    clk = FakeClock()
+    e = _engine(ttl=15.0, clock=clk)
+    e.try_reserve(10, "dg_01")
+    clk.advance(20.0)                          # TTL 초과 → 죽은 예약
+    assert e.reserve_or_wait(10, "dg_02") == "reserved"
+    assert e.holder_of(10) == "dg_02"
+
+
+def test_reserve_or_wait_reserved_clears_prior_wait():
+    e = _engine()
+    e.try_reserve(10, "dg_01")
+    assert e.reserve_or_wait(10, "dg_02") == "waiting"      # B 대기 등록
+    e.release(10, "dg_01")                     # A가 놓음
+    assert e.reserve_or_wait(10, "dg_02") == "reserved"     # B가 잡음
+    # 잡은 뒤 B의 대기가 지워져 있어야 대기 그래프가 오염되지 않는다
+    assert e.would_deadlock("dg_03", 10) is False          # 10=B보유, B는 이제 대기 안 함
