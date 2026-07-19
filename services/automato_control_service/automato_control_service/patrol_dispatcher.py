@@ -173,12 +173,36 @@ class PatrolDispatcher:
                     held.extend(seg[1])             # 새로 잡은 통로 = 점유 목록에 추가
                 seg_wps, seg_cids = seg
                 seg = None
-                reached = (seg_wps[-1] == target)   # 세그먼트 끝이 목표면 마지막에 촬영
+                seg_start = current                # 이 세그먼트 진입 노드(피드백 판정 기준)
+                reached = (seg_wps[-1] == target)  # 세그먼트 끝이 목표면 마지막에 촬영
 
-                # 2) 룩어헤드 훅: 주행 중 매 틱 다음 구간을 '대기 없이' 미리 예약.
+                # 2) 주행 중 훅 2개: 조기 반납(피드백) + 룩어헤드(다음 구간 선예약).
                 look = {"seg": None}
+                fb = {"wp": None}                  # 피드백이 적어두는 '최근 도달 노드'
+                fb_lock = threading.Lock()
 
-                def on_tick(look=look, seg_end=seg_wps[-1]):
+                def on_feedback(wp_id, fb=fb, fb_lock=fb_lock):
+                    """ROS executor 스레드 — 값만 기록(예약은 절대 안 건드림)."""
+                    with fb_lock:
+                        fb["wp"] = wp_id
+
+                def on_tick(look=look, fb=fb, fb_lock=fb_lock, seg_end=seg_wps[-1],
+                            seg_start=seg_start, seg_wps=seg_wps, seg_cids=seg_cids):
+                    # (a) 조기 반납: 지나온 게 확실한 통로를 세그먼트 끝까지 안 기다리고 반납.
+                    #     held 변경은 이 디스패치 스레드에서만 일어난다(락 불필요).
+                    with fb_lock:
+                        reached_wp = fb["wp"]
+                    if reached_wp is not None:
+                        freed = [c for c in self._passed_corridors(
+                            seg_start, seg_wps, seg_cids, reached_wp) if c in held]
+                        for cid in freed:
+                            engine.release(cid, robot_id)
+                            held.remove(cid)
+                        if freed:
+                            self._log.info(
+                                f"조기 반납 task={task_id} 로봇 위치 {reached_wp} "
+                                f"→ 통로 {freed} 해제")
+                    # (b) 룩어헤드: 다음 구간을 대기 없이 미리 예약.
                     if look["seg"] is None:
                         look["seg"] = self._try_reserve_ahead(
                             engine, robot_id, seg_end, target,
@@ -191,7 +215,8 @@ class PatrolDispatcher:
                 # 3) 세그먼트 배열 하달. 하트비트엔 live held 를 넘겨 룩어헤드분도 함께 유지.
                 code, last_wp = self._dispatch_segment(
                     client, task_id, seg_wps, capture_on_last=reached,
-                    heartbeat=(engine, held, robot_id), on_tick=on_tick)
+                    heartbeat=(engine, held, robot_id), on_tick=on_tick,
+                    on_feedback=on_feedback)
 
                 # 4) 결과 처리 = 선획득 후해제.
                 if code == 2:
@@ -243,6 +268,25 @@ class PatrolDispatcher:
         blocked = seg_cids[j] if j < len(seg_cids) else None    # path[j]->path[j+1] 통로
         standing = seg_cids[j - 1] if j >= 1 else seg_cids[0]   # 마지막으로 점유한 통로
         return path[j], blocked, standing
+
+    @staticmethod
+    def _passed_corridors(seg_start, seg_wps, seg_cids, reached_wp):
+        """주행 중 피드백의 '도달 노드' 기준으로 확실히 벗어난 통로 목록을 돌려준다.
+
+        세그먼트 경로:  seg_start -[seg_cids[0]]-> seg_wps[0] -[seg_cids[1]]-> seg_wps[1] ...
+        로봇이 reached_wp(=path[j]) 에 있으면 방금 지나온 seg_cids[j-1] 이 '서 있는 통로'다.
+        로봇에 길이가 있어 노드 도달 순간엔 아직 그 통로에 걸쳐 있을 수 있으므로 서 있는
+        통로는 남기고, 그보다 뒤쪽(seg_cids[0..j-2])만 '확실히 벗어남'으로 보아 반납한다.
+        (_segment_progress 와 동일한 판정 기준 — 그쪽은 Result 시점, 이쪽은 피드백 시점.)
+
+        모르는 노드/시작 지점이면 빈 목록 → 아무것도 반납하지 않는다(안전한 쪽으로 실패).
+        """
+        path = [seg_start] + list(seg_wps)
+        try:
+            j = path.index(reached_wp)
+        except ValueError:
+            return []                           # 알 수 없는 노드 → 반납 안 함
+        return list(seg_cids[:max(0, j - 1)])   # 서 있는 통로(j-1)보다 뒤쪽만
 
     @staticmethod
     def _release_except(engine, robot_id, held, keep):
@@ -337,7 +381,8 @@ class PatrolDispatcher:
 
     # ---------------------------- 세그먼트 하달 ---------------------------- #
     def _dispatch_segment(self, client, task_id, waypoint_ids,
-                          capture_on_last, heartbeat=None, on_tick=None):
+                          capture_on_last, heartbeat=None, on_tick=None,
+                          on_feedback=None):
         """확보된 세그먼트(연속 waypoint 목록)를 Navigate Goal(Waypoint[] 배열)로 한 번에 하달.
 
         waypoint_ids: [세그먼트 첫 노드 ... 끝 노드] — 예약을 확보한 통로들을 지나는 경로.
@@ -345,6 +390,9 @@ class PatrolDispatcher:
                          (도착·정지 후 촬영). 중간 노드는 통과만 하므로 전부 capture=False.
         heartbeat=(engine, [cid...], robot_id): 결과 대기 중 세그먼트의 모든 통로 예약을 갱신.
         on_tick: 결과 대기 중 하트비트 틱마다 호출되는 콜백(룩어헤드 = 다음 구간 선예약용).
+        on_feedback: Navigate Feedback 의 current_waypoint_id 를 받는 콜백(조기 반납용).
+                     ⚠️ ROS executor 스레드에서 실행되므로 '값 전달'만 하고, 예약 반납 같은
+                     공유 상태 변경은 디스패치 스레드(on_tick)에서 해야 한다.
         반환: (result_code, last_waypoint_id). result_code 0 성공/1 실패·막힘/2 중단.
         """
         wps = []
@@ -362,8 +410,17 @@ class PatrolDispatcher:
         goal.task_id = int(task_id)
         goal.waypoints = wps
 
+        def _fb(msg):
+            """ROS executor 스레드에서 실행 — 도달 노드만 꺼내 호출부에 넘긴다."""
+            try:
+                on_feedback(int(msg.feedback.current_waypoint_id))
+            except Exception as exc:  # noqa: BLE001
+                self._log.warn(f"피드백 처리 예외(무시): {exc}")
+
         goal_handle = _spin_wait(
-            client.send_goal_async(goal), GOAL_ACCEPT_TIMEOUT_SEC)
+            client.send_goal_async(
+                goal, feedback_callback=(_fb if on_feedback is not None else None)),
+            GOAL_ACCEPT_TIMEOUT_SEC)
         if goal_handle is None or not goal_handle.accepted:
             self._log.warn(
                 f"Goal 거부/수락 타임아웃 task={task_id} waypoints={waypoint_ids}")
