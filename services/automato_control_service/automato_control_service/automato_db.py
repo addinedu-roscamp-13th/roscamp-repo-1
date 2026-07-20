@@ -210,11 +210,17 @@ _UPDATE_INPROGRESS = (
 # RP-88: 경로는 휘발성(실행 중 재계획)이라 task_paths 에 저장하지 않고,
 # 순찰점(is_patrol_point)을 patrol_order 순으로 매번 직접 조회한다.
 # point_index 는 0부터 '연속' 재부여(ROW_NUMBER-1) — patrol_order 에 구멍이 있어도 촘촘히.
+#
+# ⚠️ pair_waypoint_id IS NULL 이 이 쿼리의 핵심이다.
+#   짝(pair) 지점은 '같은 자리에서 방향만 다른 촬영 전용 행'이라 corridors 에 등장하지 않는다.
+#   is_patrol_point 만으로 거르면 짝이 독립 순찰 지점으로 잡히는데, 통로가 없으니 경로 탐색이
+#   실패해 그 지점 촬영이 통째로 건너뛰어진다. 짝은 디스패처가 부모 도착 직후에 끼워 넣는다.
 _SELECT_PATROL_WAYPOINTS = (
     "SELECT ROW_NUMBER() OVER (ORDER BY patrol_order) - 1 AS point_index, "
     "       waypoint_id, x_coord, y_coord "
     "  FROM waypoints "
     " WHERE is_patrol_point = TRUE "
+    "   AND pair_waypoint_id IS NULL "
     " ORDER BY patrol_order"
 )
 
@@ -294,21 +300,28 @@ def load_graph(pool: ConnectionPool) -> dict:
     """토폴로지 그래프(노드=waypoints, 간선=corridors)를 읽어온다.
 
     반환:
-      waypoints: [{"waypoint_id","x","y","yaw","is_patrol_point"}, ...]
-                  (하달 Waypoint 용. yaw=지점 방향(rad, 비순찰점은 None),
-                   is_patrol_point → Waypoint.capture 판정에 사용)
+      waypoints: [{"waypoint_id","x","y","yaw","is_patrol_point","pair_of"}, ...]
+                  (하달 Waypoint 용. yaw=지점 방향(rad, 통로 경유점은 None),
+                   is_patrol_point → Waypoint.capture 판정에 사용,
+                   pair_of=이 행이 짝이면 부모 waypoint_id, 아니면 None)
       corridors: [{"corridor_id","a","b","length"}, ...]  (무방향 간선; a<b 관례.
                   length = 간선 비용(두 waypoint 유클리드 거리, m). Dijkstra 가 사용)
 
     RoutingEngine 은 이 두 리스트만으로 그래프를 구성한다(엔진은 DB를 모른다).
     corridors 가 비어 있으면(시드 미보강) 순찰 이동이 모두 skip 될 수 있다.
+
+    짝 관계(pair_of)는 사실상 정적이라 기동 시 이 한 번의 조회로 메모리에 올린다
+    (Goal 을 만들 때마다 조회하면 경로 길이만큼 DB 왕복이 생긴다).
+    → DB 에서 짝 관계를 고치면 ACS 재기동이 필요하다.
     """
     with pool.connection() as conn:
         waypoints = [
             {"waypoint_id": r["waypoint_id"], "x": r["x_coord"], "y": r["y_coord"],
-             "yaw": r["yaw_coord"], "is_patrol_point": r["is_patrol_point"]}
+             "yaw": r["yaw_coord"], "is_patrol_point": r["is_patrol_point"],
+             "pair_of": r["pair_waypoint_id"]}
             for r in conn.execute(
-                "SELECT waypoint_id, x_coord, y_coord, yaw_coord, is_patrol_point "
+                "SELECT waypoint_id, x_coord, y_coord, yaw_coord, is_patrol_point, "
+                "       pair_waypoint_id "
                 "FROM waypoints"
             ).fetchall()
         ]
@@ -321,3 +334,32 @@ def load_graph(pool: ConnectionPool) -> dict:
             ).fetchall()
         ]
     return {"waypoints": waypoints, "corridors": corridors}
+
+
+# --------------------------------------------------------------------------- #
+# 순찰 시작 노드 — 로봇 전용 충전소의 '진입 노드'
+# --------------------------------------------------------------------------- #
+# 순찰은 항상 로봇이 자기 충전소에 도킹해 있는 상태에서 시작한다. 라우터는 waypoint_id
+# 로만 경로를 계산하므로, '그 로봇이 지금 서 있는 노드'가 어디인지 알아야 첫 구간부터
+# 통로를 예약하며 움직일 수 있다.
+#   robots.charge_point_id → task_points.task_point_id → task_points.waypoint_id
+# 예전에는 이 FK 사슬이 없어 전역 상수(ACS_PATROL_START_WAYPOINT_ID)로 한 점을 찍어
+# 뒀지만, 이제 로봇마다 다른 충전소(dg_01→22, dg_02→23, dg_03→24)를 유도할 수 있다.
+_SELECT_PATROL_START_WAYPOINT = (
+    "SELECT t.waypoint_id "
+    "  FROM robots r "
+    "  JOIN task_points t ON t.task_point_id = r.charge_point_id "
+    " WHERE r.robot_id = %s"
+)
+
+
+def get_patrol_start_waypoint(pool: ConnectionPool, robot_id: str):
+    """robot_id 의 전용 충전소 진입 노드(waypoint_id)를 돌려준다. 없으면 None.
+
+    None 이 나오는 경우: 그런 로봇이 없거나, charge_point_id 가 비어 있음.
+    호출부(patrol_node)는 None 이면 설정 상수 PATROL_START_WAYPOINT_ID 로 폴백한다
+    — 충전소가 아직 등록되지 않은 로봇 때문에 순찰 전체가 막히지는 않게 한다.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(_SELECT_PATROL_START_WAYPOINT, (robot_id,)).fetchone()
+    return row["waypoint_id"] if row else None

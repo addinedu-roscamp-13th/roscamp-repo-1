@@ -13,8 +13,15 @@ ERD v33(시나리오 2 설계) 반영 — RP-88:
   - aruco_markers 테이블 신설. 정밀 도킹용 ArUco 마커/도킹 오프셋(task_points 1:1).
   - robots.charge_point_id (FK -> task_points, NULLABLE) 추가. 로봇별 전용 충전소.
   - task_points.point_type (ENUM HARVEST/PRECOOL/CHARGE) 추가. 작업 위치 종류.
+  - task_points 의 좌표(x/y/yaw) -> waypoint_id (FK -> waypoints, UNIQUE) 로 교체.
+    작업 지점의 위치를 좌표로 중복 보관하지 않고 '진입 노드'로 가리킨다.
   - harvest_batches.failed_count / exit_reason 추가. 수확 성공률·종료 사유.
   - tasks.status 값을 DONE/PARTIAL -> COMPLETED/COMPLETED_PARTIAL 로 문서와 일치시킴.
+ERD 후속 반영 — 촬영 짝(pair) 지점:
+  - waypoints.pair_waypoint_id (자기참조 FK, NULLABLE) 추가. 같은 위치에서 촬영 방향(yaw)만
+    다른 '짝' 지점을 표현한다. 카메라가 로봇 한쪽에 고정돼 통로를 한 번 지나면 한쪽 베드만
+    찍히므로, 같은 자리에서 180° 돌려 한 번 더 촬영한다. 값이 있는 행 = 짝(경로 탐색 대상
+    아님, corridors 에 등장하지 않음), NULL = 그래프에 포함되는 독립 지점.
 이전(v27)부터 이미 반영된 것:
   - tasks.status 다상태화, detection_logs.disease_image_path (VARCHAR(255)),
   - corridors 테이블(waypoint 간 무방향 간선, a<b CHECK + UNIQUE),
@@ -83,14 +90,22 @@ def upgrade() -> None:
     op.execute(
         """
         CREATE TABLE waypoints (
-            waypoint_id     INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            x_coord         DOUBLE PRECISION NOT NULL,
-            y_coord         DOUBLE PRECISION NOT NULL,
-            yaw_coord       DOUBLE PRECISION,
-            is_patrol_point BOOLEAN NOT NULL DEFAULT FALSE,
-            patrol_order    INTEGER,
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-            updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+            waypoint_id      INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            x_coord          DOUBLE PRECISION NOT NULL,
+            y_coord          DOUBLE PRECISION NOT NULL,
+            yaw_coord        DOUBLE PRECISION,
+            is_patrol_point  BOOLEAN NOT NULL DEFAULT FALSE,
+            -- 같은 위치에서 촬영 방향만 다른 '짝' 지점의 부모를 가리키는 자기참조.
+            -- NULL 이면 경로 탐색 그래프에 포함되는 독립 지점, 값이 있으면 추가 촬영 전용 행.
+            -- FK 를 거는 이유: 부모를 지웠을 때 짝이 없는 id 를 가리키는 고아 행이 되는 걸
+            -- DB 가 막아준다. ON DELETE CASCADE 는 일부러 안 건다 — 순찰 지점 하나를 실수로
+            -- 지웠을 때 두 행이 조용히 사라지면 미촬영 구간이 소리 없이 생긴다.
+            pair_waypoint_id INTEGER REFERENCES waypoints(waypoint_id),
+            patrol_order     INTEGER,
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+            -- 자기 자신을 짝으로 가리키는 행 차단(ERD 명시 제약).
+            CONSTRAINT chk_pair_not_self CHECK (pair_waypoint_id <> waypoint_id)
         );
         """
     )
@@ -100,9 +115,12 @@ def upgrade() -> None:
             task_point_id VARCHAR(50) PRIMARY KEY,
             point_type    VARCHAR(20) NOT NULL
                           CHECK (point_type IN ('HARVEST','PRECOOL','CHARGE')),
-            x_coord       DOUBLE PRECISION NOT NULL,
-            y_coord       DOUBLE PRECISION NOT NULL,
-            yaw_coord     DOUBLE PRECISION NOT NULL,
+            -- 이 작업 지점에 접근하기 위한 '진입 노드'. 좌표를 여기에 또 적지 않고
+            -- waypoints 를 가리킨다 — 같은 위치가 두 테이블에 따로 적히면 지도를 고칠 때
+            -- 한쪽만 바뀌어 소리 없이 어긋난다(단일 진실 공급원).
+            -- ACS 는 이 노드를 목적지로 경로를 계산하고, 도착 후 Dock 액션으로 전환한다.
+            -- UNIQUE: 진입 노드 하나를 두 작업 지점이 나눠 쓰지 않는다(1:1).
+            waypoint_id   INTEGER NOT NULL UNIQUE REFERENCES waypoints(waypoint_id),
             created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
         );
