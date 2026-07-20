@@ -82,13 +82,13 @@ def test_battery_too_low():
 def test_telemetry_stale_by_old_stamp():
     j = judge_robot("dg_01", _entry(stamp=NOW - 5.0), has_active_task=False,
                     threshold=THRESHOLD, now=NOW)
-    assert j["unavailable_reason"] == "TELEMETRY_STALE"
+    assert j["unavailable_reason"] == "ROBOT_OFFLINE"
 
 
 def test_telemetry_stale_when_never_received():
     j = judge_robot("dg_01", None, has_active_task=False,
                     threshold=THRESHOLD, now=NOW)
-    assert j["unavailable_reason"] == "TELEMETRY_STALE"
+    assert j["unavailable_reason"] == "ROBOT_OFFLINE"
     assert j["status"] is None
     assert j["current_position"] is None
 
@@ -102,11 +102,11 @@ def test_active_task_takes_precedence_over_battery():
 
 
 def test_stale_takes_precedence_over_nav_and_battery():
-    # stale 이면 캐시값(nav/battery)을 못 믿으므로 STALE 이 우선
+    # 미수신이면 캐시값(nav/battery)을 못 믿으므로 ROBOT_OFFLINE 이 우선
     j = judge_robot("dg_01", _entry(nav_status="NAVIGATING", battery=10.0,
                                     stamp=NOW - 9.0),
                     has_active_task=False, threshold=THRESHOLD, now=NOW)
-    assert j["unavailable_reason"] == "TELEMETRY_STALE"
+    assert j["unavailable_reason"] == "ROBOT_OFFLINE"
 
 
 # --------------------------- auto 선정 --------------------------- #

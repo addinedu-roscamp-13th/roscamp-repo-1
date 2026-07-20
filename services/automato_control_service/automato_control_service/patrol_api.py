@@ -27,7 +27,9 @@ from pydantic import BaseModel
 
 from automato_control_service import automato_db
 
-# 텔레메트리가 이 시간(초)보다 오래되면 stale 로 본다(ddago header.stamp 기준).
+# 텔레메트리가 이 시간(초)보다 오래되면 '미수신'으로 본다(ddago header.stamp 기준).
+# 이 상태의 대외 사유명은 ROBOT_OFFLINE — 시나리오1 문서 E0 5)의 enum 을 따른다
+# (같은 ACS 의 telemetry_ws 방송도 동일 이름을 쓴다).
 STALE_SEC = 3.0
 
 
@@ -63,9 +65,9 @@ def judge_robot(robot_id: str, entry: Optional[dict], has_active_task: bool,
     반환 예: {"robot_id","status","battery_percent","current_position","available"[,"unavailable_reason"]}
 
     사유 우선순위(여럿 겹칠 때):
-      활성 task > 텔레메트리 없음/stale > nav!=IDLE > 배터리 부족
-    (활성 task는 DB 사실이라 캐시 신선도와 무관하게 최우선. stale이면 캐시값을 못 믿으므로
-     nav/battery보다 먼저 STALE로 처리.)
+      활성 task > 텔레메트리 없음/오래됨 > nav!=IDLE > 배터리 부족
+    (활성 task는 DB 사실이라 캐시 신선도와 무관하게 최우선. 미수신이면 캐시값을 못 믿으므로
+     nav/battery보다 먼저 ROBOT_OFFLINE으로 처리.)
     """
     ddago = entry.get("ddago") if entry else None
     status = ddago["nav_status"] if ddago else None
@@ -76,12 +78,12 @@ def judge_robot(robot_id: str, entry: Optional[dict], has_active_task: bool,
     if has_active_task:
         reason = "ROBOT_BUSY"
     elif ddago is None:
-        reason = "TELEMETRY_STALE"          # 한 번도 수신 못 함
+        reason = "ROBOT_OFFLINE"            # 한 번도 수신 못 함
     else:
         stamp = entry.get("ddago_stamp")
         age = (now - stamp) if stamp is not None else None
         if age is None or age > stale_sec:
-            reason = "TELEMETRY_STALE"
+            reason = "ROBOT_OFFLINE"        # stale_sec 초 이상 미수신
         elif status != "IDLE":
             reason = "ROBOT_BUSY"
         elif battery is None or battery < threshold:

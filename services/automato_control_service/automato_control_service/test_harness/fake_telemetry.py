@@ -18,13 +18,13 @@
      * 여러 가짜 로봇이 이 '한 토픽'에 함께 발행하고(다중 발행자 정상), 구분은
        msg.robot_id(payload)로 한다 → fleet_aggregator 가 robot_id 로 키잉해 취합.
      * header.stamp 를 매번 '지금'(시스템 시각)으로 찍는다 → 계속 신선.
-       멈추면(Ctrl+C) 3초 뒤 ACS 에서 자연히 TELEMETRY_STALE 로 뜬다.
+       멈추면(Ctrl+C) 3초 뒤 ACS 에서 자연히 ROBOT_OFFLINE 으로 뜬다.
    값(배터리·상태·좌표 등)은 파라미터로 주고 매 틱마다 다시 읽어 발행하므로, 실행 중에
    `ros2 param set` 으로 바꾸면 '즉시' 반영된다(재시작 불필요). 이게 T2/T3 재현의 핵심:
      * 저배터리 → BATTERY_TOO_LOW :  ros2 param set /dg_02/fake_telemetry battery_percent 65.0
      * 주행중  → ROBOT_BUSY       :  ros2 param set /dg_02/fake_telemetry nav_status NAVIGATING
      * 다시 가용                  :  ros2 param set /dg_02/fake_telemetry nav_status IDLE
-     * 미수신  → TELEMETRY_STALE  :  이 노드를 Ctrl+C 로 멈춤
+     * 미수신  → ROBOT_OFFLINE    :  이 노드를 Ctrl+C 로 멈춤
 
 실행 (🖥️ 관제 PC, ROS + automato_interfaces 소싱 후) — 가짜 로봇 1대당 하나씩:
    # robot_id 는 네임스페이스(-r __ns:=/dg_02)에서 자동 유도된다(생략 가능).
