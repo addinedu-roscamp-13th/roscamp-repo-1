@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ACS 교통관제 검증</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>ACS 교통관제 검증</h1>
+    <span class="sub" id="graph-summary">맵 불러오는 중…</span>
+    <!-- 데이터 출처 전환. 맵도 렌더 코드도 그대로고, 상태가 어디서 오는지만 바뀐다.
+         SIM  = 이 프로세스 안의 RoutingEngine + 가짜 로봇 (조작 가능)
+         LIVE = 실물 ACS(8200)의 예약표를 폴링해 보여주기만 함 (관측 전용) -->
+    <span class="modeswitch" id="modeswitch">
+      <button id="mode-sim" class="on">SIM</button><button id="mode-live">LIVE</button>
+    </span>
+  </header>
+
+  <main class="layout">
+    <section>
+      <!-- 조작 막대: 여기서 순찰을 걸면 '진짜' PatrolDispatcher 가 돈다 -->
+      <div class="controls" id="controls">
+        <!-- 순찰은 전역 1건만 — 실제 DB 제약(ux_tasks_single_active_patrol)과 같은 정책 -->
+        <span class="ctl-label">순찰</span>
+        <span id="patrol-buttons"></span>
+        <span class="sep"></span>
+        <!-- 이동 지시는 제한 없음 (수확·이송처럼 순찰과 별개인 작업에 해당) -->
+        <span class="ctl-label">이동</span>
+        <select id="sel-robot" title="이동시킬 로봇"></select>
+        <span class="sep"></span>
+        <button id="btn-deadlock">데드락 시나리오</button>
+        <button id="btn-reset" class="ghost">초기화</button>
+        <span class="conn" id="conn">연결 중…</span>
+      </div>
+      <p class="ctl-hint" id="ctl-hint">
+        <b>노드 클릭</b> → 선택한 로봇을 그곳으로 이동 ·
+        <b>통로 클릭</b> → 막기/해제(로봇이 그 구간에서 막힘을 보고해 우회한다)
+      </p>
+      <!-- 맵: SVG 는 app.js 가 채운다. viewBox 도 방 크기에 맞춰 그때 정한다. -->
+      <div class="map-pane">
+        <svg id="map" role="img" aria-label="온실 맵 — 순찰 노드와 통로"></svg>
+      </div>
+    </section>
+
+    <aside class="side-pane">
+      <section class="panel">
+        <h2>로봇</h2>
+        <ul class="robots" id="robot-list"><li class="hint">대기 중…</li></ul>
+      </section>
+
+      <section class="panel">
+        <h2>이벤트 <span class="hint" id="event-count"></span></h2>
+        <!-- 디스패처가 남기는 판단 로그를 그대로 흘린다.
+             맵의 색 변화와 '왜 그렇게 했는지'가 여기서 짝지어진다. -->
+        <div class="events" id="events"></div>
+      </section>
+
+      <section class="panel">
+        <h2>범례</h2>
+        <!-- 색만으로 상태를 구분하지 않는다: 굵기·점선·라벨을 함께 쓴다.
+             (적록색맹에서 '막힘 빨강'과 '로봇2 초록'이 구분되지 않기 때문) -->
+        <ul class="legend">
+          <li><svg class="swatch" viewBox="0 0 24 8"><line class="lg-free" x1="1" y1="4" x2="23" y2="4"/></svg>통로 비어있음</li>
+          <li><svg class="swatch" viewBox="0 0 24 8"><line class="lg-r1" x1="1" y1="4" x2="23" y2="4"/></svg>로봇1 예약</li>
+          <li><svg class="swatch" viewBox="0 0 24 8"><line class="lg-r2" x1="1" y1="4" x2="23" y2="4"/></svg>로봇2 예약</li>
+          <li><svg class="swatch" viewBox="0 0 24 8"><line class="lg-r3" x1="1" y1="4" x2="23" y2="4"/></svg>로봇3 예약</li>
+          <li><svg class="swatch" viewBox="0 0 24 8"><line class="lg-avoid" x1="1" y1="4" x2="23" y2="4"/></svg>회피 중(블랙리스트)</li>
+          <li><svg class="swatch" viewBox="0 0 24 8"><line class="lg-blocked" x1="1" y1="4" x2="23" y2="4"/></svg>막힘</li>
+        </ul>
+        <ul class="legend">
+          <li><span class="dot patrol"></span>순찰점 (촬영 지점)</li>
+          <li><span class="dot via"></span>경유점</li>
+          <li><span class="dot facility"></span>시설 진입 노드</li>
+          <li><span class="dot start"></span>순찰 출발(전용 충전소)</li>
+          <li><span class="badge-ex">↻</span>짝 — 제자리 회전 재촬영</li>
+        </ul>
+      </section>
+
+      <section class="panel">
+        <h2>순찰 순서</h2>
+        <p class="hint" id="patrol-order">—</p>
+      </section>
+
+      <section class="panel">
+        <h2>로봇 출발 노드</h2>
+        <!-- robots.charge_point_id → task_points.waypoint_id 로 유도된 값.
+             예전엔 전역 상수 하나였는데 이제 로봇마다 자기 충전소에서 출발한다. -->
+        <p class="hint" id="robot-start">—</p>
+      </section>
+    </aside>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
