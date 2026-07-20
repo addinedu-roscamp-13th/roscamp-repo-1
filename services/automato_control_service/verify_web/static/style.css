@@ -1,0 +1,363 @@
+/* ACS 교통관제 검증 웹 — 색과 레이아웃.
+ *
+ * 색은 '역할(role)'로 정의하고 본문은 역할만 참조한다 → 라이트/다크 전환이 한 곳에서 끝난다.
+ * 팔레트는 검증된 기본 팔레트에서 가져왔고, 로봇 3색은 색맹 시뮬레이션 검증을 통과했다
+ * (all-pairs CVD ΔE 13.0 / normal 27.5, 라이트·다크 모두 PASS).
+ *
+ * 단, '막힘(빨강)'과 '로봇2(초록)'는 적록색맹에서 ΔE 5.9 로 구분되지 않는다.
+ * 그래서 통로 상태는 색 외에 굵기·점선을 반드시 함께 쓴다(secondary encoding).
+ */
+:root {
+  color-scheme: light;
+  --surface:        #fcfcfb;   /* 맵 바탕 */
+  --plane:          #f9f9f7;   /* 페이지 바탕 */
+  --ink:            #0b0b0b;
+  --ink-2:          #52514e;
+  --ink-muted:      #898781;
+  --hairline:       #e1e0d9;
+  --border:         rgba(11, 11, 11, .10);
+
+  --robot-1:        #2a78d6;   /* 파랑 */
+  --robot-2:        #008300;   /* 초록 */
+  --robot-3:        #e87ba4;   /* 마젠타 */
+
+  --corridor-free:  #c3c2b7;   /* 예약 없음 — 물러나는 회색 */
+  --status-avoid:   #fab219;   /* 블랙리스트(회피 중) */
+  --status-blocked: #d03b3b;   /* 막힘 */
+
+  --struct-fixed:   #eceae4;   /* 로봇팔 */
+  /* 방울토마토 베드. 열매는 붉지만 '막힘(굵은 점선)'과 형태가 완전히 달라 혼동되지 않는다
+     — 열매는 베드 사각형 안의 작은 원이고, 통로 위에는 절대 나타나지 않는다. */
+  --bed-soil:       #eff3ec;
+  --bed-leaf:       #cfe0c4;
+  --bed-edge:       #d5dfcd;
+  --tomato:         #e2503c;
+  --tomato-hi:      rgba(255, 255, 255, .55);
+
+  --fac-charge:     #e6eaf2;
+  --fac-harvest:    #f1ece1;
+  --fac-precool:    #e2eef0;
+
+  --order-bg:       #dedcd4;
+  --order-ink:      #45443f;
+  --pair-ink:       #6f6d66;
+  --hover-wash:     rgba(11, 11, 11, .07);
+}
+
+/* 다크 값은 두 스코프에 모두 선언한다:
+   media query 는 OS 설정을, data-theme 스코프는 명시적 토글(?theme=dark)을 담당하고
+   토글이 양방향으로 이겨야 한다(:not 가드로 light 스탬프가 OS-dark 를 이긴다). */
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --surface:        #1a1a19;
+    --plane:          #0d0d0d;
+    --ink:            #ffffff;
+    --ink-2:          #c3c2b7;
+    --ink-muted:      #898781;
+    --hairline:       #2c2c2a;
+    --border:         rgba(255, 255, 255, .10);
+
+    --robot-1:        #3987e5;
+    --robot-2:        #008300;
+    --robot-3:        #d55181;
+
+    --corridor-free:  #383835;
+    --struct-fixed:   #232322;
+    --bed-soil:       #1e231c;
+    --bed-leaf:       #2c3a28;
+    --bed-edge:       #2e352b;
+    --tomato:         #c8412f;
+    --tomato-hi:      rgba(255, 255, 255, .35);
+    --fac-charge:     #22252b;
+    --fac-harvest:    #262420;
+    --fac-precool:    #1f2628;
+    --order-bg:       #33322e;
+    --order-ink:      #c3c2b7;
+    --pair-ink:       #a8a69c;
+    --hover-wash:     rgba(255, 255, 255, .10);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface:        #1a1a19;
+  --plane:          #0d0d0d;
+  --ink:            #ffffff;
+  --ink-2:          #c3c2b7;
+  --ink-muted:      #898781;
+  --hairline:       #2c2c2a;
+  --border:         rgba(255, 255, 255, .10);
+
+  --robot-1:        #3987e5;
+  --robot-2:        #008300;
+  --robot-3:        #d55181;
+
+  --corridor-free:  #383835;
+  --struct-fixed:   #232322;
+  --bed-soil:       #1e231c;
+  --bed-leaf:       #2c3a28;
+  --bed-edge:       #2e352b;
+  --tomato:         #c8412f;
+  --tomato-hi:      rgba(255, 255, 255, .35);
+  --fac-charge:     #22252b;
+  --fac-harvest:    #262420;
+  --fac-precool:    #1f2628;
+  --order-bg:       #33322e;
+  --order-ink:      #c3c2b7;
+  --pair-ink:       #a8a69c;
+  --hover-wash:     rgba(255, 255, 255, .10);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--plane);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.topbar h1 { margin: 0; font-size: 15px; font-weight: 600; }
+.topbar .sub { color: var(--ink-2); font-size: 13px; }
+
+/* SIM / LIVE 전환 — 붙어 있는 두 칸 중 하나가 눌려 있는 형태(세그먼트 컨트롤).
+   지금 보고 있는 게 시뮬인지 실물인지를 한눈에 알아야 해서 오른쪽 끝에 고정한다. */
+.modeswitch { margin-left: auto; display: inline-flex; align-self: center; }
+.modeswitch button {
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: .06em;
+  padding: 3px 10px;
+  background: var(--surface);
+  color: var(--ink-muted);
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+.modeswitch button:first-child { border-radius: 4px 0 0 4px; }
+.modeswitch button:last-child  { border-radius: 0 4px 4px 0; border-left: none; }
+.modeswitch button.on { background: var(--ink); color: var(--plane); border-color: var(--ink); }
+.modeswitch button:disabled { opacity: .4; cursor: not-allowed; }
+
+/* LIVE 인 동안 조작 막대가 '왜 안 눌리는지'가 보이게 통째로 흐려 둔다. */
+body.live .controls { opacity: .45; }
+body.live #map { cursor: default; }
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 240px;
+  gap: 16px;
+  padding: 16px;
+  align-items: start;
+}
+@media (max-width: 720px) {
+  .layout { grid-template-columns: minmax(0, 1fr); }
+}
+
+.map-pane {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+}
+/* 맵은 세로로 긴 비율(96×155)이라 폭에 맞추면 아래가 잘린다.
+   높이를 화면에 맞추고 폭은 비율대로 따라오게 해 전체가 한눈에 들어오게 한다. */
+#map {
+  display: block;
+  margin: 0 auto;
+  max-height: calc(100vh - 110px);
+  max-width: 100%;
+  height: auto;
+  width: auto;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+.panel h2 { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--ink-2); }
+.hint { margin: 0; color: var(--ink-2); font-size: 12px; line-height: 1.6; }
+
+.legend { list-style: none; margin: 0 0 10px; padding: 0; }
+.legend:last-child { margin-bottom: 0; }
+.legend li {
+  display: flex; align-items: center; gap: 8px;
+  padding: 3px 0; color: var(--ink-2); font-size: 12px;
+}
+.swatch { width: 24px; height: 8px; flex: none; }
+.swatch line { stroke-linecap: round; }
+
+/* 범례 선 — 맵의 통로 스타일과 정확히 같은 규칙(색+굵기+점선)을 쓴다 */
+.lg-free    { stroke: var(--corridor-free);  stroke-width: 1.5; }
+.lg-r1      { stroke: var(--robot-1);        stroke-width: 3.5; }
+.lg-r2      { stroke: var(--robot-2);        stroke-width: 3.5; }
+.lg-r3      { stroke: var(--robot-3);        stroke-width: 3.5; }
+.lg-avoid   { stroke: var(--status-avoid);   stroke-width: 2.5; stroke-dasharray: 3 2.5; }
+.lg-blocked { stroke: var(--status-blocked); stroke-width: 3.5; stroke-dasharray: 3 2.5; }
+
+.dot {
+  width: 11px; height: 11px; border-radius: 50%; flex: none;
+  border: 1.5px solid var(--ink-muted);
+}
+.dot.patrol   { background: var(--ink-2); border-color: var(--ink-2); }
+.dot.via      { background: var(--surface); }
+.dot.facility { background: var(--surface); border-color: var(--ink-2); }
+.dot.start    { background: var(--surface); border: 2.5px solid var(--ink); }
+.badge-ex {
+  width: 11px; flex: none; text-align: center;
+  color: var(--pair-ink); font-weight: 700;
+}
+
+/* ---------------- 맵(SVG) 안쪽 ---------------- */
+/* 구조물: 배경이므로 물러나게. 데이터(노드·통로)보다 튀면 안 된다. */
+.struct-bed   { fill: url(#bed-tomato); stroke: var(--bed-edge); stroke-width: .5; }
+.struct-arm   { fill: var(--struct-fixed); stroke: var(--hairline); stroke-width: .4; }
+.struct-label { fill: var(--ink-muted); font-size: 3.2px; text-anchor: middle; }
+.room-wall    { fill: none; stroke: var(--border); stroke-width: 1.2; }
+
+/* 방울토마토 베드 무늬 — 흙 → 잎 → 열매 → 하이라이트 순으로 겹친다 */
+.bed-soil  { fill: var(--bed-soil); }
+.bed-leaf  { fill: var(--bed-leaf); }
+.tomato    { fill: var(--tomato); }
+.tomato-hi { fill: var(--tomato-hi); }
+
+/* 시설(충전소·수확대·예냉실) — DB task_points 좌표에 그린다 */
+.facility          { stroke: var(--hairline); stroke-width: .4; }
+.facility-charge   { fill: var(--fac-charge); }
+.facility-harvest  { fill: var(--fac-harvest); }
+.facility-precool  { fill: var(--fac-precool); }
+.facility-name { fill: var(--ink-2); font-size: 3.0px; text-anchor: middle; font-weight: 600; }
+.facility-sub  { fill: var(--ink-muted); font-size: 2.5px; text-anchor: middle; }
+
+.corridor {
+  stroke: var(--corridor-free);
+  stroke-width: 1.0;
+  stroke-linecap: round;
+}
+.node-patrol   { fill: var(--ink-2); stroke: var(--surface); stroke-width: .5; }
+.node-via      { fill: var(--surface); stroke: var(--ink-muted); stroke-width: .6; }
+.node-facility { fill: var(--surface); stroke: var(--ink-2); stroke-width: .7; }
+.node-start    { fill: var(--surface); stroke: var(--ink); stroke-width: 1.2; }
+.node-id       { fill: var(--ink-2); font-size: 3.0px; text-anchor: middle; font-weight: 600; }
+
+/* 순찰 순번 배지 — 노드 왼쪽 아래에 붙는 작은 원 */
+.order-badge { fill: var(--order-bg); stroke: var(--surface); stroke-width: .4; }
+.order-text  { fill: var(--order-ink); font-size: 2.4px; text-anchor: middle; font-weight: 700; }
+
+/* 클릭 히트 영역 — 보이지 않지만 눌리는 범위를 넓혀 준다.
+   fill/stroke 를 none 으로 두면 클릭도 안 먹으므로 투명색을 쓴다. */
+.corridor-hit {
+  stroke: transparent; stroke-width: 4; cursor: pointer;
+}
+.corridor-hit:hover { stroke: var(--hover-wash); }
+.node-hit { fill: transparent; cursor: pointer; }
+.node-hit:hover { fill: var(--hover-wash); }
+
+/* ── 통로 실시간 상태 ── 색 + 굵기 + 점선을 함께 바꿔 색에만 의존하지 않는다 */
+.corridor.c-res            { stroke-width: 2.6; }
+.corridor.c-res.r1         { stroke: var(--robot-1); }
+.corridor.c-res.r2         { stroke: var(--robot-2); }
+.corridor.c-res.r3         { stroke: var(--robot-3); }
+.corridor.c-avoid          { stroke: var(--status-avoid); stroke-width: 1.8;
+                             stroke-dasharray: 2.6 2.2; }
+.corridor.c-blocked        { stroke: var(--status-blocked); stroke-width: 2.8;
+                             stroke-dasharray: 2.6 2.2; }
+
+/* ── 로봇 ── */
+.robot        { stroke: var(--surface); stroke-width: .8; }
+.robot.r1     { fill: var(--robot-1); }
+.robot.r2     { fill: var(--robot-2); }
+.robot.r3     { fill: var(--robot-3); }
+.robot.idle   { opacity: .45; }
+/* LIVE 미수신 — '마지막으로 본 자리'. 속을 비우고 점선 테두리로 바꿔
+   '지금 여기 있다고 확인된 게 아니다'를 색이 아닌 형태로 말한다. */
+.robot.stale  { fill: none; stroke-width: .7; stroke-dasharray: 1.4 1.1; opacity: .8; }
+.robot.stale.r1 { stroke: var(--robot-1); }
+.robot.stale.r2 { stroke: var(--robot-2); }
+.robot.stale.r3 { stroke: var(--robot-3); }
+.robot-label.stale { opacity: .5; font-weight: 500; }
+.robot-heading { stroke-width: 1.2; stroke-linecap: round; }
+.robot-heading.r1 { stroke: var(--robot-1); }
+.robot-heading.r2 { stroke: var(--robot-2); }
+.robot-heading.r3 { stroke: var(--robot-3); }
+.robot-spin   { fill: none; stroke-width: .9; stroke-dasharray: 2 1.6; }
+.robot-spin.r1 { stroke: var(--robot-1); }
+.robot-spin.r2 { stroke: var(--robot-2); }
+.robot-spin.r3 { stroke: var(--robot-3); }
+.robot-label  { font-size: 2.8px; text-anchor: middle; font-weight: 700; }
+.robot-label.r1 { fill: var(--robot-1); }
+.robot-label.r2 { fill: var(--robot-2); }
+.robot-label.r3 { fill: var(--robot-3); }
+
+/* ── 조작 막대 ── */
+.controls {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 10px; margin-bottom: 10px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+}
+.ctl-label { color: var(--ink-2); font-size: 12px; }
+#patrol-buttons { display: inline-flex; gap: 6px; }
+.controls button {
+  font: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer;
+  border-radius: 6px; border: 1px solid var(--border);
+  background: var(--plane); color: var(--ink);
+}
+.controls button:hover { border-color: var(--ink-muted); }
+.controls button.run.r1 { border-left: 3px solid var(--robot-1); }
+.controls button.run.r2 { border-left: 3px solid var(--robot-2); }
+.controls button.run.r3 { border-left: 3px solid var(--robot-3); }
+.controls .ghost { color: var(--ink-2); }
+.conn { margin-left: auto; font-size: 12px; color: var(--ink-muted); }
+.conn.ok  { color: var(--robot-2); }
+.conn.off { color: var(--status-blocked); }
+/* LIVE 전용: ACS 는 붙었지만 아직 예약표(엔진)가 없는 중간 상태 */
+.conn.warn { color: var(--status-avoid); }
+
+/* ── 로봇 목록 ── */
+.robots { list-style: none; margin: 0; padding: 0; }
+.robots li {
+  display: flex; align-items: center; gap: 7px;
+  padding: 3px 0; font-size: 12px; color: var(--ink-2);
+}
+.chip { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.chip.r1 { background: var(--robot-1); }
+.chip.r2 { background: var(--robot-2); }
+.chip.r3 { background: var(--robot-3); }
+.rstate { margin-left: auto; color: var(--ink-muted); font-size: 11px; }
+/* LIVE 에서 텔레메트리가 끊긴 로봇 — 맵에는 안 그려지므로 목록에서만 드러난다.
+   색만으로 구분하지 않도록 점(chip)까지 비워 테두리만 남긴다. */
+.robots li.offline { opacity: .5; }
+.robots li.offline .chip { background: transparent; box-shadow: inset 0 0 0 1.5px currentColor; }
+
+/* ── 이벤트 목록 ── */
+.events {
+  max-height: 240px; overflow-y: auto;
+  font-size: 11px; line-height: 1.5; color: var(--ink-2);
+}
+.events .ev { padding: 1px 0; border-bottom: 1px solid var(--hairline); }
+.events .ev.warn { color: var(--status-blocked); }
+
+/* 짝(제자리 회전 촬영) 배지 */
+.pair-badge { fill: var(--pair-ink); font-size: 2.7px; font-weight: 600; }
+
+.controls .sep { width: 1px; height: 16px; background: var(--border); }
+.controls select {
+  font: inherit; font-size: 12px; padding: 3px 6px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--plane); color: var(--ink);
+}
+.ctl-hint {
+  margin: 0 0 10px; padding: 0 2px;
+  font-size: 11px; color: var(--ink-muted);
+}
+.ctl-hint b { color: var(--ink-2); }

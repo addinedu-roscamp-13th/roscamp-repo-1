@@ -60,6 +60,16 @@ class TelemetryCache:
                 entry["ddagi_stamp"] = (
                     a.header.stamp.sec + a.header.stamp.nanosec * 1e-9)
 
+    def robot_ids(self) -> list:
+        """지금까지 한 번이라도 텔레메트리를 받은 robot_id 목록(정렬).
+
+        '어떤 로봇이 살아있나'를 밖에서 알려면 내부 dict 를 훑어야 하는데,
+        그걸 외부에 시키면 락 없이 순회하게 된다(RuntimeError: dict changed size).
+        그래서 목록 뽑기는 캐시가 직접 락 안에서 한다.
+        """
+        with self._lock:
+            return sorted(self._data.keys())
+
     def get(self, robot_id: str):
         """가용 판정용 얕은 복사본(없으면 None)."""
         with self._lock:

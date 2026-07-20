@@ -25,7 +25,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from automato_control_service import automato_db
+from automato_control_service import automato_db, traffic_debug
 
 # 텔레메트리가 이 시간(초)보다 오래되면 '미수신'으로 본다(ddago header.stamp 기준).
 # 이 상태의 대외 사유명은 ROBOT_OFFLINE — 시나리오1 문서 E0 5)의 enum 을 따른다
@@ -124,6 +124,10 @@ def create_app(node, pool) -> FastAPI:
     pool: psycopg_pool.ConnectionPool
     """
     app = FastAPI(title="Automato Control Service — Patrol (RP-78)")
+
+    # 교통관제 관측용 읽기 전용 라우트(GET /internal/v1/debug/traffic).
+    # 검증 화면(verify_web)의 LIVE 모드가 이걸 폴링한다. 순찰 판단 로직과 무관하다.
+    traffic_debug.register(app, node)
 
     def _judge_all(snap: dict, now: float) -> dict:
         """robot_id -> 판정 dict. available/접수 양쪽에서 재사용."""
