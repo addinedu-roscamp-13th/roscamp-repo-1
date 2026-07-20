@@ -87,6 +87,10 @@ ros2 run automato_control_service patrol_node
 **가용 판정(4조건 AND)**: ①활성 task 없음(DB) ②nav_status=='IDLE'(캐시) ③battery≥임계값(캐시)
 ④최근 3초 이내 수신(캐시, ddago header.stamp). `is_charging`은 판정에 쓰지 않는다(항상 false 고정).
 
+**`unavailable_reason`**(시나리오1 E0 5) enum 준수, 우선순위 순): `ROBOT_BUSY`(①위반) →
+`ROBOT_OFFLINE`(④위반) → `ROBOT_BUSY`(②위반) → `BATTERY_TOO_LOW`(③위반).
+`CHARGING`은 쓰지 않는다(`is_charging`이 항상 false 고정이라 판정 불가).
+
 **접수 성공(200)**: `{"task_id":1024,"assigned_robot_id":"dg_01","status":"ACCEPTED","message":"..."}`
 **접수 실패(409)**: `{"status":"REJECTED","reason":"NO_AVAILABLE_ROBOT"|"BATTERY_TOO_LOW"|...,"message":"..."}`
 
@@ -119,4 +123,34 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest test/test_routing_engine.py -v
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest test/test_fleet_relay.py -v
 # 탐지 저장/중계/알림 순서·게이트·실패정책(RP-79, ROS/DB 불필요 — 협력자 주입)
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest test/test_detection_service.py -v
+```
+
+### E2E 시뮬 (물리 로봇 없이 접수~주행 전체)
+
+가짜 스탠드인(fake_telemetry / patrol_bridge / fleet_aggregator)을 launch 하나로 띄운다.
+ACS 본체는 `.env` 자동 탐색과 로그 분리를 위해 별도 터미널에서 리포 안에서 띄운다.
+
+```bash
+# 터미널 1 — 스탠드인 일괄 (로봇 수·배터리·막힘 지점을 인자로 조절)
+ros2 launch automato_control_service patrol_e2e_sim.launch.py
+ros2 launch automato_control_service patrol_e2e_sim.launch.py \
+    robots:=dg_01,dg_02,dg_03 batteries:=90.0,65.0,80.0 fail_waypoint_ids:=14
+
+# 터미널 2 — ACS 본체 (리포 안에서)
+ros2 run automato_control_service patrol_node
+
+# 터미널 3 — 조회 / 접수
+curl -s localhost:8200/internal/v1/robots/patrol/available | jq
+curl -s -X POST localhost:8200/internal/v1/tasks/patrol \
+     -H 'Content-Type: application/json' \
+     -d '{"robot_selection":"auto","robot_id":null}' | jq
+```
+
+순찰은 **전역 1건**만 허용되므로(부분 유니크 인덱스 `ux_tasks_single_active_patrol`),
+로봇을 여러 대 띄워도 동시에 주행하는 건 1대다 → 통로 경합·데드락 회피는 이 경로로
+관측되지 않는다. 강제 종료로 `IN_PROGRESS`가 남으면 다음 접수가 409가 되니 정리한다:
+
+```bash
+docker exec automato-db psql -U robot8 -d automatodb -c \
+  "UPDATE tasks SET status='FAILED', ended_at=NOW() WHERE status IN ('WAITING','IN_PROGRESS');"
 ```

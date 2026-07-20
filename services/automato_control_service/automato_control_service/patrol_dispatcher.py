@@ -254,6 +254,14 @@ class PatrolDispatcher:
                     self._release_except(engine, robot_id, held, set(seg[1]))
                     self._log.info(
                         f"룩어헤드 연장 task={task_id} 위치 {current} 다음 통로={seg[1]}")
+                elif reached:                       # 세그먼트 끝 = 목표 → 정상 도착
+                    # 뒤처리(서 있는 통로만 남기고 반납)는 아래 '대기'와 같지만 의미가 다르다.
+                    # 둘을 같은 문구로 찍으면 정상 도착이 전부 '막혀서 대기'로 보여, 로그로
+                    # 막힘을 추적할 때 원인이 어긋난다.
+                    self._log.info(
+                        f"목표 도달 task={task_id} 위치 {current} "
+                        f"(통로 {seg_cids[-1]} 유지 — 촬영·짝 처리 후 반납)")
+                    self._release_except(engine, robot_id, held, {seg_cids[-1]})
                 else:                               # 다음 못 잡음 → 세그먼트 끝에서 정지·대기
                     self._log.info(
                         f"세그먼트 끝 대기 task={task_id} 위치 {current} — 다음 통로 "
