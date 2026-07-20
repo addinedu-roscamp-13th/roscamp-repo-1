@@ -55,6 +55,7 @@ class PatrolDispatcher:
       - engine/client: run_patrol 인자로 매번 (rclpy 엔티티는 노드가 만든다).
     스스로 소유하는 공유 상태(모든 로봇 스레드가 함께 씀):
       - wp_meta : waypoint_id -> {x,y,yaw,capture}. 그래프 로드 시 노드가 채운다(1회, 읽기전용).
+      - pair_of : 부모 waypoint_id -> 짝 waypoint_id. 같이 채워진다(1회, 읽기전용).
       - _blacklist : 막힘/양보로 잠시 회피할 통로(시간 만료). 자체 락으로 보호.
     """
 
@@ -62,6 +63,9 @@ class PatrolDispatcher:
         self._log = logger
         # waypoint_id -> {"x","y","yaw","capture"}; 그래프 로드 시 노드가 채운다.
         self.wp_meta = {}
+        # 부모 waypoint_id -> 짝 waypoint_id (같은 자리, 반대 촬영 방향).
+        # 부모에 도착해 촬영한 뒤 이 짝을 추가로 하달해 제자리 회전 촬영을 시킨다.
+        self.pair_of = {}
         # 막힘/양보로 잠시 회피할 통로: corridor_id -> 만료 monotonic 시각
         self._blacklist = {}
         self._bl_lock = threading.Lock()
@@ -79,11 +83,14 @@ class PatrolDispatcher:
             return set(self._blacklist.keys())
 
     # ---------------------------- 순찰 본체 ---------------------------- #
-    def run_patrol(self, task_id, robot_id, waypoints, engine, client) -> str:
+    def run_patrol(self, task_id, robot_id, waypoints, engine, client,
+                   start_wp=None) -> str:
         """순찰 지점을 순서대로 방문. 반환: 'COMPLETED' | 'COMPLETED_PARTIAL' | 'FAILED'.
 
         engine/client 는 노드(ROS 표면)가 만들어 넘긴다 — 이 클래스는 rclpy 엔티티를
         생성하지 않고 받은 것만 사용한다.
+        start_wp: 이 로봇이 서 있는 출발 노드(전용 충전소의 진입 노드). None 이면
+                  설정 상수 PATROL_START_WAYPOINT_ID 로 폴백한다.
         """
         if not client.wait_for_server(timeout_sec=SERVER_WAIT_SEC):
             self._log.warn(
@@ -95,10 +102,11 @@ class PatrolDispatcher:
             return "COMPLETED"                 # 방문할 지점이 없음
 
         visited = set()
-        # 순찰 시작 노드(충전소 위치의 waypoint). 그래프(wp_meta)에 있으면 current 로 두고
+        # 순찰 시작 노드(로봇 전용 충전소의 진입 노드). 그래프(wp_meta)에 있으면 current 로 두고
         # 첫 순찰 지점도 _navigate 로 이동해 '첫 구간까지 통로 예약'으로 보호한다.
         # 미설정/미상이면 옛 동작으로 폴백: 첫 지점만 예약 없이 직행(이 구간은 통로 보호 없음).
-        start = PATROL_START_WAYPOINT_ID
+        # start_wp(로봇별, DB 유도)가 우선이고, 없을 때만 전역 설정 상수를 쓴다.
+        start = start_wp if start_wp is not None else PATROL_START_WAYPOINT_ID
         if start and start in self.wp_meta:
             current = start
             remaining = targets
@@ -118,6 +126,12 @@ class PatrolDispatcher:
 
         # 순찰 지점: 세그먼트(연속 통로 묶음) 단위로 이동(시작 노드가 있으면 첫 지점부터)
         skipped = []
+        # 폴백으로 첫 지점에 직행한 경우, 그 지점의 짝 촬영은 여기서 따로 챙긴다
+        # (예약 없이 간 구간이라 쥔 통로가 없다 → held=[]).
+        if visited and not self._capture_pair(
+                client, task_id, targets[0], engine, [], robot_id):
+            visited.discard(targets[0])
+            skipped.append(targets[0])
         for target in remaining:
             outcome, current = self._navigate(
                 engine, client, task_id, robot_id, current, target)
@@ -245,10 +259,53 @@ class PatrolDispatcher:
                         f"세그먼트 끝 대기 task={task_id} 위치 {current} — 다음 통로 "
                         f"미확보, 정지 후 재시도(통로 {seg_cids[-1]} 유지)")
                     self._release_except(engine, robot_id, held, {seg_cids[-1]})
+
+            # 목표 도달. 짝(같은 자리·반대 촬영 방향)이 있으면 여기서 제자리 회전 촬영까지
+            # 마친 뒤에야 이 지점을 '방문 완료'로 본다. 아직 finally 이전이라 지금 쥔 통로
+            # (held)를 그대로 들고 회전한다 — 회전 중 다른 로봇이 들어오지 못하게.
+            if not self._capture_pair(
+                    client, task_id, target, engine, held, robot_id):
+                return "skipped", current
         finally:
             for cid in list(held):
                 engine.release(cid, robot_id)       # 어떻게 나가든 남은 예약 전부 반납
         return "arrived", current
+
+    def _capture_pair(self, client, task_id, parent_wp, engine, held, robot_id) -> bool:
+        """부모 지점의 '짝'이 있으면 제자리 회전 촬영을 하달한다. 짝이 없으면 아무 것도 안 함.
+
+        왜 필요한가: 촬영 카메라가 로봇 한쪽에 고정돼 있어 통로를 한 번 지나면 한쪽 베드만
+        찍힌다. 그래서 같은 자리에서 방향(yaw)만 180° 돌려 한 번 더 찍는다. 짝은 부모와
+        x·y 가 완전히 같아서, 로봇은 '직전 waypoint 와 좌표가 같다' → 주행이 아니라 제자리
+        회전(Spin)으로 처리한다. 통로를 지나지 않으므로 corridor 예약도 필요 없다.
+
+        짝을 별도 waypoint_id 로 하달하는 이유는 사진마다 고유 식별자가 남아야 detection_logs
+        와 병해충 알림이 '어느 지점의 어느 방향'인지 그대로 특정할 수 있기 때문이다.
+
+        heartbeat 로 지금 쥔 통로(held)를 회전하는 동안 계속 유지한다 — 회전 중에 다른 로봇이
+        그 통로로 들어오면 좁은 길에서 마주친다.
+
+        반환: True(짝 없음 또는 촬영 성공) / False(짝 촬영 실패 → 이 지점은 미완).
+        """
+        pair_wp = self.pair_of.get(parent_wp)
+        if pair_wp is None:
+            return True                     # 짝이 없는 지점 — 부모 촬영으로 끝
+        if pair_wp not in self.wp_meta:
+            self._log.warn(
+                f"짝 {pair_wp}(부모 {parent_wp}) 좌표를 그래프에서 못 찾음 → 촬영 생략")
+            return False
+        self._log.info(
+            f"짝 촬영 하달 task={task_id} 부모 {parent_wp} → 짝 {pair_wp} "
+            f"(같은 자리 제자리 회전, 통로 {list(held)} 유지)")
+        code, _ = self._dispatch_segment(
+            client, task_id, [pair_wp], capture_on_last=True,
+            heartbeat=(engine, held, robot_id))
+        if code != 0:
+            self._log.warn(
+                f"짝 {pair_wp} 촬영 실패(code={code}) task={task_id} → 지점 {parent_wp} 미완 처리")
+            return False
+        self._log.info(f"짝 촬영 완료 task={task_id} 부모 {parent_wp} / 짝 {pair_wp}")
+        return True
 
     @staticmethod
     def _segment_progress(current, seg_wps, seg_cids, last_wp):

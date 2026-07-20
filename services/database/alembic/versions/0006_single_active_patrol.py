@@ -11,7 +11,7 @@
 작업으로 통로를 공유하기 때문에 필요한 것이라, 이 제약과 무관하게 그대로 유지된다.)
 
 Revision ID: 0006
-Revises: 0005
+Revises: 0004
 Create Date: 2026-07-19
 """
 from typing import Sequence, Union
@@ -20,7 +20,9 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "0006"
-down_revision: Union[str, None] = "0005"
+# 0005(짝 지점 18·19 를 corridors 에 편입하던 리비전)는 폐기됐다 — 짝은 경로 탐색에서
+# 제외한다는 설계로 바뀌어 0003 시드가 그 역할을 흡수했다. 체인을 0004 로 잇는다.
+down_revision: Union[str, None] = "0004"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -98,10 +98,16 @@ class PatrolControlNode(Node):
                 except Exception as exc:  # noqa: BLE001
                     self.get_logger().error(f"라우팅 그래프 로드 실패: {exc}")
                     return None
+                # 라우팅 그래프에는 '짝(pair)'을 넣지 않는다. 짝은 같은 자리에서 방향만
+                # 바꾸는 촬영 전용 지점이라 통로(corridor)가 없다. 그래프에 노드로 섞이면
+                # Dijkstra 가 '도달할 수 없는 목적지'를 후보로 잡을 수 있다.
+                routing_nodes = [
+                    w for w in graph["waypoints"] if w["pair_of"] is None]
                 self._engine = RoutingEngine(
-                    graph["waypoints"], graph["corridors"],
+                    routing_nodes, graph["corridors"],
                     reservation_ttl=RESERVATION_TTL_SEC)
                 # wp_meta 는 디스패처가 소유(세그먼트 하달 시 좌표/촬영 여부에 사용) → 여기서 채운다.
+                # 이쪽은 짝까지 '전부' 넣는다 — 짝을 하달하려면 그 좌표와 yaw 가 필요하다.
                 self._dispatcher.wp_meta = {
                     w["waypoint_id"]: {
                         "x": w["x"], "y": w["y"],
@@ -109,14 +115,43 @@ class PatrolControlNode(Node):
                     }
                     for w in graph["waypoints"]
                 }
+                # 부모 → 짝 맵. 디스패처가 부모 도착 직후 이 짝을 추가로 하달한다.
+                # 짝 관계는 정적이라 기동 시 1회만 만든다(DB 왕복 없음).
+                self._dispatcher.pair_of = {
+                    w["pair_of"]: w["waypoint_id"]
+                    for w in graph["waypoints"] if w["pair_of"] is not None
+                }
                 self.get_logger().info(
-                    f"라우팅 그래프 로드: 노드 {len(graph['waypoints'])} / "
+                    f"라우팅 그래프 로드: 노드 {len(routing_nodes)}"
+                    f"(짝 {len(self._dispatcher.pair_of)} 제외) / "
                     f"통로 {len(graph['corridors'])}")
                 if not graph["corridors"]:
                     self.get_logger().warn(
                         "corridors 가 비어 있음 — 순찰 이동이 모두 skip 될 수 있음"
                         "(DB corridors 시드 확인)")
             return self._engine
+
+    def _start_waypoint_for(self, robot_id: str):
+        """이 로봇이 순찰을 시작하는 노드(= 전용 충전소의 진입 노드). 실패 시 None.
+
+        순찰은 로봇이 자기 충전소에 도킹한 상태에서 시작하므로, 출발 노드는 로봇마다 다르다
+        (dg_01→22, dg_02→23, dg_03→24). DB 조회가 실패하거나 충전소가 등록돼 있지 않으면
+        None 을 돌려주고, 디스패처가 설정 상수(PATROL_START_WAYPOINT_ID)로 폴백한다.
+        """
+        if self._db_pool is None:
+            return None
+        try:
+            wp = automato_db.get_patrol_start_waypoint(self._db_pool, robot_id)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(
+                f"{robot_id} 충전소 시작 노드 조회 실패(설정 상수로 폴백): {exc}")
+            return None
+        if wp is None:
+            self.get_logger().warn(
+                f"{robot_id} 에 연결된 충전소(charge_point_id)가 없음 → 설정 상수로 폴백")
+        else:
+            self.get_logger().info(f"{robot_id} 순찰 시작 노드 = {wp}(전용 충전소)")
+        return wp
 
     def _client_for(self, robot_id: str) -> ActionClient:
         with self._action_clients_lock:
@@ -165,7 +200,8 @@ class PatrolControlNode(Node):
             else:
                 client = self._client_for(robot_id)
                 status = self._dispatcher.run_patrol(
-                    task_id, robot_id, waypoints, engine, client)
+                    task_id, robot_id, waypoints, engine, client,
+                    start_wp=self._start_waypoint_for(robot_id))
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f"디스패치 예외 task={task_id}: {exc}")
             status = "FAILED"
