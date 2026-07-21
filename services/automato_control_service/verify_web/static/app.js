@@ -207,6 +207,13 @@ function renderNodes(layer, graph, T, opts) {
     else if (isFacility) { cls = "node-facility"; r = 1.4; }
     else if (w.is_patrol_point) { cls = "node-patrol"; r = 1.9; }
 
+    // 자리 점유 링 — 노드 원 '밑'에 먼저 깔아 노드 자체 색(종류를 뜻한다)을 가리지 않게
+    // 한다. 평소엔 stroke 가 없어 보이지 않고, 예약되면 class 만 바뀌어 나타난다.
+    // 매 틱 DOM 을 만들지 않으려고 미리 그려두고 class 만 갈아끼우는 방식(통로와 동일).
+    const ring = el("circle", { cx, cy, r: r + 1.5, class: "node-ring",
+                                id: `nring-${w.waypoint_id}` });
+    layer.appendChild(ring);
+
     layer.appendChild(el("circle", { cx, cy, r, class: cls }));
 
     // 시설 노드는 시설 박스가 이미 이름을 달고 있어 번호를 또 쓰면 겹친다 → 생략.
@@ -297,6 +304,9 @@ function render(graph, layout) {
   VIEW.corridorEls = new Map(
     graph.corridors.map((c) => [String(c.corridor_id),
       document.getElementById(`corridor-${c.corridor_id}`)]));
+  VIEW.nodeRings = new Map(
+    graph.routing_node_ids.map((n) => [String(n),
+      document.getElementById(`nring-${n}`)]));
   VIEW.robotColor = new Map(
     Object.keys(graph.patrol_start).sort().map((rid, i) => [rid, (i % 3) + 1]));
   buildControls(graph);
@@ -414,6 +424,26 @@ function updateCorridors(msg) {
   }
 }
 
+/**
+ * 지점(노드) 자리 점유 표시 — 통로 색칠과 짝을 이루는 나머지 절반.
+ *
+ * 왜 필요한가: 로봇이 차지하는 공간은 '통로 위' 아니면 '지점 위'다. 통로만 칠하면
+ * 지점에 서 있는 로봇이 화면에서 투명인간이 되어, 왜 상대가 못 지나가는지 읽을 수 없다.
+ * 색만으로 구분하지 않는다 — 점유는 굵은 실선 링, 회피는 얇은 점선 링(적록색맹 대응).
+ */
+function updateNodes(msg) {
+  const holders = msg.node_holders || {};
+  const avoidNodes = new Set((msg.avoiding_nodes || []).map(String));
+  for (const [nid, ring] of VIEW.nodeRings) {
+    if (!ring) continue;
+    const holder = holders[nid];
+    let cls = "node-ring";
+    if (holder) cls += ` nr-held r${VIEW.robotColor.get(holder) || 1}`;
+    else if (avoidNodes.has(nid)) cls += " nr-avoid";
+    ring.setAttribute("class", cls);
+  }
+}
+
 /** 로봇 레이어: 3대뿐이라 매 틱 통째로 다시 그린다(간단하고 충분히 빠르다). */
 function renderRobots(msg) {
   const T = VIEW.T;
@@ -499,6 +529,7 @@ function applyState(msg) {
   applyMode(msg.mode || "SIM");
   updateConn(msg);
   updateCorridors(msg);
+  updateNodes(msg);
   renderRobots(msg);
   renderRobotList(msg);
   renderEvents(msg.events || []);

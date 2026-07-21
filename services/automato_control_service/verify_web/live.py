@@ -64,6 +64,7 @@ class LiveSource:
         self._events = []            # [{"seq","t","level","msg"}]
         self._seq = 0
         self._prev_res = {}          # 직전 틱의 {corridor_id(str): robot_id}
+        self._prev_nodes = {}        # 직전 틱의 {waypoint_id(str): robot_id}(자리 점유)
         self._prev_online = {}       # 직전 틱의 {robot_id: online 여부}
 
         self._stop = threading.Event()
@@ -83,6 +84,7 @@ class LiveSource:
             self._latest = None
             self._error = None
         self._prev_res = {}
+        self._prev_nodes = {}
         self._thread = threading.Thread(
             target=self._poll_loop, name="live-poll", daemon=True)
         self._thread.start()
@@ -149,6 +151,20 @@ class LiveSource:
                 self._add_event("INFO", f"통로 {cid} 반납 ({was})")
         self._prev_res = dict(cur)
 
+        # 자리 점유도 같은 방식으로 변화만 뽑는다. '어느 지점에 누가 서 있나'가
+        # 이번 결함의 핵심이라 통로와 나란히 보여야 원인을 읽을 수 있다.
+        cur_n = data.get("node_holders", {})
+        for nid, holder in cur_n.items():
+            was = self._prev_nodes.get(nid)
+            if was is None:
+                self._add_event("INFO", f"지점 {nid} 자리 ← {holder}")
+            elif was != holder:
+                self._add_event("INFO", f"지점 {nid} 자리 보유자 변경 {was} → {holder}")
+        for nid, was in self._prev_nodes.items():
+            if nid not in cur_n:
+                self._add_event("INFO", f"지점 {nid} 자리 반납 ({was})")
+        self._prev_nodes = dict(cur_n)
+
         for r in data.get("robots", []):
             rid, online = r["robot_id"], r.get("online", False)
             if self._prev_online.get(rid) != online:
@@ -202,8 +218,8 @@ class LiveSource:
             "blocked": [],
         }
         if data is None:
-            base.update(robots=[], reservations={}, avoiding=[],
-                        engine_ready=False)
+            base.update(robots=[], reservations={}, node_holders={},
+                        avoiding=[], avoiding_nodes=[], engine_ready=False)
             return base
 
         # ACS 와 끊긴 동안에는 '마지막으로 본 값'을 사실처럼 보여주지 않는다.
@@ -240,7 +256,10 @@ class LiveSource:
         base.update(
             robots=sorted(robots, key=lambda r: r["robot_id"]),
             reservations={} if lost else data.get("reservations", {}),
+            # 자리 점유도 예약표와 같은 취급 — 끊긴 동안은 통째로 비운다.
+            node_holders={} if lost else data.get("node_holders", {}),
             avoiding=[] if lost else data.get("avoiding", []),
+            avoiding_nodes=[] if lost else data.get("avoiding_nodes", []),
             engine_ready=(not lost) and data.get("engine_ready", False),
         )
         return base

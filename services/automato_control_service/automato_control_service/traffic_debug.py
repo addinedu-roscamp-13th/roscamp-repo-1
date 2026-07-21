@@ -18,11 +18,12 @@
      예약을 강제로 풀거나 통로를 막는 조작은 실물 로봇을 실제로 위험하게 만든다.
      검증 화면의 '조작'은 시뮬(verify_web SIM 모드)에서만 한다.
 
-정확도에 대한 정직한 한계 —
-  reserved_corridors() 로 목록을 받고 holder_of() 로 보유자를 다시 묻는 2단계라
-  그 사이에 해제되면 보유자가 None 이 되어 그 통로는 결과에서 빠진다. 화면에서 한
-  틱 덜 보이는 정도이고, 엔진에 '전체를 원자적으로 덤프하는' 메서드를 새로 넣으려면
-  검증 끝난 routing_engine 을 고쳐야 해서 일부러 이 방식을 택했다.
+정확도 —
+  예전에는 reserved_corridors() 로 목록을 받고 holder_of() 로 보유자를 다시 묻는
+  2단계라 그 사이에 해제되면 항목이 빠졌다. 노드 자리까지 관측 대상이 되면서 왕복이
+  배로 늘고 '음수면 자리'라는 규칙을 관측하는 쪽마다 다시 구현하게 되어,
+  engine.reservation_snapshot() 으로 한 락 안에서 원자적으로 덤프하도록 바꿨다.
+  TTL 지난 죽은 예약은 엔진이 걸러서 준다.
 """
 import time
 
@@ -68,27 +69,31 @@ def snapshot(node) -> dict:
     robots = [_robot_view(rid, node.cache.get(rid), now)
               for rid in node.cache.robot_ids()]
 
-    # --- 통로 예약: 엔진이 이미 만들어져 있을 때만 ---
+    # --- 예약: 엔진이 이미 만들어져 있을 때만. 통로와 '지점 자리'를 갈라서 낸다 ---
     engine = node._engine                        # noqa: SLF001  (읽기 전용 관찰)
-    reservations = {}
+    reservations, node_holders = {}, {}
+    avoiding, avoiding_nodes = [], []
     if engine is not None:
-        for cid in engine.reserved_corridors():
-            holder = engine.holder_of(cid)
-            if holder is not None:
-                reservations[str(cid)] = holder
+        snap = engine.reservation_snapshot()     # 한 락 안의 원자적 덤프
+        reservations = {str(cid): rid for cid, rid in snap["corridors"].items()}
+        node_holders = {str(n): rid for n, rid in snap["nodes"].items()}
 
-    # --- 회피 중(블랙리스트): 막힘/양보로 재계획에서 잠시 빠진 통로 ---
-    try:
-        avoiding = sorted(node._dispatcher._blacklist_active())   # noqa: SLF001
-    except Exception:                            # noqa: BLE001
-        avoiding = []
+        # --- 회피 중(블랙리스트): 막힘/양보로 재계획에서 잠시 빠진 통로/지점 ---
+        try:
+            view = node._dispatcher.blacklist_view(engine)        # noqa: SLF001
+            avoiding, avoiding_nodes = view["corridors"], view["nodes"]
+        except Exception:                        # noqa: BLE001
+            pass
 
     return {
         "server_time": now,
         "engine_ready": engine is not None,
         "robots": robots,
         "reservations": reservations,
+        # 지점 자리 점유 {노드id: 로봇}. 통로 예약과 키 공간이 겹쳐 따로 낸다.
+        "node_holders": node_holders,
         "avoiding": avoiding,
+        "avoiding_nodes": avoiding_nodes,
         "stale_sec": STALE_SEC,
     }
 

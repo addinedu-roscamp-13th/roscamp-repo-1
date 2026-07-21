@@ -197,6 +197,8 @@ body.live #map { cursor: default; }
 }
 .swatch { width: 24px; height: 8px; flex: none; }
 .swatch line { stroke-linecap: round; }
+/* 지점 자리 범례는 '선'이 아니라 '원'이라 가로로 납작한 24x8 에 넣으면 짜부라진다 */
+.swatch-ring { width: 16px; height: 16px; flex: none; }
 
 /* 범례 선 — 맵의 통로 스타일과 정확히 같은 규칙(색+굵기+점선)을 쓴다 */
 .lg-free    { stroke: var(--corridor-free);  stroke-width: 1.5; }
@@ -204,6 +206,12 @@ body.live #map { cursor: default; }
 .lg-r2      { stroke: var(--robot-2);        stroke-width: 3.5; }
 .lg-r3      { stroke: var(--robot-3);        stroke-width: 3.5; }
 .lg-avoid   { stroke: var(--status-avoid);   stroke-width: 2.5; stroke-dasharray: 3 2.5; }
+/* 지점 자리 범례 — 맵의 링과 같은 규칙(실선 굵게 / 점선 얇게) */
+.lg-ring-held  { fill: none; stroke-width: 1.6; }
+.lg-ring-held.r1 { stroke: var(--robot-1); }
+.lg-ring-avoid { fill: none; stroke: var(--status-avoid); stroke-width: 1.0;
+                 stroke-dasharray: 1.8 1.5; }
+.lg-ring-dot   { fill: var(--ink-2); }
 .lg-blocked { stroke: var(--status-blocked); stroke-width: 3.5; stroke-dasharray: 3 2.5; }
 
 .dot {
@@ -274,7 +282,27 @@ body.live #map { cursor: default; }
 .corridor.c-blocked        { stroke: var(--status-blocked); stroke-width: 2.8;
                              stroke-dasharray: 2.6 2.2; }
 
+/* ── 지점(노드) 자리 점유 ── 통로 색칠의 나머지 절반.
+   로봇이 차지하는 공간은 '통로 위' 아니면 '지점 위'다. 지점을 안 칠하면 서 있는
+   로봇이 화면에서 사라져, 왜 상대가 못 지나가는지 읽을 수 없다.
+   노드 원 자체(종류를 뜻하는 색·크기)는 건드리지 않고 바깥에 링만 덧씌운다.
+   여기서도 색에만 기대지 않는다 — 점유는 굵은 실선, 회피는 얇은 점선. */
+.node-ring                 { fill: none; stroke: none; }
+.node-ring.nr-held         { stroke-width: 1.5; }
+.node-ring.nr-held.r1      { stroke: var(--robot-1); }
+.node-ring.nr-held.r2      { stroke: var(--robot-2); }
+.node-ring.nr-held.r3      { stroke: var(--robot-3); }
+.node-ring.nr-avoid        { stroke: var(--status-avoid); stroke-width: .9;
+                             stroke-dasharray: 1.6 1.4; }
+
 /* ── 로봇 ── */
+/* 로봇 마커는 클릭을 가로채지 않는다.
+   로봇 레이어가 노드 레이어 '위'에 그려지는데, 로봇 원(r=2.6, 회전 중 4.0)이 노드
+   클릭 영역(r=3.6)의 한복판을 덮어 '로봇이 서 있는 노드'를 누를 수 없었다. 하필
+   그 노드가 시나리오를 만들 때 제일 자주 눌러야 하는 자리다.
+   로봇 선택은 조작 막대의 셀렉트로 하므로 마커 자체는 클릭 대상이 아니다. */
+.robot, .robot-heading, .robot-spin, .robot-label { pointer-events: none; }
+
 .robot        { stroke: var(--surface); stroke-width: .8; }
 .robot.r1     { fill: var(--robot-1); }
 .robot.r2     { fill: var(--robot-2); }
