@@ -27,7 +27,7 @@ DB/메모리/rosbag2 저장 없이 실시간 스트리밍만 수행한다.
    없애고 bare 로 전환하면서 us_sensor/range 구독을 되살렸다. ADC 노드(pinky_sensor_adc)가
    발행하면 실제 거리(m)가 채워지고, 아직 발행 전이면 0.0(_safe)으로 나간다.
 
-※ task_id: 같은 로봇의 patrol/navigate 서버가 goal 을 받을 때마다 /ddago/current_task 로
+※ task_id: 같은 로봇의 navigate 서버가 goal 을 받을 때마다 /ddago/current_task 로
    알려준다(latched). goal 이 끝나도 0 으로 되돌아가지 않는다 — ACS 는 한 task 를 예약 구간
    단위로 쪼개 여러 goal 로 하달하므로, goal 사이의 틈마다 0 이 되면 QT 화면에서 깜빡이고
    복귀 주행(22-1·E4, 같은 task_id 재사용) 추적도 끊긴다. 부팅 후 goal 을 한 번도 받지
@@ -152,7 +152,7 @@ class TelemetryPublisher(Node):
         # 붙들고 있다가 늦게 붙은 구독자에게도 즉시 한 번 보내주는 방식. 이 노드가
         # 언제 뜨든 최신 상태를 받으려면 발행자와 같은 프로파일로 맞춰야 한다.
         #   · Nav2 액션 status : Nav2 기본값이 이 조합이다.
-        #   · /ddago/current_task : patrol_server 가 같은 조합으로 발행한다.
+        #   · /ddago/current_task : navigate_server 가 같은 조합으로 발행한다.
         latched_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -177,7 +177,7 @@ class TelemetryPublisher(Node):
         self.create_subscription(
             GoalStatusArray, 'navigate_to_pose/_action/status',
             self._nav_status_cb, latched_qos)
-        # 현재 task: 같은 로봇의 patrol/navigate 서버가 goal 을 받을 때마다 알려준다.
+        # 현재 task: 같은 로봇의 navigate 서버가 goal 을 받을 때마다 알려준다.
         # 로봇 내부 신호라 절대명으로 고정한다(구독 소스처럼 상대명일 필요가 없다).
         self.create_subscription(
             Int64, '/ddago/current_task', self._current_task_cb, latched_qos)

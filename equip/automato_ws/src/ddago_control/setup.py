@@ -25,7 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'telemetry_publisher = ddago_control.telemetry_publisher:main',
-            'patrol_server = ddago_control.patrol_server:main',
+            'navigate_server = ddago_control.navigate_server:main',
         ],
     },
 )
