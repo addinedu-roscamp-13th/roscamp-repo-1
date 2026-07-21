@@ -82,6 +82,16 @@ class PatrolDispatcher:
                 del self._blacklist[cid]
             return set(self._blacklist.keys())
 
+    def blacklist_view(self, engine) -> dict:
+        """회피 중인 목록을 통로/지점으로 갈라서 돌려준다(관측 도구용).
+
+        _blacklist 는 통로 id(양수)와 자리 id(음수)를 한 바구니에 담는다. 화면이 이걸
+        그대로 받으면 음수를 통로 번호로 오해해 엉뚱한 선을 칠한다.
+        반환: {"corridors": [id...], "nodes": [노드id...]}
+        """
+        corridors, nodes = self._split_blocked(engine, self._blacklist_active())
+        return {"corridors": sorted(corridors), "nodes": sorted(nodes)}
+
     # ---------------------------- 순찰 본체 ---------------------------- #
     def run_patrol(self, task_id, robot_id, waypoints, engine, client,
                    start_wp=None) -> str:
@@ -124,39 +134,64 @@ class PatrolDispatcher:
             current = targets[0]
             remaining = targets[1:]
 
+        # 출발선에서 '지금 서 있는 자리'부터 잡는다. 첫 구간의 _navigate 가 잡아주긴
+        # 하지만 그 전에 짝 촬영(제자리 회전)이 낀 경로가 있어, 그동안 이 로봇이 예약표에
+        # 안 보이면 남이 그 지점으로 들어온다. 이 예약은 구간마다 _navigate 가 이어받아
+        # 순찰 내내 유지되고, 맨 끝에서 아래 finally 가 반납한다.
+        start_slot = engine.node_slot(current)
+        if engine.try_reserve(start_slot, robot_id):
+            self._log.info(f"출발 지점 {current} 자리 확보 task={task_id}")
+        else:
+            self._log.warn(
+                f"출발 지점 {current} 자리를 남(로봇 {engine.holder_of(start_slot)})이 "
+                f"쥐고 있다 task={task_id} — 예약표와 실제 위치가 어긋남")
+
         # 순찰 지점: 세그먼트(연속 통로 묶음) 단위로 이동(시작 노드가 있으면 첫 지점부터)
         skipped = []
-        # 폴백으로 첫 지점에 직행한 경우, 그 지점의 짝 촬영은 여기서 따로 챙긴다
-        # (예약 없이 간 구간이라 쥔 통로가 없다 → held=[]).
-        if visited and not self._capture_pair(
-                client, task_id, targets[0], engine, [], robot_id):
-            visited.discard(targets[0])
-            skipped.append(targets[0])
-        for target in remaining:
-            outcome, current = self._navigate(
-                engine, client, task_id, robot_id, current, target)
-            if outcome == "arrived":
-                visited.add(target)
-            elif outcome == "skipped":
-                skipped.append(target)
-            else:  # aborted (중단)
-                return "FAILED"
+        # 여기서부터 로봇은 '서 있는 자리'를 계속 쥔 채 구간을 이어간다(_navigate 가
+        # 서로 넘겨준다). 마지막 한 장은 순찰 전체를 소유하는 이 함수가 반납해야 하므로
+        # 어떤 경로로 빠져나가든 finally 를 지나게 감싼다.
+        try:
+            # 폴백으로 첫 지점에 직행한 경우, 그 지점의 짝 촬영은 여기서 따로 챙긴다.
+            # 통로는 못 쥐었어도(예약 없이 간 구간) 자리는 위에서 잡았으므로 회전하는
+            # 동안 그 자리가 하트비트로 유지된다.
+            if visited and not self._capture_pair(
+                    client, task_id, targets[0], engine, [start_slot], robot_id):
+                visited.discard(targets[0])
+                skipped.append(targets[0])
+            for target in remaining:
+                outcome, current = self._navigate(
+                    engine, client, task_id, robot_id, current, target)
+                if outcome == "arrived":
+                    visited.add(target)
+                elif outcome == "skipped":
+                    skipped.append(target)
+                else:  # aborted (중단)
+                    return "FAILED"
 
-        # 건너뛴 지점 마지막에 1회 재시도
-        for target in list(skipped):
-            outcome, current = self._navigate(
-                engine, client, task_id, robot_id, current, target)
-            if outcome == "arrived":
-                visited.add(target)
-                skipped.remove(target)
-            elif outcome == "aborted":
-                return "FAILED"
+            # 건너뛴 지점 마지막에 1회 재시도
+            for target in list(skipped):
+                outcome, current = self._navigate(
+                    engine, client, task_id, robot_id, current, target)
+                if outcome == "arrived":
+                    visited.add(target)
+                    skipped.remove(target)
+                elif outcome == "aborted":
+                    return "FAILED"
 
-        if len(visited) == len(targets):
-            return "COMPLETED"
-        if len(visited) <= 1:                  # 사실상 첫 지점만 방문
-            return "FAILED"
-        return "COMPLETED_PARTIAL"
+            if len(visited) == len(targets):
+                return "COMPLETED"
+            if len(visited) <= 1:                  # 사실상 첫 지점만 방문
+                return "FAILED"
+            return "COMPLETED_PARTIAL"
+        finally:
+            # 순찰이 끝나면 마지막 자리를 반납한다. 로봇은 아직 거기 서 있으므로 이
+            # 시점부터 교통관제에 안 보인다 — 충전소 복귀가 붙으면 복귀 경로가 자리를
+            # 이어받게 되고, 그때 이 반납은 복귀 도착 지점으로 옮겨가야 한다.
+            engine.release(engine.node_slot(current), robot_id)
+            self._log.info(
+                f"순찰 종료 task={task_id} 지점 {current} 자리 반납 "
+                f"(복귀 로직 전까지 이 지점은 교통관제에 비어 보인다)")
 
     def _navigate(self, engine, client, task_id, robot_id, current, target):
         """current→target 까지 '세그먼트 + 룩어헤드'로 이동. 반환: (outcome, 도달한 노드).
@@ -169,8 +204,18 @@ class PatrolDispatcher:
         outcome: 'arrived'(목표 도달) | 'skipped'(우회 불가로 포기) | 'aborted'(중단).
         """
         attempt_block = set()   # 이번 target 시도에서 회피할 통로(예약실패/막힘 누적)
-        held = []               # 지금 예약(점유)한 통로들 — dispatch 하트비트에 live 로 넘김
+        held = []               # 지금 예약(점유)한 자원들 — dispatch 하트비트에 live 로 넘김
         seg = None              # 다음에 하달할 세그먼트 (룩어헤드가 미리 채웠을 수 있음)
+        # 출발 전에 '지금 서 있는 자리'부터 확보한다. 앞 구간에서 넘겨받았으면 내 것이라
+        # 즉시 성공(멱등), 순찰 첫 구간이면 여기서 처음 잡는다. 이게 없으면 이동 중이
+        # 아닌 로봇이 예약표에 안 보여서 남이 그 지점으로 들어온다(원래 결함).
+        start_slot = engine.node_slot(current)
+        if engine.try_reserve(start_slot, robot_id):
+            held.append(start_slot)
+        else:
+            self._log.warn(
+                f"현재 지점 {current} 자리를 남(로봇 {engine.holder_of(start_slot)})이 "
+                f"쥐고 있다 task={task_id} — 예약표와 실제 위치가 어긋남")
         try:
             while current != target:
                 # 1) 하달할 세그먼트 확보(룩어헤드가 미리 잡아놨으면 그걸 사용).
@@ -181,10 +226,13 @@ class PatrolDispatcher:
                             f"경로 없음 task={task_id} {current}→{target} → 건너뜀")
                         return "skipped", current
                     seg = self._acquire_segment(
-                        engine, robot_id, route.hops(), attempt_block)
+                        engine, robot_id, route.hops(), attempt_block, held)
                     if seg is None:
-                        continue                    # 첫 통로 못 잡음 → 양보·재계획
-                    held.extend(seg[1])             # 새로 잡은 통로 = 점유 목록에 추가
+                        continue                    # 첫 홉 못 잡음 → 양보·재계획
+                    # 새로 잡은 자원(통로+자리)을 점유 목록에 추가. 서 있는 자리는 이미
+                    # held 에 있으므로 중복은 걸러낸다(중복이 있으면 반납이 꼬인다).
+                    held.extend(c for c in self._seg_resources(engine, seg)
+                                if c not in held)
                 seg_wps, seg_cids = seg
                 seg = None
                 seg_start = current                # 이 세그먼트 진입 노드(피드백 판정 기준)
@@ -207,15 +255,16 @@ class PatrolDispatcher:
                     with fb_lock:
                         reached_wp = fb["wp"]
                     if reached_wp is not None:
-                        freed = [c for c in self._passed_corridors(
-                            seg_start, seg_wps, seg_cids, reached_wp) if c in held]
+                        freed = [c for c in self._passed_resources(
+                            engine, seg_start, seg_wps, seg_cids, reached_wp)
+                            if c in held]
                         for cid in freed:
                             engine.release(cid, robot_id)
                             held.remove(cid)
                         if freed:
                             self._log.info(
                                 f"조기 반납 task={task_id} 로봇 위치 {reached_wp} "
-                                f"→ 통로 {freed} 해제")
+                                f"→ 자원 {freed} 해제(음수=지점 자리)")
                     # (b) 룩어헤드: 다음 구간을 대기 없이 미리 예약.
                     if look["seg"] is None:
                         look["seg"] = self._try_reserve_ahead(
@@ -245,13 +294,15 @@ class PatrolDispatcher:
                             f"(로봇 위치 {current}) → 블랙리스트 후 우회")
                         self._blacklist_add(blocked_cid)
                         attempt_block.add(blocked_cid)
-                    self._release_except(engine, robot_id, held, {standing})
+                    self._release_except(engine, robot_id, held, {standing}, current)
                     continue
                 # code == 0: 세그먼트 끝 도착.
                 current = seg_wps[-1]
                 if look["seg"] is not None:         # 룩어헤드 성공 → 끊김 없이 연장
                     seg = look["seg"]
-                    self._release_except(engine, robot_id, held, set(seg[1]))
+                    self._release_except(
+                        engine, robot_id, held,
+                        self._seg_resources(engine, seg), current)
                     self._log.info(
                         f"룩어헤드 연장 task={task_id} 위치 {current} 다음 통로={seg[1]}")
                 elif reached:                       # 세그먼트 끝 = 목표 → 정상 도착
@@ -260,13 +311,17 @@ class PatrolDispatcher:
                     # 막힘을 추적할 때 원인이 어긋난다.
                     self._log.info(
                         f"목표 도달 task={task_id} 위치 {current} "
-                        f"(통로 {seg_cids[-1]} 유지 — 촬영·짝 처리 후 반납)")
-                    self._release_except(engine, robot_id, held, {seg_cids[-1]})
+                        f"(통로 {seg_cids[-1]}·자리 {engine.node_slot(current)} 유지 "
+                        f"— 촬영·짝 처리 후 반납)")
+                    self._release_except(
+                        engine, robot_id, held, {seg_cids[-1]}, current)
                 else:                               # 다음 못 잡음 → 세그먼트 끝에서 정지·대기
                     self._log.info(
-                        f"세그먼트 끝 대기 task={task_id} 위치 {current} — 다음 통로 "
-                        f"미확보, 정지 후 재시도(통로 {seg_cids[-1]} 유지)")
-                    self._release_except(engine, robot_id, held, {seg_cids[-1]})
+                        f"세그먼트 끝 대기 task={task_id} 위치 {current} — 다음 홉 "
+                        f"미확보, 정지 후 재시도(통로 {seg_cids[-1]}·자리 "
+                        f"{engine.node_slot(current)} 유지)")
+                    self._release_except(
+                        engine, robot_id, held, {seg_cids[-1]}, current)
 
             # 목표 도달. 짝(같은 자리·반대 촬영 방향)이 있으면 여기서 제자리 회전 촬영까지
             # 마친 뒤에야 이 지점을 '방문 완료'로 본다. 아직 finally 이전이라 지금 쥔 통로
@@ -275,8 +330,11 @@ class PatrolDispatcher:
                     client, task_id, target, engine, held, robot_id):
                 return "skipped", current
         finally:
-            for cid in list(held):
-                engine.release(cid, robot_id)       # 어떻게 나가든 남은 예약 전부 반납
+            # 어떻게 나가든 남은 예약을 반납하되, '지금 서 있는 자리'만은 넘겨준다.
+            # 로봇이 물리적으로 거기 있는 한 자리를 놓으면 남이 그 지점으로 들어온다.
+            # 이 한 장은 다음 구간의 _navigate 가 이어받고, 순찰이 끝나면 run_patrol 이
+            # 반납한다(구간과 구간 사이에 예약이 끊기는 순간을 없앤다).
+            self._release_except(engine, robot_id, held, set(), current)
         return "arrived", current
 
     def _capture_pair(self, client, task_id, parent_wp, engine, held, robot_id) -> bool:
@@ -335,14 +393,26 @@ class PatrolDispatcher:
         return path[j], blocked, standing
 
     @staticmethod
-    def _passed_corridors(seg_start, seg_wps, seg_cids, reached_wp):
-        """주행 중 피드백의 '도달 노드' 기준으로 확실히 벗어난 통로 목록을 돌려준다.
+    def _passed_resources(engine, seg_start, seg_wps, seg_cids, reached_wp):
+        """주행 중 피드백의 '도달 노드' 기준으로 확실히 벗어난 자원(통로+자리)을 돌려준다.
 
         세그먼트 경로:  seg_start -[seg_cids[0]]-> seg_wps[0] -[seg_cids[1]]-> seg_wps[1] ...
-        로봇이 reached_wp(=path[j]) 에 있으면 방금 지나온 seg_cids[j-1] 이 '서 있는 통로'다.
-        로봇에 길이가 있어 노드 도달 순간엔 아직 그 통로에 걸쳐 있을 수 있으므로 서 있는
-        통로는 남기고, 그보다 뒤쪽(seg_cids[0..j-2])만 '확실히 벗어남'으로 보아 반납한다.
-        (_segment_progress 와 동일한 판정 기준 — 그쪽은 Result 시점, 이쪽은 피드백 시점.)
+        로봇이 reached_wp(=path[j]) 에 도착했다면 거기까지 오는 데 쓴 자원 — 통로
+        seg_cids[0..j-1] 과 자리 path[0..j-1] — 은 전부 벗어난 것이다. 지금 있는 자리
+        path[j] 하나만 남기고 반납한다.
+
+        왜 직전 통로까지 놓아도 되는가(예전에는 한 칸 남겼다):
+          통로만 예약하던 시절에는 통로를 놓는 순간 남이 그 통로로 들어와 한복판에서
+          마주칠 수 있어, 로봇 길이를 감안해 '서 있는 통로'를 여유로 남겼다. 지금은
+          홉이 (통로, 도착 자리) 쌍이라 자리를 못 잡으면 통로도 못 잡는다:
+            · path[j-1] → path[j] 방향으로 들어오려면 도착 자리 path[j] 가 필요한데
+              그 자리는 내가 쥐고 있다.
+            · 반대 방향은 path[j] 에서 출발해야 하는데 거기에 내가 서 있다.
+          어느 쪽으로도 진입할 수 없으므로 그 여유분은 이미 자리 예약이 대신하고 있다.
+          한 칸을 더 붙들고 있으면 같은 보호를 두 번 하면서 남의 길만 막는다.
+
+        _segment_progress 와는 판정이 다르다 — 그쪽은 '막힘' 상황이라 로봇이 통로
+        한복판에 멈춰 있을 수 있어 '도착했다'는 전제가 성립하지 않는다(보수적으로 유지).
 
         모르는 노드/시작 지점이면 빈 목록 → 아무것도 반납하지 않는다(안전한 쪽으로 실패).
         """
@@ -351,34 +421,75 @@ class PatrolDispatcher:
             j = path.index(reached_wp)
         except ValueError:
             return []                           # 알 수 없는 노드 → 반납 안 함
-        return list(seg_cids[:max(0, j - 1)])   # 서 있는 통로(j-1)보다 뒤쪽만
+        # path[j] 에 도착 = path[0..j-1] 과 그 사이 통로는 전부 벗어났다.
+        return list(seg_cids[:j]) + [engine.node_slot(n) for n in path[:j]]
 
     @staticmethod
-    def _release_except(engine, robot_id, held, keep):
-        """held(지금 쥔 통로 리스트)에서 keep 에 없는 통로를 모두 해제하고 held 를 갱신한다.
+    def _seg_resources(engine, seg):
+        """세그먼트가 점유하는 자원 전체 = 통로들 + 지나갈 자리들."""
+        seg_wps, seg_cids = seg
+        return set(seg_cids) | {engine.node_slot(w) for w in seg_wps}
 
-        선획득 후해제의 '후해제' — 유지할 통로(keep)만 남기고 나머지를 반납한다.
+    @staticmethod
+    def _release_except(engine, robot_id, held, keep, standing_node=None):
+        """held(지금 쥔 자원 리스트)에서 keep 에 없는 것을 모두 해제하고 held 를 갱신한다.
+
+        선획득 후해제의 '후해제' — 유지할 자원(keep)만 남기고 나머지를 반납한다.
+        standing_node: 지금 로봇이 물리적으로 서 있는 노드. 그 자리는 무조건 유지한다.
+        로봇이 거기 있는 한 자리를 놓으면 남이 그 지점으로 들어와 겹친다 — 이 결함이
+        '통로만 예약하던' 시절의 원래 버그였다.
         """
+        keep = set(keep)
+        if standing_node is not None:
+            keep.add(engine.node_slot(standing_node))
         for cid in list(held):
             if cid not in keep:
                 engine.release(cid, robot_id)
                 held.remove(cid)
 
+    @staticmethod
+    def _split_blocked(engine, ids):
+        """회피 대상 id 집합을 (통로 집합, 노드 집합)으로 가른다.
+
+        블랙리스트·attempt_block 은 통로 id(양수)와 노드 자리 id(음수)를 한 바구니에
+        담는다 — 부호로 갈리니 자료구조를 따로 만들 필요가 없다. find_path 는 둘을 다른
+        인자로 받으므로(통로를 빼는 것과 지점을 통째로 빼는 것은 효과가 다르다) 여기서 푼다.
+        """
+        corridors = {i for i in ids if not engine.is_node_slot(i)}
+        nodes = {engine.node_of_slot(i) for i in ids if engine.is_node_slot(i)}
+        return corridors, nodes
+
     def _plan_route(self, engine, current, target, attempt_block):
         """current→target 경로. 정상 순찰은 인접 직행, 막히면 Dijkstra 우회. 없으면 None."""
-        blocked = set(attempt_block) | self._blacklist_active()
+        blocked, blocked_nodes = self._split_blocked(
+            engine, set(attempt_block) | self._blacklist_active())
         direct = engine.corridor_between(current, target)
-        if direct is not None and direct not in blocked:
+        # 직행도 '도착 지점이 막혔는지'를 같이 본다 — 통로가 비어도 그 자리에 남이 서
+        # 있으면 갈 수 없다. 이 검사를 빠뜨리면 우회 등록해 둔 지점으로 곧장 되돌아간다.
+        if (direct is not None and direct not in blocked
+                and target not in blocked_nodes):
             return Route((current, target), (direct,))   # 인접 지점 직행(세그먼트 1개)
-        return engine.find_path(current, target, blocked=blocked)
+        return engine.find_path(current, target, blocked=blocked,
+                                blocked_nodes=blocked_nodes)
 
-    def _reserve_with_wait(self, engine, corridor_id, robot_id) -> bool:
-        """통로 예약을 '확인+획득+대기검사'(reserve_or_wait)로 시도하며 대기. 성공 True.
+    @staticmethod
+    def _res_name(engine, cid) -> str:
+        """자원 id 를 사람이 읽는 이름으로. 로그에 '통로 -7' 이 찍히면 아무도 못 읽는다."""
+        return (f"지점 {engine.node_of_slot(cid)} 자리"
+                if engine.is_node_slot(cid) else f"통로 {cid}")
+
+    def _reserve_with_wait(self, engine, corridor_id, robot_id, held=None) -> bool:
+        """자원 예약을 '확인+획득+대기검사'(reserve_or_wait)로 시도하며 대기. 성공 True.
 
         - reserved → True.
         - deadlock(쥔 채 기다리면 대기 사이클) → 즉시 양보 False(호출부가 블랙리스트+우회).
         - waiting  → RESERVE_POLL_SEC 간격 재시도, RESERVE_WAIT_SEC 넘으면 양보 False.
         양보(False)로 나갈 땐 대기 그래프에서 이 로봇의 대기를 지운다(end_wait).
+
+        held: 이 로봇이 이미 쥔 자원들. 대기하는 동안 폴링마다 하트비트를 갱신한다.
+        서서 기다리는 중에는 주행 하트비트(_dispatch_segment)가 안 돌기 때문에, 이게
+        없으면 RESERVE_WAIT_SEC(30초)를 기다리다 RESERVATION_TTL_SEC(15초)에 걸려
+        '내가 지금 서 있는 자리'가 남에게 회수된다.
         """
         deadline = time.monotonic() + RESERVE_WAIT_SEC
         while True:
@@ -387,35 +498,60 @@ class PatrolDispatcher:
                 return True
             if outcome == "deadlock":
                 self._log.warn(
-                    f"통로 {corridor_id} 대기 시 데드락 예상 → 양보(우회)")
+                    f"{self._res_name(engine, corridor_id)} 대기 시 데드락 예상 "
+                    f"→ 양보(우회)")
                 engine.end_wait(robot_id)
                 return False
             # outcome == "waiting": 안전하게 대기 중
             if time.monotonic() >= deadline:
                 self._log.warn(
-                    f"통로 {corridor_id} 예약 대기 타임아웃 → 순찰 양보")
+                    f"{self._res_name(engine, corridor_id)} 예약 대기 타임아웃 "
+                    f"→ 순찰 양보")
                 engine.end_wait(robot_id)
                 return False
+            for cid in list(held or ()):    # 대기 중에도 쥔 자원은 살려둔다(TTL 방어)
+                engine.heartbeat(cid, robot_id)
             time.sleep(RESERVE_POLL_SEC)
 
-    def _acquire_segment(self, engine, robot_id, hops, attempt_block):
+    def _acquire_segment(self, engine, robot_id, hops, attempt_block, held=None):
         """route.hops() 를 받아 한 세그먼트를 예약한다.
 
-        첫 통로는 대기하며 예약(_reserve_with_wait), 이어지는 통로는 대기 없이(try_reserve)
+        홉 하나 = (통로, 도착 자리) 한 쌍이다. 통로만 잡고 도착 자리를 못 잡으면 '들어가도
+        설 곳이 없는' 상태가 되고, 그렇다고 안 들어가면 통로만 붙잡아 남의 길을 막는다.
+        그래서 쌍 단위로 성공/실패를 판정하고, 깨진 쌍은 즉시 되돌린다.
+        첫 홉은 대기하며 예약(_reserve_with_wait), 이어지는 홉은 대기 없이(try_reserve)
         잡히는 만큼 묶는다. 반환: (seg_wps, seg_cids) 또는 None.
-        None(첫 통로 예약 대기 타임아웃=양보)이면 그 통로를 블랙리스트+attempt_block 에 넣어
+        None(첫 홉 확보 실패=양보)이면 못 잡은 자원을 블랙리스트+attempt_block 에 넣어
         호출부가 우회 재계획하게 한다.
+        자리 id 는 seg_wps 에서 node_slot 으로 언제든 얻으므로 따로 담아 다니지 않는다
+        (두 목록을 따로 들면 어긋날 때 조용한 예약 누수가 된다).
         """
         first_wp, first_cid = hops[0]
-        if not self._reserve_with_wait(engine, first_cid, robot_id):
+        first_slot = engine.node_slot(first_wp)
+        if not self._reserve_with_wait(engine, first_cid, robot_id, held):
             self._blacklist_add(first_cid)
             attempt_block.add(first_cid)
+            return None
+        # 통로를 잡은 뒤 자리를 기다리는 동안, 방금 잡은 통로도 하트비트 대상에 넣는다.
+        if not self._reserve_with_wait(engine, first_slot, robot_id,
+                                       list(held or ()) + [first_cid]):
+            # 통로는 잡았는데 도착 자리를 못 얻었다 → 쥔 통로를 반드시 도로 뱉는다.
+            # 안 뱉으면 '가지도 못하면서 길만 막는' 로봇이 되어 상대까지 묶인다.
+            engine.release(first_cid, robot_id)
+            self._log.warn(
+                f"지점 {first_wp} 자리 점유 중(로봇 {engine.holder_of(first_slot)}) "
+                f"→ 통로 {first_cid} 반납 후 그 지점을 피해 우회")
+            self._blacklist_add(first_slot)
+            attempt_block.add(first_slot)
             return None
         seg_wps = [first_wp]
         seg_cids = [first_cid]
         for next_wp, cid in hops[1:]:
             if not engine.try_reserve(cid, robot_id):
                 break                       # 세그먼트 끊김 → 여기까지
+            if not engine.try_reserve(engine.node_slot(next_wp), robot_id):
+                engine.release(cid, robot_id)   # 쌍이 깨졌으니 방금 잡은 통로도 반납
+                break
             seg_wps.append(next_wp)
             seg_cids.append(cid)
         return seg_wps, seg_cids
@@ -424,8 +560,9 @@ class PatrolDispatcher:
                            attempt_block, held_cids):
         """룩어헤드: node→target 경로의 다음 구간을 '대기 없이'(try_reserve) 미리 예약.
 
-        주행 중(on_tick) 호출된다. 잡은 통로는 held_cids 에 더해 하트비트로 유지되게 한다.
-        반환: (seg_wps, seg_cids) 또는 None(다음 통로를 아직 못 잡음 / 더 갈 곳 없음).
+        주행 중(on_tick) 호출된다. 잡은 자원은 held_cids 에 더해 하트비트로 유지되게 한다.
+        _acquire_segment 와 같은 규칙 — 홉 하나 = (통로, 도착 자리) 쌍, 쌍이 깨지면 되돌린다.
+        반환: (seg_wps, seg_cids) 또는 None(다음 홉을 아직 못 잡음 / 더 갈 곳 없음).
         """
         if node == target:
             return None                     # 이미 목표 → 미리 잡을 것 없음
@@ -435,11 +572,17 @@ class PatrolDispatcher:
         seg_wps = []
         seg_cids = []
         for next_wp, cid in route.hops():
+            slot = engine.node_slot(next_wp)
             if cid in held_cids or not engine.try_reserve(cid, robot_id):
                 break                       # 이미 쥠/남이 점유 → 대기 없이 여기서 멈춤
+            if slot not in held_cids and not engine.try_reserve(slot, robot_id):
+                engine.release(cid, robot_id)   # 쌍이 깨졌으니 방금 잡은 통로도 반납
+                break
             seg_wps.append(next_wp)
             seg_cids.append(cid)
             held_cids.append(cid)           # 하트비트 대상에 즉시 포함
+            if slot not in held_cids:
+                held_cids.append(slot)
         if not seg_cids:
             return None                     # 한 칸도 못 잡음
         return seg_wps, seg_cids

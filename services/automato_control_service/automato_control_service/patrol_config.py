@@ -92,6 +92,11 @@ BLOCK_TTL_SEC = _envf("ACS_BLOCK_TTL_SEC", 30.0)
 # 이동 대기 중 예약 유지용 하트비트 간격 / 엔진 예약 TTL(하트비트보다 커야 함)
 HEARTBEAT_SEC = _envf("ACS_HEARTBEAT_SEC", 5.0)
 RESERVATION_TTL_SEC = _envf("ACS_RESERVATION_TTL_SEC", 15.0)
+# 죽은 예약(TTL 초과)을 훑어 회수하는 주기.
+# 회수는 try_reserve 가 들어올 때도 일어나지만(그때만 TTL 을 판정한다), 아무도 그 자원을
+# 원하지 않으면 예약표에 유령으로 남는다 → 관측 API(holder_of/reserved_corridors)와
+# 데드락 사슬 검사가 죽은 로봇을 살아있는 것으로 취급한다. 그래서 주기 청소가 따로 필요하다.
+REAP_INTERVAL_SEC = _envf("ACS_REAP_INTERVAL_SEC", 5.0)
 
 # ── 순찰 시작(정적) 노드 ─────────────────────────────────────────────────── #
 # 순찰은 항상 로봇이 충전소에 있을 때 시작한다(시작 위치 고정). 라우터는 waypoint_id 로만

@@ -39,6 +39,7 @@ from rclpy.node import Node
 from automato_control_service import automato_db
 from automato_control_service.patrol_config import (
     FLEET_TOPIC,
+    REAP_INTERVAL_SEC,
     RESERVATION_TTL_SEC,
     SAVE_DETECTION_SRV,
 )
@@ -75,6 +76,9 @@ class PatrolControlNode(Node):
         # FleetTelemetry 상시 구독(1Hz)
         self.create_subscription(FleetTelemetry, FLEET_TOPIC, self._on_fleet, 10)
 
+        # 죽은 예약 주기 회수. 엔진이 아직 없으면(순찰 전) 아무 일도 안 한다.
+        self.create_timer(REAP_INTERVAL_SEC, self._reap_expired)
+
         self.get_logger().info(
             f"순찰 제어 노드 준비: 구독 {FLEET_TOPIC}, 하달 /<robot_id>/navigate "
             "(세그먼트 단위 + 통로 예약)")
@@ -87,6 +91,23 @@ class PatrolControlNode(Node):
         self.cache.update_from_fleet(msg, time.time())
 
     # ---------------------------- 엔진/클라이언트 ---------------------------- #
+    def _reap_expired(self) -> None:
+        """TTL 이 지난 죽은 예약을 회수한다(REAP_INTERVAL_SEC 마다).
+
+        ⚠️ _get_engine() 을 부르지 않는다 — 그건 없으면 DB 를 읽어 '만들어' 버린다.
+        순찰을 한 번도 안 돌린 상태에서 청소 타이머가 엔진을 깨우는 건 부작용이다.
+        예약이 생기려면 엔진이 이미 있어야 하므로, 없을 때 할 일도 없다.
+        """
+        engine = self._engine
+        if engine is None:
+            return
+        reaped = engine.reap_expired()
+        if reaped:
+            # 정상 동작에서는 나오지 않는다. 찍혔다면 로봇/스레드가 죽었거나 하트비트가
+            # 안 돈 것이므로 원인을 봐야 한다 → info 가 아니라 warn.
+            self.get_logger().warn(
+                f"죽은 예약 회수(하트비트 끊김): {reaped}")
+
     def _get_engine(self):
         """공유 라우팅 엔진을 얻는다(최초 1회 DB에서 그래프 로드). 실패 시 None."""
         with self._engine_lock:

@@ -286,3 +286,125 @@ def test_reserve_or_wait_reserved_clears_prior_wait():
     assert e.reserve_or_wait(10, "dg_02") == "reserved"     # B가 잡음
     # 잡은 뒤 B의 대기가 지워져 있어야 대기 그래프가 오염되지 않는다
     assert e.would_deadlock("dg_03", 10) is False          # 10=B보유, B는 이제 대기 안 함
+
+
+# --------------------- 노드(자리) 예약 — RP-EX 노드 점유 --------------------- #
+# 배경: 로봇이 차지하는 공간은 '통로 위' 아니면 '노드 위'다. 통로만 예약하면 노드에
+# 서 있는 로봇이 교통관제에 안 보여, 남이 '통로는 비었으니 가도 된다'며 그 자리로
+# 들어온다(정점 충돌). 노드를 '길이 0짜리 가상 통로'(id = -n)로 예약 대상에 넣어 막는다.
+
+def test_node_slot_roundtrip():
+    e = _engine()
+    assert e.node_slot(7) == -7
+    assert e.is_node_slot(-7) is True
+    assert e.is_node_slot(11) is False
+    assert e.node_of_slot(e.node_slot(7)) == 7
+
+
+def test_node_slot_reserved_like_corridor():
+    """자리도 통로와 똑같이 '한 번에 한 로봇'이다 — 예약 로직은 키의 의미를 모른다."""
+    e = _engine()
+    slot = e.node_slot(2)
+    assert e.try_reserve(slot, "dg_01") is True
+    assert e.try_reserve(slot, "dg_02") is False
+    assert e.holder_of(slot) == "dg_01"
+    assert e.release(slot, "dg_01") is True
+    assert e.try_reserve(slot, "dg_02") is True
+
+
+def test_node_slots_do_not_pollute_pathfinding():
+    """가상 통로는 예약 전용 자원이지 '길'이 아니다 — _adj 에 들어가면 안 된다.
+
+    들어가면 Dijkstra 가 '2에서 2로 가는 비용 0 간선'을 보고 경로에 중복 노드를 넣는다.
+    """
+    e = _engine()
+    route = e.find_path(1, 3)
+    assert route.nodes == (1, 2, 3) or route.nodes == (1, 4, 3)
+    assert len(set(route.nodes)) == len(route.nodes)     # 같은 노드가 두 번 안 나온다
+    assert all(cid > 0 for cid in route.corridors)       # 경로에 가상 통로가 없다
+
+
+def test_zero_waypoint_id_rejected():
+    """node_slot(0) == 0 이라 통로 0 과 키가 겹친다 → 조용히 덮어쓰느니 즉시 터뜨린다."""
+    with pytest.raises(ValueError):
+        RoutingEngine([0, 1], [{"corridor_id": 10, "a": 0, "b": 1}])
+
+
+# ------------------------ blocked_nodes (지점 통째 회피) ------------------------ #
+
+def test_blocked_nodes_detours_around_point():
+    """지점 하나를 통째로 피한다. 통로만 막아서는 다른 통로로 같은 지점에 또 들어간다."""
+    e = _engine()
+    assert e.find_path(1, 3, blocked_nodes={2}).nodes == (1, 4, 3)
+    assert e.find_path(1, 3, blocked_nodes={4}).nodes == (1, 2, 3)
+
+
+def test_blocked_nodes_does_not_check_start():
+    """내가 서 있는 자리가 막혀 있어도 거기서 출발은 해야 한다(이웃만 검사)."""
+    e = _engine()
+    assert e.find_path(1, 3, blocked_nodes={1, 2}).nodes == (1, 4, 3)
+
+
+def test_blocked_nodes_goal_unreachable():
+    e = _engine()
+    assert e.find_path(1, 3, blocked_nodes={3}) is None
+
+
+def test_blocked_nodes_all_routes_blocked():
+    e = _engine()
+    assert e.find_path(1, 3, blocked_nodes={2, 4}) is None
+
+
+# ------------------ 자리를 포함한 데드락(대기 사이클) 검사 ------------------ #
+
+def test_deadlock_cycle_through_node_slot():
+    """자리를 자원으로 등록하면 '자리 대기'가 대기 사슬에 그대로 들어간다.
+
+    would_deadlock 은 한 줄도 안 고쳤는데, 자원이 하나 늘어난 것만으로
+    '서 있는 로봇 ↔ 지나가려는 로봇' 교착을 감지하게 된다.
+    """
+    e = _engine()
+    slot2 = e.node_slot(2)
+    e.try_reserve(slot2, "dg_01")          # dg_01 이 2번에 서 있다
+    e.try_reserve(10, "dg_02")             # dg_02 가 통로10 을 쥐고
+    e.begin_wait("dg_02", slot2)           # 2번 자리를 기다린다
+    # dg_01 이 통로10 을 기다리면 사이클: dg_01 → 통로10(dg_02) → 자리2(dg_01)
+    assert e.would_deadlock("dg_01", 10) is True
+
+
+# ---------------------- reservation_snapshot (관측용 덤프) ---------------------- #
+
+def test_reservation_snapshot_splits_corridors_and_nodes():
+    """관측 쪽으로 음수 id 가 새면 화면이 통로 번호로 오해한다 → 엔진이 갈라서 준다."""
+    e = _engine()
+    e.try_reserve(10, "dg_01")
+    e.try_reserve(e.node_slot(2), "dg_01")
+    e.try_reserve(11, "dg_02")
+    snap = e.reservation_snapshot()
+    assert snap["corridors"] == {10: "dg_01", 11: "dg_02"}
+    assert snap["nodes"] == {2: "dg_01"}                 # 키가 -2 가 아니라 2
+    assert all(k > 0 for k in snap["nodes"])
+
+
+def test_reservation_snapshot_hides_expired():
+    """TTL 지난 죽은 예약은 관측에도 안 보인다(주기 회수가 아직 안 돈 사이에도)."""
+    clock = FakeClock()
+    e = _engine(ttl=15.0, clock=clock)
+    e.try_reserve(10, "dg_01")
+    e.try_reserve(e.node_slot(2), "dg_01")
+    assert e.reservation_snapshot()["corridors"] == {10: "dg_01"}
+    clock.advance(20.0)
+    snap = e.reservation_snapshot()
+    assert snap["corridors"] == {} and snap["nodes"] == {}
+
+
+def test_reap_expired_collects_node_slots():
+    """주기 회수가 자리도 걷어간다 — 유령 예약은 화면뿐 아니라 데드락 검사도 오염시킨다."""
+    clock = FakeClock()
+    e = _engine(ttl=15.0, clock=clock)
+    e.try_reserve(11, "dg_02")
+    e.try_reserve(e.node_slot(3), "dg_02")
+    clock.advance(20.0)
+    assert sorted(e.reap_expired()) == sorted([11, e.node_slot(3)])
+    assert e.holder_of(11) is None
+    assert e.holder_of(e.node_slot(3)) is None

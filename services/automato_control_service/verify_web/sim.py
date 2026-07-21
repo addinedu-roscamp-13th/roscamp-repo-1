@@ -20,7 +20,10 @@ import time
 from collections import deque
 
 from automato_control_service import automato_db
-from automato_control_service.patrol_config import RESERVATION_TTL_SEC
+from automato_control_service.patrol_config import (
+    REAP_INTERVAL_SEC,
+    RESERVATION_TTL_SEC,
+)
 from automato_control_service.patrol_dispatcher import PatrolDispatcher
 from automato_control_service.routing_engine import RoutingEngine
 
@@ -123,6 +126,43 @@ class VerifySim:
         for rid, wp in self._charge_nodes(pool).items():
             self.add_robot(rid, wp)
 
+        # 죽은 예약 주기 회수. 실 ACS 는 patrol_node 의 ROS 타이머가 같은 일을 하는데,
+        # 엔진 인스턴스를 소유한 주체가 서로 다르므로(저쪽은 ACS, 여기는 이 시뮬)
+        # 각자 자기 엔진을 청소해야 한다.
+        self._reap_stop = threading.Event()
+        self._reap_thread = threading.Thread(
+            target=self._reap_loop, name="reap", daemon=True)
+        self._reap_thread.start()
+
+    def _heartbeat_standing(self) -> None:
+        """서 있는 로봇들의 '자리' 예약을 살려둔다.
+
+        실 ACS 에서는 주행 스레드가 자기 예약을 주기적으로 하트비트한다. 그런데 시뮬에서
+        세워만 둔 로봇(초기 배치·작업 끝난 로봇)은 도는 스레드가 없어 아무도 갱신하지
+        않는다 → TTL 이 지나면 '가만히 서 있는데 자리가 회수되는' 상태가 되고, 실제로
+        그 틈으로 다른 로봇이 그 지점을 관통했다.
+        로봇이 살아 있다는 사실 자체가 하트비트의 근거이므로 여기서 대신 찍는다.
+        heartbeat 은 보유자만 갱신하므로 남의 자리를 건드리지 않는다(멱등·안전).
+        """
+        with self._lock:
+            standing = [(rid, e["robot"].snapshot().get("waypoint_id"))
+                        for rid, e in self._robots.items()]
+        for rid, wp in standing:
+            if wp is not None:
+                self.engine.heartbeat(self.engine.node_slot(wp), rid)
+
+    def _reap_loop(self) -> None:
+        """REAP_INTERVAL_SEC 마다 살아있는 자리를 갱신하고 죽은 예약을 회수한다.
+
+        wait() 가 True 를 돌려주면 중지 신호이므로 루프를 끝낸다(sleep 보다 즉시 반응).
+        """
+        while not self._reap_stop.wait(REAP_INTERVAL_SEC):
+            # 순서가 중요하다 — 산 로봇의 자리를 먼저 살려놔야 회수가 오판하지 않는다.
+            self._heartbeat_standing()
+            reaped = self.engine.reap_expired()
+            if reaped:
+                self.events.warn(f"죽은 예약 회수(하트비트 끊김): {reaped}")
+
     # ------------------------------------------------------------------ #
     def _charge_nodes(self, pool) -> dict:
         """robot_id -> 전용 충전소 진입 노드. ACS 와 같은 FK 사슬을 쓴다."""
@@ -134,6 +174,26 @@ class VerifySim:
             if wp is not None:
                 out[r["robot_id"]] = wp
         return out
+
+    def _claim_slot(self, robot_id: str, waypoint_id: int, prev_wp=None) -> None:
+        """로봇이 '서 있는 자리'를 예약표에 반영한다(옛 자리는 반납).
+
+        왜 필요한가: 실 ACS 는 run_patrol 이 출발 지점 자리를 잡고 구간마다 넘겨준다.
+        그런데 시뮬에서 세워만 둔 로봇(초기 배치·작업 끝난 로봇)은 그 경로를 안 타므로
+        예약표에 안 나타난다 → 가만히 있는 로봇이 교통관제에 투명인간이 되어 남이 그
+        지점을 관통한다. 그러면 이 도구가 잡아내려는 결함을 시뮬이 재현조차 못 한다.
+
+        ⚠️ 실물과의 차이: 실 ACS 는 순찰이 끝나면 자리를 반납한다(충전소 복귀 로직이
+        아직 없어서다). 여기서는 '로봇은 늘 어딘가에 서 있다'는 물리적 사실을 그대로
+        모델링해 세워둔 로봇도 자리를 쥐게 한다. 복귀 로직이 붙으면 양쪽이 같아진다.
+        """
+        if prev_wp is not None and prev_wp != waypoint_id:
+            self.engine.release(self.engine.node_slot(prev_wp), robot_id)
+        slot = self.engine.node_slot(waypoint_id)
+        if not self.engine.try_reserve(slot, robot_id):
+            self.events.warn(
+                f"{robot_id} 를 지점 {waypoint_id} 에 세웠지만 그 자리는 "
+                f"{self.engine.holder_of(slot)} 가 쥐고 있다(겹침)")
 
     def add_robot(self, robot_id: str, start_wp: int) -> None:
         meta = self.dispatcher.wp_meta[start_wp]
@@ -149,6 +209,7 @@ class VerifySim:
                 "status": "IDLE", "task_id": None, "result": None, "thread": None,
                 "kind": None,      # 진행 중인 작업 종류 PATROL | MOVE
             }
+        self._claim_slot(robot_id, start_wp)    # 충전소에 서 있는 것도 자리 점유다
 
     def _is_edge_blocked(self, a, b) -> bool:
         """가짜 로봇이 주행 직전에 묻는다: 이 구간 막혔나? (사용자가 화면에서 막은 통로)"""
@@ -205,6 +266,12 @@ class VerifySim:
                 result = "FAILED"
             with self._lock:
                 self._robots[robot_id].update(status="DONE", result=result)
+                # run_patrol 은 끝나면서 마지막 자리를 반납한다(실 ACS 동작). 하지만
+                # 로봇은 여전히 거기 서 있으므로 시뮬은 그 자리를 도로 쥔다 — 안 그러면
+                # 작업 끝난 로봇을 남이 관통하는, 재현하려는 결함 그 자체가 된다.
+                wp = self._robots[robot_id]["robot"].snapshot().get("waypoint_id")
+                if wp is not None:
+                    self._claim_slot(robot_id, wp)
             self.events.info(f"{robot_id} {kind} 종료 → {result}")
 
         t = threading.Thread(target=run, name=f"{kind}-{robot_id}", daemon=True)
@@ -237,9 +304,11 @@ class VerifySim:
             meta = self.dispatcher.wp_meta.get(int(waypoint_id))
             if meta is None:
                 return {"ok": False, "reason": "UNKNOWN_WAYPOINT"}
+            prev_wp = entry["robot"].snapshot().get("waypoint_id")
             entry["robot"].set_pose(meta["x"], meta["y"], yaw=meta["yaw"] or 0.0,
                                     waypoint_id=int(waypoint_id), moving=False,
                                     spinning=False)
+            self._claim_slot(robot_id, int(waypoint_id), prev_wp=prev_wp)
         return {"ok": True, "waypoint_id": int(waypoint_id)}
 
     # ---------------------- 시나리오 ---------------------- #
@@ -290,12 +359,13 @@ class VerifySim:
     # ------------------------------------------------------------------ #
     def snapshot(self, since_seq: int = 0) -> dict:
         """화면에 뿌릴 현재 상태 한 장. 브로드캐스트 루프가 10Hz 로 호출한다."""
-        # 예약표: 엔진이 공개한 holder_of 를 통로마다 물어본다(엔진 무수정 원칙).
-        reservations = {}
-        for cid in self.corridor_ids:
-            holder = self.engine.holder_of(cid)
-            if holder is not None:
-                reservations[str(cid)] = holder
+        # 예약표: 엔진이 한 락 안에서 통째로 덤프해 준다(통로/자리 분리, TTL 죽은 것 제외).
+        # 통로마다 holder_of 를 묻던 방식은 자리까지 세면 왕복이 배로 늘고, 묻는 사이에
+        # 상태가 바뀌면 화면이 어긋난다.
+        snap = self.engine.reservation_snapshot()
+        reservations = {str(cid): rid for cid, rid in snap["corridors"].items()}
+        node_holders = {str(n): rid for n, rid in snap["nodes"].items()}
+        avoid = self.dispatcher.blacklist_view(self.engine)   # 락 1회로 끝낸다
 
         with self._lock:
             robots = []
@@ -314,8 +384,12 @@ class VerifySim:
             "connected": True,
             "robots": sorted(robots, key=lambda r: r["robot_id"]),
             "reservations": reservations,
-            # 회피 중(블랙리스트) = 막힘/양보로 재계획에서 잠시 제외된 통로
-            "avoiding": sorted(self.dispatcher._blacklist_active()),
+            # 지점 자리 점유: {노드id: 로봇}. 통로 예약과 키 공간이 겹치므로 따로 낸다
+            # (같은 dict 에 음수로 섞으면 화면이 통로 번호로 오해한다).
+            "node_holders": node_holders,
+            # 회피 중(블랙리스트) = 막힘/양보로 재계획에서 잠시 제외된 통로/지점
+            "avoiding": avoid["corridors"],
+            "avoiding_nodes": avoid["nodes"],
             "blocked": blocked,
             "events": self.events.since(since_seq),
             "seq": self.events.last_seq(),
@@ -335,10 +409,14 @@ class VerifySim:
             t = e["thread"]
             if t is not None:
                 t.join(timeout=5)
-        for cid in self.corridor_ids:                 # 남은 예약 강제 회수
-            holder = self.engine.holder_of(cid)
-            if holder is not None:
-                self.engine.release(cid, holder)
+        # 남은 예약 강제 회수 — 통로뿐 아니라 '자리'도 비워야 한다. 통로만 돌면 로봇을
+        # 충전소로 되돌려 놓고도 자리 예약이 남아, 다음 시나리오에서 아무도 그 지점에
+        # 못 들어가는 유령 점유가 된다.
+        snap = self.engine.reservation_snapshot()
+        for cid, holder in snap["corridors"].items():
+            self.engine.release(cid, holder)
+        for node_id, holder in snap["nodes"].items():
+            self.engine.release(self.engine.node_slot(node_id), holder)
         with self._lock:
             self._blocked_corridors.clear()
             for rid, e in self._robots.items():
@@ -352,9 +430,12 @@ class VerifySim:
                     is_edge_blocked=self._is_edge_blocked, logger=self.events)
                 e.update(status="IDLE", task_id=None, result=None, thread=None,
                          kind=None)
+                self._claim_slot(rid, e["start_wp"])   # 충전소 자리를 다시 쥔다
         self.events.info("[조작] 시뮬 초기화")
 
     def shutdown(self) -> None:
+        self._reap_stop.set()               # 청소 스레드 먼저 세운다
+        self._reap_thread.join(timeout=2)
         with self._lock:
             entries = list(self._robots.values())
         for e in entries:
