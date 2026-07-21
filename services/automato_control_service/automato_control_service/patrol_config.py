@@ -74,7 +74,9 @@ def _envi(name: str, default: int) -> int:
 
 
 # ── 토픽/서비스 이름 (구조적 상수, .env 대상 아님) ─────────────────────────── #
-FLEET_TOPIC = "/automato/telemetry/fleet"
+# RP-114 로 텔레메트리 입력이 로봇별 /{robot_id}/telemetry 로 바뀌었다.
+# 토픽 이름·로봇 목록·구독 배선은 fleet_collector 가 소유한다
+# (DEFAULT_ROBOT_IDS / robot_telemetry_topic() / LEGACY_FLEET_TOPIC).
 # RP-79: DG 가 waypoint 마다 탐지 결과를 넘기는 ROS2 Service (ACS 가 서버).
 SAVE_DETECTION_SRV = "/automato/save_detection"
 

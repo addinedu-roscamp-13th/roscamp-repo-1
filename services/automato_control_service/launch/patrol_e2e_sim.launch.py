@@ -7,7 +7,7 @@
 띄우는 것 (robots 인자에 적은 로봇마다 2개 + 공통 1개):
   로봇마다  fake_telemetry   : /ddago/telemetry 1Hz 발행 (가짜 DdaGo 상태)
             patrol_bridge    : /<robot_id>/navigate 액션 서버 (가짜 DCS+DdaGo 주행)
-  공통      fleet_aggregator : 위를 묶어 /automato/telemetry/fleet 발행 (가짜 DCS 취합)
+  공통      dg_stub          : 위를 로봇별로 갈라 /{robot_id}/telemetry 발행 (가짜 DCS 중계)
 
 실행 (ROS + 워크스페이스 2개 소싱 후, 리포 안에서):
   # 터미널 1 — 스탠드인 일괄
@@ -99,10 +99,11 @@ def _launch_setup(context, *args, **kwargs):
             }],
         ))
 
-    # 취합 노드는 토픽이 절대경로(/automato/telemetry/fleet) 단일이라 1개만, 네임스페이스 없이.
+    # DG 중계 대역은 1개만 띄운다. 실기라면 로봇 세트마다 한 프로세스씩이지만, 이 대역은
+    # 한 머신에서 payload robot_id 로 로봇을 갈라 여러 DG 인 척 발행한다(dg_stub 참고).
     actions.append(Node(
-        package=PKG, executable='fleet_aggregator',
-        name='fleet_aggregator', output='screen'))
+        package=PKG, executable='dg_stub',
+        name='dg_stub', output='screen'))
     return actions
 
 

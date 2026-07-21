@@ -17,7 +17,8 @@ HQ(DG Control Service)로 **순찰 Action**을 하달한다. (시나리오 1 E1 
 | `automato_control_service/routing_engine.py` | **④ 라우팅/예약 엔진** — Dijkstra 경로탐색 + 예약표(통로·지점 자리, 독립 모듈, 순찰 외 재사용) |
 | `automato_control_service/detection_service.py` | **(RP-79) 탐지 오케스트레이션** — 이미지 저장/DB/notify/alert 조율 + HTTP(urllib) |
 | `automato_control_service/detection_db.py` | **(RP-79) 탐지 DB 저장** — detection_logs INSERT + task_paths.is_visited (단일 트랜잭션) |
-| `automato_control_service/fleet_telemetry_relay.py` | (RP-77) 텔레메트리 → QT 대시보드 중계 |
+| `automato_control_service/fleet_collector.py` | **(RP-114) 로봇별 텔레메트리 취합** — 세 노드가 공유하는 순수 모듈(캐시 + 구독 배선) |
+| `automato_control_service/fleet_telemetry_aggregator.py` | (RP-114) 로봇별 텔레메트리 취합 → QT 대시보드 발행(1Hz) |
 
 ### 탐지 저장·중계·알림 (RP-79)
 

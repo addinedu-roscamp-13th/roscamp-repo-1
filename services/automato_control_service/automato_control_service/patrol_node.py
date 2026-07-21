@@ -2,7 +2,7 @@
 """RP-78 ② ROS2 노드 — 텔레메트리 캐시 + Navigate 액션 클라이언트 + 순찰 디스패치.
 
 이 파일은 'ROS 표면(로봇과의 실제 통신)'을 담당한다.
-  - 구독:  /automato/telemetry/fleet (FleetTelemetry, 1Hz) → 로봇별 최신 상태 캐시
+  - 구독:  /{robot_id}/telemetry (RobotTelemetry, 1Hz, 로봇 수만큼) → 로봇별 최신 상태 캐시
   - 발신:  /{robot_id}/navigate (Navigate 액션) → DG(DG Control Service) 경유로 경로(배열) 하달
   - 종료:  방문 결과에 따라 tasks 를 COMPLETED/COMPLETED_PARTIAL/FAILED 로 마감(automato_db)
 
@@ -37,8 +37,13 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from automato_control_service import automato_db
+from automato_control_service.fleet_collector import (
+    DEFAULT_ROBOT_IDS,
+    LEGACY_FLEET_TOPIC,
+    robot_telemetry_topic,
+    subscribe_per_robot,
+)
 from automato_control_service.patrol_config import (
-    FLEET_TOPIC,
     REAP_INTERVAL_SEC,
     RESERVATION_TTL_SEC,
     SAVE_DETECTION_SRV,
@@ -73,22 +78,38 @@ class PatrolControlNode(Node):
         # wp_meta·블랙리스트는 디스패처가 소유하며, 그래프 로드 시 노드가 wp_meta 를 채운다.
         self._dispatcher = PatrolDispatcher(self.get_logger())
 
-        # FleetTelemetry 상시 구독(1Hz)
-        self.create_subscription(FleetTelemetry, FLEET_TOPIC, self._on_fleet, 10)
+        # 텔레메트리 상시 구독(1Hz) — 로봇별 /{robot_id}/telemetry
+        self.declare_parameter("robot_ids", DEFAULT_ROBOT_IDS)
+        self.declare_parameter("legacy_input", True)
+        robot_ids = list(self.get_parameter("robot_ids").value)
+        legacy_input = bool(self.get_parameter("legacy_input").value)
+        subscribe_per_robot(self, robot_ids, self._on_robot_telemetry)
+        # [삭제 예정] 팀원의 DG 이전 전까지 옛 취합 경로도 함께 받는다.
+        if legacy_input:
+            self.create_subscription(
+                FleetTelemetry, LEGACY_FLEET_TOPIC, self._on_fleet, 10)
 
         # 죽은 예약 주기 회수. 엔진이 아직 없으면(순찰 전) 아무 일도 안 한다.
         self.create_timer(REAP_INTERVAL_SEC, self._reap_expired)
 
         self.get_logger().info(
-            f"순찰 제어 노드 준비: 구독 {FLEET_TOPIC}, 하달 /<robot_id>/navigate "
-            "(세그먼트 단위 + 통로 예약)")
+            f"순찰 제어 노드 준비: 구독 {[robot_telemetry_topic(r) for r in robot_ids]}"
+            f"{f' + 옛 {LEGACY_FLEET_TOPIC}' if legacy_input else ''}, "
+            "하달 /<robot_id>/navigate (세그먼트 단위 + 통로 예약)")
 
     # ---------------------------- 주입/구독 ---------------------------- #
     def set_db_pool(self, pool) -> None:
         self._db_pool = pool
 
+    def _on_robot_telemetry(self, robot_id, msg) -> None:
+        self.cache.update_from_robot(robot_id, msg, time.time())
+
     def _on_fleet(self, msg: FleetTelemetry) -> None:
+        """[삭제 예정] 옛 /automato/telemetry/fleet 경로."""
         self.cache.update_from_fleet(msg, time.time())
+        self.get_logger().info(
+            "[삭제 예정] 옛 fleet 경로로 텔레메트리 수신 중 — DG 이전 후 "
+            "legacy_input 을 끄세요", throttle_duration_sec=30.0)
 
     # ---------------------------- 엔진/클라이언트 ---------------------------- #
     def _reap_expired(self) -> None:

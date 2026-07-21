@@ -3,7 +3,7 @@
 
 ⚠️ 실제 로봇도, 실제 DG Control Service 도 아니다. A 티어(로직 검증)에서 물리 로봇 없이
    "가용한 로봇이 하나 더 있는 것"처럼 보이게 하는 '테스트 전용' 노드다.
-   진짜 로봇/HQ 가 준비되면 이 파일은 버린다. (fleet_aggregator / patrol_bridge 와 같은 성격)
+   진짜 로봇/HQ 가 준비되면 이 파일은 버린다. (dg_stub / patrol_bridge 와 같은 성격)
 
 왜 필요한가 —
    ACS(RP-78)의 로봇 선정·교통관제는 "가용한 로봇들의 상태"를 보고 판단한다. 그 상태를 올려주는
@@ -16,7 +16,7 @@
 하는 일 —
    발행: /ddago/telemetry  (DdagoTelemetry, 기본 1Hz) — 진짜 로봇과 '같은 토픽/타입'.
      * 여러 가짜 로봇이 이 '한 토픽'에 함께 발행하고(다중 발행자 정상), 구분은
-       msg.robot_id(payload)로 한다 → fleet_aggregator 가 robot_id 로 키잉해 취합.
+       msg.robot_id(payload)로 한다 → dg_stub 이 robot_id 로 갈라 /{robot_id}/telemetry 로 올린다.
      * header.stamp 를 매번 '지금'(시스템 시각)으로 찍는다 → 계속 신선.
        멈추면(Ctrl+C) 3초 뒤 ACS 에서 자연히 ROBOT_OFFLINE 으로 뜬다.
    값(배터리·상태·좌표 등)은 파라미터로 주고 매 틱마다 다시 읽어 발행하므로, 실행 중에
@@ -34,10 +34,10 @@
    #   ros2 run automato_control_service fake_telemetry --ros-args -r __ns:=/dg_02
 
 주의 —
-   * fleet_aggregator 는 /ddago/telemetry 를 구독해 msg.robot_id 로 가르므로, 가짜마다
+   * dg_stub 은 /ddago/telemetry 를 구독해 msg.robot_id 로 가르므로, 가짜마다
      서로 다른 robot_id(=네임스페이스)를 주면 자동 취합된다(사전 목록 불필요).
    * 여러 가짜가 같은 토픽(/ddago/telemetry)에 함께 발행하는 건 정상(다중 발행자).
-     단 robot_id 는 서로 달라야 한다 — 같으면 aggregator 캐시에서 서로 덮어쓴다.
+     단 robot_id 는 서로 달라야 한다 — 같으면 dg_stub 캐시에서 서로 덮어쓴다.
    * 값을 param set 으로 바꿀 땐 선언된 타입에 맞춰라(소수 파라미터는 65.0 처럼 소수점 포함).
 """
 from automato_interfaces.msg import DdagoTelemetry
@@ -87,7 +87,7 @@ class FakeTelemetry(Node):
         # header.stamp = '지금'(시스템 시각). ACS staleness(3초)를 통과 → 멈추면 자연히 STALE.
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self._robot_id
-        msg.robot_id = self._robot_id                      # aggregator/ACS 가 이 값으로 키잉
+        msg.robot_id = self._robot_id                      # dg_stub 이 이 값으로 로봇을 가른다
         msg.task_id = int(g("task_id").value)
         msg.nav_status = str(g("nav_status").value)
         msg.is_charging = bool(g("is_charging").value)
