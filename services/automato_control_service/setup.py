@@ -28,11 +28,12 @@ setup(
             # RP-90: 텔레메트리 WebSocket 서버 — fleet 구독 → 1Hz 방송(독립 프로세스)
             'telemetry_ws_node = '
             'automato_control_service.telemetry_ws_node:main',
-            'fleet_telemetry_relay = '
-            'automato_control_service.fleet_telemetry_relay:main',
+            # RP-114: 로봇별 텔레메트리 취합 → QT 대시보드 발행(독립 프로세스)
+            'fleet_telemetry_aggregator = '
+            'automato_control_service.fleet_telemetry_aggregator:main',
             # RP-78 실물 테스트 전용 임시 스탠드인 (실제 DG Control Service 아님)
-            'fleet_aggregator = '
-            'automato_control_service.test_harness.fleet_aggregator:main',
+            'dg_stub = '
+            'automato_control_service.test_harness.dg_stub:main',
             'patrol_bridge = '
             'automato_control_service.test_harness.patrol_bridge:main',
             # A 티어 전용: 물리 로봇 없이 가짜 로봇 텔레메트리 발행 (로봇 1대로 다중 로봇 검증)

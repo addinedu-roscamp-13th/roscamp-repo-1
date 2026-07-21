@@ -15,8 +15,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   # E0 상시 텔레메트리 (ROS2 Topic)
   "msg/ServoStatus.msg"       # DdagiTelemetry.servo_health 원소
   "msg/DdagoTelemetry.msg"    # DdaGo Control Service -> DG  /ddago/telemetry (로봇 쪽 네임스페이스 없음)
-  "msg/DdagiTelemetry.msg"    # Ddagi Control Service -> DG  /dg_01/ddagi/telemetry
-  "msg/FleetTelemetry.msg"    # DG -> Automato Control Service / QT  (취합)
+  "msg/DdagiTelemetry.msg"    # Ddagi Control Service -> DG  /ddagi/telemetry (로봇 쪽 네임스페이스 없음)
+  "msg/RobotTelemetry.msg"    # DG -> Automato Control Service  /{robot_id}/telemetry (자기 세트분)
+  "msg/FleetMember.msg"       # FleetTelemetry.robots 원소 (ACS 가 robot_id 를 붙인다)
+  "msg/FleetTelemetry.msg"    # Automato Control Service -> QT  /automato/dashboard/fleet_telemetry (취합)
   # E1/E2 순찰 waypoint 보조 타입
   "msg/WaypointGoal.msg"      # (구) Patrol 보조 — Navigate 마이그레이션 후 삭제 예정
   "msg/Waypoint.msg"          # (신) Navigate 보조, capture 필드 추가

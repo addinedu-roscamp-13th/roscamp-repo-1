@@ -26,7 +26,7 @@
 
 | 단계 | 흐름 | 내 담당이 띄우는 것 | 팀원 의존 |
 | --- | --- | --- | --- |
-| **E0** | 로봇 상태 상시 스트리밍 → 취합 → 대시보드 | `telemetry_publisher`(로봇), `fleet_telemetry_relay`(ACS) | HQ가 `/automato/telemetry/fleet`로 취합 |
+| **E0** | 로봇 상태 상시 스트리밍 → 취합 → 대시보드 | `telemetry_publisher`(로봇), `fleet_telemetry_aggregator`(ACS) | ACS가 `/{robot_id}/telemetry`를 로봇별 구독해 취합(RP-114) |
 | **E1** | 순찰 접수 → 로봇 선정 → 하달 → 주행 | ACS API + `patrol_server`(로봇) | HQ가 `/dg_01/patrol` 받아 로봇에 중계 |
 | **E2** | 도착 촬영 → 분석요청 → 탐지 저장 | `patrol_server`(로봇) + ACS `save_detection` + DB | HQ/AI가 `analyze_frame` 서버 |
 | **E3** | 순찰현황 중계 + 병해충 알림 | ACS notify/alert 발신 | Web Service가 수신 |
@@ -41,7 +41,7 @@
 | 라벨 | 실제 위치 | 이번에 띄우는 것 |
 | --- | --- | --- |
 | 🤖 **[로봇 PC]** | dg_01 로봇의 RPi5 (`ssh pinky@<로봇IP>`) | 로봇 드라이버, Nav2, `telemetry_publisher`, `patrol_server`, 더미 카메라 |
-| 🖥️ **[로컬 PC]** | 관제/개발 노트북 | DB, ACS(`patrol_node`), `fleet_telemetry_relay`, 순찰 트리거 |
+| 🖥️ **[로컬 PC]** | 관제/개발 노트북 | DB, ACS(`patrol_node`), `fleet_telemetry_aggregator`, 순찰 트리거 |
 
 > **네트워크 전제.** 두 기기가 **같은 무선망 + 같은 `ROS_DOMAIN_ID`** 여야 서로 보인다.
 > 확인: 양쪽에서 `echo $ROS_DOMAIN_ID` 값이 같은지(비어 있으면 둘 다 0). 다르면
@@ -216,11 +216,13 @@ ros2 service list | grep save_detection      # /automato/save_detection
 curl -s http://localhost:8200/health         # {"ok":true,...}
 ```
 
-### ③ Fleet 릴레이(E0 대시보드 중계) — 🖥️ 로컬 (선택)
+### ③ Fleet 취합(E0 대시보드 발행) — 🖥️ 로컬 (선택)
 
 ```bash
-ros2 run automato_control_service fleet_telemetry_relay
-#  구독 /automato/telemetry/fleet → 발행 /automato/dashboard/fleet_telemetry
+ros2 run automato_control_service fleet_telemetry_aggregator
+#  구독 /{robot_id}/telemetry (로봇 수만큼) → 발행 /automato/dashboard/fleet_telemetry (1Hz)
+#  DG(dg_control) 이전이 끝나기 전까지는 옛 /automato/telemetry/fleet 도 함께 구독한다.
+#  이전 완료 후: --ros-args -p legacy_input:=false
 ```
 
 ### ④ 로봇 드라이버 + Nav2 — 🤖 로봇
