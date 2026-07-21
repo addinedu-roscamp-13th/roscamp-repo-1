@@ -28,7 +28,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Range
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Int64
 
 
 def _wait_until(predicate, timeout=5.0):
@@ -67,8 +67,9 @@ def ctx():
 
 def _make_source_pubs(helper):
     """노드가 구독하는 소스 토픽들에 대응하는 가짜 발행자 생성."""
-    # 액션 status 는 노드가 TRANSIENT_LOCAL 로 구독하므로 발행도 맞춰야 매칭된다.
-    status_qos = QoSProfile(
+    # 액션 status 와 current_task 는 노드가 TRANSIENT_LOCAL 로 구독하므로
+    # 발행도 같은 프로파일로 맞춰야 매칭된다(QoS 가 어긋나면 연결 자체가 안 된다).
+    latched_qos = QoSProfile(
         depth=1,
         reliability=ReliabilityPolicy.RELIABLE,
         durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -81,8 +82,21 @@ def _make_source_pubs(helper):
         'batt_volt': helper.create_publisher(Float32, 'battery/voltage', 10),
         'range': helper.create_publisher(Range, 'us_sensor/range', 10),
         'status': helper.create_publisher(
-            GoalStatusArray, 'navigate_to_pose/_action/status', status_qos),
+            GoalStatusArray, 'navigate_to_pose/_action/status', latched_qos),
+        'task': helper.create_publisher(
+            Int64, '/ddago/current_task', latched_qos),
     }
+
+
+def _publish_nav_status(pubs, status, sec):
+    """Nav2 액션 status 를 한 건짜리 GoalStatusArray 로 발행."""
+    st = GoalStatusArray()
+    gs = GoalStatus()
+    gs.status = status
+    # 노드는 status_list 중 stamp 가 가장 최신인 것을 고른다 → sec 로 순서를 준다.
+    gs.goal_info.stamp.sec = sec
+    st.status_list = [gs]
+    pubs['status'].publish(st)
 
 
 def _subscribe_telemetry(helper, sink):
@@ -146,6 +160,7 @@ def test_defaults_before_sources(ctx):
     # ddago 는 robot_id 를 채우지 않는다(빈 문자열) — 로봇 식별은 dcs 몫.
     assert msg.robot_id == ''
     assert msg.nav_status == 'IDLE'
+    assert msg.task_id == 0          # goal 을 한 번도 받지 않았으면 0
     assert msg.x == pytest.approx(0.0)
     assert msg.y == pytest.approx(0.0)
     assert not msg.is_charging
@@ -200,3 +215,87 @@ def test_odom_fallback_when_no_amcl(ctx):
     assert msg.x == pytest.approx(5.5)
     assert msg.y == pytest.approx(6.6)
     assert msg.header.frame_id == 'odom'
+
+
+def test_task_id_from_current_task(ctx):
+    """/ddago/current_task 로 받은 task_id 가 텔레메트리에 실린다."""
+    _node, helper = ctx
+    pubs = _make_source_pubs(helper)
+    received = []
+    _subscribe_telemetry(helper, received)
+
+    def task_reflected():
+        t = Int64()
+        t.data = 1024
+        pubs['task'].publish(t)
+        return bool(received) and received[-1].task_id == 1024
+
+    assert _wait_until(task_reflected, timeout=8.0), \
+        'current_task 가 텔레메트리 task_id 에 반영되지 않음'
+
+
+def test_task_id_persists_after_goal_ends(ctx):
+    """Goal 이 끝나도 task_id 는 0 으로 되돌아가지 않는다.
+
+    ACS 는 한 task 를 예약 구간 단위로 쪼개 여러 goal 로 하달한다(문서 E2 4단계).
+    goal 사이의 틈마다 0 이 되면 QT 화면에서 task_id 가 깜빡이고, 복귀 주행
+    (22-1·E4, 같은 task_id 재사용) 추적도 끊긴다.
+    """
+    _node, helper = ctx
+    pubs = _make_source_pubs(helper)
+    received = []
+    _subscribe_telemetry(helper, received)
+
+    # goal 하달: task_id 가 실리고 주행이 시작된 상태를 만든다.
+    def task_set():
+        t = Int64()
+        t.data = 1024
+        pubs['task'].publish(t)
+        _publish_nav_status(pubs, GoalStatus.STATUS_EXECUTING, 100)
+        return bool(received) and received[-1].task_id == 1024
+
+    assert _wait_until(task_set, timeout=8.0), 'task_id 가 실리지 않음'
+
+    # goal 종료(SUCCEEDED). 다음 구간이 하달되기 전 틈에 해당한다.
+    def goal_finished():
+        _publish_nav_status(pubs, GoalStatus.STATUS_SUCCEEDED, 200)
+        return received[-1].nav_status == 'IDLE'
+
+    assert _wait_until(goal_finished, timeout=8.0), 'goal 종료가 반영되지 않음'
+    assert received[-1].task_id == 1024, \
+        'goal 종료 후 task_id 가 0 으로 되돌아갔다 (구간 사이 깜빡임 발생)'
+
+
+def test_nav_status_has_only_two_values(ctx):
+    """nav_status 는 IDLE / NAVIGATING 두 값뿐이다.
+
+    특히 ABORTED(주행 실패)가 'FAILED' 로 남으면, 그 값이 다음 goal 까지 latch 되어
+    E1 가용 조건(nav_status = IDLE)을 영영 통과하지 못하는 교착이 생긴다.
+    """
+    _node, helper = ctx
+    pubs = _make_source_pubs(helper)
+    received = []
+    _subscribe_telemetry(helper, received)
+
+    # 먼저 주행 중으로 만든다. (초기값이 IDLE 이라 곧바로 확인하면 가짜 통과가 된다)
+    def navigating():
+        _publish_nav_status(pubs, GoalStatus.STATUS_EXECUTING, 100)
+        return bool(received) and received[-1].nav_status == 'NAVIGATING'
+
+    assert _wait_until(navigating, timeout=8.0), '주행 중 상태가 반영되지 않음'
+
+    # 취소 진행 중은 아직 감속 중이므로 NAVIGATING 을 유지한다.
+    def canceling():
+        _publish_nav_status(pubs, GoalStatus.STATUS_CANCELING, 200)
+        return received[-1].nav_status == 'NAVIGATING'
+
+    assert _wait_until(canceling, timeout=8.0), \
+        'CANCELING 이 NAVIGATING 으로 유지되지 않음'
+
+    # 주행 실패는 IDLE 로 돌아와야 한다 (실패 사실은 Navigate Result 가 전달).
+    def aborted_is_idle():
+        _publish_nav_status(pubs, GoalStatus.STATUS_ABORTED, 300)
+        return received[-1].nav_status == 'IDLE'
+
+    assert _wait_until(aborted_is_idle, timeout=8.0), \
+        'ABORTED 가 IDLE 로 매핑되지 않음 (로봇이 배정 교착에 빠진다)'
