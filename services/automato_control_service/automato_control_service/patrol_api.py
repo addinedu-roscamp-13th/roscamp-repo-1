@@ -7,11 +7,11 @@
   GET  /health                               헬스체크
 
 이 계층의 책임은 '판단'이다:
-  - 가용 판정(judge_robot): 4개 조건을 AND로 확인
+  - 가용 판정(judge_robot): 5개 조건을 AND로 확인
   - 로봇 선정(select_auto): 가용 후보 중 배터리 최고, 동점 시 robot_id 오름차순
 데이터는 두 곳에서 온다:
-  - DB(automato_db): 활성 task 여부, 배터리 임계값        ← '영속' 상태
-  - 노드 캐시(node.cache): 로봇 최신 텔레메트리           ← '순간' 상태
+  - DB(automato_db): 운영 상태, 활성 task 여부, 배터리 임계값  ← '영속' 상태
+  - 노드 캐시(node.cache): 로봇 최신 텔레메트리                ← '순간' 상태
 
 judge_robot / select_auto 는 외부 의존(ROS/DB) 없는 순수 함수라 단위테스트가 쉽다.
 create_app(node, pool) 이 노드/DB를 주입받아 엔드포인트에 연결한다.
@@ -49,25 +49,39 @@ def _iso(ts: float) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 가용 판정 (순수 함수) — 4개 조건 AND
-#   1) (DB)   해당 로봇에 활성 task 없음
-#   2) (캐시) nav_status == 'IDLE'
-#   3) (캐시) battery_percent >= 임계값
-#   4) (캐시) 최근 STALE_SEC 초 이내 수신(ddago header.stamp)
+# 가용 판정 (순수 함수) — 5개 조건 AND (시나리오1 E1 3번)
+#   1) (DB)   operational_status == 'NORMAL'
+#   2) (DB)   해당 로봇에 활성 task 없음
+#   3) (캐시) nav_status == 'IDLE'
+#   4) (캐시) battery_percent >= 임계값
+#   5) (캐시) 최근 STALE_SEC 초 이내 수신(ddago header.stamp)
 #   ※ is_charging 은 판정에 넣지 않는다(현재 항상 false 고정 → 넣으면 향후 함정).
+#
+# 1)과 3)은 성격이 다르다. nav_status 는 '지금 움직이는 중인가'라는 일시적 상태라 저절로
+# IDLE 로 돌아온다. operational_status 는 '일을 줘도 되는가'이고 사람이 손대야만 풀린다.
+# 통로에 갇힌 로봇(E2 22-2)은 멈춰 있으니 nav_status=IDLE 이고 task 도 실패 처리돼 2)까지
+# 통과하지만, 관리자가 옮겨주기 전에는 배정되면 안 된다. 그래서 축이 두 개 필요하다.
 # --------------------------------------------------------------------------- #
 def judge_robot(robot_id: str, entry: Optional[dict], has_active_task: bool,
-                threshold: float, now: float,
+                operational_status: str, threshold: float, now: float,
                 stale_sec: float = STALE_SEC) -> dict:
     """로봇 1대의 가용 여부와 (불가 시) 사유를 판정해 응답 dict로 만든다.
 
     entry: 노드 캐시의 해당 로봇 항목(없으면 None). 형태는 patrol_node.TelemetryCache 참고.
+    operational_status: robots.operational_status ('NORMAL'|'IMMOBILIZED'|'MAINTENANCE').
+      기본값을 두지 않는다 — 호출부가 빠뜨리면 '조용히 가용'으로 통과해 갇힌 로봇이
+      다시 배정된다. 필수 인자면 그 자리에서 TypeError 로 드러난다.
     반환 예: {"robot_id","status","battery_percent","current_position","available"[,"unavailable_reason"]}
 
     사유 우선순위(여럿 겹칠 때):
-      활성 task > 텔레메트리 없음/오래됨 > nav!=IDLE > 배터리 부족
-    (활성 task는 DB 사실이라 캐시 신선도와 무관하게 최우선. 미수신이면 캐시값을 못 믿으므로
+      운영상태 비정상 > 활성 task > 텔레메트리 없음/오래됨 > nav!=IDLE > 배터리 부족
+    (앞 둘은 DB 사실이라 캐시 신선도와 무관하게 우선. 그중에서도 운영상태가 먼저인 이유는
+     '사람이 가야만 풀리는' 가장 무거운 상태여서다 — 오프라인이면서 갇힌 로봇도 관리자에겐
+     IMMOBILIZED 로 보여야 현장에 나갈 판단이 선다. 미수신이면 캐시값을 못 믿으므로
      nav/battery보다 먼저 ROBOT_OFFLINE으로 처리.)
+
+    MAINTENANCE(관리자 수동 점검)도 사유명은 IMMOBILIZED 로 낸다 — 시나리오1 E0 5) 표가
+    'operational_status 가 NORMAL 이 아님 — 현장 정지 또는 점검 중'을 한 값으로 정의한다.
     """
     ddago = entry.get("ddago") if entry else None
     status = ddago["nav_status"] if ddago else None
@@ -75,7 +89,9 @@ def judge_robot(robot_id: str, entry: Optional[dict], has_active_task: bool,
     position = {"x": ddago["x"], "y": ddago["y"]} if ddago else None
 
     reason = None
-    if has_active_task:
+    if operational_status != "NORMAL":
+        reason = "IMMOBILIZED"
+    elif has_active_task:
         reason = "ROBOT_BUSY"
     elif ddago is None:
         reason = "ROBOT_OFFLINE"            # 한 번도 수신 못 함
@@ -130,11 +146,16 @@ def create_app(node, pool) -> FastAPI:
     traffic_debug.register(app, node)
 
     def _judge_all(snap: dict, now: float) -> dict:
-        """robot_id -> 판정 dict. available/접수 양쪽에서 재사용."""
+        """robot_id -> 판정 dict. available/접수 양쪽에서 재사용.
+
+        snap["operational"] 는 snap["robots"] 와 같은 조회에서 나오므로 모든 rid 에 값이
+        있다. .get(rid, "NORMAL") 로 감싸지 않는 이유 — 그 불변식이 깨진 날 조용히
+        '정상'으로 통과시키는 것보다 KeyError 로 드러나는 편이 낫다.
+        """
         return {
             rid: judge_robot(
                 rid, node.cache.get(rid), rid in snap["active"],
-                snap["threshold"], now,
+                snap["operational"][rid], snap["threshold"], now,
             )
             for rid in snap["robots"]
         }
