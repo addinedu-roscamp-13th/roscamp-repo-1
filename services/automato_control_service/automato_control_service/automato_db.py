@@ -124,19 +124,23 @@ def get_availability_snapshot(pool: ConnectionPool) -> dict:
     """가용 판정에 필요한 'DB쪽' 입력을 한 번에 모아 온다.
 
     반환:
-      robots    : 전체 로봇 id 목록(robots 테이블, 정렬됨)
-      active    : 지금 활성 task를 가진 robot_id 집합(WAITING/IN_PROGRESS)
-      threshold : PATROL 배터리 임계값(operation_battery_thresholds, 기본 70)
+      robots      : 전체 로봇 id 목록(robots 테이블, 정렬됨)
+      active      : 지금 활성 task를 가진 robot_id 집합(WAITING/IN_PROGRESS)
+      threshold   : PATROL 배터리 임계값(operation_battery_thresholds, 기본 70)
+      operational : robot_id -> operational_status('NORMAL'|'IMMOBILIZED'|'MAINTENANCE')
 
     캐시(nav_status/battery/staleness)는 노드가 들고 있으므로 여기선 안 읽는다.
+    operational_status 는 캐시가 아니라 DB 에 두는 값이다 — 정의상 사람이 손으로
+    풀어줘야 하는 상태라, ACS 가 재기동돼도 남아 있어야 한다(0007 마이그레이션 참고).
     """
     with pool.connection() as conn:
-        robots = [
-            r["robot_id"]
+        operational = {
+            r["robot_id"]: r["operational_status"]
             for r in conn.execute(
-                "SELECT robot_id FROM robots ORDER BY robot_id"
+                "SELECT robot_id, operational_status FROM robots ORDER BY robot_id"
             ).fetchall()
-        ]
+        }
+        robots = list(operational.keys())   # dict 는 삽입 순서를 지킨다 → ORDER BY 유지
         active = {
             r["assigned_robot_id"]
             for r in conn.execute(
@@ -150,7 +154,8 @@ def get_availability_snapshot(pool: ConnectionPool) -> dict:
             "WHERE task_type = 'PATROL'"
         ).fetchone()
         threshold = row["min_battery_percent"] if row else 70
-    return {"robots": robots, "active": active, "threshold": threshold}
+    return {"robots": robots, "active": active, "threshold": threshold,
+            "operational": operational}
 
 
 # --------------------------------------------------------------------------- #
@@ -159,7 +164,7 @@ def get_availability_snapshot(pool: ConnectionPool) -> dict:
 def get_telemetry_state(pool: ConnectionPool) -> tuple:
     """RP-90 방송에 필요한 'DB쪽' 사실을 한 번에 모아 온다.
 
-    반환: (active_types, threshold)
+    반환: (active_types, threshold, operational)
       active_types : {robot_id: task_type}. 활성(WAITING/IN_PROGRESS) task 가 있는 로봇만.
                      값이 그 로봇의 진행 중 task 종류(PATROL/HARVEST/TRANSFER)다 →
                      여기 있으면 ROBOT_BUSY 이고, 그 종류가 그대로 응답 task_type 이 된다.
@@ -167,8 +172,11 @@ def get_telemetry_state(pool: ConnectionPool) -> tuple:
       threshold    : 배터리 임계값(operation_battery_thresholds, 기본 70). BATTERY_TOO_LOW
                      기준. 여러 task_type 이 있으나 여기선 PATROL 기준을 '가용 표시용 단일
                      임계값'으로 쓴다(가용 조회 API 와 동일 관례).
+      operational  : {robot_id: operational_status}. 전 로봇. NORMAL 이 아니면 IMMOBILIZED
+                     사유가 된다. E1 가용 판정(get_availability_snapshot)과 같은 사실을
+                     보게 해 방송 화면과 배정 결과가 어긋나지 않도록 한다.
 
-    가벼운 SELECT 두 번뿐이라 1Hz 호출에도 부담이 없다(커넥션 풀 재사용).
+    가벼운 SELECT 세 번뿐이라 1Hz 호출에도 부담이 없다(커넥션 풀 재사용, 로봇 3대).
     """
     with pool.connection() as conn:
         active_types = {
@@ -184,7 +192,13 @@ def get_telemetry_state(pool: ConnectionPool) -> tuple:
             "WHERE task_type = 'PATROL'"
         ).fetchone()
         threshold = row["min_battery_percent"] if row else 70
-    return active_types, threshold
+        operational = {
+            r["robot_id"]: r["operational_status"]
+            for r in conn.execute(
+                "SELECT robot_id, operational_status FROM robots"
+            ).fetchall()
+        }
+    return active_types, threshold, operational
 
 
 # --------------------------------------------------------------------------- #

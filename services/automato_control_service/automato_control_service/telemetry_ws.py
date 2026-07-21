@@ -22,8 +22,14 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 # unavailable_reason 확정 우선순위(위에서부터 검사, 처음 걸리는 값 채택).
 # 여러 조건이 동시에 참일 수 있어 순서를 고정한다(예: 충전 중 + 배터리 낮음 → CHARGING).
-# 의미상 '데이터를 못 믿음(OFFLINE) → 물리 문제(CHARGING/배터리) → 정상 작업(BUSY)' 순.
-UNAVAILABLE_PRIORITY = ("ROBOT_OFFLINE", "CHARGING", "BATTERY_TOO_LOW", "ROBOT_BUSY")
+# 의미상 '사람이 가야 풀림(IMMOBILIZED) → 데이터를 못 믿음(OFFLINE) →
+#         물리 문제(CHARGING/배터리) → 정상 작업(BUSY)' 순.
+# IMMOBILIZED 가 맨 앞인 이유: 유일하게 관리자 개입 없이는 저절로 풀리지 않는 상태라,
+# 다른 사유에 가려지면 화면을 보는 사람이 현장에 나갈 판단을 못 한다.
+# patrol_api.judge_robot(E1 배정 판정)도 같은 순서를 쓴다 — 방송 화면과 배정 결과가
+# 어긋나면 "가용이라며 왜 배정이 안 되냐"가 된다.
+UNAVAILABLE_PRIORITY = ("IMMOBILIZED", "ROBOT_OFFLINE", "CHARGING",
+                        "BATTERY_TOO_LOW", "ROBOT_BUSY")
 
 # 텔레메트리가 이 시간(초)보다 오래되면 미수신으로 본다(로봇 header.stamp 기준).
 # patrol_api.STALE_SEC 과 동일한 3초 — 시스템 전체가 같은 기준을 쓴다.
@@ -40,7 +46,7 @@ BROADCAST_INTERVAL_SEC = 1.0
 
 
 def judge_robot_availability(entry: dict, now: float, active_task_type,
-                             battery_threshold: float,
+                             operational_status: str, battery_threshold: float,
                              offline_sec: float = OFFLINE_SEC) -> dict:
     """로봇 1대의 최신 상태로 RP-90 규격의 로봇 항목 1건을 만든다(가용 판정 포함).
 
@@ -52,6 +58,10 @@ def judge_robot_availability(entry: dict, now: float, active_task_type,
       active_task_type : 이 로봇의 활성 task 종류('PATROL'|'HARVEST'|'TRANSFER') 또는
                          None(활성 task 없음). 활성 task 가 있거나 nav_status!='IDLE'(이동 중)
                          이면 ROBOT_BUSY 다.
+      operational_status: robots.operational_status ('NORMAL'|'IMMOBILIZED'|'MAINTENANCE').
+                         NORMAL 이 아니면 IMMOBILIZED — 통로에 갇혔거나(E2 22-2) 점검 중이라
+                         관리자 개입 전에는 일을 줄 수 없다. 기본값을 두지 않는다(호출부가
+                         빠뜨리면 갇힌 로봇이 조용히 '가용'으로 방송된다).
       battery_threshold: 배터리 임계값(설정값; 미만이면 BATTERY_TOO_LOW)
       offline_sec      : 미수신 판정 기준 초(기본 OFFLINE_SEC)
 
@@ -64,7 +74,9 @@ def judge_robot_availability(entry: dict, now: float, active_task_type,
     age = now - entry["stamp"]
 
     # 우선순위대로 위에서부터. elif 라서 '처음 걸리는' 하나만 채택된다.
-    if age > offline_sec:
+    if operational_status != "NORMAL":
+        reason = "IMMOBILIZED"            # ⓪ 사람이 가야만 풀림 — 무엇에도 가려지면 안 됨
+    elif age > offline_sec:
         reason = "ROBOT_OFFLINE"          # ① 데이터 자체를 못 믿음(다른 필드는 마지막 값)
     elif entry["is_charging"]:
         reason = "CHARGING"               # ② 충전 중이면 배터리 낮아도 CHARGING 이 우선
@@ -98,13 +110,15 @@ def _iso_ms(ts: float) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (dt.microsecond // 1000)
 
 
-def build_message(robots_cache: list, active_types: dict, threshold: float,
-                  seq: int, now: float) -> dict:
+def build_message(robots_cache: list, active_types: dict, operational: dict,
+                  threshold: float, seq: int, now: float) -> dict:
     """캐시 스냅샷 + DB 사실로 RP-90 방송 메시지 1건(봉투)을 조립한다(순수 함수).
 
     robots_cache : FleetCache.snapshot() 결과(로봇별 최신 상태 dict 리스트)
     active_types : robot_id -> 활성 task 종류('PATROL'|'HARVEST'|'TRANSFER').
                    여기 없는 로봇은 활성 task 가 없다는 뜻(→ ROBOT_BUSY 아님, task_type None).
+    operational  : robot_id -> operational_status. 없는 로봇은 'NORMAL' 로 본다
+                   (DB 조회가 아직 성공 못 했거나, 캐시에만 있고 robots 에 없는 로봇).
     threshold    : 배터리 임계값(설정값)
     seq          : 이 메시지의 전역 단조증가 번호(끊김 없이 1씩)
     now          : 이 틱의 기준 시각(epoch 초). timestamp 와 미수신 판정에 '같은 값'을 쓴다.
@@ -114,7 +128,8 @@ def build_message(robots_cache: list, active_types: dict, threshold: float,
     """
     robots = [
         judge_robot_availability(
-            entry, now, active_types.get(entry["robot_id"]), threshold)
+            entry, now, active_types.get(entry["robot_id"]),
+            operational.get(entry["robot_id"], "NORMAL"), threshold)
         for entry in robots_cache
     ]
     return {
@@ -189,20 +204,26 @@ async def broadcast_loop(manager: ConnectionManager, cache, read_db_state,
 
     manager       : ConnectionManager (broadcast / count)
     cache         : FleetCache (snapshot). writer(ROS 스레드)가 채우고 여기서 읽는다.
-    read_db_state : 인자 없는 콜러블 → (active_types: dict, threshold: float).
-                    DB/psycopg 세부를 이 콜백 뒤에 숨겨, 이 루프는 DB 를 전혀 모른다
-                    (가짜 콜백으로 테스트가 쉽다 — ⑥ 조립부에서 실제 DB 를 연결한다).
+    read_db_state : 인자 없는 콜러블 → (active_types: dict, threshold: float,
+                    operational: dict). DB/psycopg 세부를 이 콜백 뒤에 숨겨, 이 루프는
+                    DB 를 전혀 모른다(가짜 콜백으로 테스트가 쉽다 — ⑥ 조립부가 실제 DB 연결).
     interval      : 방송 주기(초). 1.0 = 1Hz.
     logger        : 로그용(.warning/.info). rclpy 로거·std logging 둘 다 가능(없으면 무시).
 
     설계 요점:
       · 접속 0명이면 DB·조립·방송을 모두 건너뛴다 → 클라이언트 없을 때 에러/부하 0(티켓).
       · seq 는 '실제 방송할 때만' 1 증가 → 보낸 메시지들은 항상 끊김 없이 1씩 증가.
-      · DB 조회가 실패해도 방송을 멈추지 않는다 → active_types/threshold 를 직전 성공값으로
-        재사용(첫 성공 전엔 부트스트랩값). 상태가 바뀔 때만 로그해 1Hz 도배를 막는다.
+      · DB 조회가 실패해도 방송을 멈추지 않는다 → active_types/threshold/operational 을
+        직전 성공값으로 재사용(첫 성공 전엔 부트스트랩값). 상태가 바뀔 때만 로그해 1Hz
+        도배를 막는다.
+      · operational 부트스트랩이 빈 dict = 전 로봇 NORMAL 취급이라 낙관적이다. 그래도
+        되는 이유: 이 방송은 화면 표시용이고, 실제 배정은 E1 API(patrol_api)가 그때그때
+        DB 를 직접 읽어 판단한다(DB 가 죽어 있으면 503 으로 거절). 즉 여기서 잠깐
+        낙관적으로 보여도 갇힌 로봇에 일이 배정되지는 않는다.
     """
     seq = 0
-    active_types, threshold = {}, DEFAULT_BATTERY_THRESHOLD   # 첫 DB 성공 전 부트스트랩
+    # 첫 DB 성공 전 부트스트랩
+    active_types, threshold, operational = {}, DEFAULT_BATTERY_THRESHOLD, {}
     db_healthy = True
 
     while True:
@@ -216,9 +237,9 @@ async def broadcast_loop(manager: ConnectionManager, cache, read_db_state,
         # 캐시 스냅샷(복사본) — writer 와 겹치지 않게 ① FleetCache 가 복사해 준다.
         robots_cache = cache.snapshot()
 
-        # DB 사실(활성 task 종류 + 배터리 임계값). 실패해도 방송은 계속한다.
+        # DB 사실(활성 task 종류 + 배터리 임계값 + 운영 상태). 실패해도 방송은 계속한다.
         try:
-            active_types, threshold = read_db_state()
+            active_types, threshold, operational = read_db_state()
             if not db_healthy:
                 db_healthy = True
                 if logger is not None:
@@ -233,7 +254,8 @@ async def broadcast_loop(manager: ConnectionManager, cache, read_db_state,
                         % exc)
 
         seq += 1
-        msg = build_message(robots_cache, active_types, threshold, seq, time.time())
+        msg = build_message(robots_cache, active_types, operational, threshold,
+                            seq, time.time())
         # dict → JSON text frame. ensure_ascii=False 로 한글 등도 그대로 싣는다.
         await manager.broadcast(json.dumps(msg, ensure_ascii=False))
 
@@ -261,7 +283,7 @@ def create_ws_app(node, pool) -> FastAPI:
     manager = ConnectionManager()
 
     def read_db_state():
-        """방송 루프가 매 틱 호출하는 DB 조회 콜백 → (active_types, threshold)."""
+        """방송 루프가 매 틱 호출하는 DB 조회 콜백 → (active_types, threshold, operational)."""
         return automato_db.get_telemetry_state(pool)
 
     @app.websocket("/ws/telemetry")
