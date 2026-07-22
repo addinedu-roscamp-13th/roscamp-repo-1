@@ -101,6 +101,7 @@
   }
 
   function addLiveBadge() {
+    return;   // 접속 배지 비표시 (공간 절약)
     try {
       var b = document.createElement("div");
       b.id = "liveBadge";

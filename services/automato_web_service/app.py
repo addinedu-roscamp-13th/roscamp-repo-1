@@ -88,6 +88,138 @@ def _control_get(path, timeout=4):
 def _control_post(path, body, timeout=6):
     return _rq.post(CONTROL_SERVICE_URL + path, json=body, timeout=timeout)
 
+# ============================================================================
+#  E0-5) ACS 텔레메트리 WebSocket — Web Service가 '클라이언트'로 ACS에 접속(1Hz 수신)
+#    Endpoint: ws://<acs-host>:8000/ws/telemetry  (ACS가 서버)
+#    ROBOT_OFFLINE(3초 이상 미수신)은 Web이 자체 판정.
+# ============================================================================
+def _derive_telemetry_ws():
+    v = os.environ.get("ACS_TELEMETRY_WS", "").strip()
+    if v:
+        return v
+    if CONTROL_SERVICE_URL:                      # http://host:8200 → ws://host:8000/ws/telemetry
+        import urllib.parse as _up
+        host = _up.urlparse(CONTROL_SERVICE_URL).hostname
+        if host:
+            return "ws://%s:8000/ws/telemetry" % host
+    return ""
+
+TELEMETRY_WS_URL = _derive_telemetry_ws()
+ROBOT_OFFLINE_SEC = 3.0
+_TELEMETRY = {"robots": [], "recv_at": 0.0, "seq": None, "connected": False}
+_TELEMETRY_STARTED = [False]
+
+# ============================================================================
+#  자체 함대 (ACS 없이 라이브 단독 구동용) — CONTROL_SERVICE_URL 없으면 Web이 ACS 대역 겸함.
+#  값·역할·임계값을 mock_control_service._ROBOTS 와 동일하게 유지 → localhost(mock)와
+#  라이브(pythonanywhere)가 같은 화면·같은 동작(dg_01/02/03, 스펙 준수)이 되도록.
+#  dg_01·dg_02 = 수확(harvest), dg_03 = 순찰(patrol). 순찰은 전역 1대만.
+# ============================================================================
+_DEMO_FLEET = {
+    "dg_01": {"robot_id": "dg_01", "role": "harvest", "battery_percent": 85.2, "status": "IDLE",
+              "current_position": {"x": 3.21, "y": 1.05}, "operational_status": "NORMAL"},
+    "dg_02": {"robot_id": "dg_02", "role": "harvest", "battery_percent": 62.0, "status": "IDLE",
+              "current_position": {"x": 5.10, "y": 2.30}, "operational_status": "NORMAL"},
+    "dg_03": {"robot_id": "dg_03", "role": "patrol",  "battery_percent": 78.0, "status": "IDLE",
+              "current_position": {"x": 1.50, "y": 4.00}, "operational_status": "NORMAL"},
+}
+_DEMO_TASK_TYPE = {"PATROLLING": "PATROL", "HARVESTING": "HARVEST", "TRANSFERRING": "TRANSFER"}
+_DEMO_SEQ = [1040]          # 자체 함대 task_id 카운터
+
+def _demo_set_status(robot_id, status):
+    r = _DEMO_FLEET.get(robot_id)
+    if r:
+        r["status"] = status
+
+def _demo_reason(r):
+    """E1 가용 판정 (mock._unavailable_reason 과 동일 우선순위·역할별 배터리 임계값)."""
+    if r.get("operational_status") != "NORMAL":
+        return "IMMOBILIZED"
+    if r["status"] != "IDLE":
+        return "ROBOT_BUSY"
+    thr = MIN_BAT_HARVEST if r.get("role") == "harvest" else MIN_BAT_PATROL
+    if r["battery_percent"] < thr:
+        return "BATTERY_TOO_LOW"
+    return None
+
+def _demo_telemetry_robots():
+    """E0-5 축약 텔레메트리 형식 (task_type/nav_status/position/available/unavailable_reason)."""
+    out = []
+    for r in _DEMO_FLEET.values():
+        reason = _demo_reason(r)
+        out.append({
+            "robot_id": r["robot_id"],
+            "task_type": _DEMO_TASK_TYPE.get(r["status"]),
+            "nav_status": "NAVIGATING" if r["status"] in ("PATROLLING", "HARVESTING") else "IDLE",
+            "position": {"x": r["current_position"]["x"], "y": r["current_position"]["y"], "yaw": 0.0},
+            "battery_percent": r["battery_percent"], "role": r["role"],
+            "available": reason is None, "unavailable_reason": reason,
+        })
+    return out
+
+def _demo_available(kind):
+    """kind='patrol'|'harvest'. 스펙 E1-0 형식(current_position 포함). 역할 맞는 로봇만."""
+    out = []
+    for r in _DEMO_FLEET.values():
+        if r["role"] != kind:
+            continue
+        reason = _demo_reason(r)
+        rr = {"robot_id": r["robot_id"], "status": r["status"], "battery_percent": r["battery_percent"],
+              "current_position": r["current_position"], "available": reason is None}
+        if reason:
+            rr["unavailable_reason"] = reason
+        out.append(rr)
+    return out
+
+def _telemetry_ws_loop():
+    import simple_websocket
+    while True:
+        try:
+            wlog("▶ ACS 텔레메트리 WS 접속: %s" % TELEMETRY_WS_URL)
+            ws = simple_websocket.Client(TELEMETRY_WS_URL)
+            _TELEMETRY["connected"] = True
+            wlog("🟢 ACS 텔레메트리 WS 연결됨 — 1Hz 수신 시작")
+            while True:
+                msg = ws.receive(timeout=5)          # 5초 안에 못 받으면 None
+                if msg is None:
+                    continue
+                try:
+                    d = json.loads(msg)
+                except Exception:
+                    continue
+                if d.get("event") == "telemetry":
+                    _TELEMETRY["robots"] = (d.get("data") or {}).get("robots", []) or []
+                    _TELEMETRY["recv_at"] = time.time()
+                    _TELEMETRY["seq"] = d.get("seq")
+        except Exception as e:                        # noqa: BLE001 (끊김/거부 → 재접속)
+            wlog("⚠ 텔레메트리 WS 끊김/실패, 2초 후 재접속: %s" % e)
+        _TELEMETRY["connected"] = False
+        time.sleep(2)
+
+def _start_telemetry_ws():
+    if TELEMETRY_WS_URL and not _TELEMETRY_STARTED[0]:
+        _TELEMETRY_STARTED[0] = True
+        threading.Thread(target=_telemetry_ws_loop, daemon=True).start()
+
+@app.get("/api/v1/telemetry")
+def fleet_telemetry_v1():
+    """E0-5: ACS 텔레메트리 WS로 받은 최신 fleet 상태. 3초 이상 미수신이면 ROBOT_OFFLINE(Web 자체 판정).
+       텔레메트리 WS가 설정되지 않은 경우(=라이브 단독 구동)에만 자체 함대(dg_01/02/03)를 발행.
+       ACS_TELEMETRY_WS 또는 CONTROL_SERVICE_URL 이 있으면 → 실제 ACS 텔레메트리를 그대로 전달."""
+    if not TELEMETRY_WS_URL:
+        return jsonify({"event": "telemetry", "connected": True, "seq": None, "age_sec": 0.0,
+                        "ws_url": "", "robots": _demo_telemetry_robots()})
+    age = (time.time() - _TELEMETRY["recv_at"]) if _TELEMETRY["recv_at"] else None
+    stale = (age is None) or (age > ROBOT_OFFLINE_SEC)
+    robots = [dict(r) for r in _TELEMETRY["robots"]]
+    if stale:                                        # 미수신 → 전부 오프라인 판정
+        for r in robots:
+            r["available"] = False
+            r["unavailable_reason"] = "ROBOT_OFFLINE"
+    return jsonify({"event": "telemetry", "connected": bool(_TELEMETRY["connected"] and not stale),
+                    "seq": _TELEMETRY["seq"], "age_sec": round(age, 1) if age is not None else None,
+                    "ws_url": TELEMETRY_WS_URL, "robots": robots})
+
 # Farm Admin App 실시간 채널.
 #   스펙 = WebSocket `/ws/farm-admin` (아래 flask-sock 으로 구현).
 #   WebSocket 을 못 쓰는 환경(pythonanywhere 등)에서는 폴링 피드(GET /api/v1/patrol/events)로 자동 폴백.
@@ -876,26 +1008,15 @@ def patrol_available():
             d["report_req"] = True
         return jsonify({"min_battery_percent": MIN_BAT_PATROL, "robots": robots, "farm_online": True,
                         "available_count": sum(1 for r in robots if r.get("available"))})
-    d = load_patrol()
-    patrolling = any(r["status"] == "PATROLLING" for r in d["robots"])  # 순찰 최대 1대
-    out = []
-    for r in d["robots"]:
-        av, reason = _avail_reason(r)
-        if patrolling and av:            # 이미 순찰 중인 로봇이 있으면 나머지도 배정 불가
-            av, reason = False, "ALREADY_PATROLLING"
-        rr = {"robot_id": r["robot_id"], "robot_type": r["robot_type"], "status": r["status"],
-              "battery_percent": r["battery_percent"], "position": r.get("pos", ""),
-              "compose": r.get("compose", "pinky"), "available": av}
-        if reason:
-            rr["unavailable_reason"] = reason
-        out.append(rr)
-    return jsonify({"min_battery_percent": MIN_BAT_PATROL, "robots": out,
-                    "available_count": sum(1 for r in out if r["available"])})
+    # ACS·원격농장 없음(라이브 단독 구동) → 자체 함대(dg_01/02/03)로 스펙 E1-0 형식 반환
+    robots = _demo_available("patrol")
+    return jsonify({"requested_at": _sim_now(), "min_battery_percent": MIN_BAT_PATROL,
+                    "robots": robots, "available_count": sum(1 for r in robots if r["available"])})
 
 
 @app.post("/api/v1/patrol/requests")
 def patrol_request():
-    """순찰 요청. {robot_selection: auto|specific, robot_id?, mode?}
+    """순찰 요청. {robot_selection: auto|manual, robot_id?, mode?}
        Control 연동 시 /internal/v1/tasks/patrol 로 중계. 아니면 로컬 데모. (E1-2/3)"""
     data = request.get_json(force=True, silent=True) or {}
     sel = data.get("robot_selection", "auto")
@@ -920,7 +1041,7 @@ def patrol_request():
             wlog("  → 거절 ALREADY_PATROLLING (이미 순찰 중) → App 409")
             return jsonify({"status": "REJECTED", "reason": "ALREADY_PATROLLING",
                             "message": "이미 순찰 중인 로봇이 있습니다. 순찰은 한 번에 1대만 가능합니다."}), 409
-        if sel == "specific":
+        if sel == "manual":
             rr = next((r for r in robots if r.get("robot_id") == data.get("robot_id")), None)
             if not rr or not rr.get("available"):
                 wlog("  → 거절 ROBOT_NOT_AVAILABLE (%s 불가) → App 409" % data.get("robot_id"))
@@ -940,44 +1061,39 @@ def patrol_request():
         return jsonify({"task_id": task_id, "assigned_robot_id": None, "status": "ACCEPTED",
                         "mode": "remote_farm",
                         "message": "원격 농장으로 순찰 명령을 전송했습니다. 농장에서 로봇을 배정합니다."})
+    # ACS·원격농장 없음(라이브 단독 구동) → 자체 함대(dg_03=순찰)로 처리. 스펙 E1 즉시요청.
     with LOCK:
-        d = load_patrol()
-        if any(r["status"] == "PATROLLING" for r in d["robots"]):   # 순찰은 한 번에 1대만
+        if any(r["status"] == "PATROLLING" for r in _DEMO_FLEET.values()):   # 순찰은 전역 1대만
             return jsonify({"status": "REJECTED", "reason": "ALREADY_PATROLLING",
                             "message": "이미 순찰 중인 로봇이 있습니다. 순찰은 한 번에 1대만 가능합니다."}), 409
-        avail = [r for r in d["robots"] if _avail_reason(r)[0]]
+        avail = [r for r in _DEMO_FLEET.values() if r["role"] == "patrol" and _demo_reason(r) is None]
         if not avail:
             return jsonify({"status": "REJECTED", "reason": "NO_AVAILABLE_ROBOT",
                             "message": "순찰 가능한 로봇이 없습니다."}), 409
-        if sel == "auto":
-            chosen = max(avail, key=lambda r: r["battery_percent"])
-        else:
+        if sel == "manual":
             rid = data.get("robot_id")
             chosen = next((r for r in avail if r["robot_id"] == rid), None)
             if not chosen:
                 return jsonify({"status": "REJECTED", "reason": "ROBOT_NOT_AVAILABLE",
                                 "message": "선택한 로봇을 지금 쓸 수 없습니다."}), 409
-        mode = data.get("mode", "immediate")
-        sched = data.get("scheduled_at")
-        d["seq"] = d.get("seq", 1000) + 1
-        chosen["status"] = "RESERVED" if mode == "scheduled" else "PATROLLING"
-        d.setdefault("tasks", []).append({"task_id": d["seq"], "robot_id": chosen["robot_id"],
-                                          "mode": mode, "scheduled_at": sched})
-        save_patrol(d)
-    if mode != "scheduled":
-        _evolve_heat()          # 순찰 나갈 때마다 카메라가 새로 스캔 → 밀집 히트맵·작물 상태 갱신
-        # 외부 ACS가 없을 때(라이브 배포)는 Web이 ACS 역할까지 겸해 순찰 시뮬을 스스로 돌린다
-        # → 버튼 한 번으로 E2(진행)·E3(병해충)·완료 이벤트가 전부 흐름. (연동 시엔 ACS가 콜백)
-        threading.Thread(target=_simulate_local_patrol,
-                         args=(d["seq"], chosen["robot_id"]), daemon=True).start()
-    msg = ("예약 접수되었습니다 · " + str(sched)) if mode == "scheduled" else "순찰 요청이 접수되었습니다."
-    return jsonify({"task_id": d["seq"], "assigned_robot_id": chosen["robot_id"],
-                    "status": "ACCEPTED", "mode": mode, "scheduled_at": sched, "message": msg})
+        else:                                                    # auto: 배터리 최고, 동률 robot_id 오름차순
+            chosen = max(avail, key=lambda r: (r["battery_percent"], [-ord(c) for c in r["robot_id"]]))
+        _DEMO_SEQ[0] += 1
+        task_id = _DEMO_SEQ[0]
+        chosen["status"] = "PATROLLING"
+    _evolve_heat()          # 순찰 나갈 때마다 카메라가 새로 스캔 → 밀집 히트맵·작물 상태 갱신
+    # Web이 ACS 역할까지 겸해 순찰 시뮬을 스스로 돌린다 → 버튼 한 번으로 E2(진행)·E3(병해충)·완료 이벤트 흐름
+    threading.Thread(target=_simulate_local_patrol,
+                     args=(task_id, chosen["robot_id"]), daemon=True).start()
+    return jsonify({"task_id": task_id, "assigned_robot_id": chosen["robot_id"],
+                    "status": "ACCEPTED", "message": "순찰 요청이 접수되었습니다."})
 
 
 @app.post("/api/v1/patrol/reset")
 def patrol_reset():
     """데모용: 로봇 상태 + 히트맵 + 수확 실적을 초기값으로 되돌림."""
+    for r in _DEMO_FLEET.values():                  # 자체 함대 전부 대기 복귀
+        r["status"] = "IDLE"
     save_patrol(json.loads(json.dumps(PATROL_DEFAULT)))
     save_heat(json.loads(json.dumps(HEAT_DEFAULT)))
     save_harvest_stats(harvest_default())
@@ -1015,7 +1131,10 @@ def internal_patrol_completed():
     wlog("◀ ACS 콜백: 순찰 완료 task_id=%s robot=%s → App patrol_completed 푸시 + 텔레그램" % (
         d.get("task_id"), d.get("robot_id")))
     ev = _push_event({"event": "patrol_completed", "task_id": d.get("task_id"),
-                      "robot_id": d.get("robot_id"), "completed_at": d.get("completed_at"),
+                      "robot_id": d.get("robot_id"),
+                      "status": d.get("status", "COMPLETED"),                      # 스펙 E2-9-1/10
+                      "unvisited_waypoint_ids": d.get("unvisited_waypoint_ids", []),
+                      "completed_at": d.get("completed_at"),
                       "summary": d.get("summary")})
     try:
         with LOCK:
@@ -1055,6 +1174,23 @@ def internal_alerts_disease():
     return jsonify({"success": True})
 
 
+@app.post("/internal/v1/alerts/task-failed")
+def internal_alerts_task_failed():
+    """E2-13: ACS가 작업 실패 시 전달 → App 으로 task_failed 푸시(+텔레그램).
+       reason  : BLOCKED / BLOCKED_UNRECOVERABLE / DOCK_FAILED / BATTERY_DEPLETED / HARDWARE_ERROR
+       recovery_action : RETURN_TO_CHARGER / NONE"""
+    d = request.get_json(force=True, silent=True) or {}
+    wlog("◀ ACS 콜백: 작업 실패 task_id=%s robot=%s reason=%s → App task_failed 푸시 + 텔레그램" % (
+        d.get("task_id"), d.get("robot_id"), d.get("reason")))
+    ev = _push_event({"event": "task_failed",
+                      "task_id": d.get("task_id"), "robot_id": d.get("robot_id"),
+                      "task_type": d.get("task_type"), "reason": d.get("reason"),
+                      "recovery_action": d.get("recovery_action"),
+                      "message": d.get("message"), "failed_at": d.get("failed_at")})
+    _schedule_telegram_fallback(ev)   # App 열려있으면 App 발송(스펙), 닫혀있으면 서버 대신 발송
+    return jsonify({"success": True})
+
+
 # ---- 텔레그램 발송: App-driven(스펙) + 서버 폴백(웹앱 닫힌 경우) ----
 # 스펙 "앱이 알림 발송" 과 "웹앱 닫혀도 텔레그램 받기" 의 모순 해결:
 #   App 이 열려있으면 App 이 /api/v1/notify/telegram 로 발송(스펙), 그 사이 안 오면 서버가 대신 발송.
@@ -1084,6 +1220,15 @@ def _send_event_telegram(ev):
             "✅ <b>순찰 완료</b>\n로봇: %s · 작업 #%s\n익음 %s%% · 안익음 %s%% · 썩음 %s%% · 병해충 %s%%" % (
                 ev.get("robot_id"), ev.get("task_id"), s.get("ripe_percent", 0), s.get("unripe_percent", 0),
                 s.get("rotten_percent", 0), s.get("disease_percent", 0)))
+    if ev.get("event") == "task_failed":
+        _RE = {"BLOCKED": "⚠️ 통로 막힘 → 충전소로 복귀합니다",
+               "BLOCKED_UNRECOVERABLE": "🚨 로봇이 갇혔습니다 — 직접 옮긴 뒤 '복구 완료'를 눌러 주세요",
+               "DOCK_FAILED": "⚠️ 정밀 정차 실패 — 마커를 확인해 주세요",
+               "BATTERY_DEPLETED": "🔋 작업 중 배터리 소진",
+               "HARDWARE_ERROR": "🛑 로봇 하드웨어 이상"}
+        return _send_telegram("🛑 <b>작업 실패</b>\n로봇: %s · 작업 #%s (%s)\n%s\n%s" % (
+            ev.get("robot_id"), ev.get("task_id"), ev.get("task_type") or "",
+            _RE.get(ev.get("reason"), ev.get("reason") or ""), ev.get("message") or ""))
     return False, "ignored"
 
 def _telegram_fallback(ev):
@@ -1126,10 +1271,12 @@ def _simulate_local_patrol(task_id, robot_id, step=1.2):
             _schedule_telegram_fallback(ev)
     now = _sim_now()
     ev = _push_event({"event": "patrol_completed", "task_id": task_id, "robot_id": robot_id,
+                      "status": "COMPLETED", "unvisited_waypoint_ids": [],   # 스펙 E2-9-1/10
                       "completed_at": now,
                       "summary": {"ripe_percent": last["ripe"], "unripe_percent": last["unripe"],
                                   "rotten_percent": last["rotten"], "disease_percent": last["disease"]}})
-    try:                                            # 순찰 끝 → 로봇 대기 복귀(데모 상태 동기화)
+    _demo_set_status(robot_id, "IDLE")              # 자체 함대: 순찰 끝 → 대기 복귀 (텔레메트리 동기화)
+    try:                                            # (구 로컬 모델도 함께 되돌림 — 무해)
         with LOCK:
             pd = load_patrol()
             for r in pd["robots"]:
@@ -1144,7 +1291,7 @@ def _simulate_local_patrol(task_id, robot_id, step=1.2):
 def notify_telegram():
     """스펙 E2-10/E3-2: 앱이 disease_alert/patrol_completed 수신 시 텔레그램 발송(릴레이)."""
     d = request.get_json(force=True, silent=True) or {}
-    if d.get("event") not in ("disease_alert", "patrol_completed"):
+    if d.get("event") not in ("disease_alert", "patrol_completed", "task_failed"):
         return jsonify({"sent": False, "reason": "ignored"})
     if not _tg_claim(d.get("seq")):          # 다른 클라이언트/서버폴백이 이미 보냄
         return jsonify({"sent": False, "reason": "dup"})
@@ -1356,7 +1503,7 @@ def post_heatmap():
 
 # ===== E2 수확 로봇 배정 (로봇팔 필수 · arm+pinky만 · RP-67) =====
 #   순찰과 같은 fleet(patrol.json) 공유 — 한 로봇은 순찰/수확을 동시에 못 함.
-MIN_BAT_HARVEST = 60
+MIN_BAT_HARVEST = 50          # 스펙: 수확 배터리 50% 이상(기본). mock 과 동일.
 
 
 def _harvest_reason(r):
@@ -1371,50 +1518,55 @@ def _harvest_reason(r):
 
 @app.get("/api/v1/robots/harvest/available")
 def harvest_available():
-    """수확 가능한 로봇 목록. 로봇팔 탑재 & 배터리>=60 & 대기중.
+    """수확 가능한 로봇 목록(dg_01·dg_02). 배터리>=50 & 대기중.
        ※ 순찰과 달리 수확은 여러 대 동시 가능 — '최대 1대' 제한 없음."""
-    d = load_patrol()
-    out = []
-    for r in d["robots"]:
-        av, reason = _harvest_reason(r)
-        rr = {"robot_id": r["robot_id"], "robot_type": r["robot_type"], "status": r["status"],
-              "battery_percent": r["battery_percent"], "position": r.get("pos", ""),
-              "compose": r.get("compose", "pinky"), "available": av}
-        if reason:
-            rr["unavailable_reason"] = reason
-        out.append(rr)
-    return jsonify({"min_battery_percent": MIN_BAT_HARVEST, "robots": out,
-                    "available_count": sum(1 for r in out if r["available"])})
+    robots = _demo_available("harvest")
+    return jsonify({"requested_at": _sim_now(), "min_battery_percent": MIN_BAT_HARVEST,
+                    "robots": robots, "available_count": sum(1 for r in robots if r["available"])})
 
 
 @app.post("/api/v1/harvest/requests")
 def harvest_request():
-    """수확 요청. {robot_selection: auto|specific, robot_id?}
-       로봇팔·대기중 로봇 없으면 409. 수확은 여러 대 동시 가능(1대 제한 없음, E2)."""
+    """수확 요청. {robot_selection: auto|manual, robot_id?}
+       Control 연동 시 /internal/v1/tasks/harvest 로 중계(대시보드=요청 일치). 아니면 로컬 데모."""
     data = request.get_json(force=True, silent=True) or {}
     sel = data.get("robot_selection", "auto")
+    if _control_on():
+        try:
+            wlog("▶ App 요청: 수확 요청(robot_selection=%s robot_id=%s) → ACS 중계 POST /internal/v1/tasks/harvest"
+                 % (sel, data.get("robot_id")))
+            r = _control_post("/internal/v1/tasks/harvest", data)
+            js = r.json()
+            wlog("◀ ACS 응답:", js.get("status"), "→ App 반환")
+            return (jsonify(js), r.status_code)
+        except Exception as e:
+            wlog("⚠ ACS 수확 요청 실패, 로컬 폴백:", e)
+            app.logger.warning("control tasks/harvest 실패, 로컬 폴백: %s", e)
+    # ACS 없음(라이브 단독) → 자체 함대(dg_01·dg_02=수확)로 처리. 수확은 동시 여러 대 가능.
     with LOCK:
-        d = load_patrol()
-        avail = [r for r in d["robots"] if _harvest_reason(r)[0]]
+        avail = [r for r in _DEMO_FLEET.values() if r["role"] == "harvest" and _demo_reason(r) is None]
         if not avail:
             return jsonify({"status": "REJECTED", "reason": "NO_AVAILABLE_ROBOT",
-                            "message": "수확 가능한 로봇이 없습니다 (로봇팔 탑재·대기중 필요)."}), 409
-        if sel == "auto":
-            chosen = max(avail, key=lambda r: r["battery_percent"])
-        else:
+                            "message": "수확 가능한 로봇이 없습니다."}), 409
+        if sel == "manual":
             rid = data.get("robot_id")
             chosen = next((r for r in avail if r["robot_id"] == rid), None)
             if not chosen:
                 return jsonify({"status": "REJECTED", "reason": "ROBOT_NOT_AVAILABLE",
                                 "message": "선택한 로봇을 지금 쓸 수 없습니다."}), 409
-        d["seq"] = d.get("seq", 1000) + 1
+        else:
+            chosen = max(avail, key=lambda r: (r["battery_percent"], [-ord(c) for c in r["robot_id"]]))
+        _DEMO_SEQ[0] += 1
+        task_id = _DEMO_SEQ[0]
         chosen["status"] = "HARVESTING"
-        d.setdefault("tasks", []).append({"task_id": d["seq"], "robot_id": chosen["robot_id"],
-                                          "type": "harvest"})
-        save_patrol(d)
+        rid = chosen["robot_id"]
     import random
-    _bump_harvest(round(random.uniform(4, 11), 1))   # 수확 나가면 오늘 수확량 누적(순찰→히트맵과 동일 패턴)
-    return jsonify({"task_id": d["seq"], "assigned_robot_id": chosen["robot_id"],
+    _bump_harvest(round(random.uniform(4, 11), 1))   # 수확 나가면 오늘 수확량 누적
+    def _restore_harvest():                          # 5초 후 대기 복귀 (텔레메트리 동기화)
+        time.sleep(5)
+        _demo_set_status(rid, "IDLE")
+    threading.Thread(target=_restore_harvest, daemon=True).start()
+    return jsonify({"task_id": task_id, "assigned_robot_id": rid,
                     "status": "ACCEPTED", "message": "수확 요청이 접수되었습니다."})
 
 
@@ -1522,6 +1674,9 @@ def index():
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
 
+
+# E0-5 텔레메트리 WS 클라이언트 시작 (모든 정의 후 — WSGI/직접실행 둘 다에서 동작)
+_start_telemetry_ws()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
