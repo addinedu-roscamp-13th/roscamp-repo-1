@@ -29,12 +29,14 @@
   robot_id        (str)  로그 표기용 로봇 식별자             기본 'dg_01'
   capture_service (str)  CaptureFrame 서비스 이름(절대)       기본 '/ddago/capture_frame'
   source          (str)  'device' | 'file'                   기본 'device'
-  device_index    (int)  V4L2 장치 인덱스(/dev/videoN 의 N)   기본 0
+  device_index    (int)  V4L2 장치 인덱스. -1=자동탐색(by-id) / 0이상=강제   기본 -1
   image_path      (str)  file 모드에서 반환할 JPEG 경로        기본 ''
-  frame_width     (int)  요청 해상도(가로). device 모드        기본 640
-  frame_height    (int)  요청 해상도(세로). device 모드        기본 480
+  frame_width     (int)  요청 해상도(가로). device 모드        기본 1280 (16:9=최대 화각)
+  frame_height    (int)  요청 해상도(세로). device 모드        기본 720  (16:9=최대 화각)
   flush_frames    (int)  read 전에 버릴 오래된 프레임 수       기본 3
 """
+import glob
+
 import cv2
 import rclpy
 from cv_bridge import CvBridge
@@ -52,10 +54,10 @@ class CameraNode(Node):
         self.declare_parameter('robot_id', 'dg_01')
         self.declare_parameter('capture_service', '/ddago/capture_frame')
         self.declare_parameter('source', 'device')
-        self.declare_parameter('device_index', 0)
+        self.declare_parameter('device_index', -1)
         self.declare_parameter('image_path', '')
-        self.declare_parameter('frame_width', 640)
-        self.declare_parameter('frame_height', 480)
+        self.declare_parameter('frame_width', 1280)
+        self.declare_parameter('frame_height', 720)
         self.declare_parameter('flush_frames', 3)
 
         self._robot_id = self.get_parameter('robot_id').value
@@ -102,22 +104,46 @@ class CameraNode(Node):
     def _ensure_device(self):
         if self._cap is not None and self._cap.isOpened():
             return True
-        cap = cv2.VideoCapture(self._device_index)
-        if not cap.isOpened():
+        cap, src = self._open_webcam()
+        if cap is None:
             self.get_logger().warn(
-                f'웹캠 열기 실패: /dev/video{self._device_index} '
-                f'(연결/권한 확인). 요청 시 재시도한다')
+                '웹캠 열기 실패 — 연결/점유(다른 프로세스)·권한 확인. 요청 시 재시도한다')
             return False
-        # 해상도 지정 + 버퍼 1 (드라이버가 지원하면). 버퍼가 크면 오래된 프레임이
-        # 쌓여 read 가 과거 장면을 줄 수 있다 → 아래 flush 와 함께 최신성을 확보한다.
+        # 버퍼 1 (드라이버가 지원하면). 버퍼가 크면 오래된 프레임이 쌓여 read 가
+        # 과거 장면을 줄 수 있다 → _grab_frame 의 flush 와 함께 최신성을 확보한다.
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self._cap = cap
         self.get_logger().info(
-            f'웹캠 열림: /dev/video{self._device_index} '
-            f'요청 {self._width}x{self._height}')
+            f'웹캠 열림: {src} 요청 {self._width}x{self._height}')
         return True
+
+    def _open_webcam(self):
+        """열린 (VideoCapture, 소스표기) 반환 / 실패 시 (None, None).
+
+        device_index >= 0 이면 그 인덱스를 강제 사용(수동 오버라이드). -1(기본)이면
+        자동 탐색한다: USB 재연결에도 이름이 안 바뀌는 /dev/v4l/by-id 경로를 우선
+        쓰고, 없으면 인덱스를 훑는다. RPi 의 CSI(/dev/video0)는 USB 웹캠이 아니므로
+        자동 탐색에서 건너뛴다(인덱스 1부터).
+        """
+        if self._device_index >= 0:
+            cap = cv2.VideoCapture(self._device_index, cv2.CAP_V4L2)
+            if cap.isOpened() and cap.read()[0]:
+                return cap, f'/dev/video{self._device_index}'
+            cap.release()
+            return None, None
+        for path in sorted(glob.glob('/dev/v4l/by-id/*-video-index0')):
+            cap = cv2.VideoCapture(path, cv2.CAP_V4L2)
+            if cap.isOpened() and cap.read()[0]:
+                return cap, path
+            cap.release()
+        for idx in (1, 2, 3, 4, 5):
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            if cap.isOpened() and cap.read()[0]:
+                return cap, f'/dev/video{idx}'
+            cap.release()
+        return None, None
 
     # ------------------------------------------------------------------ #
     # CaptureFrame 서비스 콜백: 최신 프레임 1장 → 응답

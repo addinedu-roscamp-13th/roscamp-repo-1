@@ -65,17 +65,17 @@ def generate_launch_description():
             'source', default_value='device',
             description="카메라 프레임 소스: 'device'(실물 웹캠) 또는 'file'(정지 이미지)"),
         DeclareLaunchArgument(
-            'device_index', default_value='0',
-            description='device 모드에서 열 /dev/videoN 의 N'),
+            'device_index', default_value='-1',
+            description='device 모드에서 열 /dev/videoN 의 N. -1=자동탐색(by-id, USB 웹캠)'),
         DeclareLaunchArgument(
             'image_path', default_value='',
             description='file 모드에서 반환할 JPEG 경로'),
         DeclareLaunchArgument(
-            'frame_width', default_value='640',
-            description='device 모드 요청 해상도(가로)'),
+            'frame_width', default_value='1280',
+            description='device 모드 요청 해상도(가로). 1280/1920=16:9 최대 화각'),
         DeclareLaunchArgument(
-            'frame_height', default_value='480',
-            description='device 모드 요청 해상도(세로)'),
+            'frame_height', default_value='720',
+            description='device 모드 요청 해상도(세로). 720/1080=16:9 최대 화각'),
 
         # 카메라 노드 — CaptureFrame 서버(웹캠 프레임 제공)
         Node(
