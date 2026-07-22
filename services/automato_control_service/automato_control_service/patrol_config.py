@@ -86,10 +86,17 @@ SERVER_WAIT_SEC = _envf("ACS_SERVER_WAIT_SEC", 5.0)
 GOAL_ACCEPT_TIMEOUT_SEC = _envf("ACS_GOAL_ACCEPT_TIMEOUT_SEC", 30.0)
 # 순찰은 로봇 Nav2가 자체 재시도(2분×3=6분)를 하므로 그보다 넉넉히 기다린다.
 SEGMENT_TIMEOUT_SEC = _envf("ACS_SEGMENT_TIMEOUT_SEC", 420.0)
-# 통로 예약 대기(양보 전) / 예약 폴링 간격
-RESERVE_WAIT_SEC = _envf("ACS_RESERVE_WAIT_SEC", 30.0)
-RESERVE_POLL_SEC = _envf("ACS_RESERVE_POLL_SEC", 1.0)
-# 막힘/양보 통로를 재계획에서 제외해 둘 시간(N초 블랙리스트)
+# 자원(통로·자리) 예약 대기(양보 전) / 예약 폴링 간격.
+#   시나리오 1 문서 E2 21번의 T_wait(기본 10초) · 재시도 주기(0.5초)에 해당한다.
+#   문서는 '통로' 예약만 말하지만 구현은 홉을 (통로, 도착 자리) 쌍으로 잡으므로
+#   둘 각각에 이 대기가 걸린다(한 홉 최악 2×T_wait). 자리 예약은 문서에 없는
+#   구현 보강이라 문서값을 통로 기준으로 그대로 쓴다.
+RESERVE_WAIT_SEC = _envf("ACS_RESERVE_WAIT_SEC", 10.0)      # 문서 T_wait
+RESERVE_POLL_SEC = _envf("ACS_RESERVE_POLL_SEC", 0.5)       # 문서 재시도 주기
+# 막힘/양보 통로를 재계획에서 제외해 둘 시간(N초 블랙리스트).
+# 문서에 대응 항목이 없는 구현 세부값이다 — 문서 22(a)는 '막힌 통로를 제외하고
+# 재탐색'만 말하고 언제 다시 후보로 넣을지는 정하지 않는다. 영구 제외하면 통로가
+# 풀린 뒤에도 계속 우회하므로 시간으로 만료시킨다. T_wait/T_block 과는 다른 값이다.
 BLOCK_TTL_SEC = _envf("ACS_BLOCK_TTL_SEC", 30.0)
 # 이동 대기 중 예약 유지용 하트비트 간격 / 엔진 예약 TTL(하트비트보다 커야 함)
 HEARTBEAT_SEC = _envf("ACS_HEARTBEAT_SEC", 5.0)

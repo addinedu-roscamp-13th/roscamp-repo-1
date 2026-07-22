@@ -308,6 +308,76 @@ def set_task_status(pool: ConnectionPool, task_id: int, status: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 예외 이벤트 기록 (시나리오 1 E2 통신 규격 12번)
+# --------------------------------------------------------------------------- #
+# 왜 알림과 별도로 DB 에 남기나: WebSocket 알림은 그 순간 앱을 보고 있는 사람에게만
+# 닿는 휘발성 메시지다. event_logs 는 영구 기록이라 나중에 "지난주에 막힘이 몇 번
+# 있었나" 를 셀 수 있다. 둘 다 필요하다(문서 12번 각주).
+_INSERT_EVENT_LOG = (
+    "INSERT INTO event_logs "
+    "  (robot_id, task_id, event_type, severity, message, created_at) "
+    "VALUES (%s, %s, %s, %s, %s, %s) "
+    "RETURNING event_id"
+)
+
+# 0001 스키마의 CHECK 제약과 같은 값. 앱에서 먼저 걸러 '어떤 값이 틀렸는지'를
+# psycopg 의 제약 위반 메시지보다 읽기 쉬운 형태로 드러낸다.
+_EVENT_TYPES = ("BATTERY_LOW", "OBSTACLE_STOP", "TRAFFIC_CONTROL", "HARDWARE_ERROR")
+_SEVERITIES = ("INFO", "WARN", "CRITICAL")
+
+
+def save_event_log(pool: ConnectionPool, *, robot_id, task_id,
+                   event_type: str, severity: str, message: str,
+                   created_at) -> int:
+    """예외 이벤트 한 건을 event_logs 에 남기고 event_id 를 반환한다.
+
+    created_at 을 파라미터로 받는 이유는 detection_db 와 같다 — 호출부가 한 번 캡처한
+    시각을 DB·알림이 함께 써야 "이 알림이 어느 기록인지" 를 나중에 맞출 수 있다.
+    그래서 SQL 안에서 NOW() 를 쓰지 않는다.
+
+    robot_id / task_id 는 NULL 을 허용한다(FK 가 있을 뿐 NOT NULL 이 아니다).
+    예외: 허용되지 않은 event_type/severity 면 ValueError.
+    """
+    if event_type not in _EVENT_TYPES:
+        raise ValueError(f"허용되지 않은 event_type: {event_type}")
+    if severity not in _SEVERITIES:
+        raise ValueError(f"허용되지 않은 severity: {severity}")
+    with pool.connection() as conn:
+        row = conn.execute(
+            _INSERT_EVENT_LOG,
+            (robot_id, task_id if task_id is None else int(task_id),
+             event_type, severity, message, created_at),
+        ).fetchone()
+    return row["event_id"]
+
+
+# --------------------------------------------------------------------------- #
+# 순찰 종료 요약 (E2 통신 규격 9-1번의 summary)
+# --------------------------------------------------------------------------- #
+# 문서: "이번 task 의 탐지 기록을 집계한 평균치". 순찰 한 번에 지점 수만큼 행이
+# 쌓이므로 평균을 DB 에서 계산해 한 행으로 받는다(전 행을 앱으로 끌어오지 않는다).
+_SELECT_DETECTION_SUMMARY = (
+    "SELECT COALESCE(ROUND(AVG(ripe_percent)), 0)    AS ripe_percent, "
+    "       COALESCE(ROUND(AVG(unripe_percent)), 0)  AS unripe_percent, "
+    "       COALESCE(ROUND(AVG(rotten_percent)), 0)  AS rotten_percent, "
+    "       COALESCE(ROUND(AVG(disease_percent)), 0) AS disease_percent "
+    "  FROM detection_logs "
+    " WHERE task_id = %s"
+)
+
+
+def get_detection_summary(pool: ConnectionPool, task_id: int) -> dict:
+    """이 task 의 탐지 기록 평균치(4개 percent)를 돌려준다.
+
+    탐지 기록이 하나도 없으면(한 지점도 못 찍은 순찰) AVG 가 NULL 이라 COALESCE 로
+    0 을 채운다 — 수신측이 null 을 따로 다루지 않아도 되게 한다.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(_SELECT_DETECTION_SUMMARY, (int(task_id),)).fetchone()
+    return {k: int(v) for k, v in row.items()}
+
+
+# --------------------------------------------------------------------------- #
 # 라우팅 그래프 로드 (Phase 2) — corridors + waypoints 를 메모리 그래프 재료로 반환
 # --------------------------------------------------------------------------- #
 def load_graph(pool: ConnectionPool) -> dict:

@@ -94,8 +94,15 @@ class PatrolDispatcher:
 
     # ---------------------------- 순찰 본체 ---------------------------- #
     def run_patrol(self, task_id, robot_id, waypoints, engine, client,
-                   start_wp=None) -> str:
-        """순찰 지점을 순서대로 방문. 반환: 'COMPLETED' | 'COMPLETED_PARTIAL' | 'FAILED'.
+                   start_wp=None) -> tuple:
+        """순찰 지점을 순서대로 방문. 반환: (status, unvisited_waypoint_ids).
+
+        status: 'COMPLETED' | 'COMPLETED_PARTIAL' | 'FAILED'.
+        unvisited_waypoint_ids: sweep 후에도 못 간 순찰 지점 목록(E2 9-1 의 그 필드).
+          COMPLETED/FAILED 면 빈 리스트다 — 못 간 지점 목록이 의미 있는 것은
+          '끝까지 돌았지만 일부를 못 간' PARTIAL 뿐이고, FAILED 의 task_failed 알림에는
+          애초에 이 목록이 들어가지 않는다(문서 13번). 호출부(노드)가 이 목록을
+          patrol_completed 페이로드에 그대로 싣는다.
 
         engine/client 는 노드(ROS 표면)가 만들어 넘긴다 — 이 클래스는 rclpy 엔티티를
         생성하지 않고 받은 것만 사용한다.
@@ -105,11 +112,11 @@ class PatrolDispatcher:
         if not client.wait_for_server(timeout_sec=SERVER_WAIT_SEC):
             self._log.warn(
                 f"{robot_id} Navigate 액션 서버 미기동 → task {task_id} FAILED")
-            return "FAILED"
+            return "FAILED", []
 
         targets = [wp["waypoint_id"] for wp in waypoints]
         if not targets:
-            return "COMPLETED"                 # 방문할 지점이 없음
+            return "COMPLETED", []             # 방문할 지점이 없음
 
         visited = set()
         # 순찰 시작 노드(로봇 전용 충전소의 진입 노드). 그래프(wp_meta)에 있으면 current 로 두고
@@ -125,14 +132,24 @@ class PatrolDispatcher:
             self._log.warn(
                 f"순찰 시작 waypoint({start}) 미설정/그래프에 없음 → 첫 지점 예약 없이 "
                 f"직행(폴백) task={task_id}")
-            code, _ = self._dispatch_segment(
-                client, task_id, [targets[0]], capture_on_last=True)
-            if code != 0:
-                self._log.warn(f"첫 순찰 지점 도달 실패 → task {task_id} FAILED")
-                return "FAILED"
-            visited.add(targets[0])
             current = targets[0]
             remaining = targets[1:]
+            # 통로는 못 잡고 가지만 '도착해서 설 자리'는 미리 잡는다. 짝이 있는 지점이면
+            # 같은 배열 안에서 제자리 회전까지 하는데, 그동안 자리가 비어 보이면 남이
+            # 그 지점으로 들어온다. 아래 공통 블록의 예약은 같은 로봇이라 그대로 성공한다.
+            if not engine.try_reserve(engine.node_slot(current), robot_id):
+                self._log.warn(
+                    f"첫 지점 {current} 자리를 남(로봇 "
+                    f"{engine.holder_of(engine.node_slot(current))})이 쥐고 있다")
+            hadal, cap_ids, cap_parents = self._build_segment_goal(
+                [current], visited)
+            code, last_wp = self._dispatch_segment(
+                client, task_id, hadal, cap_ids)
+            if code != 0:
+                engine.release(engine.node_slot(current), robot_id)
+                self._log.warn(f"첫 순찰 지점 도달 실패 → task {task_id} FAILED")
+                return "FAILED", []
+            self._mark_visited(hadal, cap_ids, cap_parents, last_wp, code, visited)
 
         # 출발선에서 '지금 서 있는 자리'부터 잡는다. 첫 구간의 _navigate 가 잡아주긴
         # 하지만 그 전에 짝 촬영(제자리 회전)이 낀 경로가 있어, 그동안 이 로봇이 예약표에
@@ -152,38 +169,31 @@ class PatrolDispatcher:
         # 서로 넘겨준다). 마지막 한 장은 순찰 전체를 소유하는 이 함수가 반납해야 하므로
         # 어떤 경로로 빠져나가든 finally 를 지나게 감싼다.
         try:
-            # 폴백으로 첫 지점에 직행한 경우, 그 지점의 짝 촬영은 여기서 따로 챙긴다.
-            # 통로는 못 쥐었어도(예약 없이 간 구간) 자리는 위에서 잡았으므로 회전하는
-            # 동안 그 자리가 하트비트로 유지된다.
-            if visited and not self._capture_pair(
-                    client, task_id, targets[0], engine, [start_slot], robot_id):
-                visited.discard(targets[0])
-                skipped.append(targets[0])
             for target in remaining:
-                outcome, current = self._navigate(
-                    engine, client, task_id, robot_id, current, target)
-                if outcome == "arrived":
-                    visited.add(target)
-                elif outcome == "skipped":
+                outcome, current = self._visit(
+                    engine, client, task_id, robot_id, current, target, visited)
+                if outcome == "aborted":
+                    return "FAILED", []
+                if target not in visited:
                     skipped.append(target)
-                else:  # aborted (중단)
-                    return "FAILED"
 
-            # 건너뛴 지점 마지막에 1회 재시도
-            for target in list(skipped):
-                outcome, current = self._navigate(
-                    engine, client, task_id, robot_id, current, target)
-                if outcome == "arrived":
-                    visited.add(target)
-                    skipped.remove(target)
-                elif outcome == "aborted":
-                    return "FAILED"
+            # 건너뛴 지점 마지막에 1회 재시도(문서 23번의 sweep — 1회로 고정)
+            for target in skipped:
+                outcome, current = self._visit(
+                    engine, client, task_id, robot_id, current, target, visited)
+                if outcome == "aborted":
+                    return "FAILED", []
 
-            if len(visited) == len(targets):
-                return "COMPLETED"
-            if len(visited) <= 1:                  # 사실상 첫 지점만 방문
-                return "FAILED"
-            return "COMPLETED_PARTIAL"
+            if all(t in visited for t in targets):
+                return "COMPLETED", []
+            # 못 간 지점이 남으면 몇 개든 COMPLETED_PARTIAL 이다(문서 E2 23번).
+            # 예전엔 '한 곳만 방문했으면 FAILED' 규칙이 있었으나 문서에 근거가 없다.
+            # 순찰은 끝까지 돌았고 일부를 못 간 것이지 실패한 것이 아니다 — 그래서
+            # 이 경로에서는 task_failed 알림도 보내지 않는다. FAILED 는 로봇이 중단을
+            # 보고했을 때(aborted)와 막힘 확정 복귀(22-1)에서만 나온다.
+            # 순찰 순서(targets)를 지켜 미방문 목록을 만든다(집합 차집합은 순서를 잃는다).
+            unvisited = [t for t in targets if t not in visited]
+            return "COMPLETED_PARTIAL", unvisited
         finally:
             # 순찰이 끝나면 마지막 자리를 반납한다. 로봇은 아직 거기 서 있으므로 이
             # 시점부터 교통관제에 안 보인다 — 충전소 복귀가 붙으면 복귀 경로가 자리를
@@ -193,7 +203,28 @@ class PatrolDispatcher:
                 f"순찰 종료 task={task_id} 지점 {current} 자리 반납 "
                 f"(복귀 로직 전까지 이 지점은 교통관제에 비어 보인다)")
 
-    def _navigate(self, engine, client, task_id, robot_id, current, target):
+    def _visit(self, engine, client, task_id, robot_id, current, target, visited):
+        """순찰 지점 하나를 방문한다. 반환: (outcome, 도달한 노드).
+
+        _navigate 를 감싸며 '방문했다'의 판정만 맡는다:
+          · 오는 길에 이미 찍힌 지점이면 이동조차 하지 않는다. 문서 20번 판정식대로면
+            다시 가도 미방문이 아니라 촬영하지 않으므로 순수한 헛걸음이다.
+          · 촬영 대상이 아닌 목표(순찰 지점이 아닌 노드)는 도달만으로 방문으로 친다.
+            촬영이 방문의 근거인 지점은 _mark_visited 가 이미 넣어 준다.
+        """
+        if target in visited:
+            self._log.info(
+                f"지점 {target} 은 오는 길에 이미 촬영됨 → 목표에서 제외 task={task_id}")
+            return "arrived", current
+        outcome, current = self._navigate(
+            engine, client, task_id, robot_id, current, target, visited)
+        if (outcome == "arrived"
+                and not self.wp_meta.get(target, {}).get("capture")):
+            visited.add(target)
+        return outcome, current
+
+    def _navigate(self, engine, client, task_id, robot_id, current, target,
+                  visited):
         """current→target 까지 '세그먼트 + 룩어헤드'로 이동. 반환: (outcome, 도달한 노드).
 
         상태 2개로 움직인다:
@@ -236,7 +267,11 @@ class PatrolDispatcher:
                 seg_wps, seg_cids = seg
                 seg = None
                 seg_start = current                # 이 세그먼트 진입 노드(피드백 판정 기준)
-                reached = (seg_wps[-1] == target)  # 세그먼트 끝이 목표면 마지막에 촬영
+                reached = (seg_wps[-1] == target)  # 세그먼트 끝이 목표인가(도착 판정)
+                # 하달 배열은 예약 경로(seg_wps)에 짝을 끼워 넣은 것이라 길이가 다르다.
+                # 예약·진행도 계산은 계속 seg_wps(그래프 노드) 기준으로 한다.
+                hadal, cap_ids, cap_parents = self._build_segment_goal(
+                    seg_wps, visited)
 
                 # 2) 주행 중 훅 2개: 조기 반납(피드백) + 룩어헤드(다음 구간 선예약).
                 look = {"seg": None}
@@ -244,9 +279,14 @@ class PatrolDispatcher:
                 fb_lock = threading.Lock()
 
                 def on_feedback(wp_id, fb=fb, fb_lock=fb_lock):
-                    """ROS executor 스레드 — 값만 기록(예약은 절대 안 건드림)."""
+                    """ROS executor 스레드 — 값만 기록(예약은 절대 안 건드림).
+
+                    짝에서 온 보고는 부모 id 로 바꿔 적는다. 짝은 라우팅 그래프에
+                    없어서 그대로 두면 조기 반납이 위치를 못 알아본다(같은 자리이므로
+                    부모로 바꾸면 그대로 성립한다).
+                    """
                     with fb_lock:
-                        fb["wp"] = wp_id
+                        fb["wp"] = self._parent_of(wp_id)
 
                 def on_tick(look=look, fb=fb, fb_lock=fb_lock, seg_end=seg_wps[-1],
                             seg_start=seg_start, seg_wps=seg_wps, seg_cids=seg_cids):
@@ -272,14 +312,20 @@ class PatrolDispatcher:
                             attempt_block, held)
 
                 self._log.info(
-                    f"세그먼트 하달 task={task_id} {current}→{seg_wps} "
-                    f"통로={seg_cids} 촬영={reached}")
+                    f"세그먼트 하달 task={task_id} {current}→{hadal} "
+                    f"통로={seg_cids} 촬영={sorted(cap_ids)}")
 
                 # 3) 세그먼트 배열 하달. 하트비트엔 live held 를 넘겨 룩어헤드분도 함께 유지.
                 code, last_wp = self._dispatch_segment(
-                    client, task_id, seg_wps, capture_on_last=reached,
+                    client, task_id, hadal, cap_ids,
                     heartbeat=(engine, held, robot_id), on_tick=on_tick,
                     on_feedback=on_feedback)
+                # 촬영이 끝난 지점을 방문 완료로 올린다(짝이 있으면 짝까지 끝나야 인정).
+                self._mark_visited(
+                    hadal, cap_ids, cap_parents, last_wp, code, visited)
+                # 이후 진행도 계산은 그래프 노드 기준이므로 짝 id 를 부모로 되돌린다.
+                if last_wp is not None:
+                    last_wp = self._parent_of(last_wp)
 
                 # 4) 결과 처리 = 선획득 후해제.
                 if code == 2:
@@ -323,12 +369,27 @@ class PatrolDispatcher:
                     self._release_except(
                         engine, robot_id, held, {seg_cids[-1]}, current)
 
-            # 목표 도달. 짝(같은 자리·반대 촬영 방향)이 있으면 여기서 제자리 회전 촬영까지
-            # 마친 뒤에야 이 지점을 '방문 완료'로 본다. 아직 finally 이전이라 지금 쥔 통로
-            # (held)를 그대로 들고 회전한다 — 회전 중 다른 로봇이 들어오지 못하게.
-            if not self._capture_pair(
-                    client, task_id, target, engine, held, robot_id):
-                return "skipped", current
+            # 목표 도달. 촬영(짝이 있으면 제자리 회전 촬영까지)은 마지막 세그먼트의
+            # 하달 배열 안에서 이미 끝났고, 방문 마킹도 _mark_visited 가 마쳤다.
+            #
+            # 다만 두 경우엔 도달했는데도 촬영이 남는다:
+            #   ① 마지막 배열이 짝 바로 앞에서 끊겼다(부모만 찍고 반대쪽을 못 찍음)
+            #   ② 이미 목표 지점에 서 있어(current == target) while 을 한 번도 안 돌았다
+            #      — sweep 재시도가 여기 해당한다
+            # 로봇이 그 자리에 서 있으므로 이동 없이 촬영만 다시 하달한다. 쥐고 있는
+            # 자원(held)은 아직 반납 전이라 회전하는 동안 남이 들어오지 못한다.
+            if target not in visited:
+                hadal, cap_ids, cap_parents = self._build_segment_goal(
+                    [target], visited)
+                if cap_ids:
+                    self._log.info(
+                        f"촬영 미완 지점 {target} 재하달 task={task_id} "
+                        f"(이동 없음, 촬영={sorted(cap_ids)})")
+                    code, last_wp = self._dispatch_segment(
+                        client, task_id, hadal, cap_ids,
+                        heartbeat=(engine, held, robot_id))
+                    self._mark_visited(
+                        hadal, cap_ids, cap_parents, last_wp, code, visited)
         finally:
             # 어떻게 나가든 남은 예약을 반납하되, '지금 서 있는 자리'만은 넘겨준다.
             # 로봇이 물리적으로 거기 있는 한 자리를 놓으면 남이 그 지점으로 들어온다.
@@ -337,41 +398,89 @@ class PatrolDispatcher:
             self._release_except(engine, robot_id, held, set(), current)
         return "arrived", current
 
-    def _capture_pair(self, client, task_id, parent_wp, engine, held, robot_id) -> bool:
-        """부모 지점의 '짝'이 있으면 제자리 회전 촬영을 하달한다. 짝이 없으면 아무 것도 안 함.
+    # ---------------------------- 촬영 판정(문서 E2 20번) ---------------------------- #
+    def _build_segment_goal(self, seg_wps, visited):
+        """예약 확보한 노드 목록 → (하달 배열, 촬영 대상 id 집합, 촬영 대상 부모 목록).
 
-        왜 필요한가: 촬영 카메라가 로봇 한쪽에 고정돼 있어 통로를 한 번 지나면 한쪽 베드만
-        찍힌다. 그래서 같은 자리에서 방향(yaw)만 180° 돌려 한 번 더 찍는다. 짝은 부모와
-        x·y 가 완전히 같아서, 로봇은 '직전 waypoint 와 좌표가 같다' → 주행이 아니라 제자리
-        회전(Spin)으로 처리한다. 통로를 지나지 않으므로 corridor 예약도 필요 없다.
+        촬영 여부는 문서 판정식을 **노드마다** 적용한다:
+            capture = (순찰 지점) AND (이번 task 에서 미방문)
+        '배열의 마지막 하나만' 이 아니다 — 우회 경로가 아직 안 찍은 순찰 지점을 지나가면
+        지나는 김에 찍어야 나중에 그 지점을 목표로 다시 오지 않는다.
 
-        짝을 별도 waypoint_id 로 하달하는 이유는 사진마다 고유 식별자가 남아야 detection_logs
-        와 병해충 알림이 '어느 지점의 어느 방향'인지 그대로 특정할 수 있기 때문이다.
+        짝(같은 자리·반대 촬영 방향)이 있는 노드는 문서 20-1 대로 **바로 뒤에 연달아**
+        끼워 넣는다. 촬영 카메라가 로봇 한쪽에 고정돼 있어 통로를 한 번 지나면 한쪽 베드만
+        찍히기 때문이다. 로봇은 직전 원소와 좌표가 같으면 주행이 아니라 제자리 회전(Spin)
+        으로 분기하므로 Goal 을 한 번 더 보낼 필요가 없다. 짝은 corridors 에 없어 통로
+        예약도 필요 없다 — 부모 자리를 그대로 쓴다.
 
-        heartbeat 로 지금 쥔 통로(held)를 회전하는 동안 계속 유지한다 — 회전 중에 다른 로봇이
-        그 통로로 들어오면 좁은 길에서 마주친다.
+        짝에 별도 waypoint_id 를 주는 이유는 사진마다 고유 식별자가 남아야 detection_logs
+        와 병해충 알림이 '어느 지점의 어느 방향'인지 특정할 수 있기 때문이다.
 
-        반환: True(짝 없음 또는 촬영 성공) / False(짝 촬영 실패 → 이 지점은 미완).
+        세 번째 반환값(부모 목록)은 방문 마킹용이다. 짝 자신은 순찰 지점이 아니라
+        방문 큐에 넣지 않는다.
         """
-        pair_wp = self.pair_of.get(parent_wp)
-        if pair_wp is None:
-            return True                     # 짝이 없는 지점 — 부모 촬영으로 끝
-        if pair_wp not in self.wp_meta:
-            self._log.warn(
-                f"짝 {pair_wp}(부모 {parent_wp}) 좌표를 그래프에서 못 찾음 → 촬영 생략")
-            return False
-        self._log.info(
-            f"짝 촬영 하달 task={task_id} 부모 {parent_wp} → 짝 {pair_wp} "
-            f"(같은 자리 제자리 회전, 통로 {list(held)} 유지)")
-        code, _ = self._dispatch_segment(
-            client, task_id, [pair_wp], capture_on_last=True,
-            heartbeat=(engine, held, robot_id))
-        if code != 0:
-            self._log.warn(
-                f"짝 {pair_wp} 촬영 실패(code={code}) task={task_id} → 지점 {parent_wp} 미완 처리")
-            return False
-        self._log.info(f"짝 촬영 완료 task={task_id} 부모 {parent_wp} / 짝 {pair_wp}")
-        return True
+        hadal, capture_ids, parents = [], set(), []
+        for wp in seg_wps:
+            hadal.append(wp)
+            meta = self.wp_meta.get(wp, {})
+            if not (meta.get("capture") and wp not in visited):
+                continue                    # 순찰 지점이 아니거나 이미 찍음 → 통과만
+            capture_ids.add(wp)
+            parents.append(wp)
+            pair = self.pair_of.get(wp)
+            if pair is None:
+                continue                    # 짝 없는 지점 — 한 방향만 찍고 끝
+            if pair not in self.wp_meta:
+                self._log.warn(
+                    f"짝 {pair}(부모 {wp}) 좌표를 그래프에서 못 찾음 → 한쪽만 촬영")
+                continue
+            hadal.append(pair)
+            capture_ids.add(pair)
+        return hadal, capture_ids, parents
+
+    def _mark_visited(self, hadal, capture_ids, parents, last_wp, code, visited):
+        """이번 하달에서 '촬영까지 끝난' 순찰 지점을 방문 완료로 올린다.
+
+        문서 20-1: 방문 마킹은 **짝의 촬영이 끝난 뒤** 부모 id 로 한다. 부모를 찍은 시점에
+        마킹해버리면 그 직후 재계획이 끼어들었을 때 짝이 '이미 방문한 지점의 짝'이 되어
+        영구 미촬영으로 남는다.
+
+        code == 0 이면 배열을 끝까지 소화한 것이라 전부 인정한다. 중간에 끊겼으면 로봇이
+        실제로 도달한 last_wp 까지만 인정하고, 짝이 있는 지점은 그 짝도 도달 범위 안에
+        있어야 마킹한다.
+        """
+        if code == 0:
+            done = set(hadal)
+        elif last_wp is None:
+            return
+        else:
+            try:
+                j = hadal.index(last_wp)
+            except ValueError:
+                return                      # 배열 밖 노드 → 판정 불가, 아무것도 안 함
+            done = set(hadal[:j + 1])
+        for wp in parents:
+            if wp not in done:
+                continue
+            pair = self.pair_of.get(wp)
+            if pair is not None and pair in capture_ids and pair not in done:
+                self._log.warn(
+                    f"부모 {wp} 는 찍었으나 짝 {pair} 미촬영 → 방문 미완으로 남김")
+                continue
+            visited.add(wp)
+
+    def _parent_of(self, wp):
+        """짝 id 면 부모 id 로 바꾼다(짝이 아니면 그대로).
+
+        예약·진행도 계산은 라우팅 그래프(짝이 없는 그래프) 기준이라, 로봇이 짝에서 멈춰
+        last_waypoint_id 로 짝 id 를 돌려주면 그 노드를 못 알아본다. 짝은 부모와 같은
+        자리이므로 부모로 바꿔 주면 그대로 성립한다. 짝은 두어 개뿐이라 역맵을 따로
+        들지 않고 즉석에서 찾는다.
+        """
+        for parent, pair in self.pair_of.items():
+            if pair == wp:
+                return parent
+        return wp
 
     @staticmethod
     def _segment_progress(current, seg_wps, seg_cids, last_wp):
@@ -589,13 +698,15 @@ class PatrolDispatcher:
 
     # ---------------------------- 세그먼트 하달 ---------------------------- #
     def _dispatch_segment(self, client, task_id, waypoint_ids,
-                          capture_on_last, heartbeat=None, on_tick=None,
+                          capture_ids, heartbeat=None, on_tick=None,
                           on_feedback=None):
         """확보된 세그먼트(연속 waypoint 목록)를 Navigate Goal(Waypoint[] 배열)로 한 번에 하달.
 
-        waypoint_ids: [세그먼트 첫 노드 ... 끝 노드] — 예약을 확보한 통로들을 지나는 경로.
-        capture_on_last: 세그먼트 끝이 순찰 목표면 True → 마지막 waypoint 만 capture=True
-                         (도착·정지 후 촬영). 중간 노드는 통과만 하므로 전부 capture=False.
+        waypoint_ids: [세그먼트 첫 노드 ... 끝 노드] — 예약을 확보한 통로들을 지나는 경로에
+                      짝을 끼워 넣은 하달 배열(_build_segment_goal 이 만든다).
+        capture_ids: 이 배열에서 촬영할 노드 id 집합. 판정은 _build_segment_goal 이 끝냈고
+                     여기서는 플래그로 옮기기만 한다. 로봇은 배열의 capture=true 노드마다
+                     정지 후 촬영하므로, 중간 노드도 대상이 될 수 있다.
         heartbeat=(engine, [cid...], robot_id): 결과 대기 중 세그먼트의 모든 통로 예약을 갱신.
         on_tick: 결과 대기 중 하트비트 틱마다 호출되는 콜백(룩어헤드 = 다음 구간 선예약용).
         on_feedback: Navigate Feedback 의 current_waypoint_id 를 받는 콜백(조기 반납용).
@@ -604,15 +715,14 @@ class PatrolDispatcher:
         반환: (result_code, last_waypoint_id). result_code 0 성공/1 실패·막힘/2 중단.
         """
         wps = []
-        last_idx = len(waypoint_ids) - 1
-        for i, wid in enumerate(waypoint_ids):
+        for wid in waypoint_ids:
             m = self.wp_meta.get(wid, {})
             wps.append(Waypoint(
                 waypoint_id=int(wid),
                 x=float(m.get("x", 0.0)),
                 y=float(m.get("y", 0.0)),
                 yaw=float(m.get("yaw") or 0.0),          # 비순찰점 yaw=None → 0.0
-                capture=bool(capture_on_last if i == last_idx else False),
+                capture=bool(wid in capture_ids),
             ))
         goal = Navigate.Goal()
         goal.task_id = int(task_id)

@@ -168,7 +168,7 @@ def test_slot_never_drops_between_segments(fast_timing):
 
     t = threading.Thread(target=watch, daemon=True)
     t.start()
-    result = disp.run_patrol(
+    result, _unvisited = disp.run_patrol(
         1, "dg_01", [{"waypoint_id": 12}, {"waypoint_id": 9}, {"waypoint_id": 4}],
         engine, client, start_wp=15)
     stop.set()
@@ -264,7 +264,7 @@ def test_navigate_leaves_standing_slot_for_next_leg(fast_timing):
     engine, disp, _log = _make()
     client = FakeClient({"wp": 15})
 
-    outcome, node = disp._navigate(engine, client, 1, "dg_01", 15, 12)
+    outcome, node = disp._navigate(engine, client, 1, "dg_01", 15, 12, set())
 
     assert (outcome, node) == ("arrived", 12)
     assert engine.holder_of(engine.node_slot(12)) == "dg_01", \
@@ -278,13 +278,13 @@ def test_next_leg_inherits_the_slot(fast_timing):
     engine, disp, _log = _make()
     client = FakeClient({"wp": 15})
 
-    disp._navigate(engine, client, 1, "dg_01", 15, 12)
+    disp._navigate(engine, client, 1, "dg_01", 15, 12, set())
     assert engine.holder_of(engine.node_slot(12)) == "dg_01"
 
     # 남이 그 자리를 못 가로챈다 — 인계가 끊기지 않았다는 뜻
     assert engine.try_reserve(engine.node_slot(12), "dg_02") is False
 
-    outcome, node = disp._navigate(engine, client, 1, "dg_01", 12, 9)
+    outcome, node = disp._navigate(engine, client, 1, "dg_01", 12, 9, set())
     assert (outcome, node) == ("arrived", 9)
     assert engine.holder_of(engine.node_slot(9)) == "dg_01"
     assert engine.holder_of(engine.node_slot(12)) is None

@@ -26,6 +26,7 @@
 import os
 import threading
 import time
+from datetime import datetime, timezone
 
 from automato_interfaces.action import Navigate
 from automato_interfaces.msg import FleetTelemetry
@@ -48,6 +49,7 @@ from automato_control_service.patrol_config import (
     RESERVATION_TTL_SEC,
     SAVE_DETECTION_SRV,
 )
+from automato_control_service import patrol_notify
 from automato_control_service.patrol_dispatcher import PatrolDispatcher
 from automato_control_service.routing_engine import RoutingEngine
 from automato_control_service.telemetry_cache import TelemetryCache
@@ -61,6 +63,10 @@ class PatrolControlNode(Node):
         super().__init__("patrol_control_node", **kwargs)
         self.cache = TelemetryCache()
         self._db_pool = None                       # main()에서 주입
+        # 순찰 종료·실패 알림을 보낼 Web Service base URL. 탐지 저장(detection_service)과
+        # 같은 env 를 공유해 두 경로가 같은 백엔드를 가리키게 한다.
+        self._web_url = os.environ.get(
+            "AUTOMATO_WEB_SERVICE_URL", "http://localhost:8100")
         # robot_id -> Navigate ActionClient.
         # ⚠️ 이름 주의: rclpy.Node 는 서비스 클라이언트 목록을 self._clients(리스트)로
         # 보관하고 node.clients 프로퍼티로 노출한다. 여기에 self._clients 를 dict 로
@@ -235,13 +241,14 @@ class PatrolControlNode(Node):
         엔진 로드(DB)·액션 클라이언트 생성은 ROS/DB 자원이라 노드가 맡고, 실제 이동
         알고리즘은 self._dispatcher.run_patrol 에 넘긴다.
         """
+        unvisited = []
         try:
             engine = self._get_engine()
             if engine is None:
                 status = "FAILED"
             else:
                 client = self._client_for(robot_id)
-                status = self._dispatcher.run_patrol(
+                status, unvisited = self._dispatcher.run_patrol(
                     task_id, robot_id, waypoints, engine, client,
                     start_wp=self._start_waypoint_for(robot_id))
         except Exception as exc:  # noqa: BLE001
@@ -253,6 +260,55 @@ class PatrolControlNode(Node):
                 self.get_logger().info(f"순찰 종료 task={task_id} → {status}")
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().error(f"tasks 종료 갱신 실패 task={task_id}: {exc}")
+        # tasks 마감과 별개로 Web Service 에 순찰 결과를 알린다(E2 9-1/12/13).
+        # 이 스레드는 순찰이 이미 끝난 자리라, 여기서 동기로 보내도 순찰 루프를 막지 않는다.
+        self._report_task_result(task_id, robot_id, status, unvisited)
+
+    def _report_task_result(self, task_id, robot_id, status, unvisited) -> None:
+        """순찰 종료를 Web Service 로 알린다.
+
+        COMPLETED/COMPLETED_PARTIAL → patrol_completed(E2 9-1). summary(탐지 평균치)를
+                                      DB 에서 집계해 싣는다.
+        FAILED                      → event_logs 영구 기록(E2 12) + task_failed(E2 13).
+
+        지금 ACS 가 내는 FAILED 는 전부 로봇/통신/디스패치 이상이라(막힘 복귀 22-1 은
+        아직 없음) reason=HARDWARE_ERROR, recovery_action=NONE 으로 보낸다. 막힘(BLOCKED)
+        이라고 보내면 나중에 22-1 을 붙일 때 진짜 막힘과 구분되지 않는다.
+        """
+        now = datetime.now(timezone.utc)
+        if status in ("COMPLETED", "COMPLETED_PARTIAL"):
+            summary = {"ripe_percent": 0, "unripe_percent": 0,
+                       "rotten_percent": 0, "disease_percent": 0}
+            if self._db_pool is not None:
+                try:
+                    summary = automato_db.get_detection_summary(
+                        self._db_pool, task_id)
+                except Exception as exc:  # noqa: BLE001
+                    self.get_logger().warn(
+                        f"summary 집계 실패(0으로 발송) task={task_id}: {exc}")
+            payload = patrol_notify.build_completed_payload(
+                task_id=task_id, robot_id=robot_id, status=status,
+                unvisited_waypoint_ids=unvisited, completed_at=now,
+                summary=summary)
+            patrol_notify.send_patrol_completed(
+                self._web_url, payload, log=self.get_logger())
+            return
+        # FAILED — 영구 기록 먼저, 그다음 알림.
+        if self._db_pool is not None:
+            try:
+                automato_db.save_event_log(
+                    self._db_pool, robot_id=robot_id, task_id=task_id,
+                    event_type="HARDWARE_ERROR", severity="CRITICAL",
+                    message=f"task {task_id} 순찰 실패 (로봇 {robot_id})",
+                    created_at=now)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().error(
+                    f"event_logs 기록 실패 task={task_id}: {exc}")
+        payload = patrol_notify.build_task_failed_payload(
+            task_id=task_id, robot_id=robot_id, reason="HARDWARE_ERROR",
+            recovery_action="NONE", failed_at=now)
+        patrol_notify.send_task_failed(
+            self._web_url, payload, log=self.get_logger())
 
 
 # --------------------------------------------------------------------------- #
