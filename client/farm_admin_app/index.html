@@ -31,7 +31,7 @@
   .hidden{display:none!important}
 
   /* ---------- App shell ---------- */
-  .wrap{max-width:1280px;margin:0 auto;padding:54px 20px 60px}
+  .wrap{max-width:1880px;margin:0 auto;padding:44px 20px 14px}
   .topbar{display:flex;align-items:center;gap:14px;margin-bottom:18px;flex-wrap:wrap}
   .brand{display:flex;align-items:center;gap:11px}
   .logo{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,var(--tomato),var(--leaf));
@@ -203,6 +203,7 @@
      border:3px solid rgba(255,255,255,.18);position:relative}
   .follow .ring::before{content:"";position:absolute;inset:-3px;border-radius:50%;border:3px solid transparent;border-top-color:var(--leaf);animation:spin 2.4s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
+  @keyframes alertPulse{0%,100%{box-shadow:0 4px 16px rgba(224,72,58,.4)}50%{box-shadow:0 6px 26px rgba(224,72,58,.7)}}
   .mbnav{display:flex;background:var(--card);border-top:1px solid var(--line)}
   .mbnav button{flex:1;padding:9px 0 11px;font-size:10.5px;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:3px}
   .mbnav button .ic{font-size:17px}
@@ -242,9 +243,7 @@
 <div id="srvClock" style="position:fixed;top:0;left:0;right:0;z-index:9999;display:flex;align-items:center;justify-content:center;gap:10px;background:linear-gradient(90deg,#123c28,#16452e);color:#eafff0;padding:9px 16px;font-weight:800;font-variant-numeric:tabular-nums;box-shadow:0 2px 10px rgba(0,0,0,.28);pointer-events:none;letter-spacing:.3px"><span style="color:#8fd6a8;font-weight:600;font-size:12px">🕐 서버시간</span> <span id="srvClockT" style="font-size:17px">--:--:--</span> <span id="srvMode" style="padding:2px 10px;border-radius:999px;background:rgba(255,255,255,.14);font-size:12.5px">–</span></div>
 <div class="wrap">
   <div class="topbar">
-    <div class="brand">
-      <img src="/logo.png?v=1" alt="Automato — Smart Farm Robotics" style="height:38px;width:auto;display:block"/>
-    </div>
+    <div class="brand"></div>
     <div class="spacer"></div>
     <button class="pill" onclick="go('home')" id="homeBtn">⌂ 역할 선택</button>
   </div>
@@ -811,9 +810,123 @@ async function loadFarmMini(){
     if(el)el.innerHTML='<div style="display:flex;gap:12px;flex-wrap:wrap">'+col('📝 할 일',g.todo,'#8a9295')+col('🔨 진행 중',g.doing,'#e8912d')+col('✅ 완료',g.done,'#1d8a3e')+'</div>';
   }catch(e){}
 }
-const PATROL_REASON={BATTERY_TOO_LOW:'🔋 배터리 부족',ROBOT_BUSY:'🚧 작업 중',ALREADY_PATROLLING:'🚓 이미 순찰 중(최대 1대)',NO_AVAILABLE_ROBOT:'가능한 로봇 없음'};
+const PATROL_REASON={ROBOT_OFFLINE:'📡 오프라인(응답 없음)',IMMOBILIZED:'🛑 갇힘/정지 — 관리자 개입 필요',CHARGING:'⚡ 충전 중',BATTERY_TOO_LOW:'🔋 배터리 부족',ROBOT_BUSY:'🚧 작업 중',ALREADY_PATROLLING:'🚓 이미 순찰 중(최대 1대)',NO_AVAILABLE_ROBOT:'가능한 로봇 없음'};
 const WORK_LABEL={PATROLLING:'🚓 순찰 중',HARVESTING:'🍅 수확 중',RESERVED:'📅 예약 작업 중',CHARGING:'⚡ 충전 중',IDLE:'🟢 대기 중'};
 function busyLabel(r){ return (r.unavailable_reason==='ROBOT_BUSY')?(WORK_LABEL[r.status]||'🚧 작업 중'):null; }  // 작업 중이면 무슨 작업인지
+// E0-5 task_type (PATROL/HARVEST/TRANSFER/null) — 받은 값 그대로 라벨링
+const TASK_LABEL={PATROL:'순찰',HARVEST:'수확',TRANSFER:'이송'};
+// 로봇 역할: dg_03=순찰·운반 전용, dg_01·dg_02=수확 전용
+const ROLE={dg_01:'수확',dg_02:'수확',dg_03:'순찰·운반'};
+// 최상단 "이상 없나?" 경고 배너 — 긴급/주의/이상없음. 로봇 문제 + 작물(병해충·썩음) 임계 판정.
+function renderAlertBanner(){
+  var el=document.getElementById('alertBanner'); if(!el)return;
+  var robots=window._lastRobots||[], crop=window._heatCrop||null;
+  var urgent=[], warn=[];
+  robots.forEach(function(r){ var u=r.unavailable_reason;
+    if(u==='IMMOBILIZED') urgent.push(r.robot_id+' 갇힘(개입 필요)');
+    else if(u==='ROBOT_OFFLINE') urgent.push(r.robot_id+' 오프라인');
+    else if(u==='BATTERY_TOO_LOW') warn.push(r.robot_id+' 배터리 부족');
+  });
+  if(crop){ var tot=(crop.ripe||0)+(crop.unripe||0)+(crop.pest||0)+(crop.rot||0)||1;
+    var pest=(crop.pest||0)/tot*100, rot=(crop.rot||0)/tot*100;
+    if(pest>=5) urgent.push('병해충 '+pest.toFixed(1)+'% — 방제 시급');
+    else if(pest>0) warn.push('병해충 '+pest.toFixed(1)+'% 관찰');
+    if(rot>=5) warn.push('썩음 '+rot.toFixed(1)+'%');
+  }
+  var pad='border-radius:12px;padding:13px 18px;font-size:15.5px;font-weight:800;display:flex;align-items:center;gap:9px;';
+  if(urgent.length) el.innerHTML='<div style="'+pad+'background:#e0483a;color:#fff;box-shadow:0 4px 16px rgba(224,72,58,.4);animation:alertPulse 1.5s ease-in-out infinite">🚨 조치 필요 — '+urgent.join(' · ')+(warn.length?'<span style="font-weight:500;font-size:13px;opacity:.92"> · '+warn.join(' · ')+'</span>':'')+'</div>';
+  else if(warn.length) el.innerHTML='<div style="'+pad+'background:#fbe4c0;border-left:6px solid #e8912d;color:#8a4f0a">⚠️ 주의 — '+warn.join(' · ')+'</div>';
+  else el.innerHTML='<div style="'+pad+'background:#eafaef;border:1px solid #a9d8b5;color:#1d6a35;font-weight:700">✓ 이상 없음 — 로봇·작물 모두 정상</div>';
+}
+// 순찰/수확 요청: 자동배정/직접선택 토글 1개 공유(로봇 상태 헤더). 직접선택 시 위 로봇카드를 눌러 선택.
+// 순찰차 1대(dg_03), 수확차 2대(dg_01·dg_02)
+window._reqMode='auto'; window._reqPick=null;
+window._reqAvail={patrol:true,harvest:true};
+window._reqBusy={patrol:false,harvest:false};
+const ROLE_KIND={dg_01:'harvest',dg_02:'harvest',dg_03:'patrol'};
+function reqBar(kind){ var label=(kind==='patrol'?'순찰':'수확')+' 요청';
+  return '<div style="margin-top:10px;text-align:right"><button id="'+kind+'ReqBtn" onclick="doReq(\''+kind+'\',this)" class="btn btn-green" style="padding:7px 20px;font-size:14px">'+label+'</button></div>'; }
+function _applyReqBtnState(){
+  [['patrol','순찰'],['harvest','수확']].forEach(function(p){
+    var b=document.getElementById(p[0]+'ReqBtn'); if(!b)return;
+    var av=window._reqAvail[p[0]], busy=window._reqBusy&&window._reqBusy[p[0]];
+    b.disabled=!av; b.style.cursor=av?'pointer':'not-allowed';
+    if(av){ b.classList.add('btn-green'); b.style.background=''; b.style.color=''; b.textContent=p[1]+' 요청'; }
+    else { b.classList.remove('btn-green'); b.style.background='#d9dcde'; b.style.color='#6b7075'; b.textContent=busy?(p[1]+' 중'):'요청 불가'; }
+  });
+}
+function setReqMode2(m){ window._reqMode=m; if(m==='auto')window._reqPick=null; try{renderFleet();}catch(e){} }
+function selectRobot(rid){ if(window._reqMode!=='manual')return; window._reqPick=(window._reqPick===rid?null:rid); try{renderFleet();}catch(e){} }
+async function doReq(kind,btn){
+  if(window._reqAvail[kind]===false) return;
+  var label=(kind==='patrol'?'순찰':'수확'), mode=window._reqMode, pick=window._reqPick;
+  if(mode==='manual'){
+    if(!pick){ toast('직접 선택 — 위 로봇 상태에서 로봇을 눌러 고르세요'); return; }
+    var need=(kind==='patrol')?'patrol':'harvest';
+    if(ROLE_KIND[pick]!==need){ toast(pick+'은(는) '+(need==='patrol'?'순찰':'수확')+' 로봇이 아닙니다'); return; }
+  }
+  var body={mode:'immediate',robot_selection:mode}; if(mode==='manual')body.robot_id=pick;
+  var ep=kind==='patrol'?'/api/v1/patrol/requests':'/api/v1/harvest/requests';
+  if(btn)btn.disabled=true;
+  try{ const r=await fetch(ep,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json(); var ok=r.ok&&d.status!=='REJECTED';
+    toast(ok?(label+' 요청됨 · '+(d.assigned_robot_id||'배정 중')+(d.task_id?' (작업 #'+d.task_id+')':'')):('요청 불가 · '+(d.message||d.reason||('HTTP '+r.status))));
+  }catch(e){ toast(label+' 요청 실패'); }
+}
+// E0-5 로봇 실시간 상태(함대 텔레메트리). ACS→Web(WS)→relay 를 그대로 표시. 2초 폴링, 탭 벗어나면 자동 중단.
+function startFleetLive(){ if(window._fleetRunning) return; window._fleetRunning=true; loadFleetLive(); }  // 중복 루프 방지
+// 로봇 task/상태 → 색상 배지 (작업중·대기중·문제 상태를 색으로 즉시 구분)
+function robotStateBadge(r){
+  var u=r.unavailable_reason;
+  if(u==='ROBOT_OFFLINE')    return {t:'오프라인',       bg:'#eef0f1', fg:'#5f6469', dot:'⚫'};
+  if(u==='IMMOBILIZED')      return {t:'갇힘 · 개입 필요', bg:'#fbeaea', fg:'#b0392b', dot:'🛑'};
+  if(u==='CHARGING')         return {t:'충전 중',        bg:'#fdf3e0', fg:'#b8791a', dot:'⚡'};
+  if(u==='BATTERY_TOO_LOW')  return {t:'배터리 부족',     bg:'#fdeee4', fg:'#c2661f', dot:'🔋'};
+  if(r.task_type==='PATROL') return {t:'순찰 중',        bg:'#e6f0fb', fg:'#2f6fd0', dot:'🚓'};
+  if(r.task_type==='HARVEST')return {t:'수확 중',        bg:'#e1f5ee', fg:'#0f8f6e', dot:'🍅'};
+  if(r.task_type==='TRANSFER')return{t:'이송 중',        bg:'#efeafc', fg:'#6a4fb0', dot:'📦'};
+  if(r.available)            return {t:'대기 중 · 배정 가능', bg:'#eafaef', fg:'#1d8a3e', dot:'🟢'};
+  return {t:(r.nav_status||'상태 미상'), bg:'#eef0f1', fg:'#5f6469', dot:'⚪'};
+}
+async function loadFleetLive(){
+  var el=document.getElementById('fleetLive'); if(!el){ window._fleetRunning=false; return; }
+  try{ const d=await (await fetch('/api/v1/telemetry?t='+Date.now())).json();
+    window._lastRobots=d.robots||[]; window._lastConn=!!d.connected; renderFleet();
+  }catch(e){}
+  setTimeout(loadFleetLive, 2000);
+}
+function renderFleet(){
+  var el=document.getElementById('fleetLive'); if(!el)return;
+  var robots=window._lastRobots||[], manual=(window._reqMode==='manual');
+  function cardHTML(r){
+    var s=robotStateBadge(r);
+    var bc=r.battery_percent>50?'#1d8a3e':(r.battery_percent>=20?'#e8912d':'#e0483a');
+    var sel=(window._reqPick===r.robot_id);
+    return '<div '+(manual?'onclick="selectRobot(\''+r.robot_id+'\')" ':'')+'style="flex:1;min-width:140px;border:1.5px solid '+(sel?'var(--leaf)':'var(--line)')+';border-left:4px solid '+s.fg+';border-radius:10px;padding:10px 12px;background:'+(sel?'#eafaef':'#fff')+';'+(manual?'cursor:pointer;':'')+'">'
+      +'<div style="display:flex;justify-content:space-between;align-items:center;gap:6px"><span style="font-weight:700;font-size:15px">'+r.robot_id+'<span style="font-weight:400;font-size:11px;color:var(--muted);margin-left:5px">'+(ROLE[r.robot_id]||'')+'</span></span>'
+      +'<span style="font-size:12px;font-weight:700;padding:3px 9px;border-radius:20px;background:'+s.bg+';color:'+s.fg+'">'+s.t+'</span></div>'
+      +'<div style="font-size:13px;color:var(--muted);margin-top:6px">현재 작업: <b style="color:var(--ink)">'+(r.task_type?(TASK_LABEL[r.task_type]||r.task_type):'없음')+'</b>'+(sel?' <span style="color:var(--leaf-d);font-weight:700">· 선택됨</span>':'')+'</div>'
+      +'<div style="font-size:13px;margin-top:3px;display:flex;align-items:center;gap:6px">배터리 '+r.battery_percent+'%'
+        +'<span style="flex:1;max-width:80px;height:6px;background:#eef2f0;border-radius:4px"><span style="display:block;width:'+Math.max(0,Math.min(100,r.battery_percent))+'%;height:100%;border-radius:4px;background:'+bc+'"></span></span></div></div>';
+  }
+  var harvestR=robots.filter(function(r){return ROLE[r.robot_id]!=='순찰·운반';});   // 수확 = 왼쪽 절반
+  var patrolR=robots.filter(function(r){return ROLE[r.robot_id]==='순찰·운반';});     // 순찰 = 오른쪽 절반
+  var leftHTML=harvestR.length?harvestR.map(cardHTML).join(''):'<div style="color:var(--muted);font-size:13px">수확 로봇 없음</div>';
+  var rightHTML=patrolR.length?patrolR.map(cardHTML).join(''):'<div style="color:var(--muted);font-size:13px">순찰 로봇 없음</div>';
+  function tab(m,t){ var on=window._reqMode===m; return '<button onclick="setReqMode2(\''+m+'\')" style="padding:5px 13px;border:none;font-size:13px;font-weight:700;cursor:pointer;background:'+(on?'var(--leaf)':'#fff')+';color:'+(on?'#fff':'var(--ink)')+'">'+t+'</button>'; }
+  var toggle='<div style="display:inline-flex;border:1.5px solid var(--leaf);border-radius:9px;overflow:hidden">'+tab('auto','자동 배정')+tab('manual','직접 선택')+'</div>';
+  var hint=manual?'<span style="font-size:12px;color:var(--muted)">로봇을 눌러 선택</span>':'';
+  el.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:10px"><h3 style="margin:0">로봇 실시간 상태</h3><div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'+hint+toggle+'</div></div>'
+    +'<div class="grid g2" style="align-items:stretch"><div style="display:flex;gap:10px">'+leftHTML+'</div><div style="display:flex;gap:10px">'+rightHTML+'</div></div>';
+  var _busy=function(r){ return !!r.task_type||r.nav_status==='NAVIGATING'; };
+  // 가용 = telemetry available(역할별 배터리 기준 반영). busy = 작업 중(라벨 구분용)
+  window._reqAvail.patrol=robots.some(function(r){return ROLE[r.robot_id]==='순찰·운반'&&r.available;});
+  window._reqAvail.harvest=robots.some(function(r){return ROLE[r.robot_id]==='수확'&&r.available;});
+  window._reqBusy={patrol:robots.some(function(r){return ROLE[r.robot_id]==='순찰·운반'&&_busy(r);}),
+                   harvest:robots.some(function(r){return ROLE[r.robot_id]==='수확'&&_busy(r);})};
+  _applyReqBtnState();
+  try{renderAlertBanner();}catch(e){}
+}
 let patrolPick='auto', patrolSelId=null;
 function setPatrolPick(v){ patrolPick=v; if(v==='auto')patrolSelId=null; loadPatrol(); }
 function selectPatrolRobot(rid){ patrolSelId=(patrolSelId===rid?null:rid); loadPatrol(); }  // 한 대만(토글)
@@ -822,19 +935,19 @@ async function loadPatrol(){
   try{
     const d=await (await fetch('/api/v1/robots/patrol/available?t='+Date.now())).json();
     const box=document.getElementById('patrolBox'); if(!box)return;
-    const running=!!window._patrolLive;   // 순찰 진행 중이면 auto·specific 어느 탭이든 '요청 불가'로 통일
+    const running=!!window._patrolLive;   // 순찰 진행 중이면 auto·manual 어느 탭이든 '요청 불가'로 통일
     const avail=running?[]:d.robots.filter(r=>r.available);
     const autoPick=avail.length?avail.reduce((a,b)=>b.battery_percent>a.battery_percent?b:a):null;
     if(patrolSelId && !avail.find(r=>r.robot_id===patrolSelId)) patrolSelId=null;
     let html='<div style="padding:16px;max-width:780px;margin:0 auto">';
     html+='<h3 style="margin:0 0 8px">1. 배정 방식</h3>';
-    html+='<div style="display:flex;border:2px solid var(--leaf);border-radius:12px;overflow:hidden;max-width:380px;margin-bottom:8px">'+segBtn('setPatrolPick','auto','⚡ 자동 배정',patrolPick==='auto')+segBtn('setPatrolPick','specific','👆 직접 선택',patrolPick==='specific')+'</div>';
+    html+='<div style="display:flex;border:2px solid var(--leaf);border-radius:12px;overflow:hidden;max-width:380px;margin-bottom:8px">'+segBtn('setPatrolPick','auto','⚡ 자동 배정',patrolPick==='auto')+segBtn('setPatrolPick','manual','👆 직접 선택',patrolPick==='manual')+'</div>';
     html+='<div style="font-size:13px;color:var(--muted);margin-bottom:18px">'+(patrolPick==='auto'?('<b>대기중</b>이면서 배터리가 가장 높은 로봇을 자동 배정'+(autoPick?' → <b>'+autoPick.robot_id+'</b> (🔋'+autoPick.battery_percent+'%)':'')):'아래 <b>순찰 가능 로봇</b>에서 보낼 로봇 <b>1대</b>를 눌러 선택하세요')+'</div>';
     html+='<h3 style="margin:0 0 8px">2. 순찰 가능 로봇</h3>';
     html+='<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">';
     d.robots.forEach(r=>{
-      const ok=r.available, clickable=ok&&patrolPick==='specific';
-      const selected=(patrolPick==='specific'&&patrolSelId===r.robot_id);  // 자동배정 땐 카드 선택표시 안 함
+      const ok=r.available, clickable=ok&&patrolPick==='manual';
+      const selected=(patrolPick==='manual'&&patrolSelId===r.robot_id);  // 자동배정 땐 카드 선택표시 안 함
       const bd=selected?'#1d8a3e':(ok?'#a9d8b5':'var(--line)'), bg=selected?'#eafaef':(ok?'#f7fbf8':'#f6f7f6');
       html+='<div '+(clickable?'onclick="selectPatrolRobot(\''+r.robot_id+'\')" ':'')+'style="flex:1;min-width:190px;border:2px solid '+bd+';border-radius:12px;padding:14px 16px;background:'+bg+';'+(clickable?'cursor:pointer;':(ok?'':'opacity:.7;'))+'transition:.12s">'
         +'<div style="display:flex;align-items:center;justify-content:space-between"><span style="font-weight:700;font-size:16px">'+(ok?'🟢 ':'⚪ ')+r.robot_id+'</span>'+(selected?'<span style="color:#1d8a3e;font-weight:800;font-size:14px">✓ 선택됨</span>':(clickable?'<span style="font-size:14px;color:#1d8a3e">눌러 선택</span>':''))+'</div>'
@@ -847,10 +960,10 @@ async function loadPatrol(){
       html+='<div style="background:#fbeaea;border:1px solid #e6b0aa;color:#b0392b;border-radius:10px;padding:16px;text-align:center;font-weight:700">🚫 지금 순찰 가능한 로봇이 없습니다<br><span style="font-weight:400;font-size:13px">'+noMsg+'</span></div>';
       html+='<div style="text-align:center;margin-top:12px"><button class="btn" style="background:#d9dcde;color:#6b7075;border:1px solid #c7cbce;cursor:not-allowed" onclick="requestPatrol()">🚫 순찰 요청 불가</button></div>';
     }else{
-      const ready=patrolPick==='auto'||(patrolPick==='specific'&&patrolSelId);
+      const ready=patrolPick==='auto'||(patrolPick==='manual'&&patrolSelId);
       html+='<h3 style="margin:0 0 10px">3. 순찰 요청</h3>';
-      html+='<button class="btn btn-green" style="font-size:15px;padding:12px 22px;'+(ready?'':'opacity:.45;cursor:not-allowed')+'" onclick="requestPatrol()">🚓 순찰 요청'+(patrolPick==='specific'&&patrolSelId?' · '+patrolSelId:'')+'</button>';
-      if(patrolPick==='specific'&&!patrolSelId)html+='<div style="font-size:13px;color:#b0392b;margin-top:7px">👆 먼저 순찰 보낼 로봇 1대를 선택하세요.</div>';
+      html+='<button class="btn btn-green" style="font-size:15px;padding:12px 22px;'+(ready?'':'opacity:.45;cursor:not-allowed')+'" onclick="requestPatrol()">🚓 순찰 요청'+(patrolPick==='manual'&&patrolSelId?' · '+patrolSelId:'')+'</button>';
+      if(patrolPick==='manual'&&!patrolSelId)html+='<div style="font-size:13px;color:#b0392b;margin-top:7px">👆 먼저 순찰 보낼 로봇 1대를 선택하세요.</div>';
     }
     html+='<div id="patrolResult" style="margin-top:16px"></div></div>';
     box.innerHTML=html;
@@ -858,7 +971,7 @@ async function loadPatrol(){
 }
 async function requestPatrol(){
   const body={mode:'immediate',robot_selection:patrolPick};
-  if(patrolPick==='specific'){ if(!patrolSelId){alert('순찰 보낼 로봇 1대를 먼저 선택하세요');return;} body.robot_id=patrolSelId; }
+  if(patrolPick==='manual'){ if(!patrolSelId){alert('순찰 보낼 로봇 1대를 먼저 선택하세요');return;} body.robot_id=patrolSelId; }
   const r=await fetch('/api/v1/patrol/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const d=await r.json();const res=document.getElementById('patrolResult');
   if(r.ok&&res)res.innerHTML='<div style="background:#eef7ec;border:1px solid #9fd3ab;color:#1d6a35;border-radius:10px;padding:12px"><b>✅ '+d.message+'</b><br>배정 로봇: '+(d.assigned_robot_id||'농장에서 배정 중')+' · 작업번호 #'+d.task_id+'</div>';
@@ -867,7 +980,7 @@ async function requestPatrol(){
 }
 async function patrolReset(){await fetch('/api/v1/patrol/reset',{method:'POST'});loadPatrol();loadHeat();}
 /* ===== 수확 요청 (로봇팔 필요 · 순찰과 동일 UX) ===== */
-const HARVEST_REASON={NO_ARM:'🦾 로봇팔 없음(수확 불가)',BATTERY_TOO_LOW:'🔋 배터리 부족',ROBOT_BUSY:'🚧 작업 중',ALREADY_HARVESTING:'🍅 이미 수확 중(최대 1대)',NO_AVAILABLE_ROBOT:'가능한 로봇 없음'};
+const HARVEST_REASON={ROBOT_OFFLINE:'📡 오프라인(응답 없음)',IMMOBILIZED:'🛑 갇힘/정지 — 관리자 개입 필요',CHARGING:'⚡ 충전 중',NO_ARM:'🦾 로봇팔 없음(수확 불가)',BATTERY_TOO_LOW:'🔋 배터리 부족',ROBOT_BUSY:'🚧 작업 중',ALREADY_HARVESTING:'🍅 이미 수확 중(최대 1대)',NO_AVAILABLE_ROBOT:'가능한 로봇 없음'};
 let harvestPick='auto', harvestSelId=null;
 function setHarvestPick(v){ harvestPick=v; if(v==='auto')harvestSelId=null; loadHarvest(); }
 function selectHarvestRobot(rid){ harvestSelId=(harvestSelId===rid?null:rid); loadHarvest(); }
@@ -880,13 +993,13 @@ async function loadHarvest(){
     if(harvestSelId && !avail.find(r=>r.robot_id===harvestSelId)) harvestSelId=null;
     let html='<div>';
     html+='<h3 style="margin:0 0 8px">1. 배정 방식</h3>';
-    html+='<div style="display:flex;border:2px solid var(--leaf);border-radius:12px;overflow:hidden;max-width:380px;margin-bottom:8px">'+segBtn('setHarvestPick','auto','⚡ 자동 배정',harvestPick==='auto')+segBtn('setHarvestPick','specific','👆 직접 선택',harvestPick==='specific')+'</div>';
+    html+='<div style="display:flex;border:2px solid var(--leaf);border-radius:12px;overflow:hidden;max-width:380px;margin-bottom:8px">'+segBtn('setHarvestPick','auto','⚡ 자동 배정',harvestPick==='auto')+segBtn('setHarvestPick','manual','👆 직접 선택',harvestPick==='manual')+'</div>';
     html+='<div style="font-size:13px;color:var(--muted);margin-bottom:18px">'+(harvestPick==='auto'?('<b>로봇팔 탑재·대기중</b>이면서 배터리가 가장 높은 로봇을 자동 배정'+(autoPick?' → <b>'+autoPick.robot_id+'</b> (🔋'+autoPick.battery_percent+'%)':'')):'아래 <b>수확 가능 로봇</b>에서 보낼 로봇 <b>1대</b>를 눌러 선택하세요')+'</div>';
     html+='<h3 style="margin:0 0 8px">2. 수확 가능 로봇</h3>';
     html+='<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">';
     d.robots.forEach(r=>{
-      const ok=r.available, clickable=ok&&harvestPick==='specific';
-      const selected=(harvestPick==='specific'&&harvestSelId===r.robot_id);
+      const ok=r.available, clickable=ok&&harvestPick==='manual';
+      const selected=(harvestPick==='manual'&&harvestSelId===r.robot_id);
       const bd=selected?'#1d8a3e':(ok?'#a9d8b5':'var(--line)'), bg=selected?'#eafaef':(ok?'#f7fbf8':'#f6f7f6');
       html+='<div '+(clickable?'onclick="selectHarvestRobot(\''+r.robot_id+'\')" ':'')+'style="flex:1;min-width:190px;border:2px solid '+bd+';border-radius:12px;padding:14px 16px;background:'+bg+';'+(clickable?'cursor:pointer;':(ok?'':'opacity:.7;'))+'transition:.12s">'
         +'<div style="display:flex;align-items:center;justify-content:space-between"><span style="font-weight:700;font-size:16px">'+(ok?'🟢 ':'⚪ ')+r.robot_id+'</span>'+(selected?'<span style="color:#1d8a3e;font-weight:800;font-size:14px">✓ 선택됨</span>':(clickable?'<span style="font-size:14px;color:#1d8a3e">눌러 선택</span>':''))+'</div>'
@@ -898,10 +1011,10 @@ async function loadHarvest(){
       html+='<div style="background:#fbeaea;border:1px solid #e6b0aa;color:#b0392b;border-radius:10px;padding:16px;text-align:center;font-weight:700">🚫 지금 수확 가능한 로봇이 없습니다<br><span style="font-weight:400;font-size:13px">로봇팔을 단 로봇이 모두 작업 중이거나 배터리가 부족합니다.</span></div>';
       html+='<div style="text-align:center;margin-top:12px"><button class="btn" style="background:#d9dcde;color:#6b7075;border:1px solid #c7cbce;cursor:not-allowed" onclick="requestHarvest()">🚫 수확 요청 불가</button></div>';
     }else{
-      const ready=harvestPick==='auto'||(harvestPick==='specific'&&harvestSelId);
+      const ready=harvestPick==='auto'||(harvestPick==='manual'&&harvestSelId);
       html+='<h3 style="margin:0 0 10px">3. 수확 요청</h3>';
-      html+='<button class="btn btn-green" style="font-size:15px;padding:12px 22px;'+(ready?'':'opacity:.45;cursor:not-allowed')+'" onclick="requestHarvest()">🍅 수확 요청'+(harvestPick==='specific'&&harvestSelId?' · '+harvestSelId:'')+'</button>';
-      if(harvestPick==='specific'&&!harvestSelId)html+='<div style="font-size:13px;color:#b0392b;margin-top:7px">👆 먼저 수확 보낼 로봇 1대를 선택하세요.</div>';
+      html+='<button class="btn btn-green" style="font-size:15px;padding:12px 22px;'+(ready?'':'opacity:.45;cursor:not-allowed')+'" onclick="requestHarvest()">🍅 수확 요청'+(harvestPick==='manual'&&harvestSelId?' · '+harvestSelId:'')+'</button>';
+      if(harvestPick==='manual'&&!harvestSelId)html+='<div style="font-size:13px;color:#b0392b;margin-top:7px">👆 먼저 수확 보낼 로봇 1대를 선택하세요.</div>';
     }
     html+='<div id="harvestResult" style="margin-top:16px"></div></div>';
     box.innerHTML=html;
@@ -909,7 +1022,7 @@ async function loadHarvest(){
 }
 async function requestHarvest(){
   const body={robot_selection:harvestPick};
-  if(harvestPick==='specific'){ if(!harvestSelId){alert('수확 보낼 로봇 1대를 먼저 선택하세요');return;} body.robot_id=harvestSelId; }
+  if(harvestPick==='manual'){ if(!harvestSelId){alert('수확 보낼 로봇 1대를 먼저 선택하세요');return;} body.robot_id=harvestSelId; }
   const r=await fetch('/api/v1/harvest/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const d=await r.json();const res=document.getElementById('harvestResult');
   if(r.ok&&res)res.innerHTML='<div style="background:#eef7ec;border:1px solid #9fd3ab;color:#1d6a35;border-radius:10px;padding:12px"><b>✅ '+d.message+'</b><br>배정 로봇: '+(d.assigned_robot_id||'농장에서 배정 중')+' · 작업번호 #'+d.task_id+'</div>';
@@ -939,14 +1052,15 @@ function renderCropCard(){
   var tot=C.reduce(function(s,c){return s+c[2];},0)||1;
   var bar=C.map(function(c){return '<div style="width:'+(c[2]/tot*100)+'%;background:'+c[3]+'"></div>';}).join('');
   var tiles=C.map(function(c){ var pct=(c[2]/tot*100).toFixed(1);
-    return '<div style="border:1px solid var(--line);border-left:5px solid '+c[3]+';border-radius:10px;padding:12px 14px;background:#fff">'
-      +'<div style="display:flex;justify-content:space-between;align-items:baseline"><b style="font-size:15px">'+c[0]+'</b><span style="font-size:22px;font-weight:800;color:'+c[3]+'">'+c[2]+'<small style="font-size:12px;color:var(--muted);font-weight:600"> 송이</small></span></div>'
-      +'<div style="font-size:12px;color:var(--muted);margin-top:2px">'+c[1]+' · '+pct+'%</div></div>';
+    return '<div style="border:1px solid var(--line);border-left:5px solid '+c[3]+';border-radius:10px;padding:10px 14px;background:#fff">'
+      +'<div style="display:flex;justify-content:space-between;align-items:baseline"><b style="font-size:15px">'+c[0]+'</b><span style="font-size:22px;font-weight:800;color:'+c[3]+'">'+pct+'<small style="font-size:13px;color:'+c[3]+';font-weight:700">%</small></span></div>'
+      +'<div style="font-size:12px;color:var(--muted);margin-top:2px">'+c[1]+'</div></div>';
   }).join('');
   var meta=(window._heatMeta&&window._heatMeta.at)?(' · 갱신 '+window._heatMeta.at):'';
-  box.innerHTML='<div class="ch"><h3>🍅 순찰 중 감지한 방울토마토 상태</h3><span style="font-size:12px;color:var(--muted)">누적 '+tot+'송이'+meta+'</span></div>'
-    +'<div style="display:flex;height:16px;border-radius:8px;overflow:hidden;margin:4px 0 14px">'+bar+'</div>'
-    +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">'+tiles+'</div>';
+  box.innerHTML='<div class="ch"><h3>작물 상태 (순찰로 확인)</h3><span style="font-size:12px;color:var(--muted)">순찰 중 확인한 비율'+meta+'</span></div>'
+    +'<div style="display:flex;height:14px;border-radius:8px;overflow:hidden;margin:4px 0 12px">'+bar+'</div>'
+    +'<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px">'+tiles+'</div>';
+  try{renderAlertBanner();}catch(e){}
 }
 let harvestTimer=null;
 async function loadHarvestWork(){
@@ -1043,12 +1157,18 @@ async function loadSensors(){
   }catch(e){}
 }
 const farmTitles={f_dash:'대시보드',f_map:'농장 지도',f_mon:'실시간 모니터',f_batt:'배터리',f_patrol:'순찰 요청',f_work:'작업 관리·승인',f_report:'농장 운영 현황',f_heat:'밀집 히트맵',f_robot:'로봇 설정',f_user:'사용자 관리'};
-function farmHome(){
-  window._farmView='home';
-  document.getElementById('farmView').innerHTML=mapView();  // 홈=농장 지도(3D맵+배터리+버튼) 바로 표시
-  initFarm3D(); loadBatt(); startBattTimer(); loadHarvestStats(); startHarvestStatsTimer();
+function farmHome(){   // 홈 = 관제 대시보드 (로봇현황 + 지도/히트맵 미리보기 + 액션)
+  renderFarm('f_dash');
   var b=document.getElementById('farmBack'); if(b)b.style.display='none';
   var c=document.getElementById('farmCrumb'); if(c)c.textContent='';
+  window.scrollTo({top:0});
+}
+function openBigMap(){   // '크게 보기' → 실시간 3D 농장 지도 (여기서만 three.js 로드)
+  window._farmView='map';
+  document.getElementById('farmView').innerHTML=mapView();
+  initFarm3D(); loadBatt(); startBattTimer(); loadHarvestStats(); startHarvestStatsTimer();
+  var b=document.getElementById('farmBack'); if(b)b.style.display='inline-flex';
+  var c=document.getElementById('farmCrumb'); if(c)c.textContent='농장 지도';
   window.scrollTo({top:0});
 }
 function farmGo(v){
@@ -1111,9 +1231,25 @@ function harvestCardHTML(s){
     +'<div style="display:flex;align-items:flex-end;gap:8px;margin-top:16px">'+bars+'</div>';
 }
 function harvestSummaryShell(){ return '<div class="card" id="harvestSummary" style="margin-top:16px;padding:16px">'+harvestCardHTML(window._hstats||harvestFallback())+'</div>'; }
+// 주간 수확량 막대그래프(최근 7일, 서버가 8일 전은 자동 삭제)
+function weeklyChartHTML(){
+  var s=window._hstats||harvestFallback();
+  var week=(s&&s.week&&s.week.length)?s.week:harvestFallback().week;
+  var mx=Math.max.apply(null,week.map(function(x){return x.kg||0;}))||1;
+  var W=['일','월','화','수','목','금','토'];
+  var bars=week.map(function(x,i){ var isT=(i===week.length-1);
+    var p=String(x.date).split('-'); var dd=new Date(+p[0],+p[1]-1,+p[2]); var lab=(+p[1])+'/'+(+p[2]);
+    return '<div style="flex:1;text-align:center;min-width:0">'
+      +'<div style="font-size:12px;font-weight:800;color:var(--leaf-d);margin-bottom:3px">'+Math.round(x.kg||0)+'</div>'
+      +'<div style="height:'+((x.kg||0)/mx*50+6)+'px;background:'+(isT?'var(--leaf-d)':'var(--leaf)')+';'+(isT?'box-shadow:inset 0 0 0 2px var(--leaf-d);':'')+'border-radius:4px 4px 0 0"></div>'
+      +'<div style="font-size:11px;color:'+(isT?'var(--leaf-d)':'var(--muted)')+';font-weight:'+(isT?'700':'400')+';margin-top:4px">'+lab+'<br>'+(isT?'오늘':W[dd.getDay()])+'</div></div>';
+  }).join('');
+  return '<div class="ch"><h3>주간 수확량 (최근 7일)</h3><span style="font-size:12px;color:var(--muted)">누적 '+(((s&&s.week_total)||0)).toFixed(0)+'kg · 오늘 '+(((s&&s.today_kg)||0)).toFixed(1)+'kg</span></div>'
+    +'<div style="display:flex;align-items:flex-end;gap:6px;margin-top:6px">'+bars+'</div>';
+}
 function renderHarvestSummary(){
-  var box=document.getElementById('harvestSummary'); if(!box)return;
-  try{ box.innerHTML=harvestCardHTML(window._hstats||harvestFallback()); }catch(e){ box.innerHTML=harvestCardHTML(harvestFallback()); }
+  var w=document.getElementById('weeklyCard'); if(w){ try{ w.innerHTML=weeklyChartHTML(); }catch(e){} }
+  var box=document.getElementById('harvestSummary'); if(box){ try{ box.innerHTML=harvestCardHTML(window._hstats||harvestFallback()); }catch(e){} }
 }
 async function loadHarvestStats(){
   try{ var r=await fetch('/api/harvest/stats?t='+Date.now()); var j=await r.json(); if(j&&j.week) window._hstats=j; }catch(e){}
@@ -1128,8 +1264,9 @@ function startHarvestStatsTimer(){   // 배터리처럼 주기 폴링 → 서버
 }
 function mapView(){
   return '<div style="max-width:960px;margin:0 auto">'
+    +'<div id="fleetLive" class="card" style="margin-bottom:14px">🛰️ 로봇 실시간 상태 불러오는 중…</div>'
     +'<div style="position:relative;border-radius:18px;overflow:hidden;border:1px solid var(--line);box-shadow:0 6px 22px rgba(20,50,30,.10);background:linear-gradient(180deg,#eaf2f8,#d7e4ee)">'
-    +'<div id="farm3d" style="width:100%;height:480px;touch-action:none;cursor:grab"></div>'
+    +'<div id="farm3d" style="width:100%;height:360px;touch-action:none;cursor:grab"></div>'
     +'<div id="farm3dLoad" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#4a7a92;font-size:15px;font-weight:600">🗺️ 3D 지도 불러오는 중…</div>'
     +'</div>'
     +harvestSummaryShell()
@@ -1143,7 +1280,7 @@ function mapBtn(v,icon,label){
   return '<div onclick="farmGo(\''+v+'\')" style="background:#fff;border:2px solid var(--line);border-radius:16px;padding:18px 10px;text-align:center;cursor:pointer;transition:.15s" onmouseover="this.style.borderColor=\'var(--leaf)\';this.style.transform=\'translateY(-3px)\'" onmouseout="this.style.borderColor=\'var(--line)\';this.style.transform=\'none\'"><div style="font-size:34px;line-height:1">'+icon+'</div><div style="font-size:16px;font-weight:700;margin-top:8px">'+label+'</div></div>';
 }
 function initFarm3D(){
-  function run(){ try{ buildFarmScene(); }catch(e){ var l=document.getElementById('farm3dLoad'); if(l){l.textContent='지도를 표시할 수 없어요';} } }
+  function run(){ try{ buildFarmScene(); }catch(e){ var l=document.getElementById('farm3dLoad'); if(l){ l.style.display='flex'; l.innerHTML='<div style="text-align:center;padding:12px;font-size:13px;line-height:1.55;color:#c0392b">⚠️ 3D 지도 표시 실패<br><span style="opacity:.75;font-size:12px;color:#4a7a92">'+((e&&e.message)||e)+'</span></div>'; } console.error('[farm3d] buildFarmScene 실패:', e); } }
   if(window.THREE){ run(); return; }
   if(window._threeLoading){ var iv=setInterval(function(){ if(window.THREE){clearInterval(iv);run();} },200); return; }
   window._threeLoading=true;
@@ -1152,6 +1289,7 @@ function initFarm3D(){
   s.onload=function(){ window._threeLoading=false; run(); };
   s.onerror=function(){ var l=document.getElementById('farm3dLoad'); if(l)l.textContent='지도 로딩 실패(네트워크 확인)'; };
   document.head.appendChild(s);
+  setTimeout(function(){ if(!window.THREE){ var l=document.getElementById('farm3dLoad'); if(l) l.innerHTML='🗺️ 3D 지도는 온라인(라이브) 환경에서 표시됩니다'; } }, 6000);  // CDN 지연/차단 시 멈춤 방지
 }
 /* 실제 농장 배치 좌표 (세로로 긴 밭, X=가로 ±6, Z=길이 ±13, -Z=로봇팔쪽 상단) */
 var FARM={
@@ -1320,7 +1458,7 @@ function buildFarmScene(){
     var plb=farmLabelSprite(THREE,'dg_0'+(kk+1),'rgba(30,40,55,.9)'); plb.scale.set(1.3,0.5,1); plb.position.set(0,1.3,0); pkg.add(plb); }
   function patrolPos(u){ var wps=patrolWps,n=wps.length,ft=(((u%1)+1)%1)*n,i=Math.floor(ft)%n,f=ft-Math.floor(ft),a=wps[i],b=wps[(i+1)%n]; return {x:a.x+(b.x-a.x)*f,z:a.z+(b.z-a.z)*f,hx:b.x-a.x,hz:b.z-a.z}; }
   // ===== 카메라 궤도 =====
-  var ang=Math.PI*0.58, rad=28, elev=23, drag=false, px=0, auto=true;
+  var ang=Math.PI*0.58, rad=22, elev=18, drag=false, px=0, auto=true;
   function place(){ camera.position.set(Math.cos(ang)*rad,elev,Math.sin(ang)*rad); camera.lookAt(0,0.6,0);}
   place();
   host.onpointerdown=function(e){drag=true;auto=false;px=e.clientX;host.style.cursor='grabbing';};
@@ -1359,7 +1497,7 @@ function buildFarmScene(){
   animate();
   window.addEventListener('resize',function(){ if(!document.getElementById('farm3d'))return; var w=host.clientWidth,h=host.clientHeight; camera.aspect=w/h;camera.updateProjectionMatrix();renderer.setSize(w,h);});
 }
-let battTimer=null;
+var battTimer=null;
 function startBattTimer(){if(battTimer)clearInterval(battTimer);battTimer=setInterval(function(){if(document.getElementById('battBox'))loadBatt();else{clearInterval(battTimer);battTimer=null;}},1000);}
 async function loadBatt(){
   try{
@@ -1391,26 +1529,35 @@ function renderFarm(v){
   if(v==='f_rbstat'){ el.innerHTML=robotStatusView(); return; }
   if(v==='f_rctrl'){ el.innerHTML=robotControlView(); return; }
   if(v==='f_comm'){ el.innerHTML=commTestView(); return; }
-  if(v==='f_dash') el.innerHTML=`
-    <div class="page-h"><div><h2>농장 관리자 대시보드</h2><div class="lead">하이브리드 수확 스케줄과 로봇 운영을 한 화면에서</div></div></div>
-    <div class="grid g3">
-      <div class="card" style="grid-column:span 2"><div class="ch"><h3>즉시 수확 승인</h3></div>
-        <p style="font-size:13px;color:var(--muted);margin-bottom:12px">구역을 선택해 [즉시 수확 승인]하면 백엔드 우선순위 큐보다 <b>최우선</b>으로 처리됩니다.</p>
-        <table><thead><tr><th>구역</th><th>완숙도</th><th>물량(추정)</th><th>상태</th><th></th></tr></thead><tbody id="zoneRows">
-        ${S.zones.map((z,i)=>`<tr><td><b>${z.z}</b></td>
-          <td><span class="bat"><span class="bar"><i style="width:${z.ripe}%;background:var(--leaf)"></i></span>${z.ripe}%</span></td>
-          <td>${z.n}송이</td><td><span class="badge ${z.st==='승인 대기'?'b-warn':z.st==='관찰'?'b-charge':'b-run'}">${z.st}</span></td>
-          <td style="text-align:right"><button class="btn btn-green" style="padding:7px 12px" onclick="approve(${i})">즉시 수확 승인</button></td></tr>`).join('')}
-        </tbody></table></div>
-      <div class="card kpi" style="display:flex;flex-direction:column;gap:14px;justify-content:center">
-        <div><div class="lab">오늘 수확량</div><div class="val">${S.todayKg.toFixed(1)}<small>kg</small></div></div>
-        <div><div class="lab">승인 대기 구역</div><div class="val" style="color:var(--amber)" id="pendCount">${S.zones.filter(z=>z.st==='승인 대기').length}</div></div>
-        <button class="btn btn-ghost" style="justify-content:center" onclick="navTo('farm','f_report')">리포트 보기 →</button>
+  if(v==='f_dash'){ el.innerHTML=`
+    <div id="alertBanner" style="margin-bottom:6px"></div>
+    <div id="fleetLive" class="card" style="margin-bottom:6px;background:#f4f9f6;border:1.5px solid #c2ddce;box-shadow:0 2px 14px rgba(29,110,60,.08)">로봇 실시간 상태 불러오는 중…</div>
+    <div class="grid g2" style="margin-bottom:6px;align-items:stretch">
+      <div class="card" style="padding:12px 16px;display:flex;flex-direction:column">
+        <div style="margin-bottom:8px"><h3 style="margin:0">완숙 밀집 히트맵</h3></div>
+        <div style="border-radius:12px;overflow:hidden;border:1px solid var(--line);background:#eef2f5;height:308px;display:flex;align-items:center;justify-content:center">
+          <canvas id="farmHeat" width="300" height="360" style="width:306px;height:368px;transform:rotate(90deg);border-radius:8px"></canvas>
+        </div>
+        <div id="harvestBar">${reqBar('harvest')}</div>
+      </div>
+      <div class="card" style="padding:12px 16px;display:flex;flex-direction:column">
+        <div style="margin-bottom:8px"><h3 style="margin:0">로봇 위치 · 3D 농장 지도</h3></div>
+        <div style="position:relative;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:#eef2f5">
+          <div id="farm3d" style="width:100%;height:308px;touch-action:none;cursor:grab"></div>
+          <div id="farm3dLoad" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#4a7a92;font-size:14px;font-weight:600">3D 지도 불러오는 중…</div>
+        </div>
+        <div id="patrolBar">${reqBar('patrol')}</div>
       </div>
     </div>
-    <div class="card" style="margin-top:14px"><div class="ch"><h3>로봇별 상세 상태</h3><span class="more" onclick="navTo('farm','f_robot')">설정 →</span></div>
-      <table><thead><tr><th>로봇</th><th>상태</th><th>작업</th><th>배터리</th><th>위치</th><th>지연</th></tr></thead>
-      <tbody>${robotRows(false)}</tbody></table></div>`;
+    <div class="grid g2" style="align-items:stretch">
+      <div class="card" id="weeklyCard" style="padding:14px">${weeklyChartHTML()}</div>
+      <div class="card" id="cropCardBox" style="padding:14px">감지 상태 불러오는 중…</div>
+    </div>`;
+    try{startFleetLive();}catch(e){}
+    try{initFarm3D();}catch(e){}
+    try{loadHeat();}catch(e){}
+    try{loadHarvestStats();}catch(e){}
+  }
   if(v==='f_work') el.innerHTML=`
     <div class="page-h"><div><h2>작업 관리 · 승인</h2><div class="lead">구역별 완숙도와 승인 대기 워크플로우</div></div>
       <button class="btn btn-ghost" onclick="navTo('farm','f_dash')">← 대시보드</button></div>
@@ -1422,26 +1569,16 @@ function renderFarm(v){
         <button class="btn btn-green" style="width:100%;justify-content:center" onclick="approve(${i})">즉시 수확 승인</button></div>`).join('')}
     </div>`;
   if(v==='f_report'){ el.innerHTML=`
-    <div class="page-h"><div><h2>수확 보내기</h2><div class="lead">완숙 밀집도를 보고 수확할 로봇을 보냅니다</div></div>
+    <div class="page-h"><div><h2>수확 보내기</h2><div class="lead">수확할 로봇을 배정해 보냅니다 (완숙 밀집은 대시보드 히트맵 참고)</div></div>
       <button class="btn btn-ghost" onclick="harvestReset()">↺ 데모 초기화</button></div>
-    <div class="grid g2" style="margin-bottom:14px;align-items:stretch">
-      <div class="card"><div class="ch"><h3>🔥 어디를 딸까요? · 완숙 밀집 히트맵</h3></div>
-        <canvas id="farmHeat" width="360" height="600" style="width:100%;max-width:340px;display:block;margin:0 auto;border-radius:12px;background:#eef2f5"></canvas>
-        <div class="legend" style="justify-content:center;gap:16px;color:var(--muted);margin-top:12px">
-          <span><span class="lg" style="background:#f7d9c0"></span>낮음</span>
-          <span><span class="lg" style="background:#f0a24d"></span>보통</span>
-          <span><span class="lg" style="background:#e23b2d"></span>높음</span></div>
-        <div style="text-align:center;font-size:12.5px;color:var(--muted);margin-top:8px">🍅 붉을수록 완숙 토마토가 몰린 구역 — <b>여기부터 수확하세요</b></div>
-        <div id="heatMeta" style="text-align:center;font-size:11px;color:var(--muted);margin-top:4px"></div></div>
-      <div class="card"><div class="ch"><h3>🍅 수확 요청 · 로봇 배정</h3></div>
-        <div id="harvestBox">불러오는 중…</div></div>
-    </div>`; loadHeat(); loadHarvest(); }
+    <div class="card"><div class="ch"><h3>🍅 수확 요청 · 로봇 배정</h3></div>
+      <div id="harvestBox">불러오는 중…</div></div>`; loadHarvest(); }
   if(v==='f_patrol'){ el.innerHTML=`
     <div class="page-h"><div><h2>순찰 보내기</h2><div class="lead">순찰 로봇을 배정하고, 감지된 방울토마토 상태를 확인합니다</div></div>
       <button class="btn btn-ghost" onclick="patrolReset()">↺ 데모 초기화</button></div>
     <div id="patrolLive" class="card" style="margin-bottom:14px;border-left:4px solid var(--leaf)"></div>
-    <div id="patrolBox" class="card">불러오는 중…</div>
-    ${patrolCropCard()}`; loadPatrol(); loadHeat(); try{renderPatrolLive();}catch(e){} }
+    <div id="fleetLive" class="card" style="margin-bottom:14px">🛰️ 로봇 실시간 상태 불러오는 중…</div>
+    <div id="patrolBox" class="card">불러오는 중…</div>`; loadPatrol(); try{renderPatrolLive();}catch(e){} try{startFleetLive();}catch(e){} }
   if(v==='f_sensor'){ el.innerHTML=`
     <div class="page-h"><div><h2>로봇 상태·센서</h2><div class="lead">각 로봇의 연결·배터리·센서·모터를 실시간으로 확인합니다</div></div></div>
     <div id="sensorBox">불러오는 중…</div>
@@ -1476,6 +1613,7 @@ function heatCells(){
 function drawFarmHeat(){
   var cv=document.getElementById('farmHeat'); if(!cv)return;
   var F=FARM, g=cv.getContext('2d'), CW=cv.width, CH=cv.height, pad=22;
+  function T(t,x,y){ g.save(); g.translate(x,y); g.rotate(-Math.PI/2); g.fillText(t,0,0); g.restore(); }   // CSS 90° 회전 상쇄 → 라벨 똑바로
   function sx(x){return pad+(x+F.HX)/(F.HX*2)*(CW-2*pad);}
   function sy(z){return pad+(z+F.HZ)/(F.HZ*2)*(CH-2*pad);}
   function sw(w){return w/(F.HX*2)*(CW-2*pad);}
@@ -1531,7 +1669,7 @@ function drawFarmHeat(){
   (F.links||[]).forEach(function(lk){ var a=F.waypoints.find(function(w){return w.id===lk[0];}), b=F.waypoints.find(function(w){return w.id===lk[1];}); if(a&&b){ g.strokeStyle='rgba(31,157,85,.75)'; g.lineWidth=2; g.setLineDash([6,5]); g.beginPath(); g.moveTo(sx(a.x),sy(a.z)); g.lineTo(sx(b.x),sy(b.z)); g.stroke(); g.setLineDash([]); } });
   g.textAlign='center'; g.textBaseline='middle';
   F.waypoints.forEach(function(w){ g.fillStyle=w.gate?'#2f7fd6':'#1f9d55'; g.beginPath(); g.arc(sx(w.x),sy(w.z),7.5,0,7); g.fill();
-    g.fillStyle='#fff'; g.font='bold 9px sans-serif'; g.fillText(w.id,sx(w.x),sy(w.z)); });
+    g.fillStyle='#fff'; g.font='bold 9px sans-serif'; T(w.id,sx(w.x),sy(w.z)); });
   // 로봇팔 아래 가벽
   var wb=F.wallBar; g.fillStyle='#cbd3db'; g.fillRect(sx(wb.x)-sw(wb.w)/2,sy(wb.z)-sh(wb.d)/2,sw(wb.w),Math.max(4,sh(wb.d)));
   // 로봇팔 2대 (관절 아이콘) — 그 위 방울토마토는 위에서 밀집 '색'으로 표시함(그림 제거)
@@ -1546,11 +1684,11 @@ function drawFarmHeat(){
   var c=F.cold, ex=sx(c.x)-sw(c.w)/2, ey=sy(c.z)-sh(c.d)/2;
   g.fillStyle='rgba(120,180,220,.5)'; g.fillRect(ex,ey,sw(c.w),sh(c.d));
   g.strokeStyle='#3a7fb8'; g.lineWidth=2; g.strokeRect(ex,ey,sw(c.w),sh(c.d));
-  g.fillStyle='#12456e'; g.font='bold 12px sans-serif'; g.fillText('예냉실',sx(c.x),sy(c.z));
+  g.fillStyle='#12456e'; g.font='bold 12px sans-serif'; T('예냉실',sx(c.x),sy(c.z));
   // DG 충전소 3개 (사각 패드 — 접근 waypoint와 겹치지 않게)
   F.stations.forEach(function(s,i){ var cx=sx(s.x),cy=sy(s.z),ww=Math.max(24,sw(0.9)),hh=Math.max(17,sh(0.85));
     g.fillStyle='#2f7fd6'; g.fillRect(cx-ww/2,cy-hh/2,ww,hh);
-    g.fillStyle='#fff'; g.font='bold 11px sans-serif'; g.fillText('DG'+(i+1),cx,cy);});
+    g.fillStyle='#fff'; g.font='bold 11px sans-serif'; T('DG'+(i+1),cx,cy);});
 }
 function sliderRow(lab,val,pct){return `<div class="pr" style="margin-bottom:16px"><div class="top"><span>${lab}</span><b>${val}</b></div>
   <div class="bar2" style="height:7px"><i style="width:${pct}%;background:var(--leaf)"></i></div></div>`;}
@@ -1760,14 +1898,45 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
       try{toast(msg);}catch(_){}
     } else if(e.event==='patrol_completed'){
       var s=e.summary||{};
-      var m='✅ 순찰 완료 · '+(e.robot_id||'')+' (익음 '+(s.ripe_percent||0)+'% · 병해충 '+(s.disease_percent||0)+'%)';
-      notify('✅ 순찰 완료', m, false);
+      // 스펙 E2-10: status(COMPLETED/COMPLETED_PARTIAL) + unvisited_waypoint_ids 로 문구 분기
+      var partial=(e.status==='COMPLETED_PARTIAL');
+      var uv=e.unvisited_waypoint_ids||[];
+      var head=partial?'순찰 완료 (일부 지점 미방문)':'순찰 완료';
+      var uvtxt=partial&&uv.length?(' — '+uv.map(function(x){return x+'번';}).join(', ')+'. 통로 막힘으로 도달하지 못했습니다.'):'';
+      var m='✅ '+head+uvtxt+' · '+(e.robot_id||'')+' (익음 '+(s.ripe_percent||0)+'% · 병해충 '+(s.disease_percent||0)+'%)';
+      notify(partial?'⚠️ 순찰 완료 (일부 미방문)':'✅ 순찰 완료', m, partial);
       try{toast(m);}catch(_){}
       window._patrolLive=null; window.renderPatrolLive();
       try{loadPatrol();}catch(_){}   // 순찰 완료 → 순찰 화면 다시 '배정 가능'으로
+    } else if(e.event==='task_failed'){
+      // 스펙 E2-14: 작업 실패 알림. reason별 문구·심각도(긴급/경고).
+      var RE={
+        BLOCKED:{t:'통로 막힘으로 작업을 중단하고 충전소로 복귀합니다.',u:false},
+        BLOCKED_UNRECOVERABLE:{t:'통로에 갇혔습니다. 직접 이동시킨 뒤 복구 완료를 눌러 주세요.',u:true},
+        DOCK_FAILED:{t:'정밀 정차에 실패했습니다. 마커를 확인해 주세요.',u:false},
+        BATTERY_DEPLETED:{t:'작업 중 배터리가 소진되었습니다.',u:true},
+        HARDWARE_ERROR:{t:'로봇 하드웨어 이상이 발생했습니다.',u:true}
+      };
+      var r=RE[e.reason]||{t:(e.message||'작업이 실패했습니다.'),u:true};
+      var rid=e.robot_id||'로봇';
+      var body=e.message||(rid+'이(가) '+r.t);
+      banner(
+        '<div style="background:linear-gradient(180deg,'+(r.u?'#e5462f,#c0392b':'#f0a020,#d4870f')+');color:#fff;border-radius:16px;padding:15px 16px;display:flex;gap:14px;align-items:center;animation:dzIn .3s ease'+(r.u?', dzGlow 1.9s ease-in-out infinite':'')+'">'
+        +'<div style="width:56px;height:56px;flex:none;border-radius:12px;background:rgba(255,255,255,.2);display:flex;align-items:center;justify-content:center;font-size:30px">'+(r.u?'🚨':'⚠️')+'</div>'
+        +'<div style="flex:1;min-width:0">'
+          +'<div style="font-size:19px;font-weight:800;letter-spacing:-.3px">'+(r.u?'🛑 로봇 긴급 상황':'⚠️ 작업 실패')+'</div>'
+          +'<div style="font-size:14px;font-weight:600;margin-top:3px;opacity:.97">'+rid+' · 작업 #'+(e.task_id||'')+'</div>'
+          +'<div style="font-size:14px;margin-top:4px;opacity:.95">'+body+'</div>'
+        +'</div>'
+        +'<button onclick="var x=document.getElementById(\'diseaseBanner\');if(x)x.style.display=\'none\'" title="닫기" style="flex:none;align-self:flex-start;background:rgba(255,255,255,.22);border:none;color:#fff;width:28px;height:28px;border-radius:50%;font-size:14px;line-height:1;cursor:pointer">✕</button>'
+        +'</div>'
+      );
+      notify((r.u?'🚨 ':'⚠️ ')+rid+' 작업 실패', body, r.u);
+      try{toast('🛑 '+rid+' 작업 실패 · '+r.t);}catch(_){}
+      try{loadPatrol();}catch(_){}   // 실패 로봇 상태 갱신
     }
-    // 스펙 E2-10/E3-2: 앱이 텔레그램 발송 (토큰 노출 방지 위해 Web 릴레이 호출, seq로 중복방지)
-    if(e.event==='disease_alert'||e.event==='patrol_completed'){
+    // 스펙 E2-10/E2-14/E3-2: 앱이 텔레그램 발송 (토큰 노출 방지 위해 Web 릴레이 호출, seq로 중복방지)
+    if(e.event==='disease_alert'||e.event==='patrol_completed'||e.event==='task_failed'){
       try{ fetch('/api/v1/notify/telegram',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(e)}); }catch(_){}
     }
   }
