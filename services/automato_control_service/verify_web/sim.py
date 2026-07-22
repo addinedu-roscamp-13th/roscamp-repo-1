@@ -259,7 +259,8 @@ class VerifySim:
 
         def run():
             try:
-                result = dispatcher.run_patrol(
+                # run_patrol 은 (status, 미방문목록) 을 돌려준다. 검증 화면은 status 만 쓴다.
+                result, _unvisited = dispatcher.run_patrol(
                     task_id, robot_id, targets, engine, client, start_wp=start_wp)
             except Exception as exc:  # noqa: BLE001
                 self.events.warn(f"{robot_id} 작업 예외: {exc}")

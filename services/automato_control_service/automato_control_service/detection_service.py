@@ -30,12 +30,14 @@ HTTP 클라이언트:
   수신처(대시보드/알림 백엔드)는 아직 미정이라 base URL 을 설정값(AUTOMATO_WEB_SERVICE_URL)으로
   빼둔다. 경로는 계약이라 상수로 고정한다.
 """
-import json
 import os
 import time
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+
+# 발송 자체(urllib)는 공용 모듈로 뺐다 — 순찰 종료·작업 실패 알림(patrol_notify)도
+# 같은 방법으로 보내기 때문이다. 여기서는 '무엇을 어떤 정책으로' 만 정한다.
+from automato_control_service.internal_http import post_json
 
 # NOTE: detection_db(psycopg 의존)는 __init__ 의 기본 db_fn 을 만들 때만 '지연 임포트'한다.
 # 그래야 DB 드라이버 없이도 이 모듈을 임포트해 순수 로직/오케스트레이션을 단위테스트할 수 있다.
@@ -170,19 +172,6 @@ def image_msg_to_jpeg_bytes(image_msg, log=None) -> bytes:
         if log is not None:
             log.warn(f"병해충 이미지 변환 실패({exc}) → 이미지 없이 진행")
         return b""
-
-
-# --------------------------------------------------------------------------- #
-# HTTP 유틸 (stdlib urllib) — 2xx 면 상태코드 반환, 아니면 예외
-# --------------------------------------------------------------------------- #
-def post_json(url: str, payload: dict, timeout: float) -> int:
-    """JSON 을 POST 하고 HTTP 상태코드를 반환. 비2xx/네트워크 오류는 예외로 올린다."""
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return int(getattr(r, "status", 200))
 
 
 # --------------------------------------------------------------------------- #
