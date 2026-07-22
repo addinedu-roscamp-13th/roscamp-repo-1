@@ -270,7 +270,7 @@ def upgrade() -> None:
     op.execute(
         """
         CREATE TABLE aruco_markers (
-            marker_id       INTEGER PRIMARY KEY,
+            marker_id       VARCHAR(50) PRIMARY KEY,
             task_point_id   VARCHAR(50) NOT NULL UNIQUE
                             REFERENCES task_points(task_point_id),
             dictionary      VARCHAR(30) NOT NULL DEFAULT 'DICT_4X4_50',
