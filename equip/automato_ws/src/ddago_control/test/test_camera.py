@@ -6,8 +6,9 @@
 을 계약대로 하는지, 그리고 이미지가 없을 때 예외로 죽지 않고 success=false 로
 알리는지 검증한다.
 
-device 모드(cv2.VideoCapture)는 실물 웹캠이 있어야 해 여기서 다루지 않는다
-(실물 검증은 rp76 필드 테스트에서).
+device 모드의 실제 촬영 경로(cv2.VideoCapture)는 실물 웹캠이 있어야 해 여기서
+다루지 않는다(실물 검증은 rp76 필드 테스트에서). 다만 유휴 release(배터리 절전)와
+AE 워밍업 로직은 가짜 cap(_FakeCap)을 주입해 하드웨어 없이 검증한다.
 
 실행:
   source /opt/ros/jazzy/setup.bash
@@ -108,4 +109,104 @@ def test_file_mode_missing_image_reports_failure():
         assert resp.message != ''
     finally:
         spun.shutdown()
+        rclpy.shutdown()
+
+
+# ---------------------------------------------------------------------- #
+# device 모드 유휴 release / AE 워밍업 — 실물 웹캠 없이 로직만 검증
+# ---------------------------------------------------------------------- #
+class _FakeCap:
+    """cv2.VideoCapture 대역: release/grab 호출을 기록만 한다."""
+
+    def __init__(self):
+        self.released = False
+        self.grab_count = 0
+
+    def isOpened(self):
+        return not self.released
+
+    def set(self, *_args):
+        return True
+
+    def grab(self):
+        self.grab_count += 1
+        return True
+
+    def release(self):
+        self.released = True
+
+
+def _device_node(**params):
+    """device 모드 CameraNode. device_index=99(없는 장치) 강제라 어느 PC 에서
+    돌려도 실물 웹캠을 건드리지 않고 '열기 실패' 경로로 즉시 빠진다."""
+    overrides = [
+        Parameter('source', Parameter.Type.STRING, 'device'),
+        Parameter('device_index', Parameter.Type.INTEGER, 99),
+    ]
+    for name, val in params.items():
+        ptype = (Parameter.Type.DOUBLE if isinstance(val, float)
+                 else Parameter.Type.INTEGER)
+        overrides.append(Parameter(name, ptype, val))
+    return CameraNode(parameter_overrides=overrides)
+
+
+def test_idle_release_after_timeout():
+    """마지막 사용 후 idle_release_sec 지나면 타이머 콜백이 cap 을 놓아 준다."""
+    rclpy.init()
+    node = _device_node(idle_release_sec=10.0)
+    try:
+        fake = _FakeCap()
+        node._cap = fake
+        node._last_use = time.monotonic() - 11.0   # 유휴 11초 경과로 위장
+        node._on_idle_check()
+        assert fake.released is True
+        assert node._cap is None                    # 다음 요청 때 재오픈되도록 비움
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_idle_within_window_keeps_open():
+    """유휴 시간이 문턱 미만이면 cap 을 유지한다(연속 촬영은 빨라야 한다)."""
+    rclpy.init()
+    node = _device_node(idle_release_sec=10.0)
+    try:
+        fake = _FakeCap()
+        node._cap = fake
+        node._last_use = time.monotonic()           # 방금 사용
+        node._on_idle_check()
+        assert fake.released is False
+        assert node._cap is fake
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_idle_timer_disabled_when_nonpositive():
+    """idle_release_sec<=0 이면 타이머를 안 만든다(예전 '상시 열림' 동작 유지)."""
+    rclpy.init()
+    node = _device_node(idle_release_sec=0.0)
+    try:
+        assert node._idle_timer is None
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_warmup_grabs_on_fresh_open():
+    """새로 연 경우에만 AE 워밍업 grab 이 warmup_frames 만큼 나간다."""
+    rclpy.init()
+    node = _device_node(warmup_frames=15)
+    try:
+        fake = _FakeCap()
+        node._open_webcam = lambda: (fake, 'fake')  # 실물 오픈을 대역으로 치환
+        assert node._ensure_device() is True
+        assert fake.grab_count == 15                # 새로 열었으니 워밍업 발생
+        assert node._cap is fake
+
+        fake.grab_count = 0
+        assert node._ensure_device() is True        # 이미 열려 있으면
+        assert fake.grab_count == 0                 # 워밍업을 반복하지 않는다
+    finally:
+        node.destroy_node()
         rclpy.shutdown()
