@@ -76,16 +76,16 @@ class DGCard(QFrame):
         self.batt_detail.setStyleSheet("color:#7a887a; font-size:11px;")
         root.addWidget(self.batt_detail)
 
-        # 주행 타일: 초음파 + 위치 + (미지원) 라이다/IMU/모터온도
+        # 주행 타일: 위치 + (미지원) 라이다/IMU/모터온도
+        # 초음파(us_range)는 실제로 데이터가 오지 않아 모니터링에서 제외했다.
         drive_grid = QGridLayout()
         drive_grid.setSpacing(6)
-        self.tile_us, self.val_us = _tile("초음파")
         self.tile_pos, self.val_pos = _tile("위치 x,y")
         self.tile_yaw, self.val_yaw = _tile("방향 yaw")
         self.tile_lidar, _ = _tile("라이다", unsupported=True)
         self.tile_imu, _ = _tile("IMU", unsupported=True)
         for col, w in enumerate(
-            [self.tile_us, self.tile_pos, self.tile_yaw]
+            [self.tile_pos, self.tile_yaw]
         ):
             drive_grid.addWidget(w, 0, col)
         # 미지원(추후 협의) 타일 — 주행모터온도는 제거됨
@@ -175,7 +175,7 @@ class DGCard(QFrame):
             self.nav_badge.setStyleSheet(style.badge_qss("idle"))
             self.batt_bar.setValue(0)
             self.batt_detail.setText("- V")
-            for lbl in (self.val_us, self.val_pos, self.val_yaw):
+            for lbl in (self.val_pos, self.val_yaw):
                 lbl.setText("-")
             return
         meta = config.nav_status_meta(d.nav_status)
@@ -185,7 +185,6 @@ class DGCard(QFrame):
         ))
         self.batt_bar.setValue(int(d.battery_percent))
         self.batt_detail.setText(f"{d.battery_voltage:.2f} V")
-        self.val_us.setText(f"{d.us_range_m:.2f} m")
         self.val_pos.setText(f"{d.x:.2f}, {d.y:.2f}")
         self.val_yaw.setText(f"{d.yaw:.2f}")
 

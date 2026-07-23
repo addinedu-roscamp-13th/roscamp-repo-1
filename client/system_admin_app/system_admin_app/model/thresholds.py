@@ -30,10 +30,6 @@ def ddago_status(d: Optional[DdagoState]) -> tuple[str, list[str]]:
         level = _worst(level, "warn")
         reasons.append(f"배터리 부족 ({d.battery_percent:.0f}%)")
 
-    if 0.0 < d.us_range_m <= config.US_RANGE_WARN_M:
-        level = _worst(level, "warn")
-        reasons.append(f"장애물 근접 ({d.us_range_m:.2f}m)")
-
     if config.nav_status_meta(d.nav_status)["level"] == "crit":
         level = _worst(level, "crit")
         reasons.append(f"주행 상태 {config.nav_status_meta(d.nav_status)['label']}")
@@ -68,7 +64,15 @@ def ddagi_status(a: Optional[DdagiState]) -> tuple[str, list[str]]:
 
 
 def unit_status(unit: DGUnit) -> tuple[str, list[str]]:
-    """DG 단위 종합 상태(주행+로봇팔 중 나쁜 쪽)와 전체 사유."""
+    """DG 단위 종합 상태(주행+로봇팔 중 나쁜 쪽)와 전체 사유.
+
+    통신 두절이면 다른 판정을 덮어쓴다. ACS가 끊긴 로봇의 마지막 값을 계속 보내므로,
+    두절을 표시하지 않으면 굳어버린 옛 수치가 정상 상태처럼 보인다.
+    """
+    if unit.is_offline:
+        age = f"{unit.age_sec:.0f}초" if unit.age_sec is not None else "?"
+        return "crit", [f"통신 두절 ({age} 미수신)"]
+
     go_level, go_reasons = ddago_status(unit.ddago)
     if unit.is_drive_only:
         return go_level, go_reasons
