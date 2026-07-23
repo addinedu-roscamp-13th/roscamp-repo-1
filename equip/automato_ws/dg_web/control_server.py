@@ -12,6 +12,7 @@
     POST /api/test/e0                → 상시 모니터링(FleetTelemetry 취합) 판정
     POST /api/test/e1                → 순찰 시작(Navigate 경로 접수→DdaGo 하달) 판정
     POST /api/test/e2                → 체크·저장(capture 노드 분석→SaveDetection→순찰완료) 판정
+    POST /api/test/e4                → 복귀·도킹(Dock 중계 ACS→DCS→DdaGo) 판정
     GET  /api/logs                   → 최근 흐름 로그 추림(참고용)
 
 dg_ai 시뮬을 껐다 켜면 dashboard.sh 가 active 를 real/sim 으로 자동 전환하고,
@@ -228,8 +229,42 @@ def eval_e2():
     return ok, dcs[-4:] + acs[-4:]
 
 
-EVALS = {'e0': eval_e0, 'e1': eval_e1, 'e2': eval_e2}
-EVAL_NAMES = {'e0': 'E0 상시 모니터링', 'e1': 'E1 순찰 시작', 'e2': 'E2 체크·저장'}
+def _trigger_dock():
+    """ACS 역할로 Dock goal 하달(dashboard.sh dock). 완주까지 기다린다."""
+    subprocess.run(['bash', DASH, 'dock'], capture_output=True, text=True, timeout=90)
+
+
+def eval_e4():
+    """E4-6 복귀 후 정밀 도킹: ACS→DCS 로 Dock goal 접수 → DCS→DdaGo 중계 →
+    결과가 ACS 로 되돌아오는지까지.
+
+    DCS 는 중계자다. 실제 도킹 기동(마커 탐색→중심선 정렬→접근→회전→후진)은 DdaGo 가
+    하고, 여기서 보는 것은 **중계가 값을 잃지 않는가**다. 특히 final_lateral_m(중심선
+    이탈)·final_yaw_error(스큐)는 ACS 가 도킹 품질을 판정하는 근거라 빠지면 안 된다.
+    """
+    clear_wire()   # 실행 시 메시지 초기화
+    _trigger_dock()
+
+    keys = ['도킹 지시 수신', '도킹 하달', '도킹 종료', '도킹 결과 전달']
+
+    def done():
+        dcs = _tail_filtered('/tmp/dash_dcs.log', keys, n=12)
+        return (any('도킹 지시 수신' in l for l in dcs)      # ACS → DCS 접수
+                and any('도킹 하달' in l for l in dcs)        # DCS → DdaGo 중계
+                and any('도킹 종료' in l for l in dcs)        # DdaGo → DCS 결과
+                and any('도킹 결과 전달' in l for l in dcs))  # DCS → ACS 반환
+
+    ok = _wait_until(done, 30)
+    dcs = _tail_filtered('/tmp/dash_dcs.log', keys, n=8)
+    if ok:
+        # 성공이라면 code=0 이어야 한다(중계는 됐는데 도킹이 실패한 경우를 가른다).
+        ok = any('code=0' in l for l in dcs if '도킹 결과 전달' in l)
+    return ok, dcs or ['(DCS 로그 없음 — dcs/ddago UP 확인)']
+
+
+EVALS = {'e0': eval_e0, 'e1': eval_e1, 'e2': eval_e2, 'e4': eval_e4}
+EVAL_NAMES = {'e0': 'E0 상시 모니터링', 'e1': 'E1 순찰 시작', 'e2': 'E2 체크·저장',
+              'e4': 'E4 복귀·도킹'}
 
 
 class Handler(BaseHTTPRequestHandler):
