@@ -69,6 +69,8 @@ class MonitorTab(QWidget):
     def on_snapshot(self, snap: FleetSnapshot) -> None:
         self.latest = snap
         now = time.monotonic()
+        # 이 값은 '마지막 메시지 도착 시각' 표시용일 뿐, 생존 판정에는 쓰지 않는다.
+        # (생존 판정은 _render()에서 로봇별 stamp 나이로 한다 — DGUnit.is_offline)
         for rid in snap.units:
             self.last_seen[rid] = now
         self.history.ingest(snap)
@@ -85,8 +87,11 @@ class MonitorTab(QWidget):
         newest = 0.0
         for rid in config.ROBOT_IDS:
             seen = self.last_seen.get(rid, 0.0)
-            online = (now - seen) <= config.STALE_SEC if seen else False
             unit = self.latest.unit(rid) if self.latest else None
+            # 생존 판정은 '스냅샷에 있는가'가 아니라 '그 로봇 stamp가 신선한가'로 한다.
+            # ACS는 끊긴 로봇도 마지막 값을 계속 배열에 실어 보내므로(E0 ④), 도착만
+            # 보고 판정하면 죽은 로봇이 영원히 온라인으로 남는다.
+            online = unit is not None and not unit.is_offline
             self.cards[rid].update_unit(unit, online)
             if online:
                 online_count += 1

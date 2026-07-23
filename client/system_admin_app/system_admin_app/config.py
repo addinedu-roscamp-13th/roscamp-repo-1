@@ -58,7 +58,6 @@ BATTERY_WARN_PERCENT = 30.0      # 이하: 주의
 BATTERY_CRIT_PERCENT = 20.0      # 이하: 위험
 SERVO_TEMP_WARN_C = 60           # 이상: 주의
 SERVO_TEMP_CRIT_C = 65           # 이상: 과열(위험). 그래프 기준선도 이 값.
-US_RANGE_WARN_M = 0.30           # 이하: 장애물 근접 주의
 
 # --- nav_status 표시 매핑 (라벨/레벨) ---
 # level: ok / busy / warn / crit

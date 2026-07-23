@@ -35,7 +35,7 @@ class DdagoState:
     yaw: float = 0.0
     battery_percent: float = 0.0
     battery_voltage: float = 0.0
-    us_range_m: float = 0.0
+    # 초음파(us_range)는 실제 데이터가 오지 않아 모니터링에서 제외 — 필드도 두지 않는다.
     rx_time: float = field(default_factory=time.monotonic)  # 수신 시각(monotonic)
 
 
@@ -87,10 +87,22 @@ class DGUnit:
     robot_id: str
     ddago: Optional[DdagoState] = None
     ddagi: Optional[DdagiState] = None
+    # 이 로봇 텔레메트리의 나이(초). ACS가 실어 보낸 header.stamp와 수신 시각의 차.
+    age_sec: Optional[float] = None
 
     @property
     def is_drive_only(self) -> bool:
         return self.robot_id in config.DRIVE_ONLY_ROBOTS
+
+    @property
+    def is_offline(self) -> bool:
+        """통신 두절 여부 (E0 ④ 규격: 3초 이상 미갱신).
+
+        ACS는 텔레메트리가 끊긴 로봇도 배열에서 빼지 않고 마지막 값을 계속 보낸다
+        (빼면 화면에서 로봇이 깜빡이고 '연결 끊김'과 '존재하지 않음'을 구분할 수 없다).
+        따라서 **배열에 있다는 것이 살아있다는 뜻이 아니며**, stamp의 나이로만 판정한다.
+        """
+        return self.age_sec is not None and self.age_sec >= config.STALE_SEC
 
 
 @dataclass
