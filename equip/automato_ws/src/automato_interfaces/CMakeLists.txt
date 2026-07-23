@@ -29,6 +29,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   # E1/E2 순찰 (ROS2 Action) — ACS→DG, DG→DdaGo 공통 재사용
   "action/Patrol.action"      # (구) 단일 waypoint — Navigate 마이그레이션 후 삭제 예정
   "action/Navigate.action"    # (신) 경로(Waypoint[]) 하달  /{robot_id}/navigate, /{robot_id}/ddago/navigate
+  # E4-6/E2 22-1 충전소 정밀 후진 도킹
+  "action/Dock.action"        # ACS→DG /{robot_id}/dock, DG→DdaGo /ddago/dock
   DEPENDENCIES std_msgs sensor_msgs
 )
 

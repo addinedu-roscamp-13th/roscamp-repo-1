@@ -325,14 +325,14 @@ const MSGS = [
   { key: 'acs',   dir: 'to_dcs',   iface: 'Navigate',           type: 'action',  name: '/{rid}/navigate',            scen: 'E1' },
   { key: 'acs',   dir: 'from_dcs', iface: 'Navigate/feedback',  type: 'action',  name: '/{rid}/navigate (feedback)', scen: 'E1·E2' },
   { key: 'acs',   dir: 'from_dcs', iface: 'Navigate/result',    type: 'action',  name: '/{rid}/navigate (result)',   scen: 'E1·E2' },
-  { key: 'acs',   dir: 'from_dcs', iface: 'FleetTelemetry',     type: 'topic',   name: '/automato/telemetry/fleet',  scen: 'E0' },
+  { key: 'acs',   dir: 'from_dcs', iface: 'RobotTelemetry',     type: 'topic',   name: '/{rid}/telemetry',           scen: 'E0' },
   { key: 'acs',   dir: 'from_dcs', iface: 'SaveDetection',      type: 'service', name: '/automato/save_detection',   scen: 'E2·E3' },
-  { key: 'ddago', dir: 'from_dcs', iface: 'Navigate(→DdaGo)',   type: 'action',  name: '/{rid}/ddago/navigate',      scen: 'E1·E2' },
-  { key: 'ddago', dir: 'to_dcs',   iface: 'Navigate(→DdaGo)/feedback', type: 'action', name: '/{rid}/ddago/navigate (feedback)', scen: 'E1·E2' },
-  { key: 'ddago', dir: 'to_dcs',   iface: 'Navigate(→DdaGo)/result',   type: 'action', name: '/{rid}/ddago/navigate (result)',   scen: 'E1·E2' },
-  { key: 'ddago', dir: 'to_dcs',   iface: 'DdagoTelemetry',     type: 'topic',   name: '/{rid}/ddago/telemetry',     scen: 'E0' },
+  { key: 'ddago', dir: 'from_dcs', iface: 'Navigate(→DdaGo)',   type: 'action',  name: '/ddago/navigate',            scen: 'E1·E2' },
+  { key: 'ddago', dir: 'to_dcs',   iface: 'Navigate(→DdaGo)/feedback', type: 'action', name: '/ddago/navigate (feedback)', scen: 'E1·E2' },
+  { key: 'ddago', dir: 'to_dcs',   iface: 'Navigate(→DdaGo)/result',   type: 'action', name: '/ddago/navigate (result)',   scen: 'E1·E2' },
+  { key: 'ddago', dir: 'to_dcs',   iface: 'DdagoTelemetry',     type: 'topic',   name: '/ddago/telemetry',           scen: 'E0' },
   { key: 'ddago', dir: 'to_dcs',   iface: 'AnalyzeFrame',       type: 'service', name: '/dg/analyze_frame',          scen: 'E2' },
-  { key: 'ddagi', dir: 'to_dcs',   iface: 'DdagiTelemetry',     type: 'topic',   name: '/{rid}/ddagi/telemetry',     scen: 'E0' },
+  { key: 'ddagi', dir: 'to_dcs',   iface: 'DdagiTelemetry',     type: 'topic',   name: '/ddagi/telemetry',           scen: 'E0' },
   { key: 'dg_ai', dir: 'from_dcs', iface: 'analyze_request',    type: 'TCP',     name: '4B len + JSON',              scen: 'E2' },
   { key: 'dg_ai', dir: 'to_dcs',   iface: 'analyze_response',   type: 'TCP',     name: '4B len + JSON',              scen: 'E2·E3' },
 ];
@@ -429,7 +429,7 @@ function flashLink(key, iface, dir) {
   }
 }
 // 텔레메트리(1Hz 스트림)는 타임라인을 뒤덮어 clear를 무력화 → 토글로 숨김
-const TEL_IFACES = new Set(['DdagoTelemetry', 'DdagiTelemetry', 'FleetTelemetry']);
+const TEL_IFACES = new Set(['DdagoTelemetry', 'DdagiTelemetry', 'RobotTelemetry']);
 function hideTelOn() { const c = document.getElementById('hide-tel'); return !!(c && c.checked); }
 function applyTelFilter(list) {
   return hideTelOn() ? (list || []).filter(e => !TEL_IFACES.has(e.iface)) : (list || []);
@@ -500,7 +500,7 @@ async function refreshWire() {
 }
 
 const TESTS = [
-  { key: 'e0', name: 'E0 상시 모니터링', desc: '실행 시 시뮬 텔레메트리 상시 발행 → DCS 취합 → ACS FleetTelemetry 수신 (중지 버튼으로 정지)' },
+  { key: 'e0', name: 'E0 상시 모니터링', desc: '실행 시 시뮬 텔레메트리 상시 발행 → DCS 취합 → ACS RobotTelemetry 수신 (중지 버튼으로 정지)' },
   { key: 'e1', name: 'E1 순찰 시작',     desc: 'ACS→DCS 경로(Waypoint[]) 접수 → DCS→DdaGo 구간 하달' },
   { key: 'e2', name: 'E2 체크·저장',     desc: 'capture 노드 분석 → SaveDetection 저장(병해충 시 이미지 동봉) → 순찰 완료' },
 ];

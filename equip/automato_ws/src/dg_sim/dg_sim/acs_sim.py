@@ -4,7 +4,7 @@
 팀원이 개발 중인 실제 Automato Control Service(ACS) 대역. 즉시-응답 스텁.
 
 담당(시퀀스 다이어그램, 2026-07-14 개정):
-  E0  FleetTelemetry 구독 (DCS ← )               /automato/telemetry/fleet   (로그로 확인)
+  E0  RobotTelemetry 구독 (DCS ← )               /{robot_id}/telemetry       (로그로 확인)
   E1  Navigate 액션 클라이언트 (→ DCS)           /{robot_id}/navigate
         - **예약 확보된 구간까지만** Waypoint[] 로 하달(루프 주체=ACS)
         - 구간 result(last_waypoint_id) 받으면 다음 구간 하달 (E2 4단계)
@@ -28,7 +28,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from automato_interfaces.action import Navigate
-from automato_interfaces.msg import FleetTelemetry, Waypoint
+from automato_interfaces.msg import RobotTelemetry, Waypoint
 from automato_interfaces.srv import SaveDetection
 from std_srvs.srv import Trigger
 
@@ -59,9 +59,9 @@ class AcsSim(Node):
         self.last_waypoint_id = -1  # 마지막 구간 result의 last_waypoint_id(검증용)
         self.capture_ids = []      # 이번 순찰의 촬영 지점(capture=true) 목록(검증용)
 
-        # E0 FleetTelemetry 구독
+        # E0 RobotTelemetry 구독 — DG 는 자기 세트분만 /{robot_id}/telemetry 로 보낸다
         self.create_subscription(
-            FleetTelemetry, '/automato/telemetry/fleet',
+            RobotTelemetry, '/%s/telemetry' % self.robot_id,
             self._on_fleet, 10, callback_group=self._cb)
 
         # E1 Navigate 액션 클라이언트
@@ -77,7 +77,7 @@ class AcsSim(Node):
         self.create_service(
             Trigger, '/acs_sim/start_patrol', self._on_trigger, callback_group=self._cb)
 
-        self.get_logger().info('ACS 시뮬 시작: Navigate클라 /%s/navigate, SaveDetection서버, Fleet구독'
+        self.get_logger().info('ACS 시뮬 시작: Navigate클라 /%s/navigate, SaveDetection서버, Telemetry구독'
                                % self.robot_id)
 
         if self.get_parameter('auto_start').value:
