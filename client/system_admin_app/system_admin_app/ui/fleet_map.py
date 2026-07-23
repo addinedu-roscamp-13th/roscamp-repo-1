@@ -29,6 +29,16 @@ ARROW_TIP = 0.10    # 중심~팁 거리
 ARROW_BASE = 0.03   # 중심~밑변 거리 (원 바로 앞에서 시작)
 ARROW_HW = 0.035    # 밑변 반폭
 
+# 마커(원) 지름 — 데이터(m) 단위. 화살표와 같은 좌표계라 줌에 함께 스케일된다.
+# (픽셀 단위로 두면 화살표만 커지고 원은 그대로여서 확대 시 따로 논다.)
+DOT_SIZE = 0.07
+DOT_SIZE_SEL = 0.11
+
+# 화면 표시 방향. invertX+invertY = 중심 기준 180° 회전(배경·마커·화살표가 함께 돈다).
+# 실물 맵을 물리적으로 180° 돌려놓으면 소프트웨어 회전은 꺼야 화면이 실물과 맞는다.
+# 실물 배치가 다시 바뀌면 이 값만 토글한다.
+MAP_ROTATE_180 = False
+
 
 def _arrow_polygon(x: float, y: float, yaw: float) -> QPolygonF:
     """(x,y)에서 yaw 방향으로 향하는 짧은 화살촉 삼각형(데이터 좌표)."""
@@ -58,20 +68,23 @@ class FleetMap(QWidget):
         self.plot.showGrid(x=True, y=True, alpha=0.3)
         self.plot.setLabel("bottom", "X (m)")
         self.plot.setLabel("left", "Y (m)")
-        # 맵을 180° 회전 표시 (우리가 보는 방향에 맞춤).
-        # X·Y 축을 모두 뒤집으면 = 중심 기준 180° 회전 → 배경 이미지·로봇 마커·
-        # 방향 화살표가 데이터 변경 없이 한꺼번에 회전한다.
+        # 화면 회전 (MAP_ROTATE_180). 실물 맵을 물리적으로 180° 돌려놔서 현재는 끔.
         vb = self.plot.getViewBox()
-        vb.invertX(True)
-        vb.invertY(True)
+        vb.invertX(MAP_ROTATE_180)
+        vb.invertY(MAP_ROTATE_180)
         root.addWidget(self.plot)
 
         # 배경 SLAM 맵 (정적 파일)
         self.map_bg: pg.ImageItem | None = None
         self._load_background()
 
-        self.scatter = pg.ScatterPlotItem()
+        # pxMode=False: 마커 크기를 데이터(m) 단위로 → 방향 화살표와 함께 스케일.
+        self.scatter = pg.ScatterPlotItem(pxMode=False)
         self.plot.addItem(self.scatter)
+
+        # focus 모드에서 뷰 자동맞춤은 '로봇 선택이 바뀔 때 1회'만. 이후 사용자
+        # 줌/팬을 보존한다(매 프레임 setRange 하면 확대가 즉시 풀린다).
+        self._pending_fit = True
 
         # 로봇별 방향 화살표(삼각형) + 라벨
         self.head: dict[str, QGraphicsPolygonItem] = {}
@@ -119,6 +132,8 @@ class FleetMap(QWidget):
             self.plot.setYRange(m.origin_y - pad, m.origin_y + m.height_m + pad)
 
     def set_selected(self, robot_id: str | None) -> None:
+        if robot_id != self.selected:
+            self._pending_fit = True   # 선택이 바뀌면 새 로봇에 1회 맞춘다
         self.selected = robot_id
 
     def update_positions(self, snap: FleetSnapshot | None) -> None:
@@ -137,7 +152,7 @@ class FleetMap(QWidget):
             base = style.ROBOT_COLOR.get(rid, "#555")
             # focus 모드에서 비선택 로봇은 옅게
             faded = self.focus_mode and self.selected is not None and not is_sel
-            size = 22 if is_sel else 14
+            size = DOT_SIZE_SEL if is_sel else DOT_SIZE
             spots.append({
                 "pos": (x, y), "size": size,
                 "brush": pg.mkBrush("#bbbbbb" if faded else base),
@@ -150,11 +165,13 @@ class FleetMap(QWidget):
             self.label[rid].setText(rid.upper())
         self.scatter.setData(spots)
 
-        # focus 모드: 선택 로봇 중심으로 범위 확대
-        if self.focus_mode and self.selected is not None and xs:
+        # focus 모드: 선택 로봇 중심으로 1회만 맞춘다. 이후에는 사용자가 확대/이동한
+        # 뷰를 유지한다(매 프레임 setRange 하면 확대가 즉시 풀려버린다).
+        if self.focus_mode and self._pending_fit and self.selected is not None:
             unit = snap.unit(self.selected) if snap else None
             if unit and unit.ddago:
                 cx, cy = unit.ddago.x, unit.ddago.y
                 r = 1.5
                 self.plot.setXRange(cx - r, cx + r)
                 self.plot.setYRange(cy - r, cy + r)
+                self._pending_fit = False

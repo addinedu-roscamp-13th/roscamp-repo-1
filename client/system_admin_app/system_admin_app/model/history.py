@@ -52,7 +52,9 @@ class FleetHistory:
             temp_val = None
             batt_val = None
             if unit is not None:
-                if unit.ddagi is not None:
+                # 주행 전용 로봇은 로봇팔이 없으므로 온도선을 그리지 않는다.
+                # (ACS가 ddagi를 보내와도 '설정상 팔 없음'인 카드 표시와 맞춘다.)
+                if unit.ddagi is not None and not unit.is_drive_only:
                     mt = unit.ddagi.max_temperature
                     temp_val = float(mt) if mt is not None else None
                 if unit.ddago is not None:
