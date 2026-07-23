@@ -5,7 +5,7 @@
 
   E0 상시 모니터링:
     - 구독  /{robot_id}/ddago/telemetry (DdagoTelemetry)
-    - 구독  /{robot_id}/ddagi/telemetry (DdagiTelemetry)
+    - 구독  /ddagi/telemetry (DdagiTelemetry, robot_id 는 메시지 필드로 필터링)
     - 발행  /automato/telemetry/fleet    (FleetTelemetry, 1Hz 취합)
   E1/E2 순찰(경로 하달):
     - 액션 서버      /{robot_id}/navigate        (Navigate, Waypoint[]) ← Automato Control Service
@@ -89,7 +89,7 @@ class DcsNode(Node):
             DdagoTelemetry, '/%s/ddago/telemetry' % self.robot_id,
             self._on_ddago_tel, 10, callback_group=self._cb_re)
         self.create_subscription(
-            DdagiTelemetry, '/%s/ddagi/telemetry' % self.robot_id,
+            DdagiTelemetry, '/ddagi/telemetry',
             self._on_ddagi_tel, 10, callback_group=self._cb_re)
         self._fleet_pub = self.create_publisher(
             FleetTelemetry, '/automato/telemetry/fleet', 10)

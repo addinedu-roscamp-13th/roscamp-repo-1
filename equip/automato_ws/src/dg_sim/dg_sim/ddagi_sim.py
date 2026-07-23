@@ -6,7 +6,7 @@
   - 서비스 /ddagi_sim/start_telemetry (std_srvs/Trigger) 호출 시 burst_sec 초 동안 1Hz 발행
   - 파라미터 auto_telemetry=true 면 상시 발행(테스트/상시 필요 시)
 
-Topic: /{robot_id}/ddagi/telemetry  (automato_interfaces/msg/DdagiTelemetry, 1Hz)
+Topic: /ddagi/telemetry (automato_interfaces/msg/DdagiTelemetry, 1Hz, robot_id 는 메시지 필드)
 """
 import time
 
@@ -28,12 +28,11 @@ class DdagiSim(Node):
         self._task_id = 1024
         self._tel_until = float('inf') if self.get_parameter('auto_telemetry').value else 0.0
         self._pub = self.create_publisher(
-            DdagiTelemetry, '/%s/ddagi/telemetry' % self.robot_id, 10)
+            DdagiTelemetry, '/ddagi/telemetry', 10)
         self.create_timer(1.0, self._tick)
         self.create_service(Trigger, '/ddagi_sim/start_telemetry', self._on_start_tel)
         self.create_service(Trigger, '/ddagi_sim/stop_telemetry', self._on_stop_tel)
-        self.get_logger().info('Ddagi 시뮬 시작 → /%s/ddagi/telemetry (실행 시 연속 발행, 중지까지)'
-                               % self.robot_id)
+        self.get_logger().info('Ddagi 시뮬 시작 → /ddagi/telemetry (실행 시 연속 발행, 중지까지)')
 
     def _on_start_tel(self, request, response):
         self._tel_until = float('inf')   # 중지 전까지 상시 발행

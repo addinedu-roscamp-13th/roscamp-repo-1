@@ -2,7 +2,7 @@
 """시나리오1 E0  Ddagi 텔레메트리 퍼블리셔 통합 테스트.
 
 퍼블리셔 노드와 구독자 노드를 한 프로세스에서 함께 스핀시켜
-/{robot_id}/ddagi/telemetry 토픽에 DdagiTelemetry 가 정상 발행되는지 검증한다.
+/ddagi/telemetry 토픽에 DdagiTelemetry 가 정상 발행되는지 검증한다.
 
 실행:
   source /opt/ros/jazzy/setup.bash
@@ -50,10 +50,10 @@ def ros_ctx():
     rclpy.shutdown()
 
 
-def _subscribe(client_node, robot_id='dg_01'):
+def _subscribe(client_node):
     received = []
     client_node.create_subscription(
-        DdagiTelemetry, f'/{robot_id}/ddagi/telemetry', received.append, 10)
+        DdagiTelemetry, '/ddagi/telemetry', received.append, 10)
     return received
 
 
