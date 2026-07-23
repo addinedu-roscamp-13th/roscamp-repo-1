@@ -27,6 +27,7 @@ setup(
             'telemetry_publisher = ddago_control.telemetry_publisher:main',
             'navigate_server = ddago_control.navigate_server:main',
             'dock_server = ddago_control.dock_server:main',
+            'camera_node = ddago_control.camera_node:main',
         ],
     },
 )

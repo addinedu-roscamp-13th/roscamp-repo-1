@@ -5,7 +5,7 @@
 
   E0 상시 모니터링:
     - 구독  /ddago/telemetry (DdagoTelemetry)  ← ddago/ddagi 연동은 robot_id 미사용
-    - 구독  /ddagi/telemetry (DdagiTelemetry)
+    - 구독  /ddagi/telemetry (DdagiTelemetry)  (상대가 필드를 채워 보내도 읽지 않는다)
     - 발행  /{robot_id}/telemetry  (RobotTelemetry, 1Hz — 자기 세트분)
   E1/E2 순찰(경로 하달):
     - 액션 서버      /{robot_id}/navigate        (Navigate, Waypoint[]) ← Automato Control Service

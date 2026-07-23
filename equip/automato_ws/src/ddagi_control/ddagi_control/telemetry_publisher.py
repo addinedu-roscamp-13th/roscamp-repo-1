@@ -13,7 +13,7 @@
 각자 arm_hardware.get_arm()으로 별도 시리얼 연결을 열게 되어 포트 충돌이
 날 수 있다 — 현재는 둘을 동시에 띄우지 않는 것으로 회피한다.
 
-토픽: /{robot_id}/ddagi/telemetry  (문서 스펙 예: /dg_01/ddagi/telemetry)
+토픽: /ddagi/telemetry (robot_id 는 메시지 필드로 전달, 토픽 네임스페이스에는 없음)
 메시지: automato_interfaces/msg/DdagiTelemetry
 
 파라미터:
@@ -69,7 +69,7 @@ class TelemetryPublisher(Node):
         self._robot_id = self.get_parameter('robot_id').value
         rate_hz = self.get_parameter('publish_rate_hz').value
 
-        topic = f'/{self._robot_id}/ddagi/telemetry'
+        topic = '/ddagi/telemetry'
         self._pub = self.create_publisher(DdagiTelemetry, topic, 10)
         self._timer = self.create_timer(1.0 / rate_hz, self._on_timer)
         self.get_logger().info(f'Ddagi 텔레메트리 퍼블리셔 시작: {topic} ({rate_hz}Hz)')

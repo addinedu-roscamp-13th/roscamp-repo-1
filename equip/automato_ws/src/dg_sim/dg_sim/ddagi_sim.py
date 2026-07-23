@@ -6,7 +6,7 @@
   - 서비스 /ddagi_sim/start_telemetry (std_srvs/Trigger) 호출 시 burst_sec 초 동안 1Hz 발행
   - 파라미터 auto_telemetry=true 면 상시 발행(테스트/상시 필요 시)
 
-Topic: /ddagi/telemetry  (automato_interfaces/msg/DdagiTelemetry, 1Hz. 연동에 robot_id 미사용)
+Topic: /ddagi/telemetry (automato_interfaces/msg/DdagiTelemetry, 1Hz, robot_id 는 메시지 필드)
 """
 import time
 
@@ -28,7 +28,7 @@ class DdagiSim(Node):
         self._task_id = 1024
         self._tel_until = float('inf') if self.get_parameter('auto_telemetry').value else 0.0
         self._pub = self.create_publisher(
-            DdagiTelemetry, '/ddagi/telemetry', 10)   # 연동에 robot_id 미사용
+            DdagiTelemetry, '/ddagi/telemetry', 10)
         self.create_timer(1.0, self._tick)
         self.create_service(Trigger, '/ddagi_sim/start_telemetry', self._on_start_tel)
         self.create_service(Trigger, '/ddagi_sim/stop_telemetry', self._on_stop_tel)
@@ -53,6 +53,7 @@ class DdagiSim(Node):
             return   # 실행 트리거 전/후에는 발행 안 함
         msg = DdagiTelemetry()
         msg.header.stamp = self.get_clock().now().to_msg()
+        msg.robot_id = self.robot_id
         msg.task_id = self._task_id
         msg.is_paused = False
         msg.joint_angles = [10.2, -30.5, 45.0, 0.0, -12.3, 5.5]

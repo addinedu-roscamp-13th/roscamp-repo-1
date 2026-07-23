@@ -21,7 +21,7 @@ import time
 
 from automato_interfaces.action import Navigate
 from automato_interfaces.msg import Waypoint
-from automato_interfaces.srv import AnalyzeFrame
+from automato_interfaces.srv import AnalyzeFrame, CaptureFrame
 from ddago_control.navigate_server import NavigateServer
 from nav2_msgs.action import NavigateToPose, Spin
 import pytest
@@ -30,7 +30,6 @@ from rclpy.action import ActionClient, ActionServer, CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.parameter import Parameter
-from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
 
@@ -67,6 +66,11 @@ class _Harness:
         self.nav_goals = []          # 가짜 Nav2 가 받은 NavigateToPose.Goal 들(순서대로)
         self.spin_goals = []         # 가짜 Nav2 가 받은 Spin.Goal 들
         self.analyze_requests = []   # 가짜 DCS 가 수신한 AnalyzeFrame.Request 들
+        self.capture_requests = []   # 가짜 카메라 노드가 수신한 CaptureFrame.Request 들
+        # 카메라 준비 여부/프레임 크기. 기본은 '프레임 없음'(응답 success=false).
+        self.camera_ready = False
+        self.frame_width = 640
+        self.frame_height = 480
         self.feedbacks = []          # Navigate 액션 client 가 받은 Feedback 들
         self.cbg = ReentrantCallbackGroup()
 
@@ -96,9 +100,10 @@ class _Harness:
             AnalyzeFrame, '/dg/analyze_frame', self._analyze_cb,
             callback_group=self.cbg)
 
-        # 가짜 카메라 이미지 발행자
-        self.cam_pub = self.helper.create_publisher(
-            Image, 'image_raw', qos_profile_sensor_data)
+        # 가짜 카메라 노드: CaptureFrame 서비스 서버
+        self.helper.create_service(
+            CaptureFrame, '/ddago/capture_frame', self._capture_cb,
+            callback_group=self.cbg)
 
         # Navigate 액션 client (노드의 서버 /ddago/navigate 호출)
         self.nav_client = ActionClient(
@@ -148,18 +153,29 @@ class _Harness:
         response.request_id = 'req-test-1'
         return response
 
-    # ------- 카메라 프레임 준비 ------- #
-    def publish_camera(self, frame_id='pinky_cam', width=640, height=480):
+    # ------- 가짜 카메라 노드(CaptureFrame 서비스) ------- #
+    def _capture_cb(self, request, response):
+        self.capture_requests.append(request)
+        if not self.camera_ready:
+            # 프레임이 없는 상황(카메라 미연결 등)을 흉내낸다.
+            response.success = False
+            response.message = 'no frame (test: camera_ready=False)'
+            return response
         img = Image()
-        img.header.frame_id = frame_id
-        img.width = width
-        img.height = height
+        img.header.frame_id = 'pinky_cam'
+        img.width = self.frame_width
+        img.height = self.frame_height
         img.encoding = 'rgb8'
-        # 최신 프레임이 노드에 확실히 캐시될 때까지 여러 번 발행.
-        for _ in range(5):
-            self.cam_pub.publish(img)
-            time.sleep(0.03)
-        _wait_until(lambda: self.node._latest_frame is not None, timeout=3.0)
+        response.success = True
+        response.image = img
+        response.message = ''
+        return response
+
+    def enable_camera(self, width=640, height=480):
+        """카메라가 프레임을 줄 수 있는 상태로 만든다(요청 시 success=True)."""
+        self.frame_width = width
+        self.frame_height = height
+        self.camera_ready = True
 
     # ------- Navigate goal 전송 ------- #
     def send_navigate(self, waypoints, task_id=1):
@@ -285,7 +301,7 @@ def test_empty_waypoints_is_rejected(harness):
 # --------------------------------------------------------------------------- #
 def test_capture_flag_decides_analyze_request(harness):
     """capture=true 인 노드에서만 분석을 요청한다(통과 노드는 촬영하지 않는다)."""
-    harness.publish_camera()
+    harness.enable_camera()
     wps = [
         _wp(3, 1.0, 0.0, capture=False),    # 통과
         _wp(4, 2.0, 0.0, capture=False),    # 통과
@@ -310,7 +326,7 @@ def test_missing_frame_does_not_fail_navigation(harness):
 
     촬영 실패로 주행을 실패시키면 ACS 가 '통로 막힘'으로 오해해 우회·복귀를 밟는다.
     """
-    # 카메라 미발행 → latest_frame 은 None
+    # camera_ready=False(기본) → CaptureFrame 이 success=False → 분석 스킵
     wps = [_wp(10, 1.0, 0.0, capture=True)]
 
     _gh, result_future = harness.send_navigate(wps)
@@ -326,7 +342,7 @@ def test_missing_frame_does_not_fail_navigation(harness):
 # --------------------------------------------------------------------------- #
 def test_same_position_spins_instead_of_driving(harness):
     """직전과 좌표가 같으면 주행이 아니라 제자리 회전으로 처리한다."""
-    harness.publish_camera()
+    harness.enable_camera()
     wps = [
         _wp(10, 1.2, 3.4, yaw=1.57, capture=True),    # 주행 후 촬영
         _wp(18, 1.2, 3.4, yaw=-1.57, capture=True),   # 짝 — 제자리 회전 후 촬영
