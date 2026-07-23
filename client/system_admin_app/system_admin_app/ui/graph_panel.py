@@ -95,6 +95,12 @@ class GraphPanel(QWidget):
         if meta["threshold"] is not None:
             self.threshold_line.setValue(meta["threshold"])
 
+        # 온도 지표에선 주행 전용 로봇(로봇팔 없음) 곡선을 숨긴다.
+        # 배터리 지표에선 전 로봇을 보인다. (카드의 '로봇팔 없음' 표시와 일치)
+        for rid, curve in self.curves.items():
+            drive_only = rid in config.DRIVE_ONLY_ROBOTS
+            curve.setVisible(not (self.metric == "temp" and drive_only))
+
     def refresh(self) -> None:
         import time
         t0 = time.monotonic()
