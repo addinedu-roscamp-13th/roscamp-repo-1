@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # DG Control Service(DCS) 테스트 스택 올리기/내리기.
 #   ./dashboard.sh up            # dcs + 시뮬4종 + rosbridge + web 전부 기동
+#   ./dashboard.sh up --no-sim   # 시뮬4종 빼고 기동 (실장비 연동 시)
+#                                #   실제 로봇/ACS 가 붙을 때 시뮬이 같이 떠 있으면
+#                                #   같은 토픽·액션 이름에 발행자·서버가 둘씩 생겨
+#                                #   goal 이 엉뚱한 쪽으로 가거나 텔레메트리가 섞인다.
 #   ./dashboard.sh down          # 전부 종료
 #   ./dashboard.sh status        # 상태 확인
 #   ./dashboard.sh restart       # 재기동
+#   ./dashboard.sh dock          # E4 도킹 goal 하달 (ACS 역할: /{ROBOT_ID}/dock)
 #   ./dashboard.sh stop  <노드>  # 특정 노드만 내림  (dcs|acs|ddago|ddagi|dg_ai|rosbridge|web)
 #   ./dashboard.sh start <노드>  # 특정 노드만 올림
 #
@@ -54,12 +59,22 @@ status() {
 }
 
 up() {
+  # --no-sim: 시뮬 4종(acs·ddago·ddagi·dg_ai)을 띄우지 않는다. 실장비가 그 자리를
+  # 대신하므로, 같이 띄우면 이름이 겹쳐 충돌한다(위 헤더 설명 참조).
+  local no_sim=0
+  [ "${1:-}" = "--no-sim" ] && no_sim=1
   echo "▶ DG 테스트 스택 시작... (ROBOT_ID=$ROBOT_ID)"
+  [ "$no_sim" = 1 ] && echo "  --no-sim: 시뮬(acs·ddago·ddagi·dg_ai) 제외 — 실장비가 붙어야 동작"
   start_one dcs
-  start_one dg_ai
-  start_one ddagi
-  start_one ddago
-  start_one acs
+  if [ "$no_sim" = 0 ]; then
+    start_one dg_ai
+    start_one ddagi
+    start_one ddago
+    start_one acs
+  else
+    # 시뮬 dg_ai 를 안 띄우므로 AI 접속대상은 실서비스로 돌린다.
+    set_ai_active real
+  fi
   setsid bash -c "$SRC; exec ros2 run rosbridge_server rosbridge_websocket" >/tmp/dash_rb.log  2>&1 & disown
   setsid bash -c "exec python3 $WS/dg_web/control_server.py"                  >/tmp/dash_http.log 2>&1 & disown
   sleep 2
@@ -123,24 +138,36 @@ run_telemetry_stop() {
   bash -c "$SRC; ros2 service call /ddago_sim/stop_telemetry std_srvs/srv/Trigger; ros2 service call /ddagi_sim/stop_telemetry std_srvs/srv/Trigger" 2>&1
 }
 
+# E4-6 정밀 도킹: ACS 역할로 Dock goal 을 DCS 에 하달한다.
+#   ACS → DCS(/{ROBOT_ID}/dock) → DdaGo(/ddago/dock) 중계 사슬을 한 번에 태운다.
+# 마커 정보는 실제로는 ACS 가 DB(작업 지점의 ChArUco 보드)에서 조회해 채운다.
+# 아래 값은 현장 보드(mid24 스테이션 A): 6x5칸, 칸 24mm / 마커 18mm, 시작 ID 500.
+run_dock() {
+  bash -c "$SRC; ros2 action send_goal /$ROBOT_ID/dock automato_interfaces/action/Dock \
+    '{task_id: 1024, task_point_id: CHARGE_01, marker_id: \"500\",
+      dictionary: DICT_5X5_1000, squares_x: 6, squares_y: 5,
+      square_size_m: 0.024, marker_size_m: 0.018}' --feedback" 2>&1
+}
+
 # 최근 흐름 로그(분석→저장→순찰결과)만 추려 출력.
 logs() {
   echo "== DCS =="
-  grep -hE '순찰 경로 수신|DdaGo 하달|분석결과|구간 결과 전달' /tmp/dash_dcs.log 2>/dev/null | tail -12
+  grep -hE '순찰 경로 수신|DdaGo 하달|분석결과|구간 결과 전달|도킹 지시 수신|도킹 하달|도킹 종료|도킹 결과 전달' /tmp/dash_dcs.log 2>/dev/null | tail -12
   echo "== ACS =="
   grep -hE '순찰 시작|구간 하달|SaveDetection 저장|구간 결과|순찰 완료|Fleet 수신' /tmp/dash_acs.log 2>/dev/null | tail -12
 }
 
 case "${1:-}" in
-  up)      up ;;
+  up)      up "${2:-}" ;;
   down)    down ;;
   stop)    stop_one "${2:-}" ;;
   start)   start_one "${2:-}" ;;
   status)  status ;;
-  restart) down; sleep 1; up ;;
+  restart) down; sleep 1; up "${2:-}" ;;
   test)           run_test ;;
   telemetry)      run_telemetry ;;
   telemetry-stop) run_telemetry_stop ;;
+  dock)           run_dock ;;
   logs)           logs ;;
-  *) echo "usage: $0 {up|down|status|restart|test|telemetry|telemetry-stop|logs|stop <node>|start <node>}  # node: dcs|acs|ddago|ddagi|dg_ai|rosbridge|web"; exit 1 ;;
+  *) echo "usage: $0 {up [--no-sim]|down|status|restart [--no-sim]|test|dock|telemetry|telemetry-stop|logs|stop <node>|start <node>}  # node: dcs|acs|ddago|ddagi|dg_ai|rosbridge|web"; exit 1 ;;
 esac

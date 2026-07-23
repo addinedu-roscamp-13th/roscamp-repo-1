@@ -11,6 +11,10 @@
         - **capture==true 노드에서만** RGB 촬영 흉내 → DCS 로 AnalyzeFrame 분석요청 (E2 3단계)
         - 취소(cancel) 요청 시 그 자리에서 중단 → result_code=2, 도달한 마지막 노드 반환
   E2    AnalyzeFrame 서비스 클라이언트 (→ DCS)    /dg/analyze_frame
+  E4-6  Dock 액션 서버 (DCS ← )                  /ddago/dock
+        - 실제 도킹 기동(마커 탐색→중심선 정렬→접근→180도 회전→후진)은 하지 않는다.
+          phase 를 순서대로 흘려보내 **DCS 의 중계**(feedback·result·cancel)를 검증한다.
+        - 취소 요청 시 그 자리에서 CANCELED + result_code=3
 """
 import os
 import threading
@@ -24,7 +28,7 @@ from rclpy.node import Node
 
 from std_srvs.srv import Trigger
 
-from automato_interfaces.action import Navigate
+from automato_interfaces.action import Dock, Navigate
 from automato_interfaces.msg import DdagoTelemetry
 from automato_interfaces.srv import AnalyzeFrame
 from sensor_msgs.msg import Image
@@ -72,10 +76,17 @@ class DdagoSim(Node):
             cancel_callback=lambda _gh: CancelResponse.ACCEPT,
             callback_group=self._cb)
 
+        # E4 Dock 서버. 실기동 대신 phase 를 순서대로 흘려 DCS 중계를 검증한다.
+        self._dock_srv = ActionServer(
+            self, Dock, '/ddago/dock',   # 연동에 robot_id 미사용
+            execute_callback=self._dock_execute,
+            cancel_callback=lambda _gh: CancelResponse.ACCEPT,
+            callback_group=self._cb)
+
         self._analyze_cli = self.create_client(
             AnalyzeFrame, '/dg/analyze_frame', callback_group=self._cb)
 
-        self.get_logger().info('DdaGo 시뮬 시작: /ddago/{telemetry,navigate}')
+        self.get_logger().info('DdaGo 시뮬 시작: /ddago/{telemetry,navigate,dock}')
 
     # ---- E0 텔레메트리 (실행 트리거 시에만) ----
     def _on_start_tel(self, request, response):
@@ -162,6 +173,55 @@ class DdagoSim(Node):
         return result
 
     # ---- E2 분석 요청 (→ DCS) ----
+    # ---- E4-6 Dock (DCS ← ) : 실기동 대신 phase 만 흘려 중계를 검증 ----
+    # 실제 도킹은 ddago_control/dock_server 가 카메라·odom 으로 수행한다. 여기서는
+    # DCS 가 goal 을 그대로 넘기는지, feedback/result 를 손실 없이 되돌리는지,
+    # 취소가 끝까지 전파되는지만 본다.
+    DOCK_PHASES = [
+        ('SEARCHING', 0.50, True),
+        ('CENTERING', 0.40, True),
+        ('APPROACHING', 0.30, True),
+        ('STAGED', 0.24, True),
+        ('ROTATING', 0.24, True),
+        ('REVERSING', 0.00, False),   # 180도 돈 뒤라 카메라가 보드를 못 본다
+    ]
+
+    def _dock_execute(self, goal_handle):
+        req = goal_handle.request
+        self.get_logger().info(
+            '도킹 goal 수신: task=%d point=%s marker=%s %dx%d sq=%.3f mk=%.3f'
+            % (req.task_id, req.task_point_id, req.marker_id,
+               req.squares_x, req.squares_y, req.square_size_m, req.marker_size_m))
+
+        per = self.move_delay / len(self.DOCK_PHASES) if self.move_delay > 0 else 0.0
+        for phase, dist, seen in self.DOCK_PHASES:
+            if goal_handle.is_cancel_requested:
+                self.get_logger().warn('취소 요청 → 도킹 중단 (phase=%s)' % phase)
+                goal_handle.canceled()
+                r = Dock.Result()
+                r.result_code = 3            # 3: 중단
+                r.message = '취소로 중단 (phase=%s)' % phase
+                return r
+            fb = Dock.Feedback()
+            fb.phase = phase
+            fb.marker_detected = seen
+            fb.distance_to_marker_m = float(dist)
+            goal_handle.publish_feedback(fb)
+            if per > 0:
+                time.sleep(per)
+
+        r = Dock.Result()
+        r.result_code = 0
+        # 실장비 실측(ddago03)과 같은 자릿수의 값을 돌려 ACS 쪽 표시를 확인할 수 있게 한다.
+        r.final_lateral_m = -0.012        # 중심선 이탈(좌우)
+        r.final_yaw_error = 0.021         # 스큐
+        r.final_error_m = abs(r.final_lateral_m)
+        r.message = '도킹 완료(시뮬)'
+        goal_handle.succeed()
+        self.get_logger().info('도킹 완료(시뮬): task=%d lateral=%.3fm yaw=%.3frad'
+                               % (req.task_id, r.final_lateral_m, r.final_yaw_error))
+        return r
+
     def _request_analyze(self, task_id, waypoint_id):
         if not self._analyze_cli.wait_for_service(timeout_sec=5.0):
             self.get_logger().error('DCS AnalyzeFrame 서비스 없음')

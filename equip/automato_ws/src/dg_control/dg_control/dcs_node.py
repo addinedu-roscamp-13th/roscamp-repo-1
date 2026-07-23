@@ -10,6 +10,9 @@
   E1/E2 순찰(경로 하달):
     - 액션 서버      /{robot_id}/navigate        (Navigate, Waypoint[]) ← Automato Control Service
     - 액션 클라이언트 /ddago/navigate            (Navigate, Waypoint[]) → DdaGo Control Service
+  E4-6/E2 22-1 정밀 도킹(중계):
+    - 액션 서버      /{robot_id}/dock            (Dock) ← Automato Control Service
+    - 액션 클라이언트 /ddago/dock                 (Dock) → DdaGo Control Service
   E2 촬영·분석·저장:
     - 서비스 서버    /dg/analyze_frame           (AnalyzeFrame) ← DdaGo (capture 노드 도착 후)
     - TCP 클라이언트  DG AI Service               (4B len+JSON)  → 분석 위임
@@ -45,7 +48,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallb
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from automato_interfaces.action import Navigate
+from automato_interfaces.action import Dock, Navigate
 from automato_interfaces.msg import RobotTelemetry
 from automato_interfaces.srv import AnalyzeFrame, SaveDetection
 from sensor_msgs.msg import Image
@@ -69,11 +72,14 @@ class DcsNode(Node):
         self.declare_parameter('fleet_stale_sec', 3.0)
         # DdaGo 가 구간(Waypoint[]) 하나를 끝낼 때까지 기다리는 상한(초)
         self.declare_parameter('ddago_result_timeout_sec', 180.0)
+        # DdaGo 도킹 한 번의 상한(초). 탐색 1.1바퀴(~35s)+중심선 기동+접근+회전+후진.
+        self.declare_parameter('dock_result_timeout_sec', 180.0)
 
         self.robot_id = self.get_parameter('robot_id').value
         fleet_hz = float(self.get_parameter('fleet_hz').value)
         self._fleet_stale = float(self.get_parameter('fleet_stale_sec').value)
         self._ddago_timeout = float(self.get_parameter('ddago_result_timeout_sec').value)
+        self._dock_timeout = float(self.get_parameter('dock_result_timeout_sec').value)
 
         # 콜백 그룹: 서비스/타이머는 동시 처리(Reentrant), 액션 클라이언트는 순차(Exclusive).
         self._cb_re = ReentrantCallbackGroup()
@@ -112,6 +118,18 @@ class DcsNode(Node):
             self, Navigate, '/ddago/navigate',   # 로봇 쪽은 robot_id 미사용
             callback_group=self._cb_client)
 
+        # ---- E4 Dock 액션 서버 (ACS ← ) / 클라이언트 (→ DdaGo) ----
+        # 주행과 도킹은 같은 로봇을 쓰므로 Navigate 와 _ddago_lock 을 공유한다
+        # (주행 중 도킹 goal 이 겹쳐 들어가면 로봇이 두 명령을 동시에 받는다).
+        self._dock_srv = ActionServer(
+            self, Dock, '/%s/dock' % self.robot_id,
+            execute_callback=self._dock_execute,
+            cancel_callback=lambda _gh: CancelResponse.ACCEPT,
+            callback_group=self._cb_re)
+        self._dock_client = ActionClient(
+            self, Dock, '/ddago/dock',   # 로봇 쪽은 robot_id 미사용
+            callback_group=self._cb_client)
+
         # ---- E2 AnalyzeFrame 서비스 서버 (DdaGo ← ) ----
         self.create_service(
             AnalyzeFrame, '/dg/analyze_frame', self._on_analyze_frame,
@@ -134,8 +152,10 @@ class DcsNode(Node):
         self._ddago_lock = threading.Lock()
 
         self.get_logger().info(
-            'DCS 준비: robot_id=%s | Navigate서버 /%s/navigate | AI target=%s'
-            % (self.robot_id, self.robot_id, self.get_parameter('ai_target_file').value))
+            'DCS 준비: robot_id=%s | Navigate서버 /%s/navigate | Dock서버 /%s/dock '
+            '| AI target=%s'
+            % (self.robot_id, self.robot_id, self.robot_id,
+               self.get_parameter('ai_target_file').value))
 
     # 실제 오간 메시지 내용을 한 줄 JSON(@@WIRE@@)으로 남긴다. 대시보드가 읽어 표시.
     #   direction: 'to_dcs'(상대→DCS) | 'from_dcs'(DCS→상대)
@@ -299,6 +319,122 @@ class DcsNode(Node):
                                % (r.result_code, r.last_waypoint_id))
         self._wire('to_dcs', 'Navigate(→DdaGo)/result', self._msg_to_dict(r))
         return r.result_code, r.last_waypoint_id, r.message
+
+    # ===== E4-6 / E2 22-1 Dock 중계 — ACS 의 도킹 지시를 DdaGo 로 그대로 =====
+    def _dock_execute(self, goal_handle):
+        """ACS 가 하달한 Dock goal 을 DdaGo 로 중계하고, feedback·result 를 그대로 ACS 로.
+
+        실제 도킹 기동(마커 탐색 → 중심선 정렬 → 접근 → 180도 회전 → 후진 접붙임)은
+        DdaGo 몫이다. N_dock 재시도와 task_failed 알림은 ACS 몫이라 여기에는 없다
+        (DCS 는 중계자 — E2-6 "DG는 중계만 한다").
+        """
+        req = goal_handle.request
+        self.get_logger().info(
+            '도킹 지시 수신(ACS→DCS): task=%d point=%s marker=%s'
+            % (req.task_id, req.task_point_id, req.marker_id))
+        self._wire('to_dcs', 'Dock', self._msg_to_dict(req))
+
+        r, err = self._dock_ddago(req, goal_handle)
+
+        result = Dock.Result()
+        if r is not None:
+            # 값 손실 없이 그대로. final_lateral_m(중심선 이탈)·final_yaw_error(스큐)는
+            # ACS 가 도킹 품질을 판정·기록하는 근거라 빠뜨리면 안 된다.
+            result.result_code = int(r.result_code)
+            result.final_error_m = float(r.final_error_m)
+            result.final_lateral_m = float(r.final_lateral_m)
+            result.final_yaw_error = float(r.final_yaw_error)
+            result.message = r.message or ''
+        else:
+            # 중계 자체가 실패(서버 없음/거부/무응답/취소). Dock 의 result_code 에는
+            # 인프라 실패용 값이 따로 없으므로 3(중단)으로 보내고 사유는 message 에 담는다.
+            result.result_code = 3
+            result.message = err or '중계 실패'
+
+        # 취소 요청이 와 있으면 결과가 무엇이든 CANCELED 로 끝낸다. ROS2 goal 은
+        # CANCELING 상태에서 succeed() 로 넘어갈 수 없고, ACS 도 자기가 취소한 goal 이
+        # 성공으로 돌아오면 상태를 잘못 판단한다.
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+        elif result.result_code == 0:
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
+
+        self.get_logger().info('도킹 결과 전달(DCS→ACS): task=%d code=%d %s'
+                               % (req.task_id, result.result_code, result.message))
+        self._wire('from_dcs', 'Dock/result', self._msg_to_dict(result))
+        return result
+
+    def _dock_ddago(self, req, up_gh):
+        """DdaGo 에 Dock 하달 → 피드백 중계 → (DdaGo result | None, 실패사유).
+
+        주행(Navigate)과 같은 로봇이라 _ddago_lock 을 공유한다 — 주행 중에 도킹 goal 이
+        겹쳐 들어가면 로봇이 두 명령을 동시에 받게 된다.
+        """
+        with self._ddago_lock:
+            return self._dock_ddago_locked(req, up_gh)
+
+    def _dock_ddago_locked(self, req, up_gh):
+        if not self._dock_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('DdaGo Dock 액션 서버 없음')
+            return None, 'DdaGo Dock 서버 없음'
+
+        self.get_logger().info('DdaGo 도킹 하달(DCS→DdaGo): task=%d point=%s'
+                               % (req.task_id, req.task_point_id))
+        self._wire('from_dcs', 'Dock(→DdaGo)', self._msg_to_dict(req))
+
+        def on_fb(fb_msg):
+            fb = fb_msg.feedback
+            nf = Dock.Feedback()
+            nf.phase = fb.phase
+            nf.marker_detected = fb.marker_detected
+            nf.distance_to_marker_m = fb.distance_to_marker_m
+            self._wire('to_dcs', 'Dock(→DdaGo)/feedback', self._msg_to_dict(fb))
+            try:
+                up_gh.publish_feedback(nf)      # DdaGo 진행상황 → ACS 로 중계
+                self._wire('from_dcs', 'Dock/feedback', self._msg_to_dict(nf))
+            except Exception:   # noqa: BLE001 - 상위가 이미 끝났으면 무시
+                pass
+
+        # goal 은 받은 것을 그대로 넘긴다(필드 복사 누락 방지). 하달 → 수락 대기.
+        holder = {}
+        acc_ev = threading.Event()
+        sfut = self._dock_client.send_goal_async(req, feedback_callback=on_fb)
+        sfut.add_done_callback(lambda f: (holder.__setitem__('gh', f.result()), acc_ev.set()))
+        acc_ev.wait(timeout=5.0)
+        gh = holder.get('gh')
+        if gh is None or not gh.accepted:
+            self.get_logger().error('DdaGo Dock goal 거부/무응답')
+            return None, 'DdaGo Dock goal 거부'
+
+        # 결과 대기. 그 사이 ACS 가 취소하면(E2 22-1) DdaGo goal 도 취소 중계한다.
+        rholder = {}
+        res_ev = threading.Event()
+        gh.get_result_async().add_done_callback(
+            lambda f: (rholder.__setitem__('r', f.result().result), res_ev.set()))
+        waited = 0.0
+        cancel_sent = False
+        while not res_ev.wait(0.5):
+            # 취소는 한 번만 보낸다. 매 주기 재전송하면 같은 goal 에 취소 요청이
+            # 쌓이기만 하고 얻는 게 없다(DdaGo 는 이미 취소 처리 중이다).
+            if up_gh.is_cancel_requested and not cancel_sent:
+                cancel_sent = True
+                self.get_logger().warn('ACS 취소 요청 → DdaGo 도킹 취소 중계')
+                gh.cancel_goal_async()
+            waited += 0.5
+            if waited >= self._dock_timeout:
+                self.get_logger().warn('DdaGo 도킹 결과 무응답(timeout)')
+                return None, 'DdaGo 도킹 결과 timeout'
+
+        r = rholder.get('r')
+        if r is None:
+            return None, 'DdaGo 도킹 결과 없음'
+        self.get_logger().info(
+            'DdaGo 도킹 종료: code=%d lateral=%.3fm yaw=%.3frad'
+            % (r.result_code, r.final_lateral_m, r.final_yaw_error))
+        self._wire('to_dcs', 'Dock(→DdaGo)/result', self._msg_to_dict(r))
+        return r, ''
 
     @staticmethod
     def _image_to_jpeg_b64(img):

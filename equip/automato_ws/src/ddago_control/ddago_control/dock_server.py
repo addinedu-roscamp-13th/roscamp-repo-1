@@ -68,6 +68,8 @@ from rclpy.action import ActionServer, CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Int64
 
 # 같은 액션 이름으로 서버가 둘 뜨는 것을 막는 락 파일. 환경변수로 바꿀 수 있다.
 LOCK_PATH = os.environ.get('DDAGO_DOCK_LOCK', '/tmp/ddago_dock_server.lock')
@@ -486,6 +488,20 @@ class DockServer(Node):
         self._cmd_pub = self.create_publisher(
             Twist, self.get_parameter('cmd_vel_topic').value, 10)
 
+        # 현재 task 알림 (로봇 내부 신호). telemetry_publisher 가 이 값을 텔레메트리의
+        # task_id 로 싣는다 — 두 노드는 프로세스가 달라 변수를 공유할 수 없다.
+        # 문서 규정: task_id = 로봇이 마지막으로 받은 Navigate/Dock goal 의 task_id.
+        # navigate_server 와 같은 latched(TRANSIENT_LOCAL, depth 1) 조합이라
+        # 구독자가 나중에 떠도 마지막 값을 받는다.
+        self._task_pub = self.create_publisher(
+            Int64, '/ddago/current_task',
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+
         self._server = ActionServer(
             self, Dock, '/ddago/dock',
             execute_callback=self._execute,
@@ -652,6 +668,13 @@ class DockServer(Node):
         log.info('도킹 시작: task=%d point=%s 보드=%dx%d id=%s staging=%.2fm 후진=%.2fm'
                  % (goal.task_id, goal.task_point_id, goal.squares_x,
                     goal.squares_y, goal.marker_id, staging, reverse))
+        # goal 이 끝나도 0 으로 되돌리지 않는다: E4 복귀·도킹은 새 task 를 만들지 않고
+        # 끝난 순찰의 task_id 를 그대로 쓰므로, 여기서 0 이 되면 '어느 작업 때문에
+        # 복귀·도킹 중인지' 추적이 끊긴다.
+        task_msg = Int64()
+        task_msg.data = int(goal.task_id)
+        self._task_pub.publish(task_msg)
+        log.info('현재 task 알림 → /ddago/current_task: task_id=%d' % task_msg.data)
 
         fb = Dock.Feedback()
         last_fb = 0.0
