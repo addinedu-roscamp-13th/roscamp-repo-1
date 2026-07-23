@@ -58,17 +58,40 @@ class AiTcpClient:
         self._lock = threading.Lock()
 
     # ----- 엔드포인트 결정 (dg_ai_target.json 의 active) -----
-    def resolve_endpoint(self):
+    def resolve_target(self):
+        """(endpoint, active) 반환. active 는 'real'|'sim', 파일을 못 읽거나 값이
+        비면 'default'(= default_endpoint 폴백)."""
         try:
             with open(self.target_file, 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
             active = cfg.get('active', 'sim')
             ep = cfg.get(active)
             if ep:
-                return ep.strip()
+                return ep.strip(), active
         except (OSError, ValueError, KeyError):
             pass
-        return self.default_endpoint
+        return self.default_endpoint, 'default'
+
+    def resolve_endpoint(self):
+        return self.resolve_target()[0]
+
+    def probe(self):
+        """지금 접속 대상에 실제로 붙어본다(기동 시 연결 확인용).
+
+        analyze() 와 같은 지속 소켓을 쓰므로, 성공하면 그 연결을 그대로 두고
+        첫 분석 요청이 재사용한다(이미 붙어 있으면 아무 것도 하지 않음).
+        반환: {'endpoint', 'active', 'ok', 'error'}
+        """
+        ep, active = self.resolve_target()
+        with self._lock:
+            try:
+                self._ensure_connected_locked()
+                return {'endpoint': self._cur_endpoint or ep, 'active': active,
+                        'ok': True, 'error': ''}
+            except (OSError, ConnectionError) as e:
+                self._close_locked()
+                return {'endpoint': ep, 'active': active,
+                        'ok': False, 'error': str(e)}
 
     def _log(self, msg):
         if self.log is not None:
