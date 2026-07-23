@@ -16,6 +16,15 @@ CLASSES = ['ripe', 'unripe', 'rotten', 'disease']
 # 이 클래스가 하나라도 감지되면 응답에 레이블링된 이미지를 함께 반환한다.
 LABEL_TRIGGER_CLASSES = ('rotten', 'disease')
 
+# 레이블링 이미지(encode_labeled_image)에 그려지는 박스 텍스트만 한글로 표시.
+# 모델 매칭(CLASSES)과 JSON 응답 필드명(ripe_percent 등)은 영문을 그대로 쓴다.
+KOREAN_LABELS = {
+    'ripe': '익음',
+    'unripe': '미숙',
+    'rotten': '무름',
+    'disease': '병충해',
+}
+
 
 class ModelNotReadyError(RuntimeError):
     pass
@@ -99,8 +108,13 @@ class TomatoDetector:
 
     @staticmethod
     def encode_labeled_image(result: Any) -> str:
-        """탐지 박스를 그린 이미지를 JPEG로 인코딩해 base64 문자열로 반환."""
-        annotated = result.plot()  # BGR ndarray, 박스+라벨이 그려진 상태
+        """탐지 박스를 그린 이미지를 JPEG로 인코딩해 base64 문자열로 반환.
+
+        박스 라벨 텍스트만 한글로 바꿔서 그린다(result.names 는 이 결과 객체
+        인스턴스에만 있는 속성이라, 여기서 새 dict 로 바꿔치기해도 모델의
+        원본 클래스 이름(analyze() 매칭에 쓰이는)에는 영향이 없다)."""
+        result.names = {idx: KOREAN_LABELS.get(name, name) for idx, name in result.names.items()}
+        annotated = result.plot()  # BGR ndarray, 박스+한글 라벨이 그려진 상태
         ok, buf = cv2.imencode('.jpg', annotated)
         if not ok:
             raise ValueError('LABELED_IMAGE_ENCODE_FAILED')

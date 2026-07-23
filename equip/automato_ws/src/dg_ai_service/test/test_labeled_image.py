@@ -15,12 +15,15 @@ from collections import Counter
 import numpy as np
 
 from dg_ai_service.analysis_server import handle_analyze_frame_request
+from dg_ai_service.yolo_detector import TomatoDetector
 
 JPEG_MAGIC = b'\xff\xd8'
 
 
 class _FakeResult:
     """TomatoDetector.encode_labeled_image() 가 필요로 하는 최소 인터페이스."""
+
+    names = {0: 'ripe', 1: 'unripe', 2: 'rotten', 3: 'disease'}
 
     def plot(self):
         return np.zeros((4, 4, 3), dtype=np.uint8)
@@ -85,3 +88,11 @@ def test_no_detections_no_labeled_image():
         'ripe_percent': 0, 'unripe_percent': 0,
         'rotten_percent': 0, 'disease_percent': 0,
     }
+
+
+def test_encode_labeled_image_draws_korean_labels():
+    """박스에 그려지는 텍스트만 한글로 바뀌고, 원본 result 객체 타입은 유지."""
+    result = _FakeResult()
+    TomatoDetector.encode_labeled_image(result)
+
+    assert result.names == {0: '익음', 1: '미숙', 2: '무름', 3: '병충해'}
