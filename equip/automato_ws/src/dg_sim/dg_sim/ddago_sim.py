@@ -4,8 +4,8 @@
 팀원이 개발 중인 실제 DdaGo Control Service 대역. 즉시-응답 스텁.
 
 담당(시퀀스 다이어그램, 2026-07-14 개정):
-  E0    DdagoTelemetry 1Hz 발행                  /{robot_id}/ddago/telemetry
-  E1/E2 Navigate 액션 서버 (DCS ← )              /{robot_id}/ddago/navigate
+  E0    DdagoTelemetry 1Hz 발행                  /ddago/telemetry
+  E1/E2 Navigate 액션 서버 (DCS ← )              /ddago/navigate
         - goal(Waypoint[] 경로) 접수 → waypoint 마다 feedback(current_waypoint_id,
           waypoint_index) → 배열 끝까지 주행 → result(result_code=0, last_waypoint_id)
         - **capture==true 노드에서만** RGB 촬영 흉내 → DCS 로 AnalyzeFrame 분석요청 (E2 3단계)
@@ -59,7 +59,7 @@ class DdagoSim(Node):
         self._tel_until = float('inf') if self.get_parameter('auto_telemetry').value else 0.0
 
         self._tel_pub = self.create_publisher(
-            DdagoTelemetry, '/%s/ddago/telemetry' % self.robot_id, 10)
+            DdagoTelemetry, '/ddago/telemetry', 10)   # 연동에 robot_id 미사용
         self.create_timer(1.0, self._tick, callback_group=self._cb)
         self.create_service(Trigger, '/ddago_sim/start_telemetry', self._on_start_tel,
                             callback_group=self._cb)
@@ -67,7 +67,7 @@ class DdagoSim(Node):
                             callback_group=self._cb)
 
         self._navigate_srv = ActionServer(
-            self, Navigate, '/%s/ddago/navigate' % self.robot_id,
+            self, Navigate, '/ddago/navigate',   # 연동에 robot_id 미사용
             execute_callback=self._execute,
             cancel_callback=lambda _gh: CancelResponse.ACCEPT,
             callback_group=self._cb)
@@ -75,7 +75,7 @@ class DdagoSim(Node):
         self._analyze_cli = self.create_client(
             AnalyzeFrame, '/dg/analyze_frame', callback_group=self._cb)
 
-        self.get_logger().info('DdaGo 시뮬 시작: /%s/ddago/{telemetry,navigate}' % self.robot_id)
+        self.get_logger().info('DdaGo 시뮬 시작: /ddago/{telemetry,navigate}')
 
     # ---- E0 텔레메트리 (실행 트리거 시에만) ----
     def _on_start_tel(self, request, response):
@@ -97,7 +97,6 @@ class DdagoSim(Node):
             return   # 실행 트리거 전/후에는 발행 안 함
         msg = DdagoTelemetry()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.robot_id = self.robot_id
         msg.task_id = self._task_id
         msg.nav_status = 'NAVIGATING' if self._task_id else 'IDLE'
         msg.is_charging = False

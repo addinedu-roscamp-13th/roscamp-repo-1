@@ -102,7 +102,7 @@ def test_full_patrol_loop(system):
 
 
 def test_fleet_telemetry(system):
-    """E0: DCS가 ddago/ddagi 텔레메트리를 취합해 FleetTelemetry로 ACS에 전달."""
+    """E0: DCS가 ddago/ddagi 텔레메트리를 묶어 RobotTelemetry로 ACS에 전달."""
     acs = system['acs']
     # ddago/ddagi 텔레메트리(1Hz)가 DCS를 거쳐 취합돼 올라올 때까지 대기
     deadline = time.time() + 8.0
@@ -111,7 +111,7 @@ def test_fleet_telemetry(system):
             or len(acs.last_fleet.ddagos) < 1
             or len(acs.last_fleet.ddagis) < 1):
         time.sleep(0.2)
-    assert acs.fleet_count > 0, 'FleetTelemetry 수신 안 됨'
+    assert acs.fleet_count > 0, 'RobotTelemetry 수신 안 됨'
     assert acs.last_fleet is not None
     assert len(acs.last_fleet.ddagos) >= 1, 'ddago 텔레메트리 취합 안 됨'
     assert len(acs.last_fleet.ddagis) >= 1, 'ddagi 텔레메트리 취합 안 됨'

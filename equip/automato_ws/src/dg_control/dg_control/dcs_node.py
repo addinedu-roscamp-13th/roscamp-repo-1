@@ -4,12 +4,12 @@
 시퀀스 다이어그램(Confluence page 23691289, 2026-07-14 개정)의 DCS 역할을 구현한다.
 
   E0 상시 모니터링:
-    - 구독  /{robot_id}/ddago/telemetry (DdagoTelemetry)
-    - 구독  /ddagi/telemetry (DdagiTelemetry, robot_id 는 메시지 필드로 필터링)
-    - 발행  /automato/telemetry/fleet    (FleetTelemetry, 1Hz 취합)
+    - 구독  /ddago/telemetry (DdagoTelemetry)  ← ddago/ddagi 연동은 robot_id 미사용
+    - 구독  /ddagi/telemetry (DdagiTelemetry)  (상대가 필드를 채워 보내도 읽지 않는다)
+    - 발행  /{robot_id}/telemetry  (RobotTelemetry, 1Hz — 자기 세트분)
   E1/E2 순찰(경로 하달):
     - 액션 서버      /{robot_id}/navigate        (Navigate, Waypoint[]) ← Automato Control Service
-    - 액션 클라이언트 /{robot_id}/ddago/navigate  (Navigate, Waypoint[]) → DdaGo Control Service
+    - 액션 클라이언트 /ddago/navigate            (Navigate, Waypoint[]) → DdaGo Control Service
   E2 촬영·분석·저장:
     - 서비스 서버    /dg/analyze_frame           (AnalyzeFrame) ← DdaGo (capture 노드 도착 후)
     - TCP 클라이언트  DG AI Service               (4B len+JSON)  → 분석 위임
@@ -46,7 +46,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from automato_interfaces.action import Navigate
-from automato_interfaces.msg import FleetTelemetry
+from automato_interfaces.msg import RobotTelemetry
 from automato_interfaces.srv import AnalyzeFrame, SaveDetection
 from sensor_msgs.msg import Image
 
@@ -65,7 +65,7 @@ class DcsNode(Node):
         self.declare_parameter('fleet_hz', 1.0)
         self.declare_parameter('ai_target_file', DEFAULT_AI_TARGET_FILE)
         self.declare_parameter('ai_default_endpoint', '127.0.0.1:9100')
-        # 신선한 로봇 텔레메트리가 이 시간(초) 넘게 안 오면 FleetTelemetry 발행 중지
+        # 신선한 로봇 텔레메트리가 이 시간(초) 넘게 안 오면 RobotTelemetry 발행 중지
         self.declare_parameter('fleet_stale_sec', 3.0)
         # DdaGo 가 구간(Waypoint[]) 하나를 끝낼 때까지 기다리는 상한(초)
         self.declare_parameter('ddago_result_timeout_sec', 180.0)
@@ -80,19 +80,23 @@ class DcsNode(Node):
         self._cb_client = MutuallyExclusiveCallbackGroup()
 
         # ---- E0 텔레메트리 ----
-        self._ddago_tel = {}   # robot_id -> DdagoTelemetry
-        self._ddagi_tel = {}   # robot_id -> DdagiTelemetry
-        self._ddago_rx = {}    # robot_id -> 마지막 수신 시각
-        self._ddagi_rx = {}
+        # ddago/ddagi 연동에는 robot_id 를 쓰지 않는다(물리망 분리). DG 는 자기 세트의
+        # 것만 받으므로 최신값 한 벌만 들고 있으면 된다(메시지의 robot_id 필드도 안 읽는다).
+        self._ddago_tel = None   # 최신 DdagoTelemetry
+        self._ddagi_tel = None   # 최신 DdagiTelemetry
+        self._ddago_rx = 0.0     # 마지막 수신 시각
+        self._ddagi_rx = 0.0
         from automato_interfaces.msg import DdagiTelemetry, DdagoTelemetry
         self.create_subscription(
-            DdagoTelemetry, '/%s/ddago/telemetry' % self.robot_id,
+            DdagoTelemetry, '/ddago/telemetry',
             self._on_ddago_tel, 10, callback_group=self._cb_re)
         self.create_subscription(
             DdagiTelemetry, '/ddagi/telemetry',
             self._on_ddagi_tel, 10, callback_group=self._cb_re)
+        # DG -> ACS 는 자기 세트분(RobotTelemetry)을 /{robot_id}/telemetry 로 보낸다.
+        # 어느 로봇인지는 네임스페이스가 말해준다(이 구간만 robot_id 사용).
         self._fleet_pub = self.create_publisher(
-            FleetTelemetry, '/automato/telemetry/fleet', 10)
+            RobotTelemetry, '/%s/telemetry' % self.robot_id, 10)
         self.create_timer(1.0 / fleet_hz, self._publish_fleet,
                           callback_group=self._cb_re)
 
@@ -105,7 +109,7 @@ class DcsNode(Node):
 
         # ---- E1/E2 Navigate 액션 클라이언트 (→ DdaGo, 경로 배열 그대로 중계) ----
         self._ddago_client = ActionClient(
-            self, Navigate, '/%s/ddago/navigate' % self.robot_id,
+            self, Navigate, '/ddago/navigate',   # 로봇 쪽은 robot_id 미사용
             callback_group=self._cb_client)
 
         # ---- E2 AnalyzeFrame 서비스 서버 (DdaGo ← ) ----
@@ -171,47 +175,35 @@ class DcsNode(Node):
         return conv(msg)
 
     # ============================ E0 텔레메트리 ============================
-    def _wrong_robot(self, kind, msg):
-        """토픽 이름의 robot_id 와 메시지 안의 robot_id 가 다르면 무시하고 경고.
-
-        둘이 어긋나면(예: 로봇은 dg_01 로 발행하는데 DCS 는 dg_02 로 떠 있음) 아무 에러 없이
-        엉뚱한 로봇 데이터를 취합하게 된다. ROBOT_ID 환경변수 오설정을 바로 드러내기 위한 방어."""
-        if msg.robot_id and msg.robot_id != self.robot_id:
-            self.get_logger().warn(
-                '%s 의 robot_id 불일치: 수신=%s, DCS=%s → 무시 (ROBOT_ID 환경변수 확인)'
-                % (kind, msg.robot_id, self.robot_id))
-            return True
-        return False
-
+    # ddago/ddagi 연동에는 robot_id 가 없다(물리망이 로봇별로 분리되어 DG 는 자기 세트의
+    # 것만 받는다). 메시지에 robot_id 필드가 있어도 읽지 않는다 — 어느 로봇인지는 DG 자신이
+    # 안다(self.robot_id). 그래서 세트당 최신값 한 벌만 보관한다.
     def _on_ddago_tel(self, msg):
-        if self._wrong_robot('DdagoTelemetry', msg):
-            return
-        self._ddago_tel[msg.robot_id] = msg
-        self._ddago_rx[msg.robot_id] = time.time()
+        self._ddago_tel = msg
+        self._ddago_rx = time.time()
         self._wire('to_dcs', 'DdagoTelemetry', self._msg_to_dict(msg))
 
     def _on_ddagi_tel(self, msg):
-        if self._wrong_robot('DdagiTelemetry', msg):
-            return
-        self._ddagi_tel[msg.robot_id] = msg
-        self._ddagi_rx[msg.robot_id] = time.time()
+        self._ddagi_tel = msg
+        self._ddagi_rx = time.time()
         self._wire('to_dcs', 'DdagiTelemetry', self._msg_to_dict(msg))
 
     def _publish_fleet(self):
-        # 신선한(최근 fleet_stale 초 이내 수신) 로봇 텔레메트리만 취합.
+        # 신선한(최근 fleet_stale 초 이내 수신) 것만 싣는다.
+        # 배열이지만 길이는 0 또는 1 — 세트에 주행로봇/팔이 각각 하나뿐(옵셔널 표현).
         now = time.time()
-        ddagos = [d for rid, d in self._ddago_tel.items()
-                  if now - self._ddago_rx.get(rid, 0) < self._fleet_stale]
-        ddagis = [d for rid, d in self._ddagi_tel.items()
-                  if now - self._ddagi_rx.get(rid, 0) < self._fleet_stale]
+        ddagos = ([self._ddago_tel] if self._ddago_tel is not None
+                  and now - self._ddago_rx < self._fleet_stale else [])
+        ddagis = ([self._ddagi_tel] if self._ddagi_tel is not None
+                  and now - self._ddagi_rx < self._fleet_stale else [])
         if not ddagos and not ddagis:
             return   # 신선한 텔레메트리 없음(E0 중지 등) → DCS→ACS 발행 중지
-        msg = FleetTelemetry()
+        msg = RobotTelemetry()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.ddagos = ddagos
         msg.ddagis = ddagis
         self._fleet_pub.publish(msg)
-        self._wire('from_dcs', 'FleetTelemetry', self._msg_to_dict(msg))
+        self._wire('from_dcs', 'RobotTelemetry', self._msg_to_dict(msg))
 
     # ===== E1/E2 Navigate 중계 — ACS 가 하달한 경로(Waypoint[])를 DdaGo 에 그대로 =====
     def _navigate_execute(self, goal_handle):
