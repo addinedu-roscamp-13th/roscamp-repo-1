@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """RP-75  E0 텔레메트리 Publisher 단위 테스트.
 
-가짜 소스 토픽(odom/amcl_pose/battery(percent·voltage)/us_sensor·range/navigate
-status)을 발행해 TelemetryPublisher 가 telemetry 로 취합·발행하는지 검증한다.
+가짜 소스 토픽(odom/amcl_pose/battery(percent·voltage)/navigate status)을
+발행해 TelemetryPublisher 가 telemetry 로 취합·발행하는지 검증한다.
+(초음파 us_range_m 은 미사용 — 항상 0.0 발행을 검증한다. 노드 독스트링 참고.)
 로봇 없이(가짜 pub) 로직만 확인하는 "1단계 검증"의 자동화판이다.
 
 TESTING.md 규약: SingleThreadedExecutor 로 노드+헬퍼를 한 스레드에서 스핀,
@@ -27,7 +28,6 @@ import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import Range
 from std_msgs.msg import Float32, Int64
 
 
@@ -80,7 +80,6 @@ def _make_source_pubs(helper):
             PoseWithCovarianceStamped, 'amcl_pose', 10),
         'batt_pct': helper.create_publisher(Float32, 'battery/percent', 10),
         'batt_volt': helper.create_publisher(Float32, 'battery/voltage', 10),
-        'range': helper.create_publisher(Range, 'us_sensor/range', 10),
         'status': helper.create_publisher(
             GoalStatusArray, 'navigate_to_pose/_action/status', latched_qos),
         'task': helper.create_publisher(
@@ -129,10 +128,6 @@ def _publish_all_sources(pubs, amcl_yaw):
     volt.data = 12.3
     pubs['batt_volt'].publish(volt)
 
-    rng = Range()
-    rng.range = 0.4
-    pubs['range'].publish(rng)
-
     st = GoalStatusArray()
     gs = GoalStatus()
     gs.status = GoalStatus.STATUS_EXECUTING
@@ -177,8 +172,9 @@ def test_fields_reflect_sources(ctx):
 
     def reflected():
         _publish_all_sources(pubs, amcl_yaw)
+        # 배터리 전압(12.3)을 반영 완료 신호로 쓴다 — 기본값 0.0 과 뚜렷이 구분되는 값.
         return bool(received) and \
-            received[-1].us_range_m == pytest.approx(0.4, abs=1e-3)
+            received[-1].battery_voltage == pytest.approx(12.3, abs=1e-3)
 
     assert _wait_until(reflected, timeout=8.0), \
         '텔레메트리에 소스값이 반영되지 않음'
@@ -191,7 +187,8 @@ def test_fields_reflect_sources(ctx):
     assert msg.battery_voltage == pytest.approx(12.3, abs=1e-3)
     assert msg.battery_percent == pytest.approx(78.0, abs=1e-2)  # battery/percent
     assert not msg.is_charging   # 핑키는 충전상태 미제공 → 항상 False
-    assert msg.us_range_m == pytest.approx(0.4, abs=1e-3)
+    # 초음파 미사용 — 어떤 소스를 발행해도 us_range_m 은 항상 0.0 이어야 한다.
+    assert msg.us_range_m == pytest.approx(0.0)
     assert msg.nav_status == 'NAVIGATING'          # EXECUTING → NAVIGATING
 
 
