@@ -159,7 +159,7 @@
       </div>
 
       <div class="panel">
-        <h2>시나리오 테스트 (E0 · E1 · E2 · E4 · S2 E2)</h2>
+        <h2>시나리오 테스트 (E0 · E1 · E2 · E4 · S2 E2 · S2 E3)</h2>
         <div class="note">시퀀스 다이어그램의 3개 시나리오를 항목별로 실행·판정합니다.
           <b>dcs · acs · ddago · ddagi · dg_ai</b> 가 모두 UP이어야 합니다.
           각 항목 <b>실행</b> → PASS/FAIL 과 근거 로그가 표시됩니다.</div>
@@ -505,6 +505,7 @@ const TESTS = [
   { key: 'e2', name: 'E2 체크·저장',     desc: 'capture 노드 분석 → SaveDetection 저장(병해충 시 이미지 동봉) → 순찰 완료' },
   { key: 'e4', name: 'E4 복귀·도킹',     desc: 'ACS→DCS Dock goal 접수 → DCS→DdaGo 중계 → 결과(중심선 이탈·스큐) 반환. DCS는 중계자' },
   { key: 's2e2', name: 'S2 E2 수확 이동·도킹', desc: 'ACS→DCS 수확지점 경로(전 구간 capture=false, 촬영 없음) → 도착 후 Dock 하달·중계 → 도킹 성공 시 E3 진입 게이트 오픈' },
+  { key: 's2e3', name: 'S2 E3 수확 대상 인식', desc: 'E2(이동+도킹)로 게이트 오픈 → 수확 시작(Harvest) → ACS→DCS→Ddagi 중계 → 라운드 Feedback·종료 사유(exit_reason) 반환. DG는 중계자' },
 ];
 function renderTests() {
   const c = document.getElementById('tests');

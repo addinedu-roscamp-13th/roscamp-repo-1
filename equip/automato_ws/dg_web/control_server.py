@@ -153,10 +153,12 @@ def read_logs():
     return {
         'dcs': _tail_filtered('/tmp/dash_dcs.log',
                               ['경로 수신', 'DdaGo 하달', '분석결과', '구간 결과 전달',
-                               '도킹 결과 전달', 'E3 진입 가능']),
+                               '도킹 결과 전달', 'E3 진입 가능', '수확 시작 수신',
+                               'Ddagi 수확 하달', '수확 결과 전달']),
         'acs': _tail_filtered('/tmp/dash_acs.log',
                               ['순찰 시작', '구간 하달', 'SaveDetection 저장', '구간 결과',
-                               '순찰 완료', 'Fleet 수신']),
+                               '순찰 완료', 'Fleet 수신', '수확 시작 하달', '수확 진행',
+                               '수확 결과']),
     }
 
 
@@ -263,10 +265,10 @@ def eval_e4():
     return ok, dcs or ['(DCS 로그 없음 — dcs/ddago UP 확인)']
 
 
-def _trigger_harvest():
-    """ACS 역할로 수확 이동+도킹 하달(dashboard.sh harvest). 서비스 호출은 즉시 반환하고
+def _trigger_harvest_move():
+    """ACS 역할로 수확 이동+도킹 하달(dashboard.sh harvest-move). 서비스 호출은 즉시 반환하고
     시나리오는 백그라운드로 돈다(완주는 아래 eval 이 로그로 폴링)."""
-    subprocess.run(['bash', DASH, 'harvest'], capture_output=True, text=True, timeout=40)
+    subprocess.run(['bash', DASH, 'harvest-move'], capture_output=True, text=True, timeout=40)
 
 
 def eval_s2e2():
@@ -277,7 +279,7 @@ def eval_s2e2():
     '경로 수신 → 도킹 지시 수신 → 도킹 결과 전달(code=0) → E3 진입 가능(도킹 성공)' 4단계가
     DCS 로그에 모두 남는지로 한다. 도킹이 실패하면 게이트가 열리지 않아 FAIL 로 갈린다."""
     clear_wire()   # 실행 시 메시지 초기화
-    _trigger_harvest()
+    _trigger_harvest_move()
 
     open_key = 'E3 진입 가능(도킹 성공'   # 게이트 오픈(성공)만. '해제'(clear)와 구분된다.
     keys = ['경로 수신', '도킹 지시 수신', '도킹 결과 전달', open_key]
@@ -294,9 +296,57 @@ def eval_s2e2():
     return ok, dcs or ['(DCS 로그 없음 — dcs·acs·ddago UP 확인)']
 
 
-EVALS = {'e0': eval_e0, 'e1': eval_e1, 'e2': eval_e2, 'e4': eval_e4, 's2e2': eval_s2e2}
+def _trigger_harvest():
+    """ACS 역할로 수확 시작(E3) 하달(dashboard.sh harvest). 도킹 성공한 task 로
+    Harvest 를 하달한다. 즉시 반환하고 수확 진행은 백그라운드(로그 폴링으로 판정)."""
+    subprocess.run(['bash', DASH, 'harvest'], capture_output=True, text=True, timeout=60)
+
+
+def eval_s2e3():
+    """S2 E3 수확 대상 인식(DG Harvest 중계): 도킹 성공(is_docked)한 task 로 수확을 시작해
+    ACS→DCS→Ddagi 로 Harvest 가 중계되고, 라운드 Feedback·종료 사유가 그대로 되돌아오는지.
+
+    수확은 E2 도킹이 선행돼야 하므로(게이트) 이 테스트는 **E2(이동+도킹) → E3(수확)** 를
+    이어서 실행한다. 판정: 도킹 성공(E3 진입 가능) → 수확 시작 수신 → Ddagi 수확 하달 →
+    수확 결과 전달(exit_reason=DEPLETED/FULL/MAX_ROUNDS_EXCEEDED) 이 DCS 로그에 남는지.
+    도킹 안 된 task 로는 goal 이 거부(reject)돼 수확 하달이 없으므로 FAIL 로 갈린다."""
+    clear_wire()   # 실행 시 메시지 초기화
+
+    # 1) E2 이동+도킹으로 게이트를 연다
+    _trigger_harvest_move()
+    open_key = 'E3 진입 가능(도킹 성공'
+
+    def docked():
+        return any(open_key in l for l in
+                   _tail_filtered('/tmp/dash_dcs.log', [open_key], n=5))
+
+    if not _wait_until(docked, 40):
+        dcs = _tail_filtered('/tmp/dash_dcs.log',
+                             ['경로 수신', '도킹 결과 전달', open_key], n=8)
+        return False, ['(E2 도킹 실패 — E3 는 도킹 성공이 선행돼야 함)'] + dcs
+
+    # 2) E3 수확 시작
+    _trigger_harvest()
+    exits = ('exit=DEPLETED', 'exit=FULL', 'exit=MAX_ROUNDS_EXCEEDED')
+    keys = ['수확 시작 수신', 'Ddagi 수확 하달', 'Ddagi 수확 종료', '수확 결과 전달']
+
+    def done():
+        dcs = _tail_filtered('/tmp/dash_dcs.log', keys, n=20)
+        return (any('수확 시작 수신' in l for l in dcs)          # ACS → DCS 접수
+                and any('Ddagi 수확 하달' in l for l in dcs)      # DCS → Ddagi 중계
+                and any('수확 결과 전달' in l and any(e in l for e in exits)
+                        for l in dcs))                            # DCS → ACS 정상 종료 반환
+
+    ok = _wait_until(done, 40)
+    dcs = _tail_filtered('/tmp/dash_dcs.log', keys, n=10)
+    return ok, dcs or ['(DCS 로그 없음 — dcs·acs·ddago·ddagi UP 확인)']
+
+
+EVALS = {'e0': eval_e0, 'e1': eval_e1, 'e2': eval_e2, 'e4': eval_e4,
+         's2e2': eval_s2e2, 's2e3': eval_s2e3}
 EVAL_NAMES = {'e0': 'E0 상시 모니터링', 'e1': 'E1 순찰 시작', 'e2': 'E2 체크·저장',
-              'e4': 'E4 복귀·도킹', 's2e2': 'S2 E2 수확 이동·도킹'}
+              'e4': 'E4 복귀·도킹', 's2e2': 'S2 E2 수확 이동·도킹',
+              's2e3': 'S2 E3 수확 대상 인식'}
 
 
 class Handler(BaseHTTPRequestHandler):
