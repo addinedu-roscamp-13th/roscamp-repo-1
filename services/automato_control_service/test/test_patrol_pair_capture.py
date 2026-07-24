@@ -117,7 +117,7 @@ def _run(client, start_wp=1, targets=(2, 3)):
     d = _make_dispatcher()
     engine = RoutingEngine(NODES, CORRIDORS)
     waypoints = [{"waypoint_id": t} for t in targets]
-    status, _unvisited = d.run_patrol(
+    status, _unvisited, _last = d.run_patrol(
         1, "dg_01", waypoints, engine, client, start_wp=start_wp)
     return status, client.sent
 
