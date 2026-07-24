@@ -28,6 +28,7 @@
 실행:
   PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest test/test_patrol_pair_capture.py -v
 """
+import math
 import os
 import sys
 from types import SimpleNamespace
@@ -221,3 +222,40 @@ def test_start_wp_가_주어지면_그_노드에서_출발한다():
     _status, sent = _run(FakeClient(), start_wp=1, targets=(2,))
     first_ids = sent[0][0]
     assert first_ids[0] == 2, f"첫 하달이 출발 노드의 다음이 아니다: {first_ids}"
+
+
+# =========================================================================== #
+# ⑦ 통과·미촬영 노드는 '진행 방향'을 향한다 (두리번거림 제거, RP-EX)
+# =========================================================================== #
+# 배경: 예전에는 촬영 지점이 아닌 노드의 yaw 를 무조건 0(동쪽)으로 강제했다.
+# 그래서 로봇이 그냥 지나가면 될 노드에서도 동쪽으로 고개를 돌려, 실측에서 이동
+# 1m 당 1500° 넘게 회전(두리번거림)했다. 촬영은 capture=true 노드에서만 하므로,
+# 그 외 노드는 '가는 방향(다음 노드 쪽)'을 향하게 해 불필요한 회전을 없앤다.
+def test__travel_yaw_는_다음_노드_쪽을_향한다():
+    coords = [(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)]
+    assert PatrolDispatcher._travel_yaw(coords, 0) == math.atan2(1.0, 1.0)   # 다음(1,1)
+    assert PatrolDispatcher._travel_yaw(coords, 1) == math.atan2(-1.0, 1.0)  # 다음(2,0)
+    # 마지막 노드는 다음이 없으므로 '오던 방향'을 유지한다.
+    assert PatrolDispatcher._travel_yaw(coords, 2) == math.atan2(-1.0, 1.0)
+
+
+def test__travel_yaw_같은자리거나_한점이면_0():
+    """두 점이 같으면(짝 등) 진행 방향 계산이 불가 → 0.0 폴백."""
+    assert PatrolDispatcher._travel_yaw([(1.0, 2.0), (1.0, 2.0)], 0) == 0.0
+    assert PatrolDispatcher._travel_yaw([(5.0, 5.0)], 0) == 0.0
+
+
+def test_통과노드는_0이_아니라_진행방향으로_하달된다():
+    """통과 노드(1)를 지나 촬영 노드(2)로 가는 배열을 직접 하달해 yaw 를 확인한다."""
+    d = _make_dispatcher()
+    client = FakeClient()
+    # 1=(0,0) 통과점, 2=(1,2) 촬영점. capture_ids 에 2 만 넣는다.
+    d._dispatch_segment(client, 1, [1, 2], {2})
+    _ids, _caps, goal = client.sent[0]
+    passthru, capture = goal.waypoints[0], goal.waypoints[1]
+    assert passthru.capture is False and capture.capture is True
+    # 통과점: 다음 노드(1,2) 쪽 = atan2(2,1). 예전의 0(동쪽)이 아니다.
+    assert passthru.yaw == math.atan2(2.0, 1.0)
+    assert passthru.yaw != 0.0
+    # 촬영점: DB 의 베드 방향(-1.57)을 그대로 유지한다.
+    assert capture.yaw == -1.57

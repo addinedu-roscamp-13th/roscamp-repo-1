@@ -12,6 +12,7 @@ patrol_node(ROS 표면)에서 '동작 결정' 로직을 떼어낸 클래스. rcl
   - (A) 사람·물건 잠깐 막음은 로봇 Nav2가 자체 예산(순찰 2분×3)으로 처리 → 결과만 기다림
 통로 예약·경로 탐색은 routing_engine(독립 모듈)이 담당하고 여기선 호출만 한다.
 """
+import math
 import threading
 import time
 
@@ -697,6 +698,29 @@ class PatrolDispatcher:
         return seg_wps, seg_cids
 
     # ---------------------------- 세그먼트 하달 ---------------------------- #
+    @staticmethod
+    def _travel_yaw(coords, i):
+        """통과·미촬영 노드의 목표 방향 = 진행 방향(rad).
+
+        촬영 지점은 베드 쪽 고정 방향(DB yaw)이 필요하지만, 그냥 지나가는 노드까지
+        방향을 강제하면 로봇이 그 방향(예전엔 0=동쪽)으로 고개를 돌리느라 두리번거린다.
+        대신 '다음 노드 쪽'을 향하게 하면 가는 방향을 보고 지나가 회전이 없어진다.
+
+        다음 노드가 있으면 그쪽을, 마지막 노드면 직전에서 오던 방향을 유지한다.
+        두 점이 같으면(짝 등 이례적 상황) 계산 불가라 0.0 으로 폴백한다.
+        """
+        n = len(coords)
+        if i + 1 < n:
+            (ax, ay), (bx, by) = coords[i], coords[i + 1]
+        elif i > 0:
+            (ax, ay), (bx, by) = coords[i - 1], coords[i]
+        else:
+            return 0.0
+        dx, dy = bx - ax, by - ay
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return 0.0
+        return math.atan2(dy, dx)
+
     def _dispatch_segment(self, client, task_id, waypoint_ids,
                           capture_ids, heartbeat=None, on_tick=None,
                           on_feedback=None):
@@ -714,15 +738,31 @@ class PatrolDispatcher:
                      공유 상태 변경은 디스패치 스레드(on_tick)에서 해야 한다.
         반환: (result_code, last_waypoint_id). result_code 0 성공/1 실패·막힘/2 중단.
         """
+        # 좌표를 먼저 모은다 — 통과 노드 yaw 를 '진행 방향(다음 노드 쪽)'으로 잡으려면
+        # 이웃 노드의 좌표가 필요하기 때문이다.
+        coords = [
+            (float(self.wp_meta.get(w, {}).get("x", 0.0)),
+             float(self.wp_meta.get(w, {}).get("y", 0.0)))
+            for w in waypoint_ids
+        ]
         wps = []
-        for wid in waypoint_ids:
+        for i, wid in enumerate(waypoint_ids):
             m = self.wp_meta.get(wid, {})
+            is_capture = bool(wid in capture_ids)
+            if is_capture:
+                # 촬영 지점: 베드를 봐야 사진이 나온다 → DB 에 지정된 방향 그대로.
+                yaw = float(m.get("yaw") or 0.0)
+            else:
+                # 통과(및 이번에 안 찍는) 지점: 방향을 강제하면 불필요한 회전이 생긴다.
+                # NavigateToPose 는 목표에 반드시 방향이 필요하므로 '진행 방향'을 준다
+                # → 로봇이 가는 쪽을 보고 지나가 두리번거림이 사라진다.
+                yaw = self._travel_yaw(coords, i)
             wps.append(Waypoint(
                 waypoint_id=int(wid),
-                x=float(m.get("x", 0.0)),
-                y=float(m.get("y", 0.0)),
-                yaw=float(m.get("yaw") or 0.0),          # 비순찰점 yaw=None → 0.0
-                capture=bool(wid in capture_ids),
+                x=coords[i][0],
+                y=coords[i][1],
+                yaw=yaw,
+                capture=is_capture,
             ))
         goal = Navigate.Goal()
         goal.task_id = int(task_id)
