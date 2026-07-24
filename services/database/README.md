@@ -56,7 +56,7 @@ python smoke_check.py
 
 `waypoints` · `robots` · `task_points` · `tasks` · `detection_logs`
 · `harvest_batches` · `unload_logs` · `event_logs` · `task_assignment_snapshot`
-· `operation_battery_thresholds` · `corridors` · `aruco_markers`
+· `operation_battery_thresholds` · `corridors` · `charuco_boards`
 
 **핵심 규칙**
 - **부분 유니크 인덱스** `ux_tasks_active_robot`: 한 로봇에 활성(`WAITING`/`IN_PROGRESS`) task 중복 배정 차단.
@@ -76,7 +76,9 @@ python smoke_check.py
 ## 시나리오 2 반영 (ERD v33 · RP-88)
 
 - **`task_paths` 폐기(삭제)**: 경로는 실행 중 재계획되는 휘발성 데이터라 ACS 메모리에서 관리하고, DB엔 요청(`tasks`)과 결과만 남긴다.
-- **`aruco_markers` 신설**: 정밀 도킹용 ArUco 마커/도킹 오프셋. `task_points`와 1:1(`task_point_id` UNIQUE), `marker_id`는 인쇄된 마커 값이라 자연키.
+- **`charuco_boards` 신설**: 정밀 도킹용 ChArUco 보드/도킹 오프셋. `task_points`와 1:1(`task_point_id` UNIQUE), `marker_id`는 보드가 점유하는 마커 ID 범위의 시작 번호라 자연키.
+  단일 ArUco 가 아니라 보드를 쓰는 이유는 자세를 체스판 코너에서 얻어 서브픽셀 정밀도가 나오고, 접붙임 직전 보드가 잘려도 남은 코너로 계산되기 때문. 그래서 보드 구성(`squares_x/y`, `square_size_m`)까지 저장한다.
+  CHECK 2개(`marker_size_m < square_size_m`, `squares_x/y >= 3`)로 값 뒤집힘을 막는다 — 뒤집혀도 검출은 되고 거리 추정만 조용히 틀어져 원인 찾기가 어렵다.
 - **`robots.charge_point_id`** (FK→`task_points`, NULLABLE): 로봇별 전용 충전소.
 - **`task_points.point_type`** (`HARVEST`/`PRECOOL`/`CHARGE`): 작업 위치 종류.
 - **`harvest_batches.failed_count` / `exit_reason`**(`DEPLETED`/`FULL`/`MAX_ROUNDS_EXCEEDED`): 수확 성공률·종료 사유.
