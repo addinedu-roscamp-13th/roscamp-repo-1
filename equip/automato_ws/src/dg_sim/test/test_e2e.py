@@ -48,8 +48,11 @@ def system():
         Parameter('ai_target_file', value='/nonexistent/dg_ai_target.json'),
         Parameter('ai_default_endpoint', value='127.0.0.1:%d' % AI_PORT),
         Parameter('fleet_hz', value=5.0),
+        Parameter('harvest_feedback_timeout_sec', value=2.0),   # 워치독 테스트용 짧게
     ])
-    ddagi = DdagiSim(parameter_overrides=[Parameter('auto_telemetry', value=True)])
+    ddagi = DdagiSim(parameter_overrides=[
+        Parameter('auto_telemetry', value=True),
+        Parameter('harvest_step_delay', value=0.1)])
     ddago = DdagoSim(parameter_overrides=[
         Parameter('move_delay', value=0.15), Parameter('auto_telemetry', value=True)])
     acs = AcsSim(parameter_overrides=[Parameter('auto_start', value=False)])
@@ -243,3 +246,101 @@ def test_dock_timeout(system_short_dock_timeout):
     assert acs.last_dock_result.result_code == 3, acs.last_dock_result.message
     assert not dcs.is_docked(task_id)
     acs.cancel_dock()   # 매달린 sim goal 을 풀어 teardown 을 빠르게
+
+
+# ============================ S2 E3 Harvest 중계 ============================
+def _dock_first(system):
+    """수확 이동+도킹으로 게이트를 연 뒤 task_id 반환(E3 진입 준비)."""
+    acs = system['acs']
+    tid = acs.send_harvest_move(num_waypoints=HARVEST_WP, seg_size=HARVEST_SEG)
+    assert _wait(lambda: acs.dock_done), '도킹 결과 미수신'
+    assert acs.last_dock_result.result_code == 0, '선행 도킹 실패'
+    assert system['dcs'].is_docked(tid), '도킹 게이트 안 열림'
+    return tid
+
+
+def test_harvest_gate_reject(system):
+    """도킹 안 된 task 로 Harvest 를 하달하면 DG 가 goal 을 거부(reject)한다."""
+    acs, dcs = system['acs'], system['dcs']
+    assert not dcs.is_docked(999999)
+    acs.send_harvest_action(999999)
+    assert _wait(lambda: acs.harvest_done), '수확 goal 응답 없음'
+    assert acs.harvest_accepted is False, '도킹 안 된 task 인데 accept 됨'
+
+
+def test_harvest_depleted(system):
+    """도킹 성공 task 로 수확 → 라운드 Feedback 이 중계되고 DEPLETED Result 가 올라온다.
+    수확 시작 시 도킹 게이트가 소비(해제)된다."""
+    acs, dcs = system['acs'], system['dcs']
+    tid = _dock_first(system)
+    acs.send_harvest_action(tid, max_capacity=7)
+
+    assert _wait(lambda: acs.harvest_done), '수확 결과 미수신'
+    assert acs.harvest_accepted is True
+    assert acs.harvest_result is not None
+    assert acs.harvest_result.exit_reason == 'DEPLETED', acs.harvest_result.message
+
+    # 라운드 Feedback 이 중계됐다 — 라운드가 진행되고 누적 카운트가 오른다
+    assert acs.harvest_feedback, 'Harvest feedback 미중계'
+    rounds_seen = {f['round'] for f in acs.harvest_feedback}
+    assert max(rounds_seen) >= 2, '라운드 진행이 안 보임: %s' % rounds_seen
+    assert acs.harvest_result.normal_count == 6   # 2라운드 × 3파지 (sim 기본)
+
+    # 수확 시작으로 게이트가 소비됐다(재진입 방지)
+    assert not dcs.is_docked(tid), '수확 시작 후에도 게이트가 열려 있음'
+
+
+def test_harvest_full(system):
+    """만차(FULL) 종료 사유가 그대로 중계된다. max_capacity 를 낮춰 도달시킨다."""
+    acs = system['acs']
+    system['ddagi'].harvest_mode = 'full'
+    tid = _dock_first(system)
+    acs.send_harvest_action(tid, max_capacity=4)   # 파지 6회 중 4개째 만차
+
+    assert _wait(lambda: acs.harvest_done), '수확 결과 미수신'
+    assert acs.harvest_result.exit_reason == 'FULL', acs.harvest_result.message
+    assert acs.harvest_result.normal_count >= 4
+
+
+def test_harvest_max_rounds(system):
+    """MAX_ROUNDS_EXCEEDED 종료 사유가 그대로 중계된다."""
+    acs = system['acs']
+    system['ddagi'].harvest_mode = 'max_rounds'
+    tid = _dock_first(system)
+    acs.send_harvest_action(tid)
+
+    assert _wait(lambda: acs.harvest_done), '수확 결과 미수신'
+    assert acs.harvest_result.exit_reason == 'MAX_ROUNDS_EXCEEDED', acs.harvest_result.message
+
+
+def test_harvest_cancel(system):
+    """ACS 취소가 DG 를 거쳐 Ddagi 까지 전파되어 수확이 중단된다."""
+    acs = system['acs']
+    system['ddagi'].harvest_step_delay = 0.4   # 취소 걸 시간 확보(라운드가 천천히)
+    tid = _dock_first(system)
+    acs.send_harvest_action(tid)
+
+    # Feedback 이 흐르기 시작하면(=수확 진행 중) 취소
+    assert _wait(lambda: len(acs.harvest_feedback) >= 1, timeout=15.0), '수확 시작 안 됨'
+    acs.cancel_harvest()
+
+    assert _wait(lambda: acs.harvest_done), '취소 결과 미수신'
+    # 취소로 끝나면 exit_reason 은 비어 있다(정상 종료 사유가 아님)
+    assert acs.harvest_result is not None
+    assert acs.harvest_result.exit_reason == '', acs.harvest_result.exit_reason
+
+
+def test_harvest_watchdog(system):
+    """Ddagi 가 진행 소식(Feedback)을 안 주면 DG 의 무수신 워치독이 안전하게 실패시킨다."""
+    acs = system['acs']
+    system['ddagi'].harvest_mode = 'hang'
+    tid = _dock_first(system)
+    acs.send_harvest_action(tid)
+
+    # DCS harvest_feedback_timeout=2.0 → 워치독이 곧 실패로 마감
+    assert _wait(lambda: acs.harvest_done, timeout=15.0), '워치독 결과 미수신'
+    assert acs.harvest_accepted is True          # goal 은 수락됐다가
+    assert acs.harvest_result is not None
+    assert acs.harvest_result.exit_reason == ''  # 정상 종료가 아님(abort)
+    assert 'watchdog' in acs.harvest_result.message
+    acs.cancel_harvest()   # 매달린 sim goal 정리

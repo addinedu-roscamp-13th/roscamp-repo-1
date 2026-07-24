@@ -1,0 +1,29 @@
+# 시나리오2 E3~E5 : 수확 사이클 전체를 감싸는 액션 (ACS→DG→Ddagi)
+#   ACS -> DG    : /{robot_id}/harvest
+#   DG  -> Ddagi : /ddagi/harvest        (로봇 쪽은 네임스페이스를 붙이지 않는다)
+#
+# 2026-07-23 구조 변경: 수확 루프 주관이 DG → Ddagi 로 이관됐다. Ddagi 가 관측·검출요청
+# (DetectTomatoes)·제외목록·라운드·파지를 내부에서 전부 주관하고, DG 는 이 액션을 **중계**
+# 만 한다(ACS↔Ddagi 사이 전달). ACS 는 Feedback 으로 진행 상황만 받는다.
+#
+# 진입 조건은 E2 도킹 성공이다. DG 는 도킹 성공(is_docked)한 task 의 goal 만 accept 한다.
+# result_code 필드가 없다 — 성공/취소/중단은 액션 goal 상태(SUCCEEDED/CANCELED/ABORTED)로
+# 표현하고, 업무적 종료 사유는 exit_reason 으로 구분한다.
+
+# ---------- Goal ----------
+int64   task_id
+int32   max_capacity          # 수확품 바구니 만차 기준 (7)
+---
+# ---------- Result ----------
+int32   normal_count          # 수확품 바구니 적재 개수
+int32   discard_count         # 폐기품 바구니 적재 개수
+int32   failed_count          # 3회 시도 후 포기한 토마토 개수
+string  exit_reason           # DEPLETED / FULL / MAX_ROUNDS_EXCEEDED
+string  message
+---
+# ---------- Feedback ----------   (Ddagi 생성 → DG 중계 → ACS)
+int32   round                 # 현재 촬영 라운드 (1부터)
+int32   normal_count          # 누적
+int32   discard_count         # 누적
+int32   failed_count          # 누적
+int32   remaining_in_round    # 이번 라운드에서 아직 처리하지 않은 개수

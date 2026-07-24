@@ -30,11 +30,11 @@ def generate_launch_description():
             'robot_id',
             default_value=EnvironmentVariable('ROBOT_ID', default_value='dg_01')),
         DeclareLaunchArgument('auto_start', default_value='true'),
-        # auto_start 시 실행할 시나리오: patrol(S1) | harvest(S2 E2 이동+도킹)
-        #   ros2 launch dg_sim dg_sim.launch.py scenario:=harvest
+        # auto_start 시 실행할 시나리오: patrol(S1) | harvest-move(S2 E2 이동+도킹)
+        #   ros2 launch dg_sim dg_sim.launch.py scenario:=harvest-move
         DeclareLaunchArgument('scenario', default_value='patrol'),
         # DdaGo 도킹 결과 시뮬: success | no_marker | error_exceeded | hang
-        #   ros2 launch dg_sim dg_sim.launch.py scenario:=harvest dock_mode:=no_marker
+        #   ros2 launch dg_sim dg_sim.launch.py scenario:=harvest-move dock_mode:=no_marker
         DeclareLaunchArgument('dock_mode', default_value='success'),
         Node(package='dg_sim', executable='ddagi_sim', name='ddagi_sim',
              parameters=[{'robot_id': robot_id}]),

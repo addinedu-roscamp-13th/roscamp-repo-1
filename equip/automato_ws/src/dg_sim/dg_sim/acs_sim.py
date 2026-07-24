@@ -27,7 +27,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from automato_interfaces.action import Dock, Navigate
+from automato_interfaces.action import Dock, Harvest, Navigate
 from automato_interfaces.msg import RobotTelemetry, Waypoint
 from automato_interfaces.srv import SaveDetection
 from std_srvs.srv import Trigger
@@ -44,7 +44,7 @@ class AcsSim(Node):
         self.declare_parameter('robot_id', 'dg_01')
         self.declare_parameter('auto_start', True)
         self.declare_parameter('auto_delay', 3.0)
-        # auto_start 시 실행할 시나리오: 'patrol'(S1) | 'harvest'(S2 E2 이동+도킹)
+        # auto_start 시 실행할 시나리오: 'patrol'(S1) | 'harvest-move'(S2 E2 이동+도킹)
         self.declare_parameter('scenario', 'patrol')
         self.declare_parameter('num_waypoints', 6)   # 경로 전체 노드 수
         self.declare_parameter('seg_size', 3)        # 한 번에 하달할 구간 크기(예약 흉내)
@@ -73,6 +73,14 @@ class AcsSim(Node):
         self.dock_feedback_phases = []  # 도킹 중 받은 phase 목록(중계 확인용)
         self._dock_gh = None            # 진행 중 Dock goal handle(취소 테스트용)
 
+        # S2 E3~E5 Harvest 상태
+        self._last_docked_task = None   # 도킹 성공한 마지막 task(수확 goal 대상)
+        self.harvest_accepted = None    # 수확 goal 수락 여부(None=미발행, True/False)
+        self.harvest_feedback = []      # 받은 Harvest Feedback 목록(라운드 중계 확인용)
+        self.harvest_result = None      # 마지막 Harvest.Result(검증용)
+        self.harvest_done = False       # 수확 result 수신 여부
+        self._harvest_gh = None         # 진행 중 Harvest goal handle(취소 테스트용)
+
         # E0 RobotTelemetry 구독 — DG 는 자기 세트분만 /{robot_id}/telemetry 로 보낸다
         self.create_subscription(
             RobotTelemetry, '/%s/telemetry' % self.robot_id,
@@ -86,6 +94,10 @@ class AcsSim(Node):
         self._dock_cli = ActionClient(
             self, Dock, '/%s/dock' % self.robot_id, callback_group=self._cb)
 
+        # S2 E3~E5 Harvest 액션 클라이언트 (도킹 성공 후 수확 시작 하달)
+        self._harvest_cli = ActionClient(
+            self, Harvest, '/%s/harvest' % self.robot_id, callback_group=self._cb)
+
         # E2 SaveDetection 서비스 서버
         self.create_service(
             SaveDetection, '/automato/save_detection',
@@ -94,7 +106,11 @@ class AcsSim(Node):
         # 수동 트리거
         self.create_service(
             Trigger, '/acs_sim/start_patrol', self._on_trigger, callback_group=self._cb)
-        # S2 E2 수확 이동+도킹 트리거
+        # S2 E2 수확 이동+도킹 트리거 (이동+도킹은 'harvest-move', 실제 수확은 'harvest')
+        self.create_service(
+            Trigger, '/acs_sim/start_harvest_move', self._on_trigger_harvest_move,
+            callback_group=self._cb)
+        # S2 E3 수확 시작 트리거 (도킹 성공한 마지막 task 로 Harvest 하달)
         self.create_service(
             Trigger, '/acs_sim/start_harvest', self._on_trigger_harvest, callback_group=self._cb)
 
@@ -153,7 +169,7 @@ class AcsSim(Node):
         # 타이머는 1회만 쓰기 위해 즉시 취소
         for t in list(self.timers):
             t.cancel()
-        if self.get_parameter('scenario').value == 'harvest':
+        if self.get_parameter('scenario').value == 'harvest-move':
             self.send_harvest_move(
                 num_waypoints=int(self.get_parameter('harvest_waypoints').value),
                 seg_size=int(self.get_parameter('harvest_seg').value),
@@ -167,7 +183,7 @@ class AcsSim(Node):
         response.message = '순찰 발행 task_id=%d' % task_id
         return response
 
-    def _on_trigger_harvest(self, request, response):
+    def _on_trigger_harvest_move(self, request, response):
         """S2 E2: 수확 위치 이동(전 구간 capture=false) → 도착 후 도킹까지 한 번에 발행."""
         task_id = self.send_harvest_move(
             num_waypoints=int(self.get_parameter('harvest_waypoints').value),
@@ -387,6 +403,8 @@ class AcsSim(Node):
         res = future.result().result
         self.last_dock_result = res
         self.dock_done = True
+        if res.result_code == 0 and self._harvest is not None:
+            self._last_docked_task = self._harvest['task_id']   # 수확 goal 대상
         self.get_logger().info('도킹 결과: code=%d lateral=%.3fm yaw=%.3frad msg=%s'
                                % (res.result_code, res.final_lateral_m,
                                   res.final_yaw_error, res.message))
@@ -397,6 +415,68 @@ class AcsSim(Node):
         if self._dock_gh is not None:
             self.get_logger().warn('ACS 도킹 취소 요청')
             self._dock_gh.cancel_goal_async()
+
+    # ---- S2 E3~E5 수확 시작 (도킹 성공 task 로 Harvest 액션 하달) ----
+    def send_harvest_action(self, task_id, max_capacity=7):
+        """도킹 성공한 task 로 수확을 시작한다(E3~E5). DG 가 /ddagi/harvest 로 중계한다.
+        도킹 안 된 task 면 DG 가 goal 을 거부(reject) → harvest_accepted=False 로 표시."""
+        if not self._harvest_cli.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('DCS Harvest 서버 없음')
+            return None
+        self.harvest_accepted = None
+        self.harvest_feedback = []
+        self.harvest_result = None
+        self.harvest_done = False
+        self._harvest_gh = None
+        goal = Harvest.Goal(task_id=int(task_id), max_capacity=int(max_capacity))
+        self.get_logger().info('수확 시작 하달: task=%d max_capacity=%d' % (task_id, max_capacity))
+        fut = self._harvest_cli.send_goal_async(goal, feedback_callback=self._on_harvest_fb)
+        fut.add_done_callback(self._on_harvest_goal_response)
+        return task_id
+
+    def _on_harvest_goal_response(self, future):
+        gh = future.result()
+        self.harvest_accepted = bool(gh.accepted)
+        if not gh.accepted:
+            self.get_logger().warn('DCS가 Harvest goal 거부(도킹 안 됨)')
+            self.harvest_done = True   # reject 도 종료로 본다(대기 해제용)
+            return
+        self._harvest_gh = gh
+        gh.get_result_async().add_done_callback(self._on_harvest_result)
+
+    def _on_harvest_fb(self, feedback_msg):
+        fb = feedback_msg.feedback
+        self.harvest_feedback.append(
+            {'round': fb.round, 'normal': fb.normal_count, 'discard': fb.discard_count,
+             'failed': fb.failed_count, 'remaining': fb.remaining_in_round})
+        self.get_logger().info('수확 진행: round=%d normal=%d discard=%d failed=%d remaining=%d'
+                               % (fb.round, fb.normal_count, fb.discard_count,
+                                  fb.failed_count, fb.remaining_in_round))
+
+    def _on_harvest_result(self, future):
+        res = future.result().result
+        self.harvest_result = res
+        self.harvest_done = True
+        self.get_logger().info('수확 결과: exit=%s normal=%d discard=%d failed=%d msg=%s'
+                               % (res.exit_reason, res.normal_count, res.discard_count,
+                                  res.failed_count, res.message))
+
+    def cancel_harvest(self):
+        """진행 중인 Harvest goal 을 취소한다(취소 전파 검증용)."""
+        if self._harvest_gh is not None:
+            self.get_logger().warn('ACS 수확 취소 요청')
+            self._harvest_gh.cancel_goal_async()
+
+    def _on_trigger_harvest(self, request, response):
+        """라이브: 도킹 성공한 마지막 task 로 수확(E3) 시작. dashboard.sh 등에서 호출."""
+        if self._last_docked_task is None:
+            response.success = False
+            response.message = '도킹 성공한 task 없음 — 먼저 수확 이동+도킹(start_harvest_move) 실행'
+            return response
+        tid = self.send_harvest_action(self._last_docked_task)
+        response.success = tid is not None
+        response.message = ('수확 시작 하달 task=%d' % tid) if tid is not None else 'Harvest 서버 없음'
+        return response
 
 
 def main(args=None):

@@ -13,9 +13,14 @@
   E4-6/E2 22-1 정밀 도킹(중계):
     - 액션 서버      /{robot_id}/dock            (Dock) ← Automato Control Service
     - 액션 클라이언트 /ddago/dock                 (Dock) → DdaGo Control Service
-  S2 E2→E3 핸드오프(상태만):
-    - 수확 위치 도킹 성공(result_code==0)한 task 만 E3 진입 허용 → is_docked() 로 노출.
-      새 주행이 시작되면(도크에서 떠남) 해제한다. Harvest 액션 서버(RP-99)가 이 게이트를 읽는다.
+  S2 E2→E3 핸드오프 게이트:
+    - 수확 위치 도킹 성공(result_code==0)한 task 만 E3 진입 허용 → is_docked() 로 판정.
+      새 주행이 시작되면(도크에서 떠남) 해제. 아래 Harvest 서버가 goal 수락 조건으로 읽는다.
+  S2 E3~E5 수확(Harvest 중계):
+    - 액션 서버      /{robot_id}/harvest         (Harvest) ← Automato Control Service
+    - 액션 클라이언트 /ddagi/harvest              (Harvest) → Ddagi Control Service
+    - 수확 루프 주관은 Ddagi(관측·검출·제외목록·라운드·파지). DG 는 goal 하달 + feedback/
+      result 중계만 한다. 도킹 성공 task 만 accept(게이트), 취소 전파, Feedback 무수신 워치독.
   E2 촬영·분석·저장:
     - 서비스 서버    /dg/analyze_frame           (AnalyzeFrame) ← DdaGo (capture 노드 도착 후)
     - TCP 클라이언트  DG AI Service               (4B len+JSON)  → 분석 위임
@@ -47,12 +52,12 @@ import threading
 import time
 
 import rclpy
-from rclpy.action import ActionClient, ActionServer, CancelResponse
+from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from automato_interfaces.action import Dock, Navigate
+from automato_interfaces.action import Dock, Harvest, Navigate
 from automato_interfaces.msg import RobotTelemetry
 from automato_interfaces.srv import AnalyzeFrame, SaveDetection
 from sensor_msgs.msg import Image
@@ -96,12 +101,18 @@ class DcsNode(Node):
         self.declare_parameter('ddago_result_timeout_sec', 180.0)
         # DdaGo 도킹 한 번의 상한(초). 탐색 1.1바퀴(~35s)+중심선 기동+접근+회전+후진.
         self.declare_parameter('dock_result_timeout_sec', 180.0)
+        # Harvest 는 여러 라운드로 오래 도는 액션이라 총 시간 상한 대신 **Feedback 무수신
+        # 워치독**으로 감시한다. 마지막 Feedback(또는 goal 수락) 이후 이 시간(초) 넘게
+        # 진행 소식이 없으면 Ddagi 가 멎은 것으로 보고 취소·실패 처리한다.
+        self.declare_parameter('harvest_feedback_timeout_sec', 30.0)
 
         self.robot_id = self.get_parameter('robot_id').value
         fleet_hz = float(self.get_parameter('fleet_hz').value)
         self._fleet_stale = float(self.get_parameter('fleet_stale_sec').value)
         self._ddago_timeout = float(self.get_parameter('ddago_result_timeout_sec').value)
         self._dock_timeout = float(self.get_parameter('dock_result_timeout_sec').value)
+        self._harvest_fb_timeout = float(
+            self.get_parameter('harvest_feedback_timeout_sec').value)
 
         # 콜백 그룹: 서비스/타이머는 동시 처리(Reentrant), 액션 클라이언트는 순차(Exclusive).
         self._cb_re = ReentrantCallbackGroup()
@@ -152,6 +163,21 @@ class DcsNode(Node):
             self, Dock, '/ddago/dock',   # 로봇 쪽은 robot_id 미사용
             callback_group=self._cb_client)
 
+        # ---- S2 E3~E5 Harvest 액션 서버 (ACS ← ) / 클라이언트 (→ Ddagi) ----
+        # 수확 루프 주관은 Ddagi 다. DG 는 Harvest 를 **중계**만 한다(goal 하달 + feedback/
+        # result 되돌림). goal 수락은 도킹 성공(is_docked)한 task 로 제한한다(goal_callback).
+        # Harvest 는 팔(Ddagi) 대상이라 주행/도킹(DdaGo)의 _ddago_lock 과는 별개 자원이다.
+        self._harvest_srv = ActionServer(
+            self, Harvest, '/%s/harvest' % self.robot_id,
+            goal_callback=self._harvest_goal_cb,
+            execute_callback=self._harvest_execute,
+            cancel_callback=lambda _gh: CancelResponse.ACCEPT,
+            callback_group=self._cb_re)
+        self._harvest_client = ActionClient(
+            self, Harvest, '/ddagi/harvest',   # 로봇 쪽은 robot_id 미사용
+            callback_group=self._cb_client)
+        self._ddagi_lock = threading.Lock()   # 동시에 뜬 Harvest goal 은 하나뿐
+
         # ---- E2 AnalyzeFrame 서비스 서버 (DdaGo ← ) ----
         self.create_service(
             AnalyzeFrame, '/dg/analyze_frame', self._on_analyze_frame,
@@ -193,8 +219,8 @@ class DcsNode(Node):
 
         self.get_logger().info(
             'DCS 준비: robot_id=%s | Navigate서버 /%s/navigate | Dock서버 /%s/dock '
-            '| AI target=%s'
-            % (self.robot_id, self.robot_id, self.robot_id,
+            '| Harvest서버 /%s/harvest | AI target=%s'
+            % (self.robot_id, self.robot_id, self.robot_id, self.robot_id,
                self.get_parameter('ai_target_file').value
                or '(dg_ai_target.json 못 찾음 -> %s 고정)'
                   % self.get_parameter('ai_default_endpoint').value))
@@ -533,6 +559,135 @@ class DcsNode(Node):
             'DdaGo 도킹 종료: code=%d lateral=%.3fm yaw=%.3frad'
             % (r.result_code, r.final_lateral_m, r.final_yaw_error))
         self._wire('to_dcs', 'Dock(→DdaGo)/result', self._msg_to_dict(r))
+        return r, ''
+
+    # ===== S2 E3~E5 Harvest 중계 — ACS 의 수확 지시를 Ddagi 로 그대로 =====
+    def _harvest_goal_cb(self, goal_request):
+        """수확 goal 수락 판정: 도킹 성공(is_docked)한 task 만 진입 허용.
+        도킹하지 않은 위치에서 팔이 수확을 시작하는 것을 막는 안전 조건(E2→E3 게이트)이다."""
+        if self.is_docked(goal_request.task_id):
+            return GoalResponse.ACCEPT
+        self.get_logger().warn(
+            '수확 goal 거부: task=%d 도킹 안 됨(E2 도킹 성공 필요)' % goal_request.task_id)
+        return GoalResponse.REJECT
+
+    def _harvest_execute(self, goal_handle):
+        """ACS 가 하달한 Harvest goal 을 Ddagi 로 중계하고, feedback·result 를 그대로 ACS 로.
+
+        라운드·검출(DetectTomatoes)·제외목록·파지는 Ddagi 몫이다(DG는 중계자). Feedback
+        무수신 워치독으로 멎음을 감지하고, ACS 취소는 Ddagi goal 취소로 전파한다.
+        """
+        req = goal_handle.request
+        self.get_logger().info('수확 시작 수신(ACS→DCS): task=%d max_capacity=%d'
+                               % (req.task_id, req.max_capacity))
+        self._wire('to_dcs', 'Harvest', self._msg_to_dict(req))
+
+        # 도킹 게이트 소비 — 이 도킹으로 열린 수확 진입 권한을 여기서 쓴다(재진입 방지).
+        self._clear_docked('수확 시작 task=%d' % req.task_id)
+
+        r, err = self._harvest_ddagi(req, goal_handle)
+
+        result = Harvest.Result()
+        if r is not None:
+            # 값 손실 없이 그대로. 누적 카운트·종료 사유는 ACS 가 실적을 기록·표시하는 근거다.
+            result.normal_count = int(r.normal_count)
+            result.discard_count = int(r.discard_count)
+            result.failed_count = int(r.failed_count)
+            result.exit_reason = r.exit_reason or ''
+            result.message = r.message or ''
+        else:
+            # 중계 자체 실패(서버 없음/거부/무응답/취소). exit_reason 은 비우고 사유는 message 로.
+            result.exit_reason = ''
+            result.message = err or '중계 실패'
+
+        # 취소가 와 있으면 결과가 무엇이든 CANCELED 로 끝낸다(ROS2 goal 은 CANCELING 에서
+        # succeed 로 못 넘어가고, ACS 도 자기가 취소한 goal 이 성공으로 오면 오판한다).
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+        elif r is not None:
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
+
+        self.get_logger().info(
+            '수확 결과 전달(DCS→ACS): task=%d exit=%s normal=%d discard=%d failed=%d'
+            % (req.task_id, result.exit_reason, result.normal_count,
+               result.discard_count, result.failed_count))
+        self._wire('from_dcs', 'Harvest/result', self._msg_to_dict(result))
+        return result
+
+    def _harvest_ddagi(self, req, up_gh):
+        with self._ddagi_lock:
+            return self._harvest_ddagi_locked(req, up_gh)
+
+    def _harvest_ddagi_locked(self, req, up_gh):
+        if not self._harvest_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('Ddagi Harvest 액션 서버 없음')
+            return None, 'Ddagi Harvest 서버 없음'
+
+        self.get_logger().info('Ddagi 수확 하달(DCS→Ddagi): task=%d' % req.task_id)
+        self._wire('from_dcs', 'Harvest(→Ddagi)', self._msg_to_dict(req))
+
+        last_fb = {'t': time.time()}   # 워치독 기준: 마지막 진행 소식(수락 시점부터 시작)
+
+        def on_fb(fb_msg):
+            fb = fb_msg.feedback
+            last_fb['t'] = time.time()
+            nf = Harvest.Feedback()
+            nf.round = fb.round
+            nf.normal_count = fb.normal_count
+            nf.discard_count = fb.discard_count
+            nf.failed_count = fb.failed_count
+            nf.remaining_in_round = fb.remaining_in_round
+            self._wire('to_dcs', 'Harvest(→Ddagi)/feedback', self._msg_to_dict(fb))
+            try:
+                up_gh.publish_feedback(nf)      # Ddagi 진행상황 → ACS 로 중계
+                self._wire('from_dcs', 'Harvest/feedback', self._msg_to_dict(nf))
+            except Exception:   # noqa: BLE001 - 상위가 이미 끝났으면 무시
+                pass
+
+        # goal 은 받은 것을 그대로 넘긴다(필드 복사 누락 방지). 하달 → 수락 대기.
+        holder = {}
+        acc_ev = threading.Event()
+        sfut = self._harvest_client.send_goal_async(req, feedback_callback=on_fb)
+        sfut.add_done_callback(lambda f: (holder.__setitem__('gh', f.result()), acc_ev.set()))
+        acc_ev.wait(timeout=5.0)
+        gh = holder.get('gh')
+        if gh is None or not gh.accepted:
+            self.get_logger().error('Ddagi Harvest goal 거부/무응답')
+            return None, 'Ddagi Harvest goal 거부'
+
+        # 결과 대기. Feedback 무수신 워치독으로 멎음 감지 + ACS 취소 전파.
+        rholder = {}
+        res_ev = threading.Event()
+        gh.get_result_async().add_done_callback(
+            lambda f: (rholder.__setitem__('r', f.result().result), res_ev.set()))
+        cancel_sent = False
+        cancel_t = None
+        while not res_ev.wait(0.5):
+            now = time.time()
+            if up_gh.is_cancel_requested and not cancel_sent:
+                cancel_sent = True
+                cancel_t = now
+                self.get_logger().warn('ACS 취소 요청 → Ddagi 수확 취소 중계')
+                gh.cancel_goal_async()
+            if cancel_sent:
+                # 취소를 보냈으면 취소 응답(canceled result)까지만 기다린다.
+                if now - cancel_t > self._harvest_fb_timeout:
+                    self.get_logger().warn('Ddagi 수확 취소 응답 timeout')
+                    return None, 'Ddagi 수확 취소 응답 timeout'
+            elif now - last_fb['t'] > self._harvest_fb_timeout:
+                # 정상 수확 중엔 라운드마다 Feedback 이 온다 → 무소식이면 멎은 것.
+                self.get_logger().warn('Ddagi 수확 진행 무소식(watchdog) → 취소·실패')
+                gh.cancel_goal_async()
+                return None, 'Ddagi 수확 무응답(watchdog)'
+
+        r = rholder.get('r')
+        if r is None:
+            return None, 'Ddagi 수확 결과 없음'
+        self.get_logger().info('Ddagi 수확 종료: exit=%s normal=%d discard=%d failed=%d'
+                               % (r.exit_reason, r.normal_count, r.discard_count, r.failed_count))
+        self._wire('to_dcs', 'Harvest(→Ddagi)/result', self._msg_to_dict(r))
         return r, ''
 
     @staticmethod
