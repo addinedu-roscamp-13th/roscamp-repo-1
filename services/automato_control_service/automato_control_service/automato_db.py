@@ -308,6 +308,31 @@ def set_task_status(pool: ConnectionPool, task_id: int, status: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 로봇 운영 상태 쓰기 (22-2 현장 정지 시 IMMOBILIZED)
+# --------------------------------------------------------------------------- #
+_VALID_OPERATIONAL_STATUS = ("NORMAL", "IMMOBILIZED", "MAINTENANCE")
+
+
+def set_operational_status(pool: ConnectionPool, robot_id: str,
+                           status: str) -> None:
+    """robots.operational_status 를 설정한다(22-2 복귀 실패 시 IMMOBILIZED 로).
+
+    이 값은 '일을 줘도 되는가' 축이라 nav_status(주행 중인가)와 별개다. NORMAL 이 아닌
+    로봇은 E1 가용 판정 1)에서 배정 후보에서 빠진다. IMMOBILIZED 는 정의상 사람이 손으로
+    NORMAL 로 되돌려야 풀리므로 메모리가 아니라 DB 에 남긴다(서비스 재기동에도 보존, 0007).
+
+    updated_at 은 set_task_status 와 같은 관례로 명시 갱신한다.
+    예외: 허용되지 않은 status 면 ValueError(0007 CHECK 제약과 같은 값을 코드에서 먼저 건다).
+    """
+    if status not in _VALID_OPERATIONAL_STATUS:
+        raise ValueError(f"허용되지 않은 operational_status: {status}")
+    sql = ("UPDATE robots SET operational_status = %s, updated_at = NOW() "
+           "WHERE robot_id = %s")
+    with pool.connection() as conn:
+        conn.execute(sql, (status, robot_id))
+
+
+# --------------------------------------------------------------------------- #
 # 예외 이벤트 기록 (시나리오 1 E2 통신 규격 12번)
 # --------------------------------------------------------------------------- #
 # 왜 알림과 별도로 DB 에 남기나: WebSocket 알림은 그 순간 앱을 보고 있는 사람에게만
@@ -447,3 +472,63 @@ def get_patrol_start_waypoint(pool: ConnectionPool, robot_id: str):
     with pool.connection() as conn:
         row = conn.execute(_SELECT_PATROL_START_WAYPOINT, (robot_id,)).fetchone()
     return row["waypoint_id"] if row else None
+
+
+# --------------------------------------------------------------------------- #
+# 복귀·도킹 조회 (E4 순찰 종료 복귀 / 22-1 막힘 실패 복귀 공통)
+# --------------------------------------------------------------------------- #
+# 순찰이 끝나거나(E4) 통로 막힘으로 실패한(22-1) 로봇은 '자기 전용 충전소'로 복귀해
+# 도킹한다. 복귀 주행의 목적지는 충전소의 '진입 노드'(waypoint_id)이고, 도착 후
+# Dock 액션에는 그 지점의 ChArUco 보드 정보를 실어 내려보낸다. 이 두 사실을 읽는다.
+#
+# get_patrol_start_waypoint 와의 차이: 그 함수는 '순찰을 어느 노드에서 시작하나'만
+# 알면 돼 waypoint_id 하나만 돌려준다. 복귀·도킹은 Dock Goal 의 task_point_id 필드와
+# 마커 조회 키로 task_point_id('CHARGE_01' 등)까지 필요해 함께 돌려준다.
+_SELECT_CHARGE_POINT = (
+    "SELECT t.task_point_id, t.waypoint_id "
+    "  FROM robots r "
+    "  JOIN task_points t ON t.task_point_id = r.charge_point_id "
+    " WHERE r.robot_id = %s"
+)
+
+
+def get_charge_point(pool: ConnectionPool, robot_id: str):
+    """robot_id 의 전용 충전소를 {task_point_id, 진입 노드 waypoint_id} 로 돌려준다.
+
+    반환: {"task_point_id": "CHARGE_01", "waypoint_id": 22} · 없으면 None.
+    None 인 경우: 그런 로봇이 없거나 charge_point_id 가 비어 있음(충전소 미등록).
+
+    좌표(x/y/yaw)는 여기서 다시 읽지 않는다 — waypoint_id 만 있으면 디스패처가 이미
+    메모리에 올려둔 그래프(load_graph 의 wp_meta)에서 얻는다. 같은 좌표를 두 곳에서
+    읽으면 지도를 고칠 때 한쪽만 바뀌어 어긋나므로, 좌표의 단일 출처는 waypoints 다.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(_SELECT_CHARGE_POINT, (robot_id,)).fetchone()
+    return dict(row) if row else None
+
+
+# 도킹 마커는 충전소뿐 아니라 수확/예냉실 지점에도 붙으므로 robot 이 아니라
+# task_point_id 로 조회한다(범용). Dock Goal 의 마커 관련 필드가 이 한 행에서 다 나온다.
+_SELECT_DOCK_MARKER = (
+    "SELECT marker_id, dictionary, squares_x, squares_y, "
+    "       square_size_m, marker_size_m, "
+    "       dock_offset_x, dock_offset_y, dock_offset_yaw "
+    "  FROM charuco_boards "
+    " WHERE task_point_id = %s"
+)
+
+
+def get_dock_marker(pool: ConnectionPool, task_point_id: str):
+    """task_point_id 의 ChArUco 보드/도킹 오프셋 한 행을 dict 로 돌려준다. 없으면 None.
+
+    반환 키: marker_id, dictionary, squares_x, squares_y, square_size_m,
+             marker_size_m, dock_offset_x, dock_offset_y, dock_offset_yaw
+    이 값들이 Dock 액션 Goal 의 마커 관련 필드로 그대로 실린다.
+
+    None 인 경우: 그 지점에 보드가 아직 시드되지 않음. 마커 실측값은 도킹 튜닝이
+    끝난 뒤 채워지므로(현 단계 미시드), 호출부(Dock 클라이언트)가 None 을 '도킹 불가'로
+    처리한다 — 없는 마커로 Goal 을 만들어 로봇이 엉뚱하게 움직이지 않게 한다.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(_SELECT_DOCK_MARKER, (task_point_id,)).fetchone()
+    return dict(row) if row else None

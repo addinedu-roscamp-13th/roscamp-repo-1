@@ -16,11 +16,14 @@ import math
 import threading
 import time
 
-from automato_interfaces.action import Navigate
+from automato_interfaces.action import Dock, Navigate
 from automato_interfaces.msg import Waypoint
 
 from automato_control_service.patrol_config import (
+    BLOCK_GIVEUP_SEC,
     BLOCK_TTL_SEC,
+    DOCK_RESULT_TIMEOUT_SEC,
+    DOCK_RETRY_MAX,
     GOAL_ACCEPT_TIMEOUT_SEC,
     HEARTBEAT_SEC,
     PATROL_START_WAYPOINT_ID,
@@ -96,7 +99,11 @@ class PatrolDispatcher:
     # ---------------------------- 순찰 본체 ---------------------------- #
     def run_patrol(self, task_id, robot_id, waypoints, engine, client,
                    start_wp=None) -> tuple:
-        """순찰 지점을 순서대로 방문. 반환: (status, unvisited_waypoint_ids).
+        """순찰 지점을 순서대로 방문. 반환: (status, unvisited_waypoint_ids, last_wp).
+
+        last_wp: 순찰이 끝난 시점 로봇이 서 있는 노드. 이 자리 예약을 '쥔 채로' 반환하고
+          (finally 에서 반납하지 않는다) 복귀 주행이 이어받는다. 시작 전 실패(서버 미기동/
+          방문 지점 없음)면 None.
 
         status: 'COMPLETED' | 'COMPLETED_PARTIAL' | 'FAILED'.
         unvisited_waypoint_ids: sweep 후에도 못 간 순찰 지점 목록(E2 9-1 의 그 필드).
@@ -113,11 +120,11 @@ class PatrolDispatcher:
         if not client.wait_for_server(timeout_sec=SERVER_WAIT_SEC):
             self._log.warn(
                 f"{robot_id} Navigate 액션 서버 미기동 → task {task_id} FAILED")
-            return "FAILED", []
+            return "FAILED_ABORTED", [], None
 
         targets = [wp["waypoint_id"] for wp in waypoints]
         if not targets:
-            return "COMPLETED", []             # 방문할 지점이 없음
+            return "COMPLETED", [], None       # 방문할 지점이 없음
 
         visited = set()
         # 순찰 시작 노드(로봇 전용 충전소의 진입 노드). 그래프(wp_meta)에 있으면 current 로 두고
@@ -149,7 +156,7 @@ class PatrolDispatcher:
             if code != 0:
                 engine.release(engine.node_slot(current), robot_id)
                 self._log.warn(f"첫 순찰 지점 도달 실패 → task {task_id} FAILED")
-                return "FAILED", []
+                return "FAILED_ABORTED", [], current
             self._mark_visited(hadal, cap_ids, cap_parents, last_wp, code, visited)
 
         # 출발선에서 '지금 서 있는 자리'부터 잡는다. 첫 구간의 _navigate 가 잡아주긴
@@ -174,7 +181,13 @@ class PatrolDispatcher:
                 outcome, current = self._visit(
                     engine, client, task_id, robot_id, current, target, visited)
                 if outcome == "aborted":
-                    return "FAILED", []
+                    return "FAILED_ABORTED", [], current
+                # 문서 22: 이 지점 우회로도 없을 때(skipped) 로봇이 '갇혔는지'(남은 순찰
+                # 지점 어디로도 못 감) 본다. 갇혔으면 T_block 재시도 후에도 못 나가면 막힘
+                # 확정 → 22-1(순찰 실패 후 충전소 복귀). 아니면 이 지점만 건너뛰고 계속.
+                if outcome == "skipped" and self._stranded_after_block(
+                        engine, robot_id, current, targets, visited):
+                    return "FAILED_BLOCKED", [], current
                 if target not in visited:
                     skipped.append(target)
 
@@ -183,10 +196,10 @@ class PatrolDispatcher:
                 outcome, current = self._visit(
                     engine, client, task_id, robot_id, current, target, visited)
                 if outcome == "aborted":
-                    return "FAILED", []
+                    return "FAILED_ABORTED", [], current
 
             if all(t in visited for t in targets):
-                return "COMPLETED", []
+                return "COMPLETED", [], current
             # 못 간 지점이 남으면 몇 개든 COMPLETED_PARTIAL 이다(문서 E2 23번).
             # 예전엔 '한 곳만 방문했으면 FAILED' 규칙이 있었으나 문서에 근거가 없다.
             # 순찰은 끝까지 돌았고 일부를 못 간 것이지 실패한 것이 아니다 — 그래서
@@ -194,15 +207,15 @@ class PatrolDispatcher:
             # 보고했을 때(aborted)와 막힘 확정 복귀(22-1)에서만 나온다.
             # 순찰 순서(targets)를 지켜 미방문 목록을 만든다(집합 차집합은 순서를 잃는다).
             unvisited = [t for t in targets if t not in visited]
-            return "COMPLETED_PARTIAL", unvisited
+            return "COMPLETED_PARTIAL", unvisited, current
         finally:
-            # 순찰이 끝나면 마지막 자리를 반납한다. 로봇은 아직 거기 서 있으므로 이
-            # 시점부터 교통관제에 안 보인다 — 충전소 복귀가 붙으면 복귀 경로가 자리를
-            # 이어받게 되고, 그때 이 반납은 복귀 도착 지점으로 옮겨가야 한다.
-            engine.release(engine.node_slot(current), robot_id)
+            # 순찰이 끝나도 마지막 자리는 '반납하지 않는다' — 복귀 주행(_return_and_dock)이
+            # 같은 로봇 자격으로 이 자리를 이어받아 도킹 성공 시점에 한 번에 해제한다.
+            # 순찰이 자리를 놓는 찰나에 남이 그 자리로 들어오는 것을 막기 위함이다.
+            # 최종 반납 책임은 호출부(_patrol_job)로 넘어간다: 복귀하면 도킹 후 해제하고,
+            # FAILED 로 끝나면 즉시 반납한다.
             self._log.info(
-                f"순찰 종료 task={task_id} 지점 {current} 자리 반납 "
-                f"(복귀 로직 전까지 이 지점은 교통관제에 비어 보인다)")
+                f"순찰 종료 task={task_id} 지점 {current} 자리 유지 → 복귀에 인계")
 
     def _visit(self, engine, client, task_id, robot_id, current, target, visited):
         """순찰 지점 하나를 방문한다. 반환: (outcome, 도달한 노드).
@@ -224,9 +237,49 @@ class PatrolDispatcher:
             visited.add(target)
         return outcome, current
 
+    # ---------------------------- 막힘 확정 판정(문서 22(b) → 22-1) ---------------------------- #
+    def _stranded_after_block(self, engine, robot_id, current, targets, visited):
+        """current 에서 남은 순찰 지점 어디로도 못 가는가(막힘 확정 판정 → 22-1).
+
+        _visit 이 skipped(우회로도 없음)를 낸 직후 부른다. 남은 미방문 순찰 지점 중 하나라도
+        지금 도달 가능하면 갇힌 게 아니다(문서 22(a): 다른 지점으로 스킵). 전부 도달 불가면
+        갇힌 것이므로 T_block(BLOCK_GIVEUP_SEC) 동안 재시도하며 통로가 풀리길 기다린다
+        (문서 22(b)). 그래도 못 나가면 True → 호출부(run_patrol)가 22-1 복귀로 넘어간다.
+        """
+        deadline = time.monotonic() + BLOCK_GIVEUP_SEC
+        while True:
+            if self._escapable(engine, robot_id, current, targets, visited):
+                return False
+            if time.monotonic() >= deadline:
+                self._log.warn(
+                    f"{robot_id} 위치 {current} 에서 남은 순찰 지점 전부 도달 불가 · "
+                    f"T_block({BLOCK_GIVEUP_SEC}s) 초과 → 막힘 확정(22-1 복귀)")
+                return True
+            time.sleep(RESERVE_POLL_SEC)
+
+    def _escapable(self, engine, robot_id, current, targets, visited):
+        """current 에서 남은 미방문 순찰 지점 중 하나라도 지금 도달 가능한가.
+
+        남이 점유한 통로(reserved_corridors)와 시간 만료 전 블랙리스트를 제외한 그래프로
+        find_path 를 돌려, 미방문 순찰 지점 하나라도 경로가 나오면 True(어디론가는 갈 수 있음).
+        내 예약은 제외한다 — 내가 쥔 자리·통로는 나한테는 막힘이 아니다.
+        """
+        blocked = (engine.reserved_corridors(exclude_robot=robot_id)
+                   | self._blacklist_active())
+        corridors, nodes = self._split_blocked(engine, blocked)
+        for t in targets:
+            if t in visited:
+                continue
+            if engine.find_path(current, t, blocked=corridors,
+                                blocked_nodes=nodes) is not None:
+                return True
+        return False
+
     def _navigate(self, engine, client, task_id, robot_id, current, target,
-                  visited):
+                  visited, capture=True):
         """current→target 까지 '세그먼트 + 룩어헤드'로 이동. 반환: (outcome, 도달한 노드).
+
+        capture=False 면 전 구간 촬영을 끈다(복귀·도킹 이동). 순찰은 기본값 True 그대로.
 
         상태 2개로 움직인다:
           - held: 지금 예약(점유)한 통로들. 하트비트로 유지하며 항상 예약표=현실이 되게 한다.
@@ -272,7 +325,7 @@ class PatrolDispatcher:
                 # 하달 배열은 예약 경로(seg_wps)에 짝을 끼워 넣은 것이라 길이가 다르다.
                 # 예약·진행도 계산은 계속 seg_wps(그래프 노드) 기준으로 한다.
                 hadal, cap_ids, cap_parents = self._build_segment_goal(
-                    seg_wps, visited)
+                    seg_wps, visited, allow_capture=capture)
 
                 # 2) 주행 중 훅 2개: 조기 반납(피드백) + 룩어헤드(다음 구간 선예약).
                 look = {"seg": None}
@@ -381,7 +434,7 @@ class PatrolDispatcher:
             # 자원(held)은 아직 반납 전이라 회전하는 동안 남이 들어오지 못한다.
             if target not in visited:
                 hadal, cap_ids, cap_parents = self._build_segment_goal(
-                    [target], visited)
+                    [target], visited, allow_capture=capture)
                 if cap_ids:
                     self._log.info(
                         f"촬영 미완 지점 {target} 재하달 task={task_id} "
@@ -399,9 +452,39 @@ class PatrolDispatcher:
             self._release_except(engine, robot_id, held, set(), current)
         return "arrived", current
 
+    # ---------------------------- 복귀 주행 진입점(E4 / 22-1) ---------------------------- #
+    def drive_to_point(self, task_id, robot_id, current, target, engine, client):
+        """current→target 을 촬영 없이(전 구간 capture=false) 한 번 주행한다.
+
+        E4(순찰 종료 후 충전소 복귀)와 22-1(막힘 실패 복귀)이 공통으로 쓰는 진입점이다.
+        순찰(run_patrol)이 촬영·방문·sweep 판정에 얽매인 것과 달리, 이건 '한 지점까지 가서
+        선다'만 한다. 속은 순찰과 똑같은 _navigate 라 복귀 주행도 통로를 예약하며 움직인다
+        — 복귀라고 예약 없이 달리면 그게 다른 로봇의 새 막힘 원인이 된다.
+
+        반환: (outcome, 도달한 노드).
+          'arrived' 목표(충전소 진입 노드) 도달 → 다음은 도킹.
+          'skipped' 우회로도 없어 못 감 → 호출부가 22-2(현장 정지)로 넘긴다.
+          'aborted' 로봇이 중단 보고 / Navigate 서버 미기동.
+        visited 는 빈 집합을 넘긴다 — 복귀는 촬영을 하지 않아 방문 개념이 없다.
+        """
+        if not client.wait_for_server(timeout_sec=SERVER_WAIT_SEC):
+            self._log.warn(
+                f"{robot_id} Navigate 서버 미기동 → 복귀 주행 불가 task={task_id}")
+            return "aborted", current
+        self._log.info(
+            f"복귀 주행 시작 task={task_id} {robot_id} {current}→{target}(충전소)")
+        return self._navigate(
+            engine, client, task_id, robot_id, current, target,
+            visited=set(), capture=False)
+
     # ---------------------------- 촬영 판정(문서 E2 20번) ---------------------------- #
-    def _build_segment_goal(self, seg_wps, visited):
+    def _build_segment_goal(self, seg_wps, visited, allow_capture=True):
         """예약 확보한 노드 목록 → (하달 배열, 촬영 대상 id 집합, 촬영 대상 부모 목록).
+
+        allow_capture=False 면 촬영 판정을 통째로 건너뛰고 '전 구간 통과' 배열만 만든다.
+        복귀(E4)·실패 복귀(22-1)·도킹 이동은 촬영이 목적이 아니라 전 구간 capture=false
+        여야 한다(문서 E2 20번: 촬영 판정식은 순찰 정상 경로에만 적용). 이 경로가 아직
+        못 간 순찰 지점을 지나가더라도 찍지 않고 방문 마킹도 하지 않는다 — 짝도 안 끼운다.
 
         촬영 여부는 문서 판정식을 **노드마다** 적용한다:
             capture = (순찰 지점) AND (이번 task 에서 미방문)
@@ -421,6 +504,9 @@ class PatrolDispatcher:
         방문 큐에 넣지 않는다.
         """
         hadal, capture_ids, parents = [], set(), []
+        if not allow_capture:
+            # 복귀·도킹 이동: 전 구간 통과. 촬영 대상도 부모 목록도 비운다.
+            return list(seg_wps), set(), []
         for wp in seg_wps:
             hadal.append(wp)
             meta = self.wp_meta.get(wp, {})
@@ -817,3 +903,104 @@ class PatrolDispatcher:
             return int(res.result_code), int(res.last_waypoint_id)
         except Exception:  # noqa: BLE001
             return 1, None
+
+    # ---------------------------- 도킹 하달(E4-6/7 · 22-1) ---------------------------- #
+    def dock(self, task_id, robot_id, charge_point_id, marker, dock_client,
+             heartbeat=None):
+        """충전소 진입 노드에 도착한 로봇을 정밀 도킹시킨다. 실패 시 N_dock 회 재시도.
+
+        marker: get_dock_marker 결과 dict(마커번호·딕셔너리·칸 구성·크기·도킹 오프셋).
+            None 이면 '도킹 불가'로 즉시 실패 반환한다 — 값도 없는 Goal 을 만들어 로봇이
+            엉뚱하게 움직이지 않게 한다(마커 시드는 도킹 튜닝 후 채워진다).
+        heartbeat=(engine, [cid...], robot_id): 도킹은 마커 탐색~후진까지 수십 초 걸려,
+            결과를 기다리는 동안 로봇이 쥔 자리(충전소 진입 노드) 예약 TTL 이 만료돼 회수
+            되지 않게 갱신한다. 예약 관리는 호출부(오케스트레이션)가 넘겨준다.
+        반환: (success: bool, result_code, message).
+          success=True  → 도킹 성공(다음: 예약 전부 해제, nav_status=IDLE).
+          success=False → N_dock 소진/마커 없음/서버 미기동 → task_failed(DOCK_FAILED).
+        """
+        if marker is None:
+            self._log.warn(
+                f"충전소 {charge_point_id} 마커 미등록 → 도킹 불가 task={task_id}")
+            return False, None, "마커 정보 없음(charuco_boards 미시드)"
+        if not dock_client.wait_for_server(timeout_sec=SERVER_WAIT_SEC):
+            self._log.warn(f"{robot_id} Dock 액션 서버 미기동 task={task_id}")
+            return False, None, "Dock 액션 서버 미기동"
+
+        goal = Dock.Goal()
+        goal.task_id = int(task_id)
+        goal.task_point_id = str(charge_point_id)
+        goal.marker_id = str(marker["marker_id"])
+        goal.dictionary = str(marker["dictionary"])
+        goal.squares_x = int(marker["squares_x"])
+        goal.squares_y = int(marker["squares_y"])
+        goal.square_size_m = float(marker["square_size_m"])
+        goal.marker_size_m = float(marker["marker_size_m"])
+        goal.dock_offset_x = float(marker["dock_offset_x"])
+        goal.dock_offset_y = float(marker["dock_offset_y"])
+        goal.dock_offset_yaw = float(marker["dock_offset_yaw"])
+
+        last_code, last_msg = None, ""
+        for attempt in range(1, DOCK_RETRY_MAX + 1):
+            self._log.info(
+                f"도킹 시도 {attempt}/{DOCK_RETRY_MAX} task={task_id} {robot_id} "
+                f"@ {charge_point_id}")
+            code, msg = self._send_dock_goal(dock_client, goal, task_id, heartbeat)
+            last_code, last_msg = code, msg
+            if code == 0:
+                self._log.info(
+                    f"도킹 성공 task={task_id} {robot_id} @ {charge_point_id}")
+                return True, 0, msg
+            self._log.warn(
+                f"도킹 실패(code={code}) task={task_id} "
+                f"시도 {attempt}/{DOCK_RETRY_MAX}: {msg}")
+        return False, last_code, last_msg
+
+    def _send_dock_goal(self, dock_client, goal, task_id, heartbeat):
+        """Dock Goal 을 한 번 하달하고 결과를 기다린다. 반환: (result_code, message).
+
+        Goal 거부/수락 타임아웃은 (1, ...) 로 취급한다 — 마커 미검출(1)과 같은 '재시도
+        가능' 등급으로 묶어 상위 재시도 루프가 다시 시도하게 한다.
+        """
+        def _fb(msg):
+            """ROS executor 스레드 — 도킹 단계(phase) 등을 로그로만 남긴다."""
+            try:
+                fb = msg.feedback
+                self._log.debug(
+                    f"도킹 진행 task={task_id} phase={fb.phase} "
+                    f"marker={fb.marker_detected} dist={fb.distance_to_marker_m:.2f}m")
+            except Exception as exc:  # noqa: BLE001
+                self._log.warn(f"도킹 피드백 처리 예외(무시): {exc}")
+
+        goal_handle = _spin_wait(
+            dock_client.send_goal_async(goal, feedback_callback=_fb),
+            GOAL_ACCEPT_TIMEOUT_SEC)
+        if goal_handle is None or not goal_handle.accepted:
+            self._log.warn(f"Dock Goal 거부/수락 타임아웃 task={task_id}")
+            return 1, "Dock Goal 거부/수락 타임아웃"
+        return self._await_dock_result(goal_handle.get_result_async(), heartbeat)
+
+    def _await_dock_result(self, result_future, heartbeat):
+        """도킹 결과 대기. 대기 중 HEARTBEAT_SEC 마다 쥔 자리 예약을 갱신한다.
+
+        주행(_await_result)과 달리 룩어헤드가 없고 타임아웃이 DOCK_RESULT_TIMEOUT_SEC 다.
+        Dock Result 는 (result_code, message) 만 꺼낸다 — 오차 축(final_*)은 로봇이 판정·
+        기록하는 값이라 ACS 의 재시도 판정에는 result_code 로 충분하다.
+        반환: (result_code, message). 타임아웃/파싱 실패는 (1, ...).
+        """
+        done = threading.Event()
+        result_future.add_done_callback(lambda _f: done.set())
+        deadline = time.monotonic() + DOCK_RESULT_TIMEOUT_SEC
+        while not done.wait(HEARTBEAT_SEC):
+            if heartbeat is not None:
+                engine, cids, robot_id = heartbeat
+                for cid in cids:
+                    engine.heartbeat(cid, robot_id)
+            if time.monotonic() >= deadline:
+                self._log.warn("도킹 결과 대기 타임아웃 → 실패 취급")
+                return 1, "도킹 결과 대기 타임아웃"
+        try:
+            res = result_future.result().result
+            return int(res.result_code), str(res.message)
+        except Exception:  # noqa: BLE001
+            return 1, "도킹 결과 파싱 실패"
