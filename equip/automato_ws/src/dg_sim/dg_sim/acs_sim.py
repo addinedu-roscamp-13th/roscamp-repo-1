@@ -27,7 +27,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from automato_interfaces.action import Navigate
+from automato_interfaces.action import Dock, Navigate
 from automato_interfaces.msg import RobotTelemetry, Waypoint
 from automato_interfaces.srv import SaveDetection
 from std_srvs.srv import Trigger
@@ -44,8 +44,14 @@ class AcsSim(Node):
         self.declare_parameter('robot_id', 'dg_01')
         self.declare_parameter('auto_start', True)
         self.declare_parameter('auto_delay', 3.0)
+        # auto_start 시 실행할 시나리오: 'patrol'(S1) | 'harvest'(S2 E2 이동+도킹)
+        self.declare_parameter('scenario', 'patrol')
         self.declare_parameter('num_waypoints', 6)   # 경로 전체 노드 수
         self.declare_parameter('seg_size', 3)        # 한 번에 하달할 구간 크기(예약 흉내)
+        # S2 E2 수확 이동 파라미터
+        self.declare_parameter('harvest_waypoints', 4)
+        self.declare_parameter('harvest_seg', 2)
+        self.declare_parameter('dock_point', 'HARVEST_01')
         self.robot_id = self.get_parameter('robot_id').value
         self._cb = ReentrantCallbackGroup()
         self._task_seq = 1024
@@ -59,6 +65,14 @@ class AcsSim(Node):
         self.last_waypoint_id = -1  # 마지막 구간 result의 last_waypoint_id(검증용)
         self.capture_ids = []      # 이번 순찰의 촬영 지점(capture=true) 목록(검증용)
 
+        # S2 E2 수확 이동 상태: 수확 위치까지 capture=false 로 이동 → 도착 후 Dock 하달
+        self._harvest = None            # {'task_id','wps','seg','seg_size','dock_point'}
+        self.harvest_move_done = False  # 수확 이동(주행) 완료 여부(검증용)
+        self.dock_done = False          # 도킹 result 수신 여부(검증용)
+        self.last_dock_result = None    # 마지막 Dock.Result(검증용)
+        self.dock_feedback_phases = []  # 도킹 중 받은 phase 목록(중계 확인용)
+        self._dock_gh = None            # 진행 중 Dock goal handle(취소 테스트용)
+
         # E0 RobotTelemetry 구독 — DG 는 자기 세트분만 /{robot_id}/telemetry 로 보낸다
         self.create_subscription(
             RobotTelemetry, '/%s/telemetry' % self.robot_id,
@@ -68,6 +82,10 @@ class AcsSim(Node):
         self._navigate_cli = ActionClient(
             self, Navigate, '/%s/navigate' % self.robot_id, callback_group=self._cb)
 
+        # S2 E2 Dock 액션 클라이언트 (수확 위치 도착 후 정밀 도킹 하달)
+        self._dock_cli = ActionClient(
+            self, Dock, '/%s/dock' % self.robot_id, callback_group=self._cb)
+
         # E2 SaveDetection 서비스 서버
         self.create_service(
             SaveDetection, '/automato/save_detection',
@@ -76,9 +94,14 @@ class AcsSim(Node):
         # 수동 트리거
         self.create_service(
             Trigger, '/acs_sim/start_patrol', self._on_trigger, callback_group=self._cb)
+        # S2 E2 수확 이동+도킹 트리거
+        self.create_service(
+            Trigger, '/acs_sim/start_harvest', self._on_trigger_harvest, callback_group=self._cb)
 
-        self.get_logger().info('ACS 시뮬 시작: Navigate클라 /%s/navigate, SaveDetection서버, Telemetry구독'
-                               % self.robot_id)
+        self.get_logger().info(
+            'ACS 시뮬 시작: Navigate클라·Dock클라 /%s/{navigate,dock}, SaveDetection서버, '
+            'Telemetry구독 | scenario=%s'
+            % (self.robot_id, self.get_parameter('scenario').value))
 
         if self.get_parameter('auto_start').value:
             delay = float(self.get_parameter('auto_delay').value)
@@ -130,12 +153,32 @@ class AcsSim(Node):
         # 타이머는 1회만 쓰기 위해 즉시 취소
         for t in list(self.timers):
             t.cancel()
-        self.send_patrol()
+        if self.get_parameter('scenario').value == 'harvest':
+            self.send_harvest_move(
+                num_waypoints=int(self.get_parameter('harvest_waypoints').value),
+                seg_size=int(self.get_parameter('harvest_seg').value),
+                dock_point=self.get_parameter('dock_point').value)
+        else:
+            self.send_patrol()
 
     def _on_trigger(self, request, response):
         task_id = self.send_patrol()
         response.success = True
         response.message = '순찰 발행 task_id=%d' % task_id
+        return response
+
+    def _on_trigger_harvest(self, request, response):
+        """S2 E2: 수확 위치 이동(전 구간 capture=false) → 도착 후 도킹까지 한 번에 발행."""
+        task_id = self.send_harvest_move(
+            num_waypoints=int(self.get_parameter('harvest_waypoints').value),
+            seg_size=int(self.get_parameter('harvest_seg').value),
+            dock_point=self.get_parameter('dock_point').value)
+        if task_id is None:
+            response.success = False
+            response.message = 'ROBOT_BUSY 또는 서버 없음 — 수확 이동 발행 실패'
+        else:
+            response.success = True
+            response.message = '수확 이동+도킹 발행 task_id=%d' % task_id
         return response
 
     def send_patrol(self, num_waypoints=None, seg_size=None):
@@ -222,6 +265,138 @@ class AcsSim(Node):
             self.get_logger().info('순찰 완료: task=%d last_wp=%d code=%d'
                                    % (p['task_id'], res.last_waypoint_id, res.result_code))
             self._patrol = None
+
+    # ---- S2 E2 수확 이동 → 도킹 (Navigate 전 구간 capture=false → 도착 후 Dock) ----
+    def send_harvest_move(self, num_waypoints=4, seg_size=2, dock_point='HARVEST_01'):
+        """수확 위치까지 이동한 뒤 도킹까지 이어서 하달한다(시나리오 2 E2).
+
+        순찰과 다른 점은 두 가지다: (1) 전 구간 capture=false — 이동 중 촬영·분석이 없다,
+        (2) 마지막 구간 도착 후 Dock 을 하달한다. 실제 ACS 는 task_points 의 수확 위치와
+        charuco_boards 의 마커 정보를 DB 에서 조회해 채운다. 여기서는 고정값으로 흉내낸다."""
+        if self._harvest is not None or self._patrol is not None:
+            self.get_logger().warn('ROBOT_BUSY — 진행 중 task 있음, 수확 이동 발행 안 함')
+            return None
+        if not self._navigate_cli.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('DCS Navigate 서버 없음 — 발행 취소')
+            return None
+        self._task_seq += 1
+        task_id = self._task_seq
+        wps = []
+        for i in range(num_waypoints):
+            wp = Waypoint()
+            wp.waypoint_id = i
+            wp.x = float(i + 1)
+            wp.y = float(i + 1) * 0.5
+            wp.capture = False        # 수확 이동은 전 구간 촬영 없음
+            wps.append(wp)
+        self._harvest = {'task_id': task_id, 'wps': wps, 'seg': 0,
+                         'seg_size': max(1, seg_size), 'dock_point': dock_point}
+        self.harvest_move_done = False
+        self.dock_done = False
+        self.last_dock_result = None
+        self.dock_feedback_phases = []
+        self._dock_gh = None
+        self.get_logger().info('수확 이동 시작: task=%d waypoints=%d (전 구간 capture=false)'
+                               % (task_id, num_waypoints))
+        self._send_next_harvest_segment()
+        return task_id
+
+    def _send_next_harvest_segment(self):
+        h = self._harvest
+        if h is None:
+            return
+        start = h['seg'] * h['seg_size']
+        seg = h['wps'][start:start + h['seg_size']]
+        if not seg:
+            return
+        goal = Navigate.Goal(task_id=h['task_id'], waypoints=seg)
+        self.get_logger().info('수확 이동 구간 하달: task=%d waypoints=%s'
+                               % (h['task_id'], [w.waypoint_id for w in seg]))
+        fut = self._navigate_cli.send_goal_async(goal, feedback_callback=self._on_navigate_fb)
+        fut.add_done_callback(self._on_harvest_nav_goal_response)
+
+    def _on_harvest_nav_goal_response(self, future):
+        gh = future.result()
+        if not gh.accepted:
+            self.get_logger().error('DCS가 수확 이동 Navigate goal 거부')
+            self._harvest = None
+            return
+        gh.get_result_async().add_done_callback(self._on_harvest_nav_result)
+
+    def _on_harvest_nav_result(self, future):
+        res = future.result().result
+        self.last_result = res
+        self.last_waypoint_id = res.last_waypoint_id
+        h = self._harvest
+        if h is None:
+            return
+        self.get_logger().info('수확 이동 구간 결과: code=%d last_wp=%d'
+                               % (res.result_code, res.last_waypoint_id))
+        if res.result_code != 0:
+            # 이동 실패/중단 → 도킹으로 넘어가지 않는다(실제 ACS 는 실패 처리·충전소 복귀).
+            self.harvest_move_done = True
+            self._harvest = None
+            return
+        h['seg'] += 1
+        remaining = len(h['wps']) - h['seg'] * h['seg_size']
+        if remaining > 0:
+            self._send_next_harvest_segment()
+        else:
+            # 수확 위치 도착 → Dock 하달 (E2 6~7). 주행 성공 이후에만 도킹한다.
+            self.harvest_move_done = True
+            self._send_dock(h['task_id'], h['dock_point'])
+
+    def _send_dock(self, task_id, task_point_id):
+        if not self._dock_cli.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('DCS Dock 서버 없음 — 도킹 취소')
+            self._harvest = None
+            return
+        goal = Dock.Goal()
+        goal.task_id = task_id
+        goal.task_point_id = task_point_id
+        # 마커(ChArUco 보드) 정보 — 실제 ACS 는 DB(charuco_boards)에서 조회해 채운다.
+        goal.marker_id = '23'
+        goal.dictionary = 'DICT_5X5_1000'
+        goal.squares_x = 6
+        goal.squares_y = 5
+        goal.square_size_m = 0.024
+        goal.marker_size_m = 0.018
+        goal.dock_offset_x = 0.0
+        goal.dock_offset_y = 0.0
+        goal.dock_offset_yaw = 0.0
+        self.get_logger().info('도킹 하달: task=%d point=%s' % (task_id, task_point_id))
+        fut = self._dock_cli.send_goal_async(goal, feedback_callback=self._on_dock_fb)
+        fut.add_done_callback(self._on_dock_goal_response)
+
+    def _on_dock_goal_response(self, future):
+        gh = future.result()
+        if not gh.accepted:
+            self.get_logger().error('DCS가 Dock goal 거부')
+            self._harvest = None
+            return
+        self._dock_gh = gh
+        gh.get_result_async().add_done_callback(self._on_dock_result)
+
+    def _on_dock_fb(self, feedback_msg):
+        fb = feedback_msg.feedback
+        self.dock_feedback_phases.append(fb.phase)
+        self.get_logger().info('도킹 진행: phase=%s marker=%s dist=%.2fm'
+                               % (fb.phase, fb.marker_detected, fb.distance_to_marker_m))
+
+    def _on_dock_result(self, future):
+        res = future.result().result
+        self.last_dock_result = res
+        self.dock_done = True
+        self.get_logger().info('도킹 결과: code=%d lateral=%.3fm yaw=%.3frad msg=%s'
+                               % (res.result_code, res.final_lateral_m,
+                                  res.final_yaw_error, res.message))
+        self._harvest = None
+
+    def cancel_dock(self):
+        """진행 중인 Dock goal 을 취소한다(E2 22-1 취소 전파 검증용)."""
+        if self._dock_gh is not None:
+            self.get_logger().warn('ACS 도킹 취소 요청')
+            self._dock_gh.cancel_goal_async()
 
 
 def main(args=None):

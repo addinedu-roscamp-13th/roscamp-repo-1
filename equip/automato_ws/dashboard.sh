@@ -8,7 +8,9 @@
 #   ./dashboard.sh down          # 전부 종료
 #   ./dashboard.sh status        # 상태 확인
 #   ./dashboard.sh restart       # 재기동
-#   ./dashboard.sh dock          # E4 도킹 goal 하달 (ACS 역할: /{ROBOT_ID}/dock)
+#   ./dashboard.sh test          # S1 순찰 1회 (ACS: /acs_sim/start_patrol)
+#   ./dashboard.sh harvest       # S2 E2 수확 이동+도킹 1회 (ACS: /acs_sim/start_harvest)
+#   ./dashboard.sh dock          # E4 도킹 goal 단발 하달 (ACS 역할: /{ROBOT_ID}/dock)
 #   ./dashboard.sh stop  <노드>  # 특정 노드만 내림  (dcs|acs|ddago|ddagi|dg_ai|rosbridge|web)
 #   ./dashboard.sh start <노드>  # 특정 노드만 올림
 #
@@ -130,6 +132,15 @@ run_test() {
   bash -c "$SRC; ros2 service call /acs_sim/start_patrol std_srvs/srv/Trigger" 2>&1
 }
 
+# S2 E2 수확 이동+도킹 1회 실행 (acs_sim 의 start_harvest 서비스 호출).
+#   ACS: 수확 위치까지 전 구간 capture=false 로 주행 → 도착 후 Dock 하달
+#        → DCS 가 /{ROBOT_ID}/{navigate,dock} 중계 → DdaGo 시뮬이 응답.
+# 도킹 실패를 보려면 먼저 DdaGo 시뮬 모드를 바꾼다(성공 복귀는 dock_mode:=success):
+#   ros2 param set /ddago_sim dock_mode no_marker   # 또는 error_exceeded / hang
+run_harvest() {
+  bash -c "$SRC; ros2 service call /acs_sim/start_harvest std_srvs/srv/Trigger" 2>&1
+}
+
 # E0 상시 모니터링: 시뮬 텔레메트리 발행 시작(상시)/중지.
 run_telemetry() {
   bash -c "$SRC; ros2 service call /ddago_sim/start_telemetry std_srvs/srv/Trigger; ros2 service call /ddagi_sim/start_telemetry std_srvs/srv/Trigger" 2>&1
@@ -152,9 +163,9 @@ run_dock() {
 # 최근 흐름 로그(분석→저장→순찰결과)만 추려 출력.
 logs() {
   echo "== DCS =="
-  grep -hE '순찰 경로 수신|DdaGo 하달|분석결과|구간 결과 전달|도킹 지시 수신|도킹 하달|도킹 종료|도킹 결과 전달' /tmp/dash_dcs.log 2>/dev/null | tail -12
+  grep -hE '경로 수신|순찰 경로 수신|DdaGo 하달|분석결과|구간 결과 전달|도킹 지시 수신|도킹 하달|도킹 종료|도킹 결과 전달|E3 진입 가능' /tmp/dash_dcs.log 2>/dev/null | tail -12
   echo "== ACS =="
-  grep -hE '순찰 시작|구간 하달|SaveDetection 저장|구간 결과|순찰 완료|Fleet 수신' /tmp/dash_acs.log 2>/dev/null | tail -12
+  grep -hE '순찰 시작|수확 이동 시작|구간 하달|수확 이동 구간|SaveDetection 저장|구간 결과|순찰 완료|도킹 하달|도킹 진행|도킹 결과|Fleet 수신' /tmp/dash_acs.log 2>/dev/null | tail -12
 }
 
 case "${1:-}" in
@@ -165,9 +176,10 @@ case "${1:-}" in
   status)  status ;;
   restart) down; sleep 1; up "${2:-}" ;;
   test)           run_test ;;
+  harvest)        run_harvest ;;
   telemetry)      run_telemetry ;;
   telemetry-stop) run_telemetry_stop ;;
   dock)           run_dock ;;
   logs)           logs ;;
-  *) echo "usage: $0 {up [--no-sim]|down|status|restart [--no-sim]|test|dock|telemetry|telemetry-stop|logs|stop <node>|start <node>}  # node: dcs|acs|ddago|ddagi|dg_ai|rosbridge|web"; exit 1 ;;
+  *) echo "usage: $0 {up [--no-sim]|down|status|restart [--no-sim]|test|harvest|dock|telemetry|telemetry-stop|logs|stop <node>|start <node>}  # node: dcs|acs|ddago|ddagi|dg_ai|rosbridge|web"; exit 1 ;;
 esac

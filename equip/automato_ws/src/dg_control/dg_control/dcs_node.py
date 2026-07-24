@@ -13,6 +13,9 @@
   E4-6/E2 22-1 정밀 도킹(중계):
     - 액션 서버      /{robot_id}/dock            (Dock) ← Automato Control Service
     - 액션 클라이언트 /ddago/dock                 (Dock) → DdaGo Control Service
+  S2 E2→E3 핸드오프(상태만):
+    - 수확 위치 도킹 성공(result_code==0)한 task 만 E3 진입 허용 → is_docked() 로 노출.
+      새 주행이 시작되면(도크에서 떠남) 해제한다. Harvest 액션 서버(RP-99)가 이 게이트를 읽는다.
   E2 촬영·분석·저장:
     - 서비스 서버    /dg/analyze_frame           (AnalyzeFrame) ← DdaGo (capture 노드 도착 후)
     - TCP 클라이언트  DG AI Service               (4B len+JSON)  → 분석 위임
@@ -170,6 +173,16 @@ class DcsNode(Node):
         # (ACS 가 겹쳐 하달하는 비정상 상황에서도 순서를 지키도록 DCS 에서 직렬화한다.)
         self._ddago_lock = threading.Lock()
 
+        # ---- S2 E2→E3 핸드오프 게이트 ----
+        # 수확 위치에 **도킹이 성공한 task 만** E3(수확 대상 인식)로 진입할 수 있다.
+        # 팔이 잘못된 위치에서 동작하는 것을 막는 안전 조건이다(도킹 실패/취소면 진입 금지).
+        # 이 값은 Harvest 액션 서버(RP-99)가 goal 수락 여부를 판정할 때 is_docked() 로 읽는다.
+        # DCS 는 상태만 관리하고, 실제 Harvest 서버는 RP-99 범위다.
+        #   set   : Dock result_code==0 (취소 아님) 일 때 그 task_id
+        #   clear : 새 주행(Navigate)이 시작되면 — 로봇이 도크에서 떠났다는 뜻
+        self._docked_lock = threading.Lock()
+        self._docked_task = None
+
         # ---- AI Service 접속 감시 ----
         # AiTcpClient 는 첫 분석 요청 때 붙는(lazy) 구조라, 순찰을 돌리기 전에는
         # 실서버/시뮬 어디에 붙는지 알 수 없었다. 기동 직후 한 번 실제로 붙어보고
@@ -251,6 +264,26 @@ class DcsNode(Node):
                 return str(v)
         return conv(msg)
 
+    # ===== S2 E2→E3 핸드오프 게이트 (도킹 성공 task 만 수확 진입 허용) =====
+    def _mark_docked(self, task_id):
+        """수확 위치 도킹 성공 → 이 task 를 E3 진입 가능 상태로 보관."""
+        with self._docked_lock:
+            self._docked_task = int(task_id)
+        self.get_logger().info('E3 진입 가능(도킹 성공): task=%d' % int(task_id))
+
+    def _clear_docked(self, reason=''):
+        """도크에서 떠남(새 주행 시작) → 진입 가능 상태 해제."""
+        with self._docked_lock:
+            prev = self._docked_task
+            self._docked_task = None
+        if prev is not None:
+            self.get_logger().info('E3 진입 가능 해제: task=%s (%s)' % (prev, reason))
+
+    def is_docked(self, task_id):
+        """이 task 가 수확 위치에 도킹된 상태인가(=E3 진입 허용). Harvest 서버(RP-99)가 읽는다."""
+        with self._docked_lock:
+            return self._docked_task == int(task_id)
+
     # ============================ E0 텔레메트리 ============================
     # ddago/ddagi 연동에는 robot_id 가 없다(물리망이 로봇별로 분리되어 DG 는 자기 세트의
     # 것만 받는다). 메시지에 robot_id 필드가 있어도 읽지 않는다 — 어느 로봇인지는 DG 자신이
@@ -290,9 +323,16 @@ class DcsNode(Node):
         req = goal_handle.request
         wps = list(req.waypoints)
         task_id = req.task_id
+        # 경로 하달은 순찰·수확 이동 공용이다(같은 Navigate 인터페이스). DCS 는 goal 만으로
+        # 둘을 구분하지 않는다 — 촬영·AI 분석 분기는 capture==true 노드에 도착한 DdaGo 가
+        # AnalyzeFrame 을 호출할 때만 일어나므로, 수확 이동(전 구간 capture=false)은
+        # 자연히 분석 경로를 타지 않는다. 여기서 capture 목록을 로그로 남겨 그 사실을 드러낸다.
+        cap = [w.waypoint_id for w in wps if w.capture]
         self.get_logger().info(
-            '순찰 경로 수신(ACS→DCS): task=%d waypoints=%d capture=%s'
-            % (task_id, len(wps), [w.waypoint_id for w in wps if w.capture]))
+            '경로 수신(ACS→DCS): task=%d waypoints=%d capture=%s'
+            % (task_id, len(wps), cap if cap else '없음(이동만)'))
+        # 새 주행이 시작되면 로봇이 도크에서 떠난 것이므로 E3 진입 게이트를 닫는다.
+        self._clear_docked('새 주행 시작 task=%d' % task_id)
         self._wire('to_dcs', 'Navigate', self._msg_to_dict(req))
 
         code, last_wp, msg = self._drive_ddago(task_id, wps, goal_handle)
@@ -415,6 +455,8 @@ class DcsNode(Node):
             goal_handle.canceled()
         elif result.result_code == 0:
             goal_handle.succeed()
+            # 도킹 성공한 task 만 E3(수확) 진입을 허용한다(취소/실패면 게이트 안 열림).
+            self._mark_docked(req.task_id)
         else:
             goal_handle.abort()
 
