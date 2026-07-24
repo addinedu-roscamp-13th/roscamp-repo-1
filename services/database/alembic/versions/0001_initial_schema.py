@@ -10,7 +10,8 @@ MySQL 표기 -> PostgreSQL 변환:
 ERD v33(시나리오 2 설계) 반영 — RP-88:
   - task_paths 테이블 폐기(삭제). 경로는 실행 중 재계획되는 휘발성 데이터라
     ACS 메모리에서 관리하고, DB에는 요청(tasks)과 결과만 영속화한다.
-  - aruco_markers 테이블 신설. 정밀 도킹용 ArUco 마커/도킹 오프셋(task_points 1:1).
+  - charuco_boards 테이블 신설. 정밀 도킹용 ChArUco 보드/도킹 오프셋(task_points 1:1).
+    단일 ArUco 가 아니라 보드를 쓰므로 보드 구성(squares_x/y, square_size_m)까지 담는다.
   - robots.charge_point_id (FK -> task_points, NULLABLE) 추가. 로봇별 전용 충전소.
   - task_points.point_type (ENUM HARVEST/PRECOOL/CHARGE) 추가. 작업 위치 종류.
   - task_points 의 좌표(x/y/yaw) -> waypoint_id (FK -> waypoints, UNIQUE) 로 교체.
@@ -51,14 +52,14 @@ _UPDATED_AT_TABLES = [
     "harvest_batches",
     "operation_battery_thresholds",
     "corridors",
-    "aruco_markers",
+    "charuco_boards",
 ]
 
 # downgrade 시 FK 자식 -> 부모 역순으로 DROP
-# (aruco_markers, robots 모두 task_points 를 참조하므로 task_points 보다 먼저 지운다)
+# (charuco_boards, robots 모두 task_points 를 참조하므로 task_points 보다 먼저 지운다)
 _DROP_ORDER = [
     "corridors",
-    "aruco_markers",
+    "charuco_boards",
     "task_assignment_snapshot",
     "event_logs",
     "unload_logs",
@@ -264,22 +265,36 @@ def upgrade() -> None:
         """
     )
 
-    # 4-2) aruco_markers — 정밀 도킹용 마커 (task_points 참조) -----------
-    #   marker_id 는 실제 인쇄된 마커에 새겨진 값(자연키)이라 IDENTITY 를 쓰지 않는다.
-    #   task_point_id UNIQUE — 작업 위치 1곳당 마커 1개.
+    # 4-2) charuco_boards — 정밀 도킹용 ChArUco 보드 (task_points 참조) ---
+    #   단일 ArUco 가 아니라 ChArUco(체스판에 마커를 심은 보드)를 쓴다. 자세를 마커
+    #   네 귀퉁이가 아니라 체스판 코너에서 얻어 서브픽셀 정밀도가 나오고, 접붙임 직전
+    #   보드가 잘려도 남은 코너로 계산된다. 그래서 마커 크기만이 아니라 보드 구성
+    #   (칸수·칸 크기)까지 저장해야 검출기가 보드 모델을 만들 수 있다.
+    #   marker_id 는 보드가 점유하는 마커 ID 범위의 '시작 번호'(자연키)라 IDENTITY 를
+    #   쓰지 않는다. 보드 1장이 floor(squares_x*squares_y/2) 개를 연속 점유한다.
+    #   task_point_id UNIQUE — 작업 위치 1곳당 보드 1장.
     op.execute(
         """
-        CREATE TABLE aruco_markers (
-            marker_id       VARCHAR(50) PRIMARY KEY,
+        CREATE TABLE charuco_boards (
+            marker_id       VARCHAR(20) PRIMARY KEY,
             task_point_id   VARCHAR(50) NOT NULL UNIQUE
                             REFERENCES task_points(task_point_id),
-            dictionary      VARCHAR(30) NOT NULL DEFAULT 'DICT_4X4_50',
+            dictionary      VARCHAR(30) NOT NULL DEFAULT 'DICT_5X5_1000',
+            squares_x       INTEGER NOT NULL,
+            squares_y       INTEGER NOT NULL,
+            square_size_m   DOUBLE PRECISION NOT NULL,
             marker_size_m   DOUBLE PRECISION NOT NULL,
             dock_offset_x   DOUBLE PRECISION NOT NULL,
             dock_offset_y   DOUBLE PRECISION NOT NULL,
             dock_offset_yaw DOUBLE PRECISION NOT NULL,
             created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-            updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            -- 마커는 체스판 칸 안에 인쇄되므로 물리적으로 항상 칸보다 작다.
+            -- 뒤집어 넣어도 검출은 되고 거리 추정만 조용히 틀어져서 제약으로 막는다.
+            CONSTRAINT ck_charuco_marker_smaller
+                CHECK (marker_size_m < square_size_m),
+            CONSTRAINT ck_charuco_board_min_size
+                CHECK (squares_x >= 3 AND squares_y >= 3)
         );
         """
     )
