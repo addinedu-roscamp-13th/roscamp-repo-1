@@ -15,12 +15,15 @@
         - 실제 도킹 기동(마커 탐색→중심선 정렬→접근→180도 회전→후진)은 하지 않는다.
           phase 를 순서대로 흘려보내 **DCS 의 중계**(feedback·result·cancel)를 검증한다.
         - 취소 요청 시 그 자리에서 CANCELED + result_code=3
+        - dock_mode 로 실패를 주입한다: success(0) / no_marker(1) / error_exceeded(2) /
+          hang(무응답 → DCS timeout). 테스트가 self.dock_mode 를 바꿔 4종을 검증한다.
 """
 import os
 import threading
 import time
 
 import rclpy
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.action import ActionServer, CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -50,9 +53,17 @@ class DdagoSim(Node):
             'image_path',
             '/home/ane/dev_ws/test_data/sample_frame.jpg')
         self.declare_parameter('image_max_width', 256)   # 원본 축소 최대 폭(px)
+        # 도킹 결과 시뮬 모드. DCS 중계가 성공/실패/무응답/취소를 모두 그대로 올리는지
+        # 검증하기 위한 스위치. 테스트는 인스턴스 속성 self.dock_mode 를 직접 바꿔 케이스별로
+        # 재사용한다(하나의 sim 노드로 4종 검증). 값: success/no_marker/error_exceeded/hang
+        self.declare_parameter('dock_mode', 'success')
         self.robot_id = self.get_parameter('robot_id').value
         self.move_delay = float(self.get_parameter('move_delay').value)
         self.burst_sec = float(self.get_parameter('burst_sec').value)
+        self.dock_mode = self.get_parameter('dock_mode').value
+        # 라이브에서 `ros2 param set /ddago_sim dock_mode no_marker` 로 실패를 주입할 수 있게
+        # 파라미터 변경을 self.dock_mode 에 반영한다(테스트는 속성을 직접 바꾼다).
+        self.add_on_set_parameters_callback(self._on_set_params)
         self._cb = ReentrantCallbackGroup()
         self._frames = self._load_frames()   # [(name, Image), ...] waypoint별 프레임
 
@@ -86,7 +97,21 @@ class DdagoSim(Node):
         self._analyze_cli = self.create_client(
             AnalyzeFrame, '/dg/analyze_frame', callback_group=self._cb)
 
-        self.get_logger().info('DdaGo 시뮬 시작: /ddago/{telemetry,navigate,dock}')
+        self.get_logger().info('DdaGo 시뮬 시작: /ddago/{telemetry,navigate,dock} (dock_mode=%s)'
+                               % self.dock_mode)
+
+    VALID_DOCK_MODES = ('success', 'no_marker', 'error_exceeded', 'hang')
+
+    def _on_set_params(self, params):
+        for p in params:
+            if p.name == 'dock_mode':
+                if p.value not in self.VALID_DOCK_MODES:
+                    return SetParametersResult(
+                        successful=False,
+                        reason='dock_mode 는 %s 중 하나' % ', '.join(self.VALID_DOCK_MODES))
+                self.dock_mode = p.value
+                self.get_logger().info('dock_mode 변경 → %s' % p.value)
+        return SetParametersResult(successful=True)
 
     # ---- E0 텔레메트리 (실행 트리거 시에만) ----
     def _on_start_tel(self, request, response):
@@ -188,10 +213,35 @@ class DdagoSim(Node):
 
     def _dock_execute(self, goal_handle):
         req = goal_handle.request
+        mode = self.dock_mode      # 실행 시점의 모드(테스트가 케이스마다 바꾼다)
         self.get_logger().info(
-            '도킹 goal 수신: task=%d point=%s marker=%s %dx%d sq=%.3f mk=%.3f'
+            '도킹 goal 수신: task=%d point=%s marker=%s %dx%d sq=%.3f mk=%.3f mode=%s'
             % (req.task_id, req.task_point_id, req.marker_id,
-               req.squares_x, req.squares_y, req.square_size_m, req.marker_size_m))
+               req.squares_x, req.squares_y, req.square_size_m, req.marker_size_m, mode))
+
+        # hang: 결과를 돌려주지 않는다 → DCS 의 dock_result_timeout 검증용.
+        # 취소/종료 시 빠져나오도록 유계 루프로 대기(테스트 teardown 안전).
+        if mode == 'hang':
+            self.get_logger().warn('도킹 무응답 시뮬(hang) — 결과 반환 지연')
+            waited = 0.0
+            while rclpy.ok() and not goal_handle.is_cancel_requested and waited < 4.0:
+                time.sleep(0.1)
+                waited += 0.1
+            r = Dock.Result()
+            r.result_code = 3
+            r.message = 'hang 종료'
+            # 종료(shutdown) 중이면 서버가 이미 내려가 상태 전이가 예외를 던진다 → 건드리지 않는다.
+            if not rclpy.ok():
+                return r
+            try:
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                    r.message = 'hang 취소'
+                else:
+                    goal_handle.abort()
+            except Exception:   # noqa: BLE001 — teardown 경합 시 무시
+                pass
+            return r
 
         per = self.move_delay / len(self.DOCK_PHASES) if self.move_delay > 0 else 0.0
         for phase, dist, seen in self.DOCK_PHASES:
@@ -209,6 +259,26 @@ class DdagoSim(Node):
             goal_handle.publish_feedback(fb)
             if per > 0:
                 time.sleep(per)
+            # no_marker: 탐색 단계에서 마커를 못 찾고 실패(code 1)
+            if mode == 'no_marker' and phase == 'SEARCHING':
+                self.get_logger().warn('마커 미검출 시뮬 → code=1')
+                goal_handle.abort()
+                r = Dock.Result()
+                r.result_code = 1
+                r.message = '마커 미검출(시뮬)'
+                return r
+
+        # error_exceeded: 기동은 끝났지만 정차 오차가 기준을 초과(code 2)
+        if mode == 'error_exceeded':
+            self.get_logger().warn('정차 오차 초과 시뮬 → code=2')
+            goal_handle.abort()
+            r = Dock.Result()
+            r.result_code = 2
+            r.final_lateral_m = 0.085     # 목표(예: 2cm) 크게 초과
+            r.final_yaw_error = 0.20
+            r.final_error_m = abs(r.final_lateral_m)
+            r.message = '정차 오차 초과(시뮬)'
+            return r
 
         r = Dock.Result()
         r.result_code = 0

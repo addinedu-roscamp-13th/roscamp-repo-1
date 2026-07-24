@@ -115,3 +115,131 @@ def test_fleet_telemetry(system):
     assert acs.last_fleet is not None
     assert len(acs.last_fleet.ddagos) >= 1, 'ddago 텔레메트리 취합 안 됨'
     assert len(acs.last_fleet.ddagis) >= 1, 'ddagi 텔레메트리 취합 안 됨'
+
+
+# ============================ S2 E2 수확 이동 + 도킹 ============================
+HARVEST_WP = 4     # 수확 위치까지 노드 수
+HARVEST_SEG = 2    # 구간 크기 → 2회에 나눠 하달
+
+
+def _wait(cond, timeout=20.0, step=0.1):
+    deadline = time.time() + timeout
+    while time.time() < deadline and not cond():
+        time.sleep(step)
+    return cond()
+
+
+def test_harvest_move_and_dock(system):
+    """S2 E2: 수확 위치까지 이동(전 구간 capture=false) → 도착 후 도킹 → 성공.
+
+    - 이동 중 촬영·분석이 전혀 없어야 한다(capture=false → AnalyzeFrame 미호출).
+    - Dock feedback(phase)·result(오차 축별 값)가 DCS 를 거쳐 그대로 ACS 로 올라온다.
+    - 도킹 성공 시에만 DCS 의 E3 진입 게이트(is_docked)가 열린다.
+    """
+    acs, dcs = system['acs'], system['dcs']
+    task_id = acs.send_harvest_move(num_waypoints=HARVEST_WP, seg_size=HARVEST_SEG)
+    assert task_id is not None
+
+    assert _wait(lambda: acs.dock_done), '도킹 결과 미수신'
+
+    # 이동은 끝났고 도킹은 성공(code 0)
+    assert acs.harvest_move_done
+    assert acs.last_dock_result is not None
+    assert acs.last_dock_result.result_code == 0, acs.last_dock_result.message
+
+    # 수확 이동은 촬영이 없다 → 분석·저장이 한 건도 없어야 한다
+    assert acs.saved == [], '수확 이동 중 분석/저장이 발생함: %s' % acs.saved
+
+    # Dock feedback(phase)이 중계됐다 — 탐색~후진까지의 단계가 올라온다
+    assert acs.dock_feedback_phases, 'Dock feedback 미중계'
+    assert 'SEARCHING' in acs.dock_feedback_phases
+
+    # 오차 축별 값이 손실 없이 중계됐다(ddago_sim 성공값과 일치)
+    assert abs(acs.last_dock_result.final_lateral_m - (-0.012)) < 1e-4
+    assert abs(acs.last_dock_result.final_yaw_error - 0.021) < 1e-4
+
+    # E3 진입 게이트: 도킹 성공한 task 만 열린다
+    assert dcs.is_docked(task_id), '도킹 성공했는데 E3 게이트가 닫힘'
+    assert not dcs.is_docked(task_id + 999), '엉뚱한 task 가 열림'
+
+
+def test_dock_failure_no_marker(system):
+    """도킹 실패(마커 미검출, code 1)가 DCS 를 거쳐 ACS 로 그대로 올라오고,
+    실패한 task 는 E3 게이트가 열리지 않는다."""
+    acs, dcs = system['acs'], system['dcs']
+    system['ddago'].dock_mode = 'no_marker'
+    task_id = acs.send_harvest_move(num_waypoints=HARVEST_WP, seg_size=HARVEST_SEG)
+
+    assert _wait(lambda: acs.dock_done), '도킹 결과 미수신'
+    assert acs.last_dock_result.result_code == 1, acs.last_dock_result.message
+    assert not dcs.is_docked(task_id), '도킹 실패인데 E3 게이트가 열림'
+
+
+def test_dock_failure_error_exceeded(system):
+    """도킹 실패(정차 오차 초과, code 2)와 축별 오차 값이 그대로 중계된다."""
+    acs, dcs = system['acs'], system['dcs']
+    system['ddago'].dock_mode = 'error_exceeded'
+    task_id = acs.send_harvest_move(num_waypoints=HARVEST_WP, seg_size=HARVEST_SEG)
+
+    assert _wait(lambda: acs.dock_done), '도킹 결과 미수신'
+    assert acs.last_dock_result.result_code == 2, acs.last_dock_result.message
+    assert acs.last_dock_result.final_lateral_m > 0.05, '오차 값이 중계되지 않음'
+    assert not dcs.is_docked(task_id)
+
+
+def test_dock_cancel(system):
+    """ACS 취소(E2 22-1)가 DCS 를 거쳐 DdaGo 까지 전파되어 도킹이 중단(code 3)된다."""
+    acs, ddago, dcs = system['acs'], system['ddago'], system['dcs']
+    ddago.move_delay = 1.2   # 취소를 걸 시간을 벌기 위해 도킹을 느리게
+    task_id = acs.send_harvest_move(num_waypoints=HARVEST_WP, seg_size=HARVEST_SEG)
+
+    # 도킹 feedback 이 흐르기 시작하면(=도킹 진행 중) 취소를 건다
+    assert _wait(lambda: len(acs.dock_feedback_phases) >= 1, timeout=15.0), '도킹 시작 안 됨'
+    acs.cancel_dock()
+
+    assert _wait(lambda: acs.dock_done), '취소 결과 미수신'
+    assert acs.last_dock_result.result_code == 3, acs.last_dock_result.message
+    assert not dcs.is_docked(task_id), '취소됐는데 E3 게이트가 열림'
+
+
+@pytest.fixture
+def system_short_dock_timeout():
+    """DCS 의 도킹 결과 대기 상한을 짧게(1.5s) 준 시스템 — 무응답 timeout 검증용."""
+    rclpy.init()
+    dcs = DcsNode(parameter_overrides=[
+        Parameter('ai_target_file', value='/nonexistent/dg_ai_target.json'),
+        Parameter('ai_default_endpoint', value='127.0.0.1:%d' % AI_PORT),
+        Parameter('fleet_hz', value=5.0),
+        Parameter('dock_result_timeout_sec', value=1.5),
+    ])
+    ddagi = DdagiSim(parameter_overrides=[Parameter('auto_telemetry', value=True)])
+    ddago = DdagoSim(parameter_overrides=[
+        Parameter('move_delay', value=0.15), Parameter('auto_telemetry', value=True)])
+    acs = AcsSim(parameter_overrides=[Parameter('auto_start', value=False)])
+
+    ex = MultiThreadedExecutor(num_threads=8)
+    for n in (dcs, ddagi, ddago, acs):
+        ex.add_node(n)
+    threading.Thread(target=ex.spin, daemon=True).start()
+    time.sleep(1.0)
+
+    yield {'dcs': dcs, 'ddago': ddago, 'ddagi': ddagi, 'acs': acs}
+
+    ex.shutdown()
+    for n in (dcs, ddagi, ddago, acs):
+        n.destroy_node()
+    rclpy.shutdown()
+
+
+def test_dock_timeout(system_short_dock_timeout):
+    """DdaGo 가 도킹 결과를 안 주면(무응답) DCS 가 상한 시간 뒤 안전하게 실패(code 3)로
+    ACS 에 돌려주고, 게이트는 열리지 않는다."""
+    sys_ = system_short_dock_timeout
+    acs, ddago, dcs = sys_['acs'], sys_['ddago'], sys_['dcs']
+    ddago.dock_mode = 'hang'
+    task_id = acs.send_harvest_move(num_waypoints=HARVEST_WP, seg_size=HARVEST_SEG)
+
+    assert _wait(lambda: acs.dock_done, timeout=15.0), 'timeout 결과 미수신'
+    assert acs.last_dock_result.result_code == 3, acs.last_dock_result.message
+    assert not dcs.is_docked(task_id)
+    acs.cancel_dock()   # 매달린 sim goal 을 풀어 teardown 을 빠르게

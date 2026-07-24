@@ -152,7 +152,8 @@ def read_wire(limit=WIRE_MAX):
 def read_logs():
     return {
         'dcs': _tail_filtered('/tmp/dash_dcs.log',
-                              ['순찰 경로 수신', 'DdaGo 하달', '분석결과', '구간 결과 전달']),
+                              ['경로 수신', 'DdaGo 하달', '분석결과', '구간 결과 전달',
+                               '도킹 결과 전달', 'E3 진입 가능']),
         'acs': _tail_filtered('/tmp/dash_acs.log',
                               ['순찰 시작', '구간 하달', 'SaveDetection 저장', '구간 결과',
                                '순찰 완료', 'Fleet 수신']),
@@ -201,12 +202,12 @@ def eval_e1():
     _trigger_patrol()
 
     def done():
-        dcs = _tail_filtered('/tmp/dash_dcs.log', ['순찰 경로 수신', 'DdaGo 하달'], n=8)
-        return (any('순찰 경로 수신' in l for l in dcs)
+        dcs = _tail_filtered('/tmp/dash_dcs.log', ['경로 수신', 'DdaGo 하달'], n=8)
+        return (any('경로 수신' in l for l in dcs)
                 and any('DdaGo 하달' in l for l in dcs))
 
     ok = _wait_until(done, 10)
-    dcs = _tail_filtered('/tmp/dash_dcs.log', ['순찰 경로 수신', 'DdaGo 하달'], n=6)
+    dcs = _tail_filtered('/tmp/dash_dcs.log', ['경로 수신', 'DdaGo 하달'], n=6)
     return ok, dcs or ['(DCS 로그 없음 — dcs UP 및 acs 트리거 확인)']
 
 
@@ -262,9 +263,40 @@ def eval_e4():
     return ok, dcs or ['(DCS 로그 없음 — dcs/ddago UP 확인)']
 
 
-EVALS = {'e0': eval_e0, 'e1': eval_e1, 'e2': eval_e2, 'e4': eval_e4}
+def _trigger_harvest():
+    """ACS 역할로 수확 이동+도킹 하달(dashboard.sh harvest). 서비스 호출은 즉시 반환하고
+    시나리오는 백그라운드로 돈다(완주는 아래 eval 이 로그로 폴링)."""
+    subprocess.run(['bash', DASH, 'harvest'], capture_output=True, text=True, timeout=40)
+
+
+def eval_s2e2():
+    """S2 E2 수확 위치 이동+도킹: ACS→DCS 로 수확지점까지 경로(전 구간 capture=false) 접수 →
+    DCS→DdaGo 중계 → 도착 후 Dock 하달·중계 → 도킹 성공 시 E3 진입 게이트 오픈까지.
+
+    순찰(E1·E2)과 달리 이동 중 촬영·분석이 없다(capture=false → 분석 경로 미진입). 판정은
+    '경로 수신 → 도킹 지시 수신 → 도킹 결과 전달(code=0) → E3 진입 가능(도킹 성공)' 4단계가
+    DCS 로그에 모두 남는지로 한다. 도킹이 실패하면 게이트가 열리지 않아 FAIL 로 갈린다."""
+    clear_wire()   # 실행 시 메시지 초기화
+    _trigger_harvest()
+
+    open_key = 'E3 진입 가능(도킹 성공'   # 게이트 오픈(성공)만. '해제'(clear)와 구분된다.
+    keys = ['경로 수신', '도킹 지시 수신', '도킹 결과 전달', open_key]
+
+    def done():
+        dcs = _tail_filtered('/tmp/dash_dcs.log', keys, n=20)
+        return (any('경로 수신' in l for l in dcs)
+                and any('도킹 지시 수신' in l for l in dcs)
+                and any('도킹 결과 전달' in l and 'code=0' in l for l in dcs)
+                and any(open_key in l for l in dcs))
+
+    ok = _wait_until(done, 40)
+    dcs = _tail_filtered('/tmp/dash_dcs.log', keys, n=10)
+    return ok, dcs or ['(DCS 로그 없음 — dcs·acs·ddago UP 확인)']
+
+
+EVALS = {'e0': eval_e0, 'e1': eval_e1, 'e2': eval_e2, 'e4': eval_e4, 's2e2': eval_s2e2}
 EVAL_NAMES = {'e0': 'E0 상시 모니터링', 'e1': 'E1 순찰 시작', 'e2': 'E2 체크·저장',
-              'e4': 'E4 복귀·도킹'}
+              'e4': 'E4 복귀·도킹', 's2e2': 'S2 E2 수확 이동·도킹'}
 
 
 class Handler(BaseHTTPRequestHandler):
