@@ -1,0 +1,16 @@
+# 시나리오2 E3 : 토마토 탐지 요청 (Ddagi Control Service -> DG AI Service)
+#   /ai/detect_tomatoes   (같은 로봇 세트 내부 통신이라 {robot_id} 네임스페이스 없음)
+#
+# 기존 DG↔AI 의 TCP detect_tomatoes 를 ROS2 Service 로 이관한 것. 의미(요청→검출결과)는 같고
+# 프로토콜만 바뀐다. AI 가 USB Depth 카메라를 직접 읽으므로 이미지는 오가지 않는다.
+# (시나리오1 순찰용 analyze_frame TCP 와는 별개이며 그것은 유지된다.)
+# ---------- Request ----------
+int64   task_id
+int32   round               # 촬영 라운드 (진단용). 요청↔응답 상관은 ROS2 가 자동 처리하므로 request_id 불필요
+---
+# ---------- Response ----------
+bool      success
+string    frame_id          # 항상 camera_link (카메라→base TF 는 Ddagi 가 수행)
+Tomato[]  tomatoes          # 익은 대상만 (NORMAL / DISCARD). 안익은(미성숙) 열매는 반환 안 함
+string    error_code        # 실패 시 (예: CAMERA_NOT_AVAILABLE)
+string    message
