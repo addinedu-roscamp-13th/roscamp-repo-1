@@ -27,7 +27,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from automato_interfaces.action import Dock, Harvest, Navigate
+from automato_interfaces.action import Dock, Harvest, Navigate, Unload
 from automato_interfaces.msg import RobotTelemetry, Waypoint
 from automato_interfaces.srv import SaveDetection
 from std_srvs.srv import Trigger
@@ -81,6 +81,13 @@ class AcsSim(Node):
         self.harvest_done = False       # 수확 result 수신 여부
         self._harvest_gh = None         # 진행 중 Harvest goal handle(취소 테스트용)
 
+        # S2 E6 Unload 상태 (예냉실 도킹 성공 후 바구니 하역)
+        self.unload_accepted = None     # 하역 goal 수락 여부(None=미발행, True/False)
+        self.unload_feedback = []       # 받은 Unload Feedback(phase) 목록(중계 확인용)
+        self.unload_result = None       # 마지막 Unload.Result(검증용)
+        self.unload_done = False        # 하역 result 수신 여부
+        self._unload_gh = None          # 진행 중 Unload goal handle(취소 테스트용)
+
         # E0 RobotTelemetry 구독 — DG 는 자기 세트분만 /{robot_id}/telemetry 로 보낸다
         self.create_subscription(
             RobotTelemetry, '/%s/telemetry' % self.robot_id,
@@ -98,6 +105,10 @@ class AcsSim(Node):
         self._harvest_cli = ActionClient(
             self, Harvest, '/%s/harvest' % self.robot_id, callback_group=self._cb)
 
+        # S2 E6 Unload 액션 클라이언트 (예냉실 도킹 성공 후 하역 하달)
+        self._unload_cli = ActionClient(
+            self, Unload, '/%s/unload' % self.robot_id, callback_group=self._cb)
+
         # E2 SaveDetection 서비스 서버
         self.create_service(
             SaveDetection, '/automato/save_detection',
@@ -113,6 +124,9 @@ class AcsSim(Node):
         # S2 E3 수확 시작 트리거 (도킹 성공한 마지막 task 로 Harvest 하달)
         self.create_service(
             Trigger, '/acs_sim/start_harvest', self._on_trigger_harvest, callback_group=self._cb)
+        # S2 E6 하역 시작 트리거 (예냉실 도킹 성공한 마지막 task 로 Unload 하달)
+        self.create_service(
+            Trigger, '/acs_sim/start_unload', self._on_trigger_unload, callback_group=self._cb)
 
         self.get_logger().info(
             'ACS 시뮬 시작: Navigate클라·Dock클라 /%s/{navigate,dock}, SaveDetection서버, '
@@ -476,6 +490,63 @@ class AcsSim(Node):
         tid = self.send_harvest_action(self._last_docked_task)
         response.success = tid is not None
         response.message = ('수확 시작 하달 task=%d' % tid) if tid is not None else 'Harvest 서버 없음'
+        return response
+
+    # ---- S2 E6 하역 시작 (예냉실 도킹 성공 task 로 Unload 액션 하달) ----
+    def send_unload_action(self, task_id, shake_delay_sec=3.0):
+        """예냉실 도킹 성공한 task 로 바구니 하역을 시작한다(E6). DG 가 /ddagi/unload 로 중계한다.
+        도킹 안 된 task 면 DG 가 goal 을 거부(reject) → unload_accepted=False 로 표시."""
+        if not self._unload_cli.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('DCS Unload 서버 없음')
+            return None
+        self.unload_accepted = None
+        self.unload_feedback = []
+        self.unload_result = None
+        self.unload_done = False
+        self._unload_gh = None
+        goal = Unload.Goal(task_id=int(task_id), shake_delay_sec=float(shake_delay_sec))
+        self.get_logger().info('하역 시작 하달: task=%d shake_delay=%.1fs'
+                               % (task_id, shake_delay_sec))
+        fut = self._unload_cli.send_goal_async(goal, feedback_callback=self._on_unload_fb)
+        fut.add_done_callback(self._on_unload_goal_response)
+        return task_id
+
+    def _on_unload_goal_response(self, future):
+        gh = future.result()
+        self.unload_accepted = bool(gh.accepted)
+        if not gh.accepted:
+            self.get_logger().warn('DCS가 Unload goal 거부(도킹 안 됨)')
+            self.unload_done = True   # reject 도 종료로 본다(대기 해제용)
+            return
+        self._unload_gh = gh
+        gh.get_result_async().add_done_callback(self._on_unload_result)
+
+    def _on_unload_fb(self, feedback_msg):
+        fb = feedback_msg.feedback
+        self.unload_feedback.append(fb.phase)
+        self.get_logger().info('하역 진행: phase=%s' % fb.phase)
+
+    def _on_unload_result(self, future):
+        res = future.result().result
+        self.unload_result = res
+        self.unload_done = True
+        self.get_logger().info('하역 결과: code=%d msg=%s' % (res.result_code, res.message))
+
+    def cancel_unload(self):
+        """진행 중인 Unload goal 을 취소한다(취소 전파 검증용)."""
+        if self._unload_gh is not None:
+            self.get_logger().warn('ACS 하역 취소 요청')
+            self._unload_gh.cancel_goal_async()
+
+    def _on_trigger_unload(self, request, response):
+        """라이브: 예냉실 도킹 성공한 마지막 task 로 하역(E6) 시작. dashboard.sh 등에서 호출."""
+        if self._last_docked_task is None:
+            response.success = False
+            response.message = '도킹 성공한 task 없음 — 먼저 예냉실 이동+도킹 실행'
+            return response
+        tid = self.send_unload_action(self._last_docked_task)
+        response.success = tid is not None
+        response.message = ('하역 시작 하달 task=%d' % tid) if tid is not None else 'Unload 서버 없음'
         return response
 
 

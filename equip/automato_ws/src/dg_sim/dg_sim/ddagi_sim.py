@@ -11,6 +11,11 @@
         - harvest_mode 로 종료 사유를 주입: depleted(DEPLETED) / full(FULL) /
           max_rounds(MAX_ROUNDS_EXCEEDED) / hang(무응답 → DCS watchdog). 테스트는
           self.harvest_mode 를 바꿔 케이스를 재사용한다.
+  E6    Unload 액션 서버 (DCS ← )                   /ddagi/unload
+        - 실제 하역(손잡이 파지·매니퓰레이션) 대신, phase 를 순서대로 흘리고
+          (GRIP_HANDLE→LIFT→WAIT→SHAKE→RETURN) result_code 를 돌려 **DCS 의 중계**와
+          **무수신 워치독**을 검증한다. unload_mode 로 결과를 주입: success(0) /
+          grip_fail(1, 손잡이 파지 실패) / hang(무응답 → DCS watchdog).
 
 Topic: /ddagi/telemetry (automato_interfaces/msg/DdagiTelemetry, 1Hz, robot_id 는 메시지 필드)
 """
@@ -24,7 +29,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_srvs.srv import Trigger
 
-from automato_interfaces.action import Harvest
+from automato_interfaces.action import Harvest, Unload
 from automato_interfaces.msg import DdagiTelemetry, ServoStatus
 
 
@@ -39,10 +44,15 @@ class DdagiSim(Node):
         self.declare_parameter('harvest_rounds', 2)            # 라운드 수
         self.declare_parameter('harvest_picks_per_round', 3)   # 라운드당 파지 수
         self.declare_parameter('harvest_step_delay', 0.2)      # 파지 1회 처리 시간(초)
+        # 하역 시뮬 파라미터
+        self.declare_parameter('unload_mode', 'success')       # success/grip_fail/hang
+        self.declare_parameter('unload_step_delay', 0.1)       # phase 1단계 처리 시간(초)
         self.robot_id = self.get_parameter('robot_id').value
         self.burst_sec = float(self.get_parameter('burst_sec').value)
         self.harvest_mode = self.get_parameter('harvest_mode').value
         self.harvest_step_delay = float(self.get_parameter('harvest_step_delay').value)
+        self.unload_mode = self.get_parameter('unload_mode').value
+        self.unload_step_delay = float(self.get_parameter('unload_step_delay').value)
         self._cb = ReentrantCallbackGroup()
         self._task_id = 1024
         self._tel_until = float('inf') if self.get_parameter('auto_telemetry').value else 0.0
@@ -59,12 +69,20 @@ class DdagiSim(Node):
             execute_callback=self._harvest_execute,
             cancel_callback=lambda _gh: CancelResponse.ACCEPT,
             callback_group=self._cb)
+        # E6 Unload 액션 서버 (DCS ← )
+        self._unload_srv = ActionServer(
+            self, Unload, '/ddagi/unload',   # 연동에 robot_id 미사용
+            execute_callback=self._unload_execute,
+            cancel_callback=lambda _gh: CancelResponse.ACCEPT,
+            callback_group=self._cb)
         # 라이브에서 `ros2 param set /ddagi_sim harvest_mode full` 로 종료 사유 주입.
         self.add_on_set_parameters_callback(self._on_set_params)
-        self.get_logger().info('Ddagi 시뮬 시작 → /ddagi/{telemetry,harvest} (harvest_mode=%s)'
-                               % self.harvest_mode)
+        self.get_logger().info(
+            'Ddagi 시뮬 시작 → /ddagi/{telemetry,harvest,unload} '
+            '(harvest_mode=%s unload_mode=%s)' % (self.harvest_mode, self.unload_mode))
 
     VALID_HARVEST_MODES = ('depleted', 'full', 'max_rounds', 'hang')
+    VALID_UNLOAD_MODES = ('success', 'grip_fail', 'hang')
 
     def _on_set_params(self, params):
         for p in params:
@@ -75,6 +93,13 @@ class DdagiSim(Node):
                         reason='harvest_mode 는 %s 중 하나' % ', '.join(self.VALID_HARVEST_MODES))
                 self.harvest_mode = p.value
                 self.get_logger().info('harvest_mode 변경 → %s' % p.value)
+            elif p.name == 'unload_mode':
+                if p.value not in self.VALID_UNLOAD_MODES:
+                    return SetParametersResult(
+                        successful=False,
+                        reason='unload_mode 는 %s 중 하나' % ', '.join(self.VALID_UNLOAD_MODES))
+                self.unload_mode = p.value
+                self.get_logger().info('unload_mode 변경 → %s' % p.value)
         return SetParametersResult(successful=True)
 
     def _on_start_tel(self, request, response):
@@ -183,6 +208,64 @@ class DdagiSim(Node):
             return self._harvest_result(normal, discard, failed,
                                         'MAX_ROUNDS_EXCEEDED', '라운드 상한(시뮬)')
         return self._harvest_result(normal, discard, failed, 'DEPLETED', '대상 소진(시뮬)')
+
+    # ---- E6 Unload (DCS ← ) : phase Feedback + 결과 주입 ----
+    # 하역 시퀀스 단계. WAIT 는 shake_delay 만큼 들고 대기하는 단계(흔들기 직전).
+    UNLOAD_PHASES = ('GRIP_HANDLE', 'LIFT', 'WAIT', 'SHAKE', 'RETURN')
+
+    @staticmethod
+    def _unload_result(code, message):
+        r = Unload.Result()
+        r.result_code = code
+        r.message = message
+        return r
+
+    def _unload_execute(self, goal_handle):
+        req = goal_handle.request
+        mode = self.unload_mode
+        self.get_logger().info('하역 goal 수신: task=%d shake_delay=%.1fs mode=%s'
+                               % (req.task_id, req.shake_delay_sec, mode))
+        delay = self.unload_step_delay   # 테스트가 직접 바꿀 수 있게 속성 사용
+
+        # hang: 진행 소식(Feedback) 없이 대기 → DCS 의 무수신 워치독 검증용.
+        if mode == 'hang':
+            self.get_logger().warn('하역 무응답 시뮬(hang) — Feedback 없이 대기')
+            waited = 0.0
+            while rclpy.ok() and not goal_handle.is_cancel_requested and waited < 6.0:
+                time.sleep(0.1)
+                waited += 0.1
+            r = self._unload_result(2, 'hang 종료')
+            if not rclpy.ok():
+                return r
+            try:
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                    r.message = 'hang 취소'
+                else:
+                    goal_handle.abort()
+            except Exception:   # noqa: BLE001 - teardown 경합 시 무시
+                pass
+            return r
+
+        for phase in self.UNLOAD_PHASES:
+            if goal_handle.is_cancel_requested:
+                self.get_logger().warn('취소 요청 → 하역 중단 (phase=%s)' % phase)
+                goal_handle.canceled()
+                return self._unload_result(2, '취소로 중단')
+            fb = Unload.Feedback()
+            fb.phase = phase
+            goal_handle.publish_feedback(fb)
+            # grip_fail: 첫 단계(손잡이 파지)에서 실패 → result_code 1.
+            if mode == 'grip_fail' and phase == 'GRIP_HANDLE':
+                goal_handle.abort()
+                return self._unload_result(1, '손잡이 파지 실패(시뮬)')
+            # WAIT 단계는 shake_delay 만큼 든 채 대기(그 외 단계는 unload_step_delay).
+            step = req.shake_delay_sec if phase == 'WAIT' else delay
+            if step > 0:
+                time.sleep(step)
+
+        goal_handle.succeed()
+        return self._unload_result(0, '하역 완료(시뮬)')
 
 
 def main(args=None):
