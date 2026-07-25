@@ -49,10 +49,12 @@ def system():
         Parameter('ai_default_endpoint', value='127.0.0.1:%d' % AI_PORT),
         Parameter('fleet_hz', value=5.0),
         Parameter('harvest_feedback_timeout_sec', value=2.0),   # 워치독 테스트용 짧게
+        Parameter('unload_feedback_timeout_sec', value=2.0),    # 하역 워치독 테스트용 짧게
     ])
     ddagi = DdagiSim(parameter_overrides=[
         Parameter('auto_telemetry', value=True),
-        Parameter('harvest_step_delay', value=0.1)])
+        Parameter('harvest_step_delay', value=0.1),
+        Parameter('unload_step_delay', value=0.05)])
     ddago = DdagoSim(parameter_overrides=[
         Parameter('move_delay', value=0.15), Parameter('auto_telemetry', value=True)])
     acs = AcsSim(parameter_overrides=[Parameter('auto_start', value=False)])
@@ -344,3 +346,80 @@ def test_harvest_watchdog(system):
     assert acs.harvest_result.exit_reason == ''  # 정상 종료가 아님(abort)
     assert 'watchdog' in acs.harvest_result.message
     acs.cancel_harvest()   # 매달린 sim goal 정리
+
+
+# ============================ S2 E6 Unload(하역) 중계 ============================
+def test_unload_gate_reject(system):
+    """예냉실 도킹 안 된 task 로 Unload 를 하달하면 DG 가 goal 을 거부(reject)한다."""
+    acs, dcs = system['acs'], system['dcs']
+    assert not dcs.is_docked(888888)
+    acs.send_unload_action(888888)
+    assert _wait(lambda: acs.unload_done), '하역 goal 응답 없음'
+    assert acs.unload_accepted is False, '도킹 안 된 task 인데 accept 됨'
+
+
+def test_unload_success(system):
+    """예냉실 도킹 성공 task 로 하역 → phase Feedback 이 순서대로 중계되고
+    result_code 0(성공) Result 가 올라온다. 하역 시작 시 도킹 게이트가 소비된다."""
+    acs, dcs = system['acs'], system['dcs']
+    tid = _dock_first(system)
+    acs.send_unload_action(tid, shake_delay_sec=0.1)   # WAIT 단계를 짧게
+
+    assert _wait(lambda: acs.unload_done), '하역 결과 미수신'
+    assert acs.unload_accepted is True
+    assert acs.unload_result is not None
+    assert acs.unload_result.result_code == 0, acs.unload_result.message
+
+    # phase Feedback 이 순서대로 중계됐다(손잡이 파지 → … → 복귀)
+    assert acs.unload_feedback, 'Unload feedback 미중계'
+    assert acs.unload_feedback == ['GRIP_HANDLE', 'LIFT', 'WAIT', 'SHAKE', 'RETURN'], \
+        '하역 phase 순서/누락: %s' % acs.unload_feedback
+
+    # 하역 시작으로 게이트가 소비됐다(재진입 방지)
+    assert not dcs.is_docked(tid), '하역 시작 후에도 게이트가 열려 있음'
+
+
+def test_unload_grip_fail(system):
+    """손잡이 파지 실패(result_code 1)가 DG 를 거쳐 그대로 ACS 로 올라온다.
+    DG 는 실패를 성공으로 바꾸지 않는다(task FAILED 판정은 ACS 몫)."""
+    acs = system['acs']
+    system['ddagi'].unload_mode = 'grip_fail'
+    tid = _dock_first(system)
+    acs.send_unload_action(tid, shake_delay_sec=0.1)
+
+    assert _wait(lambda: acs.unload_done), '하역 결과 미수신'
+    assert acs.unload_result is not None
+    assert acs.unload_result.result_code == 1, acs.unload_result.message
+
+
+def test_unload_cancel(system):
+    """ACS 취소가 DG 를 거쳐 Ddagi 까지 전파되어 하역이 중단(code 2)된다."""
+    acs = system['acs']
+    system['ddagi'].unload_step_delay = 0.4   # 취소 걸 시간 확보(phase 가 천천히)
+    tid = _dock_first(system)
+    acs.send_unload_action(tid, shake_delay_sec=0.1)
+
+    # Feedback 이 흐르기 시작하면(=하역 진행 중) 취소
+    assert _wait(lambda: len(acs.unload_feedback) >= 1, timeout=15.0), '하역 시작 안 됨'
+    acs.cancel_unload()
+
+    assert _wait(lambda: acs.unload_done), '취소 결과 미수신'
+    assert acs.unload_result is not None
+    assert acs.unload_result.result_code == 2, acs.unload_result.message
+
+
+def test_unload_watchdog(system):
+    """Ddagi 가 진행 소식(phase Feedback)을 안 주면 DG 의 무수신 워치독이 안전하게
+    실패(code 2)시킨다."""
+    acs = system['acs']
+    system['ddagi'].unload_mode = 'hang'
+    tid = _dock_first(system)
+    acs.send_unload_action(tid, shake_delay_sec=0.1)
+
+    # DCS unload_feedback_timeout=2.0 → 워치독이 곧 실패로 마감
+    assert _wait(lambda: acs.unload_done, timeout=15.0), '워치독 결과 미수신'
+    assert acs.unload_accepted is True           # goal 은 수락됐다가
+    assert acs.unload_result is not None
+    assert acs.unload_result.result_code == 2    # 중단(abort)
+    assert 'watchdog' in acs.unload_result.message
+    acs.cancel_unload()   # 매달린 sim goal 정리

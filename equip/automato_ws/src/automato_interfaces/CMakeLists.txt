@@ -33,6 +33,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/Dock.action"        # ACS→DG /{robot_id}/dock, DG→DdaGo /ddago/dock
   # 시나리오2 E3~E5 수확 사이클 (Ddagi 주관, DG 중계)
   "action/Harvest.action"     # ACS→DG /{robot_id}/harvest, DG→Ddagi /ddagi/harvest
+  # 시나리오2 E6 예냉실 바구니 하역 (Ddagi 주관, DG 중계)
+  "action/Unload.action"      # ACS→DG /{robot_id}/unload, DG→Ddagi /ddagi/unload
   DEPENDENCIES std_msgs sensor_msgs
 )
 

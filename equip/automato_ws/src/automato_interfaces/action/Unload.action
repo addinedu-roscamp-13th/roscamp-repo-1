@@ -1,0 +1,24 @@
+# 시나리오2 E6 : 예냉실 도착 후 바구니 하역 액션 (ACS→DG→Ddagi)
+#   ACS -> DG    : /{robot_id}/unload
+#   DG  -> Ddagi : /ddagi/unload         (로봇 쪽은 네임스페이스를 붙이지 않는다)
+#
+# 하역 시퀀스(손잡이 파지 → 들기 → shake_delay 대기 → 흔들기 → 복귀)는 Ddagi 가 내부에서
+# 주관하고, DG 는 이 액션을 **중계**만 한다(goal 하달 + feedback/result 되돌림). ACS 는
+# Feedback(phase)으로 진행 상황만 받는다. Harvest 중계와 같은 "DG는 중계자" 원칙이다.
+#
+# 진입 조건은 예냉실 Dock 성공이다. DG 는 도킹 성공(is_docked)한 task 의 goal 만 accept 한다
+# (도킹 안 된 위치에서 팔이 손잡이를 드는 것 차단).
+#
+# 하역은 보너스 기능이라 실패(result_code!=0)해도 ACS 는 task 를 FAILED 로 되돌리지 않는다.
+# 그 판정은 ACS 몫이고, DG 는 result_code 를 가공 없이 그대로 올린다.
+
+# ---------- Goal ----------
+int64   task_id
+float32 shake_delay_sec       # 들어올린 뒤 대기 시간 (3.0)
+---
+# ---------- Result ----------
+int32   result_code           # 0: 성공, 1: 손잡이 파지 실패, 2: 중단
+string  message
+---
+# ---------- Feedback ----------   (Ddagi 생성 → DG 중계 → ACS)
+string  phase                 # GRIP_HANDLE / LIFT / WAIT / SHAKE / RETURN
