@@ -31,8 +31,13 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/Navigate.action"    # (신) 경로(Waypoint[]) 하달  /{robot_id}/navigate, /{robot_id}/ddago/navigate
   # E4-6/E2 22-1 충전소 정밀 후진 도킹
   "action/Dock.action"        # ACS→DG /{robot_id}/dock, DG→DdaGo /ddago/dock
-  # 시나리오2 E3~E5 수확 사이클 (Ddagi 주관, DG 중계)
+  # ===== 시나리오 2: 수확 및 예냉실 이동 =====
+  # E3 토마토 검출 (Ddagi ↔ DG AI Service, ROS2 Service) — 이미지 없이 좌표만
+  "msg/Tomato.msg"            # DetectTomatoes 응답 원소 (검출 토마토 1개, camera_link 좌표)
+  "srv/DetectTomatoes.srv"    # Ddagi -> DG AI Service  /ai/detect_tomatoes
+  # E3~E5 수확 사이클 (Ddagi 주관, DG 중계) / E6 하역
   "action/Harvest.action"     # ACS→DG /{robot_id}/harvest, DG→Ddagi /ddagi/harvest
+  "action/Unload.action"      # ACS→DG /{robot_id}/unload, DG→Ddagi /ddagi/unload
   DEPENDENCIES std_msgs sensor_msgs
 )
 

@@ -1,0 +1,17 @@
+# 시나리오2 E6 [보너스] : 예냉실 바구니 하역
+#   ACS -> DG    : /{robot_id}/unload
+#   DG  -> Ddagi : /ddagi/unload         (로봇 쪽은 네임스페이스를 붙이지 않는다)
+#
+# 바구니 2개가 물리적으로 붙어 있어 손잡이가 하나뿐 → 바구니 구분 필드가 없다.
+# 한 번의 하역으로 수확품(normal)과 폐기품(discard)이 함께 쏟아진다(감수한 하드웨어 제약).
+# 하역은 보너스라, 실패해도 ACS 는 task 를 FAILED 로 되돌리지 않는다(이미 성공한 수확 실적 보호).
+# ---------- Goal ----------
+int64    task_id
+float32  shake_delay_sec     # 들어올린 뒤 대기 시간 (기본 3.0)
+---
+# ---------- Result ----------
+int32    result_code         # 0: 성공, 1: 손잡이 파지 실패, 2: 중단
+string   message
+---
+# ---------- Feedback ----------
+string   phase               # GRIP_HANDLE / LIFT / WAIT / SHAKE / RETURN
