@@ -40,6 +40,7 @@ from automato_control_service import route_runner as rr                  # noqa:
 from automato_control_service import harvest_dispatcher as hd            # noqa: E402
 from automato_control_service.harvest_dispatcher import (                # noqa: E402
     REASON_DOCK_FAILED,
+    STATUS_COMPLETED,
     STATUS_FAILED,
     HarvestDispatcher,
 )
@@ -243,6 +244,44 @@ class FakeHarvest:
         handle = _Handle(result_future)
         handle.accepted = self.accepted
         goal_future.set_result(handle)
+        return goal_future
+
+
+class _UnloadResult:
+    def __init__(self, code, message):
+        self.result = self
+        self.result_code = code
+        self.message = message
+
+
+class _UnloadFeedback:
+    def __init__(self, phase):
+        self.feedback = self
+        self.phase = phase
+
+
+class FakeUnload:
+    """하역 로봇 흉내 — result_code 로 성공/실패를 지정한다."""
+
+    def __init__(self, code=0, server_up=True):
+        self.code = code              # 0 성공 / 1 손잡이 파지 실패 / 2 중단
+        self.server_up = server_up
+        self.calls = 0
+        self.goal = None
+
+    def wait_for_server(self, timeout_sec=None):
+        return self.server_up
+
+    def send_goal_async(self, goal, feedback_callback=None):
+        self.calls += 1
+        self.goal = goal
+        if feedback_callback is not None:
+            feedback_callback(_UnloadFeedback("SHAKE"))
+        result_future = Future()
+        result_future.set_result(
+            _UnloadResult(self.code, "ok" if self.code == 0 else "unload fail"))
+        goal_future = Future()
+        goal_future.set_result(_Handle(result_future))
         return goal_future
 
 
@@ -656,3 +695,122 @@ def test_수확이_실패하면_이송도_저장도_없다(fast_timing):
 
     assert saved == [], "수확이 중단됐는데 실적을 적었다"
     assert nav.dispatched[-1][-1] == 4, "수확 실패인데 예냉실로 갔다"
+
+
+# ------------------------ E6 하역 + 완료 통지 ------------------------ #
+def _e6(disp, engine, nav, dock, harv, unload, **kw):
+    """E6 까지 가는 호출(하역 클라이언트와 콜백들을 함께 넘긴다)."""
+    clients = {"nav": nav, "dock": dock, "harvest": harv, "unload": unload}
+    return disp.run_harvest(
+        1, "dg_01", HARVEST_POINT, MARKER, engine, clients, start_wp=15,
+        precool_point=PRECOOL_POINT, precool_marker=MARKER,
+        save_batch=kw.get("save_batch", lambda h: 42),
+        save_unload=kw.get("save_unload"),
+        on_completed=kw.get("on_completed"))
+
+
+def test_하역하고_입고를_기록하고_성공으로_마감한다(fast_timing):
+    """정상 흐름의 끝 — 여기서 처음으로 COMPLETED 가 나온다."""
+    engine, disp, log, nav, dock, harv = _make()
+    unload = FakeUnload(code=0)
+    logged = []
+
+    status, reason = _e6(disp, engine, nav, dock, harv, unload,
+                         save_unload=lambda h: logged.append(h) or 9)
+
+    assert (status, reason) == (STATUS_COMPLETED, None)
+    assert unload.calls == 1, f"하역 하달 횟수가 이상하다: {unload.calls}"
+    assert unload.goal.shake_delay_sec == hd.UNLOAD_SHAKE_DELAY_SEC
+    assert logged and logged[0]["normal_count"] == 5, "입고 기록이 안 남았다"
+    assert log.has("E6 하역 완료"), f"하역 완료 로그가 없다: {log.lines}"
+    assert _no_reservations(engine), "작업이 끝났는데 예약이 남았다"
+
+
+def test_하역이_실패해도_작업은_성공이다(fast_timing):
+    """E6 의 핵심 판정 — 하역은 보너스다.
+
+    이 task 의 목적은 '따서 예냉실로 옮기기'이고 도착한 순간 달성됐다. 바구니를
+    자동으로 비우는 건 편의 기능이라 실패하면 사람이 손으로 비우면 된다. 여기서
+    FAILED 로 되돌리면 '토마토는 무사히 옮겨졌는데 수확은 실패'라는 기록이 남는다.
+    """
+    engine, disp, log, nav, dock, harv = _make()
+    unload = FakeUnload(code=1)          # 손잡이 파지 실패
+    logged = []
+
+    status, reason = _e6(disp, engine, nav, dock, harv, unload,
+                         save_unload=lambda h: logged.append(h) or 9)
+
+    assert status == STATUS_COMPLETED, "하역 실패로 수확 task 까지 실패로 뒤집혔다"
+    assert reason is None
+    assert logged == [], "하역이 실패했는데 입고를 기록했다(재고가 실제보다 는다)"
+    assert log.has("E6 하역 실패"), f"실패가 로그에 안 남았다: {log.lines}"
+
+
+def test_완료_통지에_실적과_장부번호가_실린다(fast_timing):
+    """관리자 화면이 '무엇을 얼마나 땄는지' 알려면 집계와 batch_id 가 함께 가야 한다."""
+    engine, disp, _log, nav, dock, harv = _make()
+    got = []
+
+    _e6(disp, engine, nav, dock, harv, FakeUnload(),
+        save_batch=lambda h: 123, on_completed=got.append)
+
+    assert len(got) == 1, f"완료 통지가 정확히 한 번 가야 한다: {got}"
+    assert got[0]["batch_id"] == 123
+    assert got[0]["normal_count"] == 5 and got[0]["discard_count"] == 2
+    assert got[0]["exit_reason"] == "FULL"
+
+
+def test_통지가_실패해도_작업_마감은_막지_않는다(fast_timing):
+    """알림은 못 보내도 실적은 DB 에 있다 — 통지 때문에 성공을 실패로 만들면 안 된다."""
+    engine, disp, _log, nav, dock, harv = _make()
+
+    def broken(_summary):
+        raise RuntimeError("웹 서비스 다운")
+
+    status, _reason = _e6(disp, engine, nav, dock, harv, FakeUnload(),
+                          on_completed=broken)
+
+    assert status == STATUS_COMPLETED
+
+
+def test_하역_서버가_없어도_작업은_성공이다(fast_timing):
+    """하역 서버가 안 떠 있어도 이송은 끝났다 — 사람이 비우면 된다."""
+    engine, disp, _log, nav, dock, harv = _make()
+    logged = []
+
+    status, _reason = _e6(disp, engine, nav, dock, harv,
+                          FakeUnload(server_up=False),
+                          save_unload=lambda h: logged.append(h) or 9)
+
+    assert status == STATUS_COMPLETED
+    assert logged == [], "하역을 못 했는데 입고를 기록했다"
+
+
+def test_입고_기록이_실패해도_작업은_성공이다(fast_timing):
+    """하역은 실제로 됐다 — 기록 실패로 성공을 뒤집으면 실물과 어긋난다."""
+    engine, disp, log, nav, dock, harv = _make()
+
+    def broken(_h):
+        raise RuntimeError("DB 연결 끊김")
+
+    status, _reason = _e6(disp, engine, nav, dock, harv, FakeUnload(),
+                          save_unload=broken)
+
+    assert status == STATUS_COMPLETED
+    assert log.has("입고 기록 실패"), f"실패가 로그에 안 남았다: {log.lines}"
+
+
+def test_예냉실에_못_가면_하역도_완료통지도_없다(fast_timing):
+    """도착을 못 했으면 비울 것도, 알릴 것도 없다."""
+    engine, disp, _log, nav, dock, harv = _make()
+    unload = FakeUnload()
+    got = []
+    clients = {"nav": nav, "dock": dock, "harvest": harv, "unload": unload}
+
+    status, _reason = disp.run_harvest(
+        1, "dg_01", HARVEST_POINT, MARKER, engine, clients, start_wp=15,
+        precool_point=dict(PRECOOL_POINT, waypoint_id=999),
+        precool_marker=MARKER, save_batch=lambda h: 1, on_completed=got.append)
+
+    assert status == STATUS_FAILED
+    assert unload.calls == 0 and got == []

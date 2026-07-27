@@ -134,6 +134,14 @@ HARVEST_MAX_CAPACITY = _envi("ACS_HARVEST_MAX_CAPACITY", 7)
 #   수확을 중간에 실패로 끊어버리지만, 길어도 로봇이 죽으면 액션 서버 쪽에서 먼저
 #   끊기므로 이 값이 실제로 걸리는 일은 드물다.
 HARVEST_RESULT_TIMEOUT_SEC = _envf("ACS_HARVEST_RESULT_TIMEOUT_SEC", 1800.0)
+# 하역 시 '들어올린 뒤 흔들기 전까지' 로봇이 멈춰 있는 시간(문서 E6 shake_delay).
+#   들자마자 흔들면 바구니가 출렁여 내용물이 튄다. Unload Goal 로 내려보내는
+#   '로봇에게 주는 지시'이지, ACS 가 기다리는 시간이 아니다(아래 타임아웃과 다른 것).
+UNLOAD_SHAKE_DELAY_SEC = _envf("ACS_UNLOAD_SHAKE_DELAY_SEC", 3.0)
+# Unload 액션 결과를 기다리는 최대 시간 = ACS 의 인내심. 하역 전체 동작(파지→들기→
+#   대기→흔들기→복귀)이 30초 안팎이라 그 4배로 잡는다. 딱 맞게 잡으면 로봇이 조금만
+#   굼떠도(손잡이 재시도·통신 지연) 정상 하역 중에 ACS 가 먼저 포기한다.
+UNLOAD_RESULT_TIMEOUT_SEC = _envf("ACS_UNLOAD_RESULT_TIMEOUT_SEC", 120.0)
 
 # ── 순찰 시작(정적) 노드 ─────────────────────────────────────────────────── #
 # 순찰은 항상 로봇이 충전소에 있을 때 시작한다(시작 위치 고정). 라우터는 waypoint_id 로만

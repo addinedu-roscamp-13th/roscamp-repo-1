@@ -32,7 +32,7 @@ import threading
 import time
 
 from action_msgs.msg import GoalStatus
-from automato_interfaces.action import Harvest
+from automato_interfaces.action import Harvest, Unload
 
 from automato_control_service import docking
 from automato_control_service.patrol_config import (
@@ -41,6 +41,8 @@ from automato_control_service.patrol_config import (
     HARVEST_RESULT_TIMEOUT_SEC,
     HEARTBEAT_SEC,
     SERVER_WAIT_SEC,
+    UNLOAD_RESULT_TIMEOUT_SEC,
+    UNLOAD_SHAKE_DELAY_SEC,
 )
 from automato_control_service.route_runner import RouteRunner, spin_wait
 
@@ -72,7 +74,8 @@ class HarvestDispatcher:
 
     def run_harvest(self, task_id, robot_id, harvest_point, marker, engine,
                     clients, start_wp=None, on_progress=None,
-                    precool_point=None, precool_marker=None, save_batch=None):
+                    precool_point=None, precool_marker=None, save_batch=None,
+                    save_unload=None, on_completed=None):
         """수확 task 하나를 E2~E6 순서로 처리하고 최종 상태를 돌려준다.
 
         harvest_point : 수확지 정보 dict — 노드가 automato_db.get_task_point 로 조회해 넘긴다.
@@ -96,6 +99,10 @@ class HarvestDispatcher:
         save_batch    : 수확 실적을 저장하는 콜백. 집계 dict 를 받아 batch_id 를 돌려준다.
                         이 클래스가 DB 를 모르는 채로 남기 위한 통로다(on_progress 와 같은
                         이유). 반환된 batch_id 는 E6 완료 통지에 실린다.
+        save_unload   : 하역 입고를 기록하는 콜백(E6). **하역이 성공했을 때만** 불린다 —
+                        실패했는데 입고 행이 남으면 재고가 실제보다 늘어난다.
+        on_completed  : 수확 task 완료를 알리는 콜백. 집계 + batch_id 를 받는다.
+                        노드가 Web Service 로 보낸다.
 
         반환: (status, reason)
           status: STATUS_COMPLETED | STATUS_FAILED — 노드가 tasks 에 마감한다.
@@ -232,11 +239,29 @@ class HarvestDispatcher:
             self._log.info(
                 f"[HARVEST] E5 예냉실 도킹 완료 task={task_id} {robot_id} "
                 f"@ {precool_label}")
-            # TODO(E6): 하역(Unload) + 완료 통지. batch_id 를 완료 페이로드에 싣는다.
-            self._log.warning(
-                f"[HARVEST] E6 미구현 → task {task_id} FAILED 로 마감 "
-                f"(예냉실 도킹까지는 성공, batch_id={batch_id})")
-            return STATUS_FAILED, None
+
+            # --- E6 하역 — '보너스' 라서 실패해도 task 를 되돌리지 않는다 ---
+            # 이 task 의 목적은 '따서 예냉실로 옮기기'이고, 도착한 순간 이미 달성됐다.
+            # 바구니를 자동으로 비우는 건 편의 기능이라 실패하면 사람이 손으로 비우면
+            # 된다. 여기서 FAILED 로 되돌리면 '토마토는 무사히 옮겨졌는데 수확은 실패'
+            # 라는 기록이 남아 나중에 통계가 어긋난다(Unload.action 주석의 명시 규칙).
+            self._unload(task_id, robot_id, clients["unload"], harvested,
+                         save_unload,
+                         heartbeat=(engine, [precool_slot], robot_id))
+
+            self._log.info(
+                f"[HARVEST] 수확 task 완료 task={task_id} {robot_id} "
+                f"batch_id={batch_id} 정상 {harvested['normal_count']} / "
+                f"폐기 {harvested['discard_count']}")
+            if on_completed is not None:
+                # 완료 통지는 노드가 보낸다(디스패처는 HTTP 를 모른다). 실패해도 실적은
+                # DB 에 있으므로 여기서 예외를 삼켜 task 마감을 막지 않는다.
+                try:
+                    on_completed(dict(harvested, batch_id=batch_id))
+                except Exception as exc:  # noqa: BLE001
+                    self._log.warning(
+                        f"[HARVEST] 완료 통지 실패(무시) task={task_id}: {exc}")
+            return STATUS_COMPLETED, None
         finally:
             # drive 는 '지금 서 있는 자리'를 일부러 남기고 나온다 — 다음 구간이 이어받아
             # 예약이 끊기는 순간을 없애기 위해서다. 수확은 아직 뒷단계가 없으므로 여기서
@@ -265,6 +290,89 @@ class HarvestDispatcher:
                 f"[HARVEST] E5 수확 실적 저장 실패 task={task_id}: {exc} "
                 f"— 이송은 계속한다(실적: {harvested})")
             return None
+
+    # ---------------------------- E6 하역 ---------------------------- #
+    def _unload(self, task_id, robot_id, unload_client, harvested, save_unload,
+                heartbeat=None):
+        """바구니를 비우고, 성공했을 때만 입고 기록을 남긴다. 반환: 성공 여부.
+
+        ⚠️ 실패해도 호출부는 task 를 FAILED 로 되돌리지 않는다(보너스 기능). 그래서
+        이 함수는 예외를 밖으로 내지 않고 전부 로그로 흡수한다 — 하역 문제로 수확
+        기록이 실패로 뒤집히는 일이 없어야 한다.
+
+        판정은 Navigate·Dock 과 같은 result_code 방식이다(Harvest 만 goal 상태였다).
+        """
+        if unload_client is None:
+            self._log.warning(f"[HARVEST] E6 하역 클라이언트 없음 task={task_id} → 건너뜀")
+            return False
+        try:
+            code, msg = self._run_unload_action(
+                task_id, robot_id, unload_client, heartbeat)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning(f"[HARVEST] E6 하역 예외(무시) task={task_id}: {exc}")
+            return False
+        if code != 0:
+            # 1=손잡이 파지 실패 / 2=중단. 사람이 손으로 비우면 되므로 task 는 성공이다.
+            self._log.warning(
+                f"[HARVEST] E6 하역 실패(code={code}) task={task_id} {robot_id}: {msg} "
+                f"— task 는 성공으로 유지한다(사람이 바구니를 비우면 된다)")
+            return False
+        self._log.info(f"[HARVEST] E6 하역 완료 task={task_id} {robot_id}")
+        # 입고 기록은 '성공했을 때만' 남긴다 — 실패했는데 입고 행이 있으면 재고가 는다.
+        if save_unload is not None:
+            try:
+                unload_id = save_unload(harvested)
+                self._log.info(
+                    f"[HARVEST] E6 입고 기록 task={task_id} unload_id={unload_id}")
+            except Exception as exc:  # noqa: BLE001
+                self._log.error(
+                    f"[HARVEST] E6 입고 기록 실패 task={task_id}: {exc} "
+                    f"— 하역은 됐다(수확 실적은 harvest_batches 에 남아 있다)")
+        return True
+
+    def _run_unload_action(self, task_id, robot_id, unload_client, heartbeat):
+        """Unload 액션을 하달하고 결과를 기다린다. 반환: (result_code, message)."""
+        if not unload_client.wait_for_server(timeout_sec=SERVER_WAIT_SEC):
+            return 1, "Unload 액션 서버 미기동"
+
+        goal = Unload.Goal()
+        goal.task_id = int(task_id)
+        goal.shake_delay_sec = float(UNLOAD_SHAKE_DELAY_SEC)
+
+        def _fb(msg):
+            """ROS executor 스레드 — 하역 단계(phase)를 로그로만 남긴다."""
+            try:
+                self._log.info(
+                    f"[HARVEST] 하역 진행 task={task_id} phase={msg.feedback.phase}")
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning(f"[HARVEST] 하역 피드백 처리 예외(무시): {exc}")
+
+        self._log.info(
+            f"[HARVEST] E6 하역 시작 task={task_id} {robot_id} "
+            f"(들고 {UNLOAD_SHAKE_DELAY_SEC}초 대기 후 흔들기)")
+        goal_handle = spin_wait(
+            unload_client.send_goal_async(goal, feedback_callback=_fb),
+            GOAL_ACCEPT_TIMEOUT_SEC)
+        if goal_handle is None or not goal_handle.accepted:
+            # DG 는 예냉실 도킹에 성공한 task 의 goal 만 accept 한다.
+            return 1, "Unload Goal 거부/수락 타임아웃"
+
+        result_future = goal_handle.get_result_async()
+        done = threading.Event()
+        result_future.add_done_callback(lambda _f: done.set())
+        deadline = time.monotonic() + UNLOAD_RESULT_TIMEOUT_SEC
+        while not done.wait(HEARTBEAT_SEC):
+            if heartbeat is not None:
+                engine, cids, rid = heartbeat
+                for cid in cids:
+                    engine.heartbeat(cid, rid)
+            if time.monotonic() >= deadline:
+                return 1, f"하역 결과 대기 타임아웃({UNLOAD_RESULT_TIMEOUT_SEC}s)"
+        try:
+            res = result_future.result().result
+            return int(res.result_code), str(res.message)
+        except Exception:  # noqa: BLE001
+            return 1, "하역 결과 파싱 실패"
 
     # ---------------------------- E3~E4 수확 ---------------------------- #
     def _run_harvest_action(self, task_id, robot_id, harvest_client,

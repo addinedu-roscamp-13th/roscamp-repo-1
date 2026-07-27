@@ -416,7 +416,10 @@ class AutomatoControlNode(Node):
                         task_id, robot_id),
                     precool_point=precool_point,
                     precool_marker=precool_marker,
-                    save_batch=self._harvest_batch_saver(task_id, robot_id))
+                    save_batch=self._harvest_batch_saver(task_id, robot_id),
+                    save_unload=self._unload_log_saver(task_id, robot_id),
+                    on_completed=self._harvest_completed_reporter(
+                        task_id, robot_id))
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f"수확 디스패치 예외 task={task_id}: {exc}")
             status, reason = "FAILED", None
@@ -475,6 +478,38 @@ class AutomatoControlNode(Node):
                 failed_count=harvested["failed_count"],
                 exit_reason=harvested["exit_reason"])
         return _save
+
+    def _unload_log_saver(self, task_id, robot_id):
+        """하역 입고를 unload_logs 에 적고 unload_id 를 돌려주는 콜백을 만든다. (E6)
+
+        수량은 수확 집계를 그대로 옮긴다 — 바구니 2개(수확품/폐기품)가 붙어 있어 한 번에
+        같이 입고된다. 하역이 **성공했을 때만** 디스패처가 이 콜백을 부른다.
+        """
+        def _save(harvested: dict) -> int:
+            return automato_db.save_unload_log(
+                self._db_pool, task_id, robot_id,
+                normal_qty=harvested["normal_count"],
+                discard_qty=harvested["discard_count"])
+        return _save
+
+    def _harvest_completed_reporter(self, task_id, robot_id):
+        """수확 완료를 Web Service 로 알리는 콜백을 만든다(E6).
+
+        1회 발송하고 실패해도 재시도하지 않는다 — 실적은 이미 tasks·harvest_batches 에
+        있어 화면을 새로 고치면 보인다(순찰 patrol_completed 와 같은 정책).
+        """
+        def _report(summary: dict) -> None:
+            payload = harvest_notify.build_completed_payload(
+                task_id=task_id, robot_id=robot_id,
+                batch_id=summary["batch_id"],
+                normal_count=summary["normal_count"],
+                discard_count=summary["discard_count"],
+                failed_count=summary["failed_count"],
+                exit_reason=summary["exit_reason"],
+                completed_at=datetime.now(timezone.utc))
+            harvest_notify.send_harvest_completed(
+                self._web_url, payload, log=self.get_logger())
+        return _report
 
     def _harvest_progress_reporter(self, task_id, robot_id):
         """수확 진행 상황을 Web Service 로 중계하는 콜백을 만든다(E4). (RP-123)
