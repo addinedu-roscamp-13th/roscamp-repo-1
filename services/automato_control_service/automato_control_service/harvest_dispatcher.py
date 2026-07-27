@@ -28,9 +28,21 @@ automato_node(ROS 표면)에서 '수확 동작 결정' 로직을 떼어낸 클�
       크래시에 실적이 통째로 날아간다.
 """
 
+import threading
+import time
+
+from action_msgs.msg import GoalStatus
+from automato_interfaces.action import Harvest
+
 from automato_control_service import docking
-from automato_control_service.patrol_config import SERVER_WAIT_SEC
-from automato_control_service.route_runner import RouteRunner
+from automato_control_service.patrol_config import (
+    GOAL_ACCEPT_TIMEOUT_SEC,
+    HARVEST_MAX_CAPACITY,
+    HARVEST_RESULT_TIMEOUT_SEC,
+    HEARTBEAT_SEC,
+    SERVER_WAIT_SEC,
+)
+from automato_control_service.route_runner import RouteRunner, spin_wait
 
 # 최종 상태 — 노드가 tasks 에 마감한다(automato_db.set_task_status 의 유효값과 호환).
 STATUS_COMPLETED = "COMPLETED"
@@ -59,7 +71,7 @@ class HarvestDispatcher:
         return self.runner.wp_meta
 
     def run_harvest(self, task_id, robot_id, harvest_point, marker, engine,
-                    clients, start_wp=None):
+                    clients, start_wp=None, on_progress=None):
         """수확 task 하나를 E2~E6 순서로 처리하고 최종 상태를 돌려준다.
 
         harvest_point : 수확지 정보 dict — 노드가 automato_db.get_task_point 로 조회해 넘긴다.
@@ -73,6 +85,9 @@ class HarvestDispatcher:
         clients       : 노드가 만든 액션 클라이언트 묶음
                         {"nav","dock","harvest","unload"} (robot_id 로 바인딩됨)
         start_wp      : 출발 노드(로봇 전용 충전소 진입노드).
+        on_progress   : 수확 진행 상황을 받을 콜백(dict). 노드가 이걸 Web Service 로
+                        중계한다 — 이 클래스는 HTTP 를 모른 채로 남아야 ROS·DB·네트워크
+                        없이 단위테스트가 된다(설계노트 2 와 같은 이유).
 
         반환: (status, reason)
           status: STATUS_COMPLETED | STATUS_FAILED — 노드가 tasks 에 마감한다.
@@ -150,10 +165,26 @@ class HarvestDispatcher:
             self._log.info(
                 f"[HARVEST] E2 도킹 완료 task={task_id} {robot_id} @ {label} "
                 f"(자리 {entry_slot} 유지 — 수확 중 남이 들어오면 안 된다)")
-            # TODO(E3~E6): 여기부터 Harvest 액션·실적 저장·예냉실 이송이 붙는다.
+
+            # --- E3~E4 수확 — Ddagi 가 주관하고 ACS 는 시키고 기다린다 ---
+            # 도킹과 같은 이유로 heartbeat 를 넘긴다. 수확은 분 단위라 이게 없으면
+            # 팔 작업 중에 자리를 뺏긴다.
+            harvested = self._run_harvest_action(
+                task_id, robot_id, clients["harvest"], on_progress,
+                heartbeat=(engine, [entry_slot], robot_id))
+            if harvested is None:
+                self._log.warning(
+                    f"[HARVEST] E3~4 수확 실패/중단 task={task_id} {robot_id} → FAILED")
+                return STATUS_FAILED, None
+
+            self._log.info(
+                f"[HARVEST] E3~4 수확 종료 task={task_id} {robot_id} "
+                f"정상 {harvested['normal_count']} / 폐기 {harvested['discard_count']} "
+                f"/ 실패 {harvested['failed_count']} (사유 {harvested['exit_reason']})")
+            # TODO(E5~E6): 실적 저장(콜백) → 예냉실 주행·도킹 → 하역·완료 통지.
             self._log.warning(
-                f"[HARVEST] E3~E6 미구현 → task {task_id} FAILED 로 마감 "
-                f"(수확지 도킹까지는 성공)")
+                f"[HARVEST] E5~E6 미구현 → task {task_id} FAILED 로 마감 "
+                f"(수확까지는 성공)")
             return STATUS_FAILED, None
         finally:
             # drive 는 '지금 서 있는 자리'를 일부러 남기고 나온다 — 다음 구간이 이어받아
@@ -162,3 +193,110 @@ class HarvestDispatcher:
             engine.release(engine.node_slot(current), robot_id)
             self._log.info(
                 f"[HARVEST] task={task_id} 지점 {current} 자리 반납")
+
+    # ---------------------------- E3~E4 수확 ---------------------------- #
+    def _run_harvest_action(self, task_id, robot_id, harvest_client,
+                            on_progress=None, heartbeat=None):
+        """Harvest 액션을 하달하고 끝날 때까지 기다린다. 성공하면 집계 dict, 아니면 None.
+
+        수확 루프(관측·검출요청·제외목록·라운드·파지)는 전부 Ddagi 안에서 돈다. DG 는
+        중계만 하고, ACS 는 Goal 하나 던지고 Feedback 을 받아 넘기다가 결과를 받는다.
+
+        ⚠️ 성공 판정이 Navigate·Dock 과 다르다. Harvest.action 에는 result_code 필드가
+           **없고**, 성공/취소/중단은 액션 goal 상태(SUCCEEDED/CANCELED/ABORTED)로
+           표현한다. 상태를 안 보고 결과 본문만 읽으면, 로봇이 중간에 중단(ABORTED)해도
+           집계가 0으로 채워져 있어 '수확 성공'으로 오인한다 → 빈 바구니를 예냉실로 나른다.
+
+        on_progress(dict): Feedback 이 올 때마다 호출(라운드·누적 3개·남은 개수).
+            ⚠️ ROS executor 스레드에서 실행된다. 호출부(노드)는 여기서 무거운 일을 하지
+            말고 fire-and-forget 통지만 해야 한다 — 막히면 액션 콜백 처리가 밀린다.
+            이 클래스가 직접 통지하지 않는 이유: HTTP 를 모르는 순수 오케스트레이터로
+            남겨야 ROS·DB·네트워크 없이 단위테스트가 된다.
+        heartbeat=(engine, [cid...], robot_id): 결과를 기다리는 동안 자리 예약 갱신.
+            수확은 분 단위라 이게 없으면 팔 작업 중에 자리를 뺏긴다.
+        반환: {"normal_count","discard_count","failed_count","exit_reason","message"}
+              또는 None(서버 미기동 / Goal 거부 / 타임아웃 / 중단·취소).
+        """
+        if not harvest_client.wait_for_server(timeout_sec=SERVER_WAIT_SEC):
+            self._log.warning(
+                f"[HARVEST] {robot_id} Harvest 액션 서버 미기동 task={task_id}")
+            return None
+
+        goal = Harvest.Goal()
+        goal.task_id = int(task_id)
+        goal.max_capacity = int(HARVEST_MAX_CAPACITY)
+
+        def _fb(msg):
+            """ROS executor 스레드 — 진행 상황을 호출부에 넘기기만 한다."""
+            try:
+                fb = msg.feedback
+                self._log.info(
+                    f"[HARVEST] 진행 task={task_id} 라운드 {fb.round} "
+                    f"정상 {fb.normal_count} 폐기 {fb.discard_count} "
+                    f"실패 {fb.failed_count} 남은 {fb.remaining_in_round}")
+                if on_progress is not None:
+                    on_progress({
+                        "round": int(fb.round),
+                        "normal_count": int(fb.normal_count),
+                        "discard_count": int(fb.discard_count),
+                        "failed_count": int(fb.failed_count),
+                        "remaining_in_round": int(fb.remaining_in_round),
+                    })
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning(f"[HARVEST] 진행 피드백 처리 예외(무시): {exc}")
+
+        self._log.info(
+            f"[HARVEST] E3~4 수확 시작 task={task_id} {robot_id} "
+            f"(만차 기준 {HARVEST_MAX_CAPACITY})")
+        goal_handle = spin_wait(
+            harvest_client.send_goal_async(goal, feedback_callback=_fb),
+            GOAL_ACCEPT_TIMEOUT_SEC)
+        if goal_handle is None or not goal_handle.accepted:
+            # DG 는 '도킹 성공한 task' 의 goal 만 accept 한다 → 거부는 도킹 상태 불일치 신호.
+            self._log.warning(
+                f"[HARVEST] Harvest Goal 거부/수락 타임아웃 task={task_id} "
+                f"(DG 가 도킹 상태를 다르게 알고 있을 수 있다)")
+            return None
+
+        return self._await_harvest_result(
+            goal_handle.get_result_async(), task_id, heartbeat)
+
+    def _await_harvest_result(self, result_future, task_id, heartbeat):
+        """수확 결과 대기. 대기 중 HEARTBEAT_SEC 마다 쥔 자리 예약을 갱신한다.
+
+        반환: 집계 dict(성공) 또는 None(타임아웃/중단·취소/파싱 실패).
+        """
+        done = threading.Event()
+        result_future.add_done_callback(lambda _f: done.set())
+        deadline = time.monotonic() + HARVEST_RESULT_TIMEOUT_SEC
+        while not done.wait(HEARTBEAT_SEC):
+            if heartbeat is not None:
+                engine, cids, robot_id = heartbeat
+                for cid in cids:
+                    engine.heartbeat(cid, robot_id)
+            if time.monotonic() >= deadline:
+                self._log.warning(
+                    f"[HARVEST] 수확 결과 대기 타임아웃"
+                    f"({HARVEST_RESULT_TIMEOUT_SEC}s) task={task_id} → 실패 취급")
+                return None
+        try:
+            response = result_future.result()
+            status = int(response.status)
+            res = response.result
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning(f"[HARVEST] 수확 결과 파싱 실패 task={task_id}: {exc}")
+            return None
+        if status != GoalStatus.STATUS_SUCCEEDED:
+            # 여기가 이 함수의 존재 이유다. 집계 필드는 중단됐어도 0 으로 채워져 오므로
+            # 본문만 보면 '아무것도 못 땄지만 성공'과 구분되지 않는다.
+            self._log.warning(
+                f"[HARVEST] 수확이 정상 종료되지 않았다 task={task_id} "
+                f"(goal status={status}) → 실패 취급")
+            return None
+        return {
+            "normal_count": int(res.normal_count),
+            "discard_count": int(res.discard_count),
+            "failed_count": int(res.failed_count),
+            "exit_reason": str(res.exit_reason),
+            "message": str(res.message),
+        }

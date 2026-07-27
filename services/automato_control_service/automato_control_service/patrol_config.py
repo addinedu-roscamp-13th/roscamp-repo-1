@@ -125,6 +125,16 @@ DOCK_RETRY_MAX = _envi("ACS_DOCK_RETRY_MAX", 3)             # 문서 N_dock
 #   여유배로 확정한다.
 DOCK_RESULT_TIMEOUT_SEC = _envf("ACS_DOCK_RESULT_TIMEOUT_SEC", 120.0)
 
+# --- 시나리오2 수확 (RP-123) ---
+# 바구니 만차 기준(문서 E3~E4). Harvest Goal 로 로봇에 내려보내고, 로봇은 이 개수를
+#   채우면 exit_reason=FULL 로 스스로 종료한다. ACS 는 개수를 세지 않는다.
+HARVEST_MAX_CAPACITY = _envi("ACS_HARVEST_MAX_CAPACITY", 7)
+# Harvest 액션 결과를 기다리는 최대 시간. 수확은 '라운드 × 토마토 개수'만큼 반복해
+#   주행·도킹과 시간 규모가 다르다(분 단위). 넉넉히 잡는 쪽이 안전하다 — 짧으면 정상
+#   수확을 중간에 실패로 끊어버리지만, 길어도 로봇이 죽으면 액션 서버 쪽에서 먼저
+#   끊기므로 이 값이 실제로 걸리는 일은 드물다.
+HARVEST_RESULT_TIMEOUT_SEC = _envf("ACS_HARVEST_RESULT_TIMEOUT_SEC", 1800.0)
+
 # ── 순찰 시작(정적) 노드 ─────────────────────────────────────────────────── #
 # 순찰은 항상 로봇이 충전소에 있을 때 시작한다(시작 위치 고정). 라우터는 waypoint_id 로만
 # 경로를 계산하는데, 충전소(task_points)와 그래프 노드(waypoints)는 FK 로 안 이어져 있어

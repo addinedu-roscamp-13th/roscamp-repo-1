@@ -55,6 +55,7 @@ from automato_control_service.patrol_config import (
 )
 from automato_control_service import docking
 from automato_control_service import harvest_dispatcher
+from automato_control_service import harvest_notify
 from automato_control_service import patrol_notify
 from automato_control_service.harvest_dispatcher import HarvestDispatcher
 from automato_control_service.patrol_dispatcher import PatrolDispatcher
@@ -403,7 +404,9 @@ class AutomatoControlNode(Node):
                 }
                 status, reason = self._harvest_dispatcher.run_harvest(
                     task_id, robot_id, harvest_point, marker, engine, clients,
-                    start_wp=self._start_waypoint_for(robot_id))
+                    start_wp=self._start_waypoint_for(robot_id),
+                    on_progress=self._harvest_progress_reporter(
+                        task_id, robot_id))
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f"수확 디스패치 예외 task={task_id}: {exc}")
             status, reason = "FAILED", None
@@ -424,6 +427,28 @@ class AutomatoControlNode(Node):
         # TODO(E6): 수확 완료를 Web Service 로 통지 — 보낼 모듈(harvest_notify)은 이미
         # 있고 배선만 남았다. 완료 페이로드에 수확 실적(normal/discard/failed)이 들어가는데
         # 그 값이 E3~4 Harvest 액션 결과에서 나오므로, 그 단계가 붙어야 채울 수 있다.
+
+    def _harvest_progress_reporter(self, task_id, robot_id):
+        """수확 진행 상황을 Web Service 로 중계하는 콜백을 만든다(E4). (RP-123)
+
+        디스패처는 HTTP 를 모르므로 '진행이 있었다'는 사실만 이 콜백으로 알려 오고,
+        실제 발송은 여기서 한다. fire-and-forget 이라 실패해도 수확을 멈추지 않는다 —
+        놓쳐도 최종 실적은 DB(harvest_batches)에 남아 화면을 새로 고치면 보인다.
+
+        ⚠️ 이 콜백은 ROS executor 스레드에서 실행된다. 여기서 오래 붙들면 액션 피드백
+        처리가 밀리므로, 예외는 전부 삼키고 짧게 끝낸다.
+        """
+        def _report(progress: dict) -> None:
+            try:
+                payload = harvest_notify.build_progress_payload(
+                    task_id=task_id, robot_id=robot_id,
+                    reported_at=datetime.now(timezone.utc), **progress)
+                harvest_notify.send_harvest_progress(
+                    self._web_url, payload, log=self.get_logger())
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(
+                    f"수확 진행 통지 실패(무시) task={task_id}: {exc}")
+        return _report
 
     def _report_task_result(self, task_id, robot_id, status, unvisited) -> None:
         """순찰 종료를 Web Service 로 알린다.

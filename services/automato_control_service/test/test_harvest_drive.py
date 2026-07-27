@@ -16,6 +16,9 @@
   5. 도착하면 도킹한다(docking.dock 공용 모듈). 도킹 중에도 자리를 쥐고 있어야 하고
      (로봇이 거기 붙어 팔 작업을 한다), 실패하면 DOCK_FAILED 사유를 노드에 알려
      관리자 통지가 나가게 한다.
+  6. 도킹 후 수확을 시킨다. 수확은 Ddagi 가 주관하고 ACS 는 기다리기만 하는데,
+     **성공 판정을 goal 상태로** 해야 한다(Harvest 에는 result_code 가 없다).
+     진행 보고는 콜백으로 노드에 넘긴다(디스패처는 HTTP 를 모른다).
 
 테스트 그래프(일직선):  15 --c16-- 12 --c13-- 9 --c7-- 4
   15 = 로봇 충전소 진입노드, 4 = 수확지(HARVEST_01) 진입노드
@@ -31,8 +34,10 @@ from concurrent.futures import Future
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from action_msgs.msg import GoalStatus                                   # noqa: E402
 from automato_control_service import docking                             # noqa: E402
 from automato_control_service import route_runner as rr                  # noqa: E402
+from automato_control_service import harvest_dispatcher as hd            # noqa: E402
 from automato_control_service.harvest_dispatcher import (                # noqa: E402
     REASON_DOCK_FAILED,
     STATUS_FAILED,
@@ -177,6 +182,67 @@ class FakeDock:
         return goal_future
 
 
+class _HarvestResult:
+    def __init__(self, normal, discard, failed, exit_reason):
+        self.normal_count = normal
+        self.discard_count = discard
+        self.failed_count = failed
+        self.exit_reason = exit_reason
+        self.message = "ok"
+
+
+class _HarvestResponse:
+    """액션 결과 응답 — 본문(result)과 **goal 상태(status)** 를 함께 담는다.
+
+    Harvest 는 result_code 가 없어서 이 status 로 성공/중단을 가린다.
+    """
+    def __init__(self, status, result):
+        self.status = status
+        self.result = result
+
+
+class _HarvestFeedback:
+    def __init__(self, round_, normal, discard, failed, remaining):
+        self.feedback = self
+        self.round = round_
+        self.normal_count = normal
+        self.discard_count = discard
+        self.failed_count = failed
+        self.remaining_in_round = remaining
+
+
+class FakeHarvest:
+    """수확 로봇 흉내 — 피드백을 몇 번 보낸 뒤 지정한 상태로 끝난다."""
+
+    def __init__(self, status=GoalStatus.STATUS_SUCCEEDED, normal=5, discard=2,
+                 failed=1, exit_reason="FULL", server_up=True, accepted=True,
+                 feedbacks=()):
+        self.status = status
+        self.result = _HarvestResult(normal, discard, failed, exit_reason)
+        self.server_up = server_up
+        self.accepted = accepted
+        self.feedbacks = feedbacks
+        self.calls = 0
+        self.goal = None
+
+    def wait_for_server(self, timeout_sec=None):
+        return self.server_up
+
+    def send_goal_async(self, goal, feedback_callback=None):
+        self.calls += 1
+        self.goal = goal
+        for fb in self.feedbacks:
+            if feedback_callback is not None:
+                feedback_callback(fb)
+        result_future = Future()
+        result_future.set_result(_HarvestResponse(self.status, self.result))
+        goal_future = Future()
+        handle = _Handle(result_future)
+        handle.accepted = self.accepted
+        goal_future.set_result(handle)
+        return goal_future
+
+
 @pytest.fixture
 def fast_timing(monkeypatch):
     """대기·하트비트를 짧게.
@@ -188,22 +254,24 @@ def fast_timing(monkeypatch):
     monkeypatch.setattr(rr, "RESERVE_POLL_SEC", 0.02)
     monkeypatch.setattr(rr, "HEARTBEAT_SEC", 0.02)
     monkeypatch.setattr(docking, "HEARTBEAT_SEC", 0.02)
+    monkeypatch.setattr(hd, "HEARTBEAT_SEC", 0.02)   # 수확 결과 대기
 
 
-def _make(nav=None, dock=None):
+def _make(nav=None, dock=None, harvest=None):
     engine = RoutingEngine(WAYPOINTS, CORRIDORS, reservation_ttl=60.0)
     log = _Log()
     disp = HarvestDispatcher(log)
     disp.runner.wp_meta = dict(WP_META)
     return (engine, disp, log,
             (nav if nav is not None else FakeNav()),
-            (dock if dock is not None else FakeDock()))
+            (dock if dock is not None else FakeDock()),
+            (harvest if harvest is not None else FakeHarvest()))
 
 
-def _clients(nav, dock=None):
-    """E2 가 쓰는 것은 nav·dock 뿐 — harvest/unload 는 아직 부르지 않는다
+def _clients(nav, dock=None, harvest=None):
+    """E2~E4 가 쓰는 것은 nav·dock·harvest — unload(E6)는 아직 부르지 않는다
     (None 이라 실수로 부르면 즉시 AttributeError 로 드러난다)."""
-    return {"nav": nav, "dock": dock, "harvest": None, "unload": None}
+    return {"nav": nav, "dock": dock, "harvest": harvest, "unload": None}
 
 
 def _no_reservations(engine):
@@ -214,10 +282,10 @@ def _no_reservations(engine):
 # --------------------------------------------------------------------------- #
 def test_수확지까지_주행하고_자리를_반납한다(fast_timing):
     """1·2 — 수확지에 도달하고, 끝나면 예약이 하나도 안 남는다."""
-    engine, disp, log, nav, dock = _make()
+    engine, disp, log, nav, dock, harv = _make()
 
     status, _reason = disp.run_harvest(
-        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock), start_wp=15)
+        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock, harv), start_wp=15)
 
     # 15 → 4 까지 실제로 하달됐는가(마지막 하달의 끝이 수확지여야 한다)
     assert nav.dispatched, "Navigate 하달이 한 번도 없었다"
@@ -231,10 +299,10 @@ def test_수확지까지_주행하고_자리를_반납한다(fast_timing):
 
 def test_촬영_없는_평범한_주행으로_하달된다(fast_timing):
     """수확은 순찰 훅을 안 쓴다 — 하달 배열에 촬영 플래그도 짝도 끼지 않는다."""
-    engine, disp, _log, nav, dock = _make()
+    engine, disp, _log, nav, dock, harv = _make()
 
     disp.run_harvest(1, "dg_01", HARVEST_POINT, MARKER, engine,
-                     _clients(nav, dock), start_wp=15)
+                     _clients(nav, dock, harv), start_wp=15)
 
     flat = [wp for seg in nav.dispatched for wp in seg]
     assert set(flat) <= set(WAYPOINTS), \
@@ -243,12 +311,12 @@ def test_촬영_없는_평범한_주행으로_하달된다(fast_timing):
 
 def test_경로가_없으면_FAILED_이고_예약도_안_남는다(fast_timing):
     """3 — 남이 길목을 다 쥐고 있어 갈 수 없으면 끊는다(그때도 뒷정리는 한다)."""
-    engine, disp, log, nav, dock = _make()
+    engine, disp, log, nav, dock, harv = _make()
     # 유일한 통로(15-12)의 도착 자리를 남이 쥐고 있으면 이 일직선 그래프에선 우회로가 없다.
     assert engine.try_reserve(engine.node_slot(12), "dg_09") is True
 
     status, _reason = disp.run_harvest(
-        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock), start_wp=15)
+        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock, harv), start_wp=15)
 
     assert status == STATUS_FAILED
     assert log.has("E2 주행 실패"), f"실패 로그가 없다: {log.lines}"
@@ -259,10 +327,10 @@ def test_경로가_없으면_FAILED_이고_예약도_안_남는다(fast_timing):
 
 def test_로봇이_중단을_보고하면_FAILED(fast_timing):
     """3 — 로봇이 스스로 멈췄다(result_code=2)면 재시도 없이 끊는다."""
-    engine, disp, _log, nav, dock = _make(FakeNav(code=2))
+    engine, disp, _log, nav, dock, harv = _make(FakeNav(code=2))
 
     status, _reason = disp.run_harvest(
-        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock), start_wp=15)
+        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock, harv), start_wp=15)
 
     assert status == STATUS_FAILED
     assert _no_reservations(engine), "중단 보고 뒤에도 예약이 남았다"
@@ -270,10 +338,10 @@ def test_로봇이_중단을_보고하면_FAILED(fast_timing):
 
 def test_출발점을_모르면_나서지도_않는다(fast_timing):
     """4 — 순찰과 달리 폴백하지 않는다. 한 발짝도 움직이면 안 된다."""
-    engine, disp, log, nav, dock = _make()
+    engine, disp, log, nav, dock, harv = _make()
 
     status, _reason = disp.run_harvest(
-        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock), start_wp=None)
+        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock, harv), start_wp=None)
 
     assert status == STATUS_FAILED
     assert nav.dispatched == [], "출발점을 모르는데 로봇을 움직였다"
@@ -283,11 +351,11 @@ def test_출발점을_모르면_나서지도_않는다(fast_timing):
 
 def test_그래프에_없는_수확지는_거절한다(fast_timing):
     """DB 에는 있지만 라우팅 그래프에 없는 지점 — 경로 계산이 불가능하다."""
-    engine, disp, _log, nav, dock = _make()
+    engine, disp, _log, nav, dock, harv = _make()
     ghost = dict(HARVEST_POINT, waypoint_id=999)
 
     status, _reason = disp.run_harvest(
-        1, "dg_01", ghost, MARKER, engine, _clients(nav, dock), start_wp=15)
+        1, "dg_01", ghost, MARKER, engine, _clients(nav, dock, harv), start_wp=15)
 
     assert status == STATUS_FAILED
     assert nav.dispatched == []
@@ -295,10 +363,10 @@ def test_그래프에_없는_수확지는_거절한다(fast_timing):
 
 def test_액션서버가_없으면_즉시_끊는다(fast_timing):
     """안 걸러내면 Goal 마다 수락 타임아웃을 다 기다린 뒤에야 실패한다."""
-    engine, disp, _log, nav, dock = _make(FakeNav(server_up=False))
+    engine, disp, _log, nav, dock, harv = _make(FakeNav(server_up=False))
 
     status, _reason = disp.run_harvest(
-        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock), start_wp=15)
+        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock, harv), start_wp=15)
 
     assert status == STATUS_FAILED
     assert nav.dispatched == []
@@ -307,10 +375,10 @@ def test_액션서버가_없으면_즉시_끊는다(fast_timing):
 # ------------------------------ E2 ChArUco 도킹 ------------------------------ #
 def test_도착하면_수확지_마커로_도킹한다(fast_timing):
     """5 — 도착 후 도킹을 한 번 하달하고, Goal 에 그 지점의 마커가 실린다."""
-    engine, disp, log, nav, dock = _make()
+    engine, disp, log, nav, dock, harv = _make()
 
     disp.run_harvest(1, "dg_01", HARVEST_POINT, MARKER, engine,
-                     _clients(nav, dock), start_wp=15)
+                     _clients(nav, dock, harv), start_wp=15)
 
     assert dock.calls == 1, f"도킹 하달 횟수가 이상하다: {dock.calls}"
     # 충전소가 아니라 '이 수확지'로 도킹해야 한다 — 지점 id 를 잘못 실으면 로봇이
@@ -327,7 +395,7 @@ def test_도킹_중에는_자리를_쥐고_있다(fast_timing):
     도킹 시점에 예약표를 들여다봐, 로봇이 수확지 자리를 쥔 채인지 확인한다.
     (끝난 뒤가 아니라 '도킹 중'이어야 의미가 있다 — 끝나면 finally 가 반납한다.)
     """
-    engine, disp, _log, nav, dock = _make()
+    engine, disp, _log, nav, dock, harv = _make()
     seen = {}
 
     real_send = dock.send_goal_async
@@ -338,7 +406,7 @@ def test_도킹_중에는_자리를_쥐고_있다(fast_timing):
 
     dock.send_goal_async = spy
     disp.run_harvest(1, "dg_01", HARVEST_POINT, MARKER, engine,
-                     _clients(nav, dock), start_wp=15)
+                     _clients(nav, dock, harv), start_wp=15)
 
     assert seen.get("holder") == "dg_01", \
         f"도킹 중에 수확지 자리를 안 쥐고 있었다(홀더={seen.get('holder')})"
@@ -346,10 +414,10 @@ def test_도킹_중에는_자리를_쥐고_있다(fast_timing):
 
 def test_마커가_없으면_도킹을_시도조차_안_한다(fast_timing):
     """마커 미시드(None)는 정상 상태다 — 값 없는 Goal 로 로봇을 움직이면 안 된다."""
-    engine, disp, _log, nav, dock = _make()
+    engine, disp, _log, nav, dock, harv = _make()
 
     status, reason = disp.run_harvest(
-        1, "dg_01", HARVEST_POINT, None, engine, _clients(nav, dock), start_wp=15)
+        1, "dg_01", HARVEST_POINT, None, engine, _clients(nav, dock, harv), start_wp=15)
 
     assert dock.calls == 0, "마커도 없이 Dock Goal 을 보냈다"
     assert status == STATUS_FAILED
@@ -359,10 +427,10 @@ def test_마커가_없으면_도킹을_시도조차_안_한다(fast_timing):
 
 def test_도킹이_계속_실패하면_N회_재시도_후_DOCK_FAILED(fast_timing):
     """N_dock 소진 → FAILED + DOCK_FAILED 사유(노드가 이걸 보고 관리자에게 알린다)."""
-    engine, disp, log, nav, dock = _make(dock=FakeDock(code=1))
+    engine, disp, log, nav, dock, harv = _make(dock=FakeDock(code=1))
 
     status, reason = disp.run_harvest(
-        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock), start_wp=15)
+        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock, harv), start_wp=15)
 
     assert dock.calls == docking.DOCK_RETRY_MAX, \
         f"재시도 횟수가 규격(N_dock)과 다르다: {dock.calls}"
@@ -374,12 +442,110 @@ def test_도킹이_계속_실패하면_N회_재시도_후_DOCK_FAILED(fast_timin
 
 def test_주행_실패는_도킹까지_가지_않는다(fast_timing):
     """길이 막혀 못 갔으면 도킹 단계는 아예 없다(그리고 DOCK_FAILED 도 아니다)."""
-    engine, disp, _log, nav, dock = _make()
+    engine, disp, _log, nav, dock, harv = _make()
     assert engine.try_reserve(engine.node_slot(12), "dg_09") is True
 
     status, reason = disp.run_harvest(
-        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock), start_wp=15)
+        1, "dg_01", HARVEST_POINT, MARKER, engine, _clients(nav, dock, harv), start_wp=15)
 
     assert dock.calls == 0, "도착도 못 했는데 도킹을 시도했다"
     assert status == STATUS_FAILED
     assert reason is None, "주행 실패에 도킹 실패 사유가 붙었다"
+
+
+# ------------------------------ E3~E4 수확 ------------------------------ #
+def test_도킹_후_수확을_시킨다(fast_timing):
+    """6 — 도킹이 끝나면 Harvest 를 한 번 하달하고, 만차 기준이 Goal 에 실린다."""
+    engine, disp, log, nav, dock, harv = _make()
+
+    disp.run_harvest(1, "dg_01", HARVEST_POINT, MARKER, engine,
+                     _clients(nav, dock, harv), start_wp=15)
+
+    assert harv.calls == 1, f"수확 하달 횟수가 이상하다: {harv.calls}"
+    assert harv.goal.max_capacity == hd.HARVEST_MAX_CAPACITY
+    assert log.has("E3~4 수확 종료"), f"수확 종료 로그가 없다: {log.lines}"
+    assert _no_reservations(engine), "수확이 끝났는데 예약이 남았다"
+
+
+def test_중단된_수확을_성공으로_오인하지_않는다(fast_timing):
+    """가장 중요한 판정 — Harvest 에는 result_code 가 없다.
+
+    로봇이 중간에 뻗으면(ABORTED) 집계 필드는 0 으로 채워져 오는데, 본문만 읽으면
+    '아무것도 못 땄지만 정상 종료'와 구분되지 않는다. 그러면 빈 바구니를 예냉실까지
+    나르게 된다. goal 상태를 봐야만 걸러진다.
+    """
+    engine, disp, log, nav, dock, harv = _make(
+        harvest=FakeHarvest(status=GoalStatus.STATUS_ABORTED,
+                            normal=0, discard=0, failed=0, exit_reason=""))
+
+    status, reason = disp.run_harvest(
+        1, "dg_01", HARVEST_POINT, MARKER, engine,
+        _clients(nav, dock, harv), start_wp=15)
+
+    assert status == STATUS_FAILED
+    assert reason is None, "수확 중단은 도킹 실패가 아니다"
+    assert not log.has("E3~4 수확 종료"), \
+        "중단(ABORTED)인데 수확이 정상 종료된 것으로 처리됐다"
+    assert _no_reservations(engine), "수확 중단 뒤에도 예약이 남았다"
+
+
+def test_진행_보고를_콜백으로_넘긴다(fast_timing):
+    """수확 중 들어오는 보고를 그대로 호출부(노드)에 넘긴다 — 발송은 노드가 한다."""
+    engine, disp, _log, nav, dock, harv = _make(
+        harvest=FakeHarvest(feedbacks=[
+            _HarvestFeedback(1, 2, 0, 0, 3),
+            _HarvestFeedback(2, 5, 2, 1, 0),
+        ]))
+    got = []
+
+    disp.run_harvest(1, "dg_01", HARVEST_POINT, MARKER, engine,
+                     _clients(nav, dock, harv), start_wp=15,
+                     on_progress=got.append)
+
+    assert len(got) == 2, f"진행 보고가 그대로 안 넘어왔다: {got}"
+    assert got[0]["round"] == 1 and got[0]["normal_count"] == 2
+    assert got[1]["remaining_in_round"] == 0
+
+
+def test_수확_중에도_자리를_쥐고_있다(fast_timing):
+    """수확은 분 단위다 — 그동안 자리를 놓으면 팔 작업 중에 남이 들어온다."""
+    engine, disp, _log, nav, dock, harv = _make()
+    seen = {}
+    real_send = harv.send_goal_async
+
+    def spy(goal, feedback_callback=None):
+        seen["holder"] = engine.holder_of(engine.node_slot(4))
+        return real_send(goal, feedback_callback)
+
+    harv.send_goal_async = spy
+    disp.run_harvest(1, "dg_01", HARVEST_POINT, MARKER, engine,
+                     _clients(nav, dock, harv), start_wp=15)
+
+    assert seen.get("holder") == "dg_01", \
+        f"수확 중에 자리를 안 쥐고 있었다(홀더={seen.get('holder')})"
+
+
+def test_수확_서버가_없거나_거부하면_FAILED(fast_timing):
+    """DG 는 '도킹 성공한 task' 의 goal 만 받는다 → 거부는 상태 불일치 신호다."""
+    engine, disp, _log, nav, dock, harv = _make(
+        harvest=FakeHarvest(accepted=False))
+
+    status, _reason = disp.run_harvest(
+        1, "dg_01", HARVEST_POINT, MARKER, engine,
+        _clients(nav, dock, harv), start_wp=15)
+
+    assert status == STATUS_FAILED
+    assert _no_reservations(engine)
+
+
+def test_도킹_실패하면_수확까지_가지_않는다(fast_timing):
+    """도킹이 안 됐는데 팔을 뻗으면 엉뚱한 곳을 집는다."""
+    engine, disp, _log, nav, dock, harv = _make(dock=FakeDock(code=1))
+
+    status, reason = disp.run_harvest(
+        1, "dg_01", HARVEST_POINT, MARKER, engine,
+        _clients(nav, dock, harv), start_wp=15)
+
+    assert harv.calls == 0, "도킹에 실패했는데 수확을 시켰다"
+    assert status == STATUS_FAILED
+    assert reason == REASON_DOCK_FAILED
