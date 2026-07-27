@@ -130,6 +130,22 @@ def select_auto(judged: list) -> Optional[str]:
     return candidates[0]["robot_id"]
 
 
+def judge_all(node, snap: dict, now: float) -> dict:
+    """robot_id -> 판정 dict. 가용조회/순찰접수/수확접수에서 공유(RP-123 에서 모듈로 추출).
+
+    snap["operational"] 는 snap["robots"] 와 같은 조회에서 나오므로 모든 rid 에 값이
+    있다. .get(rid, "NORMAL") 로 감싸지 않는 이유 — 그 불변식이 깨진 날 조용히
+    '정상'으로 통과시키는 것보다 KeyError 로 드러나는 편이 낫다.
+    """
+    return {
+        rid: judge_robot(
+            rid, node.cache.get(rid), rid in snap["active"],
+            snap["operational"][rid], snap["threshold"], now,
+        )
+        for rid in snap["robots"]
+    }
+
+
 # --------------------------------------------------------------------------- #
 # FastAPI 앱 팩토리
 # --------------------------------------------------------------------------- #
@@ -145,20 +161,11 @@ def create_app(node, pool) -> FastAPI:
     # 검증 화면(verify_web)의 LIVE 모드가 이걸 폴링한다. 순찰 판단 로직과 무관하다.
     traffic_debug.register(app, node)
 
-    def _judge_all(snap: dict, now: float) -> dict:
-        """robot_id -> 판정 dict. available/접수 양쪽에서 재사용.
-
-        snap["operational"] 는 snap["robots"] 와 같은 조회에서 나오므로 모든 rid 에 값이
-        있다. .get(rid, "NORMAL") 로 감싸지 않는 이유 — 그 불변식이 깨진 날 조용히
-        '정상'으로 통과시키는 것보다 KeyError 로 드러나는 편이 낫다.
-        """
-        return {
-            rid: judge_robot(
-                rid, node.cache.get(rid), rid in snap["active"],
-                snap["operational"][rid], snap["threshold"], now,
-            )
-            for rid in snap["robots"]
-        }
+    # 수확 접수 라우트(POST /internal/v1/tasks/harvest)도 같은 앱에 얹는다(순찰·수확 HTTP 공유).
+    # 함수 안에서 import — harvest_api 가 이 모듈의 순수 함수(judge_all/select_auto)를 쓰므로
+    # 모듈 최상단에서 import 하면 순환이 된다. create_app 은 앱 기동 시 1회만 도니 비용도 무의미.
+    from automato_control_service import harvest_api
+    harvest_api.register(app, node, pool)
 
     @app.get("/health")
     def health():
@@ -175,7 +182,7 @@ def create_app(node, pool) -> FastAPI:
                 content={"error": "DB_UNAVAILABLE", "message": str(exc)},
             )
         now = time.time()
-        robots = list(_judge_all(snap, now).values())
+        robots = list(judge_all(node, snap, now).values())
         return {
             "requested_at": _iso(now),
             "min_battery_percent": snap["threshold"],
@@ -194,7 +201,7 @@ def create_app(node, pool) -> FastAPI:
                          "message": str(exc)},
             )
         now = time.time()
-        judged = _judge_all(snap, now)
+        judged = judge_all(node, snap, now)
 
         # --- 로봇 선정 ---
         if req.robot_selection == "manual":
