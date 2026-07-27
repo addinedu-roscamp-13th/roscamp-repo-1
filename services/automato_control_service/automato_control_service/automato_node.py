@@ -28,7 +28,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from automato_interfaces.action import Navigate
+from automato_interfaces.action import Dock, Harvest, Navigate, Unload
 from automato_interfaces.msg import FleetTelemetry
 from automato_interfaces.srv import SaveDetection
 import rclpy
@@ -50,6 +50,7 @@ from automato_control_service.patrol_config import (
     SAVE_DETECTION_SRV,
 )
 from automato_control_service import patrol_notify
+from automato_control_service.harvest_dispatcher import HarvestDispatcher
 from automato_control_service.patrol_dispatcher import PatrolDispatcher
 from automato_control_service.routing_engine import RoutingEngine
 from automato_control_service.telemetry_cache import TelemetryCache
@@ -83,6 +84,9 @@ class AutomatoControlNode(Node):
         # 분리(composition). 노드는 필요한 것(logger·engine·client)을 넘겨주고 위임만 한다.
         # wp_meta·블랙리스트는 디스패처가 소유하며, 그래프 로드 시 노드가 wp_meta 를 채운다.
         self._dispatcher = PatrolDispatcher(self.get_logger())
+        # 수확(E2~E6)도 같은 composition 으로 분리. 순찰과 엔진·wp_meta 를 공유하고
+        # (교통관제 일관성) 흐름만 별도 클래스가 주관한다.
+        self._harvest_dispatcher = HarvestDispatcher(self.get_logger())
 
         # 텔레메트리 상시 구독(1Hz) — 로봇별 /{robot_id}/telemetry
         self.declare_parameter("robot_ids", DEFAULT_ROBOT_IDS)
@@ -163,6 +167,8 @@ class AutomatoControlNode(Node):
                     }
                     for w in graph["waypoints"]
                 }
+                # 수확 디스패처도 같은 좌표 메타를 공유한다(주행 골 구성에 필요).
+                self._harvest_dispatcher.wp_meta = self._dispatcher.wp_meta
                 # 부모 → 짝 맵. 디스패처가 부모 도착 직후 이 짝을 추가로 하달한다.
                 # 짝 관계는 정적이라 기동 시 1회만 만든다(DB 왕복 없음).
                 self._dispatcher.pair_of = {
@@ -201,13 +207,24 @@ class AutomatoControlNode(Node):
             self.get_logger().info(f"{robot_id} 순찰 시작 노드 = {wp}(전용 충전소)")
         return wp
 
-    def _client_for(self, robot_id: str) -> ActionClient:
+    def _action_client_for(self, robot_id: str, action_type,
+                           suffix: str) -> ActionClient:
+        """robot_id 의 특정 액션 클라이언트를 캐시에서 얻거나 만든다(/{robot_id}/{suffix}).
+
+        Navigate·Dock·Harvest·Unload 를 하나의 캐시로 관리한다. 키는 'robot_id/suffix'
+        (예: 'dg_01/navigate', 'dg_01/harvest') 라 액션끼리 안 겹친다.
+        """
+        key = f"{robot_id}/{suffix}"
         with self._action_clients_lock:
-            client = self._action_clients.get(robot_id)
+            client = self._action_clients.get(key)
             if client is None:
-                client = ActionClient(self, Navigate, f"/{robot_id}/navigate")
-                self._action_clients[robot_id] = client
+                client = ActionClient(self, action_type, f"/{robot_id}/{suffix}")
+                self._action_clients[key] = client
             return client
+
+    def _client_for(self, robot_id: str) -> ActionClient:
+        """순찰용 Navigate 액션 클라이언트(하위호환 이름)."""
+        return self._action_client_for(robot_id, Navigate, "navigate")
 
     def prewarm_clients(self, robot_ids) -> None:
         """알려진 로봇의 Navigate 액션 클라이언트를 executor spin 시작 전에 미리 만든다.
@@ -263,6 +280,52 @@ class AutomatoControlNode(Node):
         # tasks 마감과 별개로 Web Service 에 순찰 결과를 알린다(E2 9-1/12/13).
         # 이 스레드는 순찰이 이미 끝난 자리라, 여기서 동기로 보내도 순찰 루프를 막지 않는다.
         self._report_task_result(task_id, robot_id, status, unvisited)
+
+    # ---------------------------- 수확 디스패치 진입점 (RP-123) ---------------------------- #
+    def start_harvest(self, task_id: int, robot_id: str,
+                      harvest_location: str) -> None:
+        """API(C1)가 호출. 수확 task 하나를 별도 스레드로 돌린다(순찰 start_patrol 과 대칭).
+
+        harvest_location: 수확 위치 task_point_id(예: 'HARVEST_01'). 예냉실은 디스패처가
+        내부에서 조회하므로 여기선 안 넘긴다.
+        """
+        t = threading.Thread(
+            target=self._harvest_job, args=(task_id, robot_id, harvest_location),
+            name=f"harvest-{robot_id}-{task_id}", daemon=True)
+        t.start()
+        self.get_logger().info(
+            f"수확 디스패치 시작: task={task_id} robot={robot_id} 목적지={harvest_location}")
+
+    def _harvest_job(self, task_id: int, robot_id: str,
+                     harvest_location: str) -> None:
+        """스레드 본체: 엔진·액션 클라이언트를 준비해 디스패처에 위임하고 tasks 에 마감.
+
+        순찰 _patrol_job 과 같은 골격. 다른 점은 액션 클라이언트가 4종
+        (Navigate/Dock/Harvest/Unload)이라는 것뿐. (지금 run_harvest 는 스텁이라 FAILED)
+        """
+        status = "FAILED"
+        try:
+            engine = self._get_engine()
+            if engine is not None:
+                clients = {
+                    "nav": self._action_client_for(robot_id, Navigate, "navigate"),
+                    "dock": self._action_client_for(robot_id, Dock, "dock"),
+                    "harvest": self._action_client_for(robot_id, Harvest, "harvest"),
+                    "unload": self._action_client_for(robot_id, Unload, "unload"),
+                }
+                status = self._harvest_dispatcher.run_harvest(
+                    task_id, robot_id, harvest_location, engine, clients,
+                    start_wp=self._start_waypoint_for(robot_id))
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f"수확 디스패치 예외 task={task_id}: {exc}")
+            status = "FAILED"
+        if self._db_pool is not None:
+            try:
+                automato_db.set_task_status(self._db_pool, task_id, status)
+                self.get_logger().info(f"수확 종료 task={task_id} → {status}")
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().error(f"tasks 종료 갱신 실패 task={task_id}: {exc}")
+        # TODO(C2): 수확 완료/실패를 Web Service 로 통지(순찰 _report_task_result 대응).
 
     def _report_task_result(self, task_id, robot_id, status, unvisited) -> None:
         """순찰 종료를 Web Service 로 알린다.
