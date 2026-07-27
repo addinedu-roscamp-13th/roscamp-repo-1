@@ -43,6 +43,16 @@ class PatrolInProgressError(Exception):
     """
 
 
+class HarvestInProgressError(Exception):
+    """요청한 수확 위치에 이미 활성(WAITING/IN_PROGRESS) HARVEST task가 있어 거부.
+
+    수확은 순찰과 달리 여러 대가 '서로 다른 수확 위치'에서 동시에 가능하다. 그래서 전역
+    1건이 아니라 '수확 위치(task_point_id)별 1건'을 강제한다. DB의 부분 유니크 인덱스
+    (ux_tasks_active_harvest_location) 위반을 예외로 바꿔 던지고, API 계층이 409
+    (HARVEST_IN_PROGRESS)로 응답한다. (로봇당 활성 1건은 RobotBusyError가 별도 담당)
+    """
+
+
 # --------------------------------------------------------------------------- #
 # 접속 정보(DSN) 로딩
 # --------------------------------------------------------------------------- #
@@ -120,13 +130,21 @@ def create_pool() -> ConnectionPool:
 # --------------------------------------------------------------------------- #
 # 가용 판정 입력 조회 (available API / 접수 API 공통)
 # --------------------------------------------------------------------------- #
-def get_availability_snapshot(pool: ConnectionPool) -> dict:
+# operation_battery_thresholds 행이 없을 때의 방어용 기본값
+# (ERD 명시 기본값: PATROL 70 / HARVEST·TRANSFER 50)
+_DEFAULT_BATTERY_THRESHOLD = {"PATROL": 70, "HARVEST": 50, "TRANSFER": 50}
+
+
+def get_availability_snapshot(pool: ConnectionPool, task_type: str = "PATROL") -> dict:
     """가용 판정에 필요한 'DB쪽' 입력을 한 번에 모아 온다.
+
+    task_type: 배터리 임계값을 어느 기능 기준으로 볼지 (PATROL/HARVEST/TRANSFER).
+               기본 PATROL 이라 기존 순찰 호출부는 그대로 동작한다.
 
     반환:
       robots      : 전체 로봇 id 목록(robots 테이블, 정렬됨)
       active      : 지금 활성 task를 가진 robot_id 집합(WAITING/IN_PROGRESS)
-      threshold   : PATROL 배터리 임계값(operation_battery_thresholds, 기본 70)
+      threshold   : task_type 배터리 임계값(operation_battery_thresholds, 없으면 기본값 맵)
       operational : robot_id -> operational_status('NORMAL'|'IMMOBILIZED'|'MAINTENANCE')
 
     캐시(nav_status/battery/staleness)는 노드가 들고 있으므로 여기선 안 읽는다.
@@ -151,9 +169,11 @@ def get_availability_snapshot(pool: ConnectionPool) -> dict:
         }
         row = conn.execute(
             "SELECT min_battery_percent FROM operation_battery_thresholds "
-            "WHERE task_type = 'PATROL'"
+            "WHERE task_type = %s",
+            (task_type,),
         ).fetchone()
-        threshold = row["min_battery_percent"] if row else 70
+        threshold = (row["min_battery_percent"] if row
+                     else _DEFAULT_BATTERY_THRESHOLD.get(task_type, 50))
     return {"robots": robots, "active": active, "threshold": threshold,
             "operational": operational}
 
@@ -281,6 +301,50 @@ def accept_patrol_task(pool: ConnectionPool, robot_id: str,
         # psycopg 는 위반한 인덱스명을 exc.diag.constraint_name 으로 알려준다.
         if getattr(exc.diag, "constraint_name", None) == "ux_tasks_single_active_patrol":
             raise PatrolInProgressError(str(exc)) from exc
+        raise RobotBusyError(str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- #
+# 수확 접수 트랜잭션 (RP-123) — 순찰과 동일 골격, task_point_id(수확 위치)만 추가
+# --------------------------------------------------------------------------- #
+_INSERT_HARVEST_TASK = (
+    "INSERT INTO tasks (task_type, status, assigned_robot_id, task_point_id, "
+    "created_at, updated_at) "
+    "VALUES ('HARVEST', 'WAITING', %s, %s, NOW(), NOW()) RETURNING task_id"
+)
+
+
+def accept_harvest_task(pool: ConnectionPool, robot_id: str,
+                        harvest_location: str, snapshot_json: str) -> int:
+    """수확 task 를 접수한다. ①~③을 하나의 트랜잭션으로 실행(예외 시 전체 롤백).
+
+    ① tasks INSERT (HARVEST/WAITING, task_point_id=harvest_location) -> task_id 확보
+    ② task_assignment_snapshot INSERT (명령 직전 로봇 상태 JSONB) — 순찰과 공용 상수
+    ③ tasks 를 IN_PROGRESS 로 전환 — 순찰과 공용 상수
+
+    경로(수확지 진입노드)는 여기서 뽑지 않는다. 디스패처가 get_task_point 로 진입노드를
+    조회해 Dijkstra 로 계산한다(예냉실 이송도 같은 조회를 재사용하므로 접수와 분리).
+
+    반환: task_id
+
+    예외(둘 다 INSERT 시 부분 유니크 인덱스 위반 → 트랜잭션 자동 롤백):
+      HarvestInProgressError — 그 수확 위치에 이미 활성 HARVEST 존재
+                               (ux_tasks_active_harvest_location).
+      RobotBusyError         — 그 로봇이 이미 활성 task 보유(ux_tasks_active_robot).
+    """
+    try:
+        with pool.connection() as conn:
+            with conn.transaction():   # BEGIN ~ COMMIT/ROLLBACK 자동 관리
+                task_id = conn.execute(
+                    _INSERT_HARVEST_TASK, (robot_id, harvest_location)
+                ).fetchone()["task_id"]
+                conn.execute(_INSERT_SNAPSHOT, (task_id, robot_id, snapshot_json))
+                conn.execute(_UPDATE_INPROGRESS, (task_id,))
+        return task_id
+    except psycopg.errors.UniqueViolation as exc:
+        # 위반한 인덱스명으로 사유를 구분한다(psycopg: exc.diag.constraint_name).
+        if getattr(exc.diag, "constraint_name", None) == "ux_tasks_active_harvest_location":
+            raise HarvestInProgressError(str(exc)) from exc
         raise RobotBusyError(str(exc)) from exc
 
 
@@ -447,3 +511,105 @@ def get_patrol_start_waypoint(pool: ConnectionPool, robot_id: str):
     with pool.connection() as conn:
         row = conn.execute(_SELECT_PATROL_START_WAYPOINT, (robot_id,)).fetchone()
     return row["waypoint_id"] if row else None
+
+
+# --------------------------------------------------------------------------- #
+# 작업 지점(수확지/예냉실) 진입노드 조회 (RP-123) — task_points ⋈ waypoints
+#   수확지는 요청이 준 id 로, 예냉실은 point_type 으로 찾는다.
+# --------------------------------------------------------------------------- #
+_TASK_POINT_COLS = (
+    "SELECT tp.task_point_id, tp.point_type, tp.waypoint_id, "
+    "       w.x_coord, w.y_coord, w.yaw_coord "
+    "  FROM task_points tp "
+    "  JOIN waypoints w ON w.waypoint_id = tp.waypoint_id "
+)
+_SELECT_TASK_POINT = _TASK_POINT_COLS + " WHERE tp.task_point_id = %s"
+_SELECT_PRECOOL_POINT = (
+    _TASK_POINT_COLS + " WHERE tp.point_type = 'PRECOOL' "
+    " ORDER BY tp.task_point_id LIMIT 1"
+)
+
+
+def _row_to_task_point(row):
+    """task_points ⋈ waypoints 한 행을 디스패처용 dict 로. row 가 None 이면 None."""
+    if row is None:
+        return None
+    return {
+        "task_point_id": row["task_point_id"],
+        "point_type": row["point_type"],
+        "waypoint_id": row["waypoint_id"],
+        "x": row["x_coord"],
+        "y": row["y_coord"],
+        "yaw": row["yaw_coord"],
+    }
+
+
+def get_task_point(pool: ConnectionPool, task_point_id: str):
+    """task_point_id(예: HARVEST_01)의 진입노드+좌표+종류를 dict 로. 없으면 None.
+
+    반환: {"task_point_id","point_type","waypoint_id","x","y","yaw"}
+    point_type 검증(HARVEST 가 맞는지)은 호출부(API)가 한다 — 여기선 있는 그대로 돌려준다.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(_SELECT_TASK_POINT, (task_point_id,)).fetchone()
+    return _row_to_task_point(row)
+
+
+def get_precool_point(pool: ConnectionPool):
+    """예냉실 진입노드+좌표를 dict 로. 없으면 None. (현재 PRECOOL_01 1곳 — ERD/charuco 시드 기준)
+
+    LIMIT 1: 예냉실이 하나라는 전제. 여러 개가 되면 이 함수를 '어느 예냉실로 갈지' 선택
+    로직으로 확장한다(수확지처럼 id 로 특정하거나 최단거리 선택 등).
+    """
+    with pool.connection() as conn:
+        row = conn.execute(_SELECT_PRECOOL_POINT).fetchone()
+    return _row_to_task_point(row)
+
+
+# --------------------------------------------------------------------------- #
+# 수확 결과 영속화 (RP-123) — 집계만 남긴다(개별 토마토 좌표·등급은 DB에 저장 안 함)
+# --------------------------------------------------------------------------- #
+_INSERT_HARVEST_BATCH = (
+    "INSERT INTO harvest_batches "
+    "(task_id, robot_id, normal_count, discard_count, failed_count, exit_reason, "
+    "created_at, updated_at) "
+    "VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW()) RETURNING batch_id"
+)
+
+
+def save_harvest_batch(pool: ConnectionPool, task_id: int, robot_id: str,
+                       normal_count: int, discard_count: int,
+                       failed_count: int, exit_reason: str) -> int:
+    """수확 배치 실적 1행을 저장하고 batch_id 를 반환한다.
+
+    E5(수확 종료 직후) 호출 — 예냉실 도착이 아니라 여기서 저장한다. 이송 중 로봇이
+    멈춰도 이미 딴 실적은 사실로 남아야 하기 때문(Harvest.Result 값을 그대로 옮김).
+    """
+    with pool.connection() as conn:
+        return conn.execute(
+            _INSERT_HARVEST_BATCH,
+            (task_id, robot_id, normal_count, discard_count,
+             failed_count, exit_reason),
+        ).fetchone()["batch_id"]
+
+
+# unload_logs 는 created_at 만 있고 updated_at 이 없다(ERD 그대로) — INSERT 컬럼이 다르다.
+_INSERT_UNLOAD_LOG = (
+    "INSERT INTO unload_logs (task_id, robot_id, normal_qty, discard_qty, created_at) "
+    "VALUES (%s, %s, %s, %s, NOW()) RETURNING unload_id"
+)
+
+
+def save_unload_log(pool: ConnectionPool, task_id: int, robot_id: str,
+                    normal_qty: int, discard_qty: int) -> int:
+    """하역 입고 1행을 저장하고 unload_id 를 반환한다.
+
+    E6 하역 동작이 '성공했을 때만' 호출한다(실패 시 행 없음 — 하지만 수확 실적은 이미
+    harvest_batches 에 있어 유실 안 됨). 수량은 그 task 의 harvest_batches 집계값을
+    그대로 옮긴다. 바구니 2개가 붙어 있어 한 번에 normal/discard 가 동시 입고된다.
+    """
+    with pool.connection() as conn:
+        return conn.execute(
+            _INSERT_UNLOAD_LOG,
+            (task_id, robot_id, normal_qty, discard_qty),
+        ).fetchone()["unload_id"]
