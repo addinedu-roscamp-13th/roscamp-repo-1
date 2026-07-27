@@ -28,6 +28,8 @@ setup(
             'navigate_server = ddago_control.navigate_server:main',
             'dock_server = ddago_control.dock_server:main',
             'camera_node = ddago_control.camera_node:main',
+            'reflective_detector = ddago_control.reflective_dock.detector_node:main',
+            'reflective_dock = ddago_control.reflective_dock.dock_controller:main',
         ],
     },
 )
