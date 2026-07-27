@@ -216,6 +216,32 @@ class AutomatoControlNode(Node):
             self.get_logger().info(f"{robot_id} 순찰 시작 노드 = {wp}(전용 충전소)")
         return wp
 
+    def _task_point_for(self, task_point_id: str):
+        """작업 지점(수확지/예냉실)의 진입노드+좌표 dict. 실패 시 None. (RP-123)
+
+        수확 디스패처는 DB 를 만지지 않는 경계라, '미리 조회할 수 있는' 이 값은 노드가
+        읽어 넘긴다(_start_waypoint_for 와 같은 관례). 접수 API 가 이미 같은 조회로
+        위치를 검증했지만 여기서 다시 읽는다 — 접수와 디스패치는 스레드도 시점도 달라,
+        그 사이 지점이 바뀌었을 수 있고 API 는 waypoint_id 를 노드로 넘기지 않는다.
+        """
+        if self._db_pool is None:
+            self.get_logger().error(
+                f"DB 풀이 없어 작업 지점 {task_point_id} 를 조회할 수 없다")
+            return None
+        try:
+            tp = automato_db.get_task_point(self._db_pool, task_point_id)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f"작업 지점 {task_point_id} 조회 실패: {exc}")
+            return None
+        if tp is None:
+            self.get_logger().error(
+                f"작업 지점 {task_point_id} 가 task_points 에 없음")
+        else:
+            self.get_logger().info(
+                f"작업 지점 {task_point_id} → 진입노드 {tp['waypoint_id']} "
+                f"({tp['point_type']})")
+        return tp
+
     def _action_client_for(self, robot_id: str, action_type,
                            suffix: str) -> ActionClient:
         """robot_id 의 특정 액션 클라이언트를 캐시에서 얻거나 만든다(/{robot_id}/{suffix}).
@@ -309,13 +335,17 @@ class AutomatoControlNode(Node):
                      harvest_location: str) -> None:
         """스레드 본체: 엔진·액션 클라이언트를 준비해 디스패처에 위임하고 tasks 에 마감.
 
-        순찰 _patrol_job 과 같은 골격. 다른 점은 액션 클라이언트가 4종
-        (Navigate/Dock/Harvest/Unload)이라는 것뿐. (지금 run_harvest 는 스텁이라 FAILED)
+        순찰 _patrol_job 과 같은 골격. 다른 점은 두 가지다:
+          · 액션 클라이언트가 4종(Navigate/Dock/Harvest/Unload)이다.
+          · 수확지 진입노드를 여기서 조회해 넘긴다 — 디스패처는 DB 를 만지지 않는다는
+            경계(harvest_dispatcher 설계노트 2) 때문이다. 순찰이 start_wp 를 여기서
+            조회해 넘기는 것과 같은 관례다.
         """
         status = "FAILED"
         try:
             engine = self._get_engine()
-            if engine is not None:
+            harvest_point = self._task_point_for(harvest_location)
+            if engine is not None and harvest_point is not None:
                 clients = {
                     "nav": self._action_client_for(robot_id, Navigate, "navigate"),
                     "dock": self._action_client_for(robot_id, Dock, "dock"),
@@ -323,7 +353,7 @@ class AutomatoControlNode(Node):
                     "unload": self._action_client_for(robot_id, Unload, "unload"),
                 }
                 status = self._harvest_dispatcher.run_harvest(
-                    task_id, robot_id, harvest_location, engine, clients,
+                    task_id, robot_id, harvest_point, engine, clients,
                     start_wp=self._start_waypoint_for(robot_id))
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f"수확 디스패치 예외 task={task_id}: {exc}")
@@ -334,7 +364,10 @@ class AutomatoControlNode(Node):
                 self.get_logger().info(f"수확 종료 task={task_id} → {status}")
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().error(f"tasks 종료 갱신 실패 task={task_id}: {exc}")
-        # TODO(C2): 수확 완료/실패를 Web Service 로 통지(순찰 _report_task_result 대응).
+        # TODO(E6): 수확 완료를 Web Service 로 통지 — 보낼 모듈(harvest_notify)은 이미
+        # 있고 배선만 남았다. 완료 페이로드에 수확 실적(normal/discard/failed)이 들어가는데
+        # 그 값이 E3~4 Harvest 액션 결과에서 나오므로, 그 단계가 붙어야 채울 수 있다.
+        # 실패 통지는 시나리오1 규격을 그대로 쓴다(patrol_notify.send_task_failed).
 
     def _report_task_result(self, task_id, robot_id, status, unvisited) -> None:
         """순찰 종료를 Web Service 로 알린다.
