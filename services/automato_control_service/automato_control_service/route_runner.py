@@ -39,7 +39,7 @@ from automato_control_service.patrol_config import (
 from automato_control_service.routing_engine import Route
 
 
-def _spin_wait(future, timeout: float):
+def spin_wait(future, timeout: float):
     """executor(백그라운드 spin)가 완료해 줄 future를, 다른 스레드에서 기다린다.
 
     executor가 이미 spin 중이므로 여기서 또 spin하면 안 된다. done 콜백이 Event를
@@ -593,7 +593,7 @@ class RouteRunner:
             except Exception as exc:  # noqa: BLE001
                 self._log.warn(f"피드백 처리 예외(무시): {exc}")
 
-        goal_handle = _spin_wait(
+        goal_handle = spin_wait(
             client.send_goal_async(
                 goal, feedback_callback=(_fb if on_feedback is not None else None)),
             GOAL_ACCEPT_TIMEOUT_SEC)

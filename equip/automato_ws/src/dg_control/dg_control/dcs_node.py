@@ -21,6 +21,13 @@
     - 액션 클라이언트 /ddagi/harvest              (Harvest) → Ddagi Control Service
     - 수확 루프 주관은 Ddagi(관측·검출·제외목록·라운드·파지). DG 는 goal 하달 + feedback/
       result 중계만 한다. 도킹 성공 task 만 accept(게이트), 취소 전파, Feedback 무수신 워치독.
+  S2 E6 예냉실 하역(Unload 중계):
+    - 액션 서버      /{robot_id}/unload          (Unload) ← Automato Control Service
+    - 액션 클라이언트 /ddagi/unload               (Unload) → Ddagi Control Service
+    - 하역 시퀀스(손잡이 파지→들기→대기→흔들기→복귀) 주관은 Ddagi. DG 는 goal 하달 +
+      feedback(phase)/result 중계만 한다. 예냉실 도킹 성공 task 만 accept(게이트), 취소
+      전파, Feedback 무수신 워치독. 하역 실패도 result_code 를 가공 없이 그대로 올린다
+      (task FAILED 판정은 ACS 몫 — 하역은 보너스라 실패해도 수확 실적을 지우지 않는다).
   E2 촬영·분석·저장:
     - 서비스 서버    /dg/analyze_frame           (AnalyzeFrame) ← DdaGo (capture 노드 도착 후)
     - TCP 클라이언트  DG AI Service               (4B len+JSON)  → 분석 위임
@@ -57,7 +64,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallb
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from automato_interfaces.action import Dock, Harvest, Navigate
+from automato_interfaces.action import Dock, Harvest, Navigate, Unload
 from automato_interfaces.msg import RobotTelemetry
 from automato_interfaces.srv import AnalyzeFrame, SaveDetection
 from sensor_msgs.msg import Image
@@ -105,6 +112,9 @@ class DcsNode(Node):
         # 워치독**으로 감시한다. 마지막 Feedback(또는 goal 수락) 이후 이 시간(초) 넘게
         # 진행 소식이 없으면 Ddagi 가 멎은 것으로 보고 취소·실패 처리한다.
         self.declare_parameter('harvest_feedback_timeout_sec', 30.0)
+        # 하역(Unload)도 phase 진행 소식이 이 시간(초) 넘게 없으면 멎은 것으로 보고 실패
+        # 처리한다. 시퀀스에 shake_delay(기본 3초) 대기가 있으므로 그보다 넉넉해야 한다.
+        self.declare_parameter('unload_feedback_timeout_sec', 15.0)
 
         self.robot_id = self.get_parameter('robot_id').value
         fleet_hz = float(self.get_parameter('fleet_hz').value)
@@ -113,6 +123,8 @@ class DcsNode(Node):
         self._dock_timeout = float(self.get_parameter('dock_result_timeout_sec').value)
         self._harvest_fb_timeout = float(
             self.get_parameter('harvest_feedback_timeout_sec').value)
+        self._unload_fb_timeout = float(
+            self.get_parameter('unload_feedback_timeout_sec').value)
 
         # 콜백 그룹: 서비스/타이머는 동시 처리(Reentrant), 액션 클라이언트는 순차(Exclusive).
         self._cb_re = ReentrantCallbackGroup()
@@ -176,7 +188,24 @@ class DcsNode(Node):
         self._harvest_client = ActionClient(
             self, Harvest, '/ddagi/harvest',   # 로봇 쪽은 robot_id 미사용
             callback_group=self._cb_client)
-        self._ddagi_lock = threading.Lock()   # 동시에 뜬 Harvest goal 은 하나뿐
+        # 수확(Harvest)과 하역(Unload)은 같은 팔(Ddagi)을 쓰므로 _ddagi_lock 을 공유한다
+        # — 수확 중 하역 goal 이 겹쳐 들어가면 팔이 두 명령을 동시에 받게 된다(E3~E6 는
+        # 시간상 겹치지 않지만, 겹쳐 하달되는 비정상 상황에서도 순서를 지키도록 직렬화).
+        self._ddagi_lock = threading.Lock()   # 동시에 뜬 Harvest/Unload goal 은 하나뿐
+
+        # ---- S2 E6 Unload 액션 서버 (ACS ← ) / 클라이언트 (→ Ddagi) ----
+        # 하역 시퀀스(손잡이 파지→들기→대기→흔들기→복귀) 주관은 Ddagi 다. DG 는 Unload 를
+        # **중계**만 한다(goal 하달 + feedback/result 되돌림). goal 수락은 예냉실 도킹 성공
+        # (is_docked)한 task 로 제한한다(goal_callback).
+        self._unload_srv = ActionServer(
+            self, Unload, '/%s/unload' % self.robot_id,
+            goal_callback=self._unload_goal_cb,
+            execute_callback=self._unload_execute,
+            cancel_callback=lambda _gh: CancelResponse.ACCEPT,
+            callback_group=self._cb_re)
+        self._unload_client = ActionClient(
+            self, Unload, '/ddagi/unload',   # 로봇 쪽은 robot_id 미사용
+            callback_group=self._cb_client)
 
         # ---- E2 AnalyzeFrame 서비스 서버 (DdaGo ← ) ----
         self.create_service(
@@ -219,8 +248,8 @@ class DcsNode(Node):
 
         self.get_logger().info(
             'DCS 준비: robot_id=%s | Navigate서버 /%s/navigate | Dock서버 /%s/dock '
-            '| Harvest서버 /%s/harvest | AI target=%s'
-            % (self.robot_id, self.robot_id, self.robot_id, self.robot_id,
+            '| Harvest서버 /%s/harvest | Unload서버 /%s/unload | AI target=%s'
+            % (self.robot_id, self.robot_id, self.robot_id, self.robot_id, self.robot_id,
                self.get_parameter('ai_target_file').value
                or '(dg_ai_target.json 못 찾음 -> %s 고정)'
                   % self.get_parameter('ai_default_endpoint').value))
@@ -688,6 +717,130 @@ class DcsNode(Node):
         self.get_logger().info('Ddagi 수확 종료: exit=%s normal=%d discard=%d failed=%d'
                                % (r.exit_reason, r.normal_count, r.discard_count, r.failed_count))
         self._wire('to_dcs', 'Harvest(→Ddagi)/result', self._msg_to_dict(r))
+        return r, ''
+
+    # ===== S2 E6 Unload 중계 — ACS 의 하역 지시를 Ddagi 로 그대로 =====
+    def _unload_goal_cb(self, goal_request):
+        """하역 goal 수락 판정: 예냉실 도킹 성공(is_docked)한 task 만 진입 허용.
+        도킹하지 않은 위치에서 팔이 손잡이를 드는 것을 막는 안전 조건이다."""
+        if self.is_docked(goal_request.task_id):
+            return GoalResponse.ACCEPT
+        self.get_logger().warn(
+            '하역 goal 거부: task=%d 도킹 안 됨(예냉실 Dock 성공 필요)' % goal_request.task_id)
+        return GoalResponse.REJECT
+
+    def _unload_execute(self, goal_handle):
+        """ACS 가 하달한 Unload goal 을 Ddagi 로 중계하고, feedback·result 를 그대로 ACS 로.
+
+        하역 시퀀스(손잡이 파지→들기→대기→흔들기→복귀)는 Ddagi 몫이다(DG는 중계자). Feedback
+        무수신 워치독으로 멎음을 감지하고, ACS 취소는 Ddagi goal 취소로 전파한다. 하역 실패
+        (result_code!=0)도 값을 가공하지 않고 그대로 올린다 — task FAILED 판정은 ACS 몫이다.
+        """
+        req = goal_handle.request
+        self.get_logger().info('하역 시작 수신(ACS→DCS): task=%d shake_delay=%.1fs'
+                               % (req.task_id, req.shake_delay_sec))
+        self._wire('to_dcs', 'Unload', self._msg_to_dict(req))
+
+        # 예냉실 도킹 게이트 소비 — 이 도킹으로 열린 하역 진입 권한을 여기서 쓴다(재진입 방지).
+        self._clear_docked('하역 시작 task=%d' % req.task_id)
+
+        r, err = self._unload_ddagi(req, goal_handle)
+
+        result = Unload.Result()
+        if r is not None:
+            # 값 손실 없이 그대로. result_code(성공/파지실패/중단)는 ACS 가 하역 성공 여부를
+            # 판정·기록하는 근거다. DG 는 성공/실패를 재판정하지 않는다.
+            result.result_code = int(r.result_code)
+            result.message = r.message or ''
+        else:
+            # 중계 자체 실패(서버 없음/거부/무응답/취소). result_code 2(중단)로 보내고 사유는 message.
+            result.result_code = 2
+            result.message = err or '중계 실패'
+
+        # 취소가 와 있으면 결과가 무엇이든 CANCELED 로 끝낸다(ROS2 goal 은 CANCELING 에서
+        # succeed 로 못 넘어가고, ACS 도 자기가 취소한 goal 이 성공으로 오면 오판한다).
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+        elif r is not None and result.result_code == 0:
+            goal_handle.succeed()
+        else:
+            # 하역 실패(파지 실패 등)도 액션은 abort 로 끝나지만, ACS 는 이 result_code 를
+            # 보고 task 를 FAILED 로 되돌리지 않는다(하역은 보너스).
+            goal_handle.abort()
+
+        self.get_logger().info('하역 결과 전달(DCS→ACS): task=%d code=%d %s'
+                               % (req.task_id, result.result_code, result.message))
+        self._wire('from_dcs', 'Unload/result', self._msg_to_dict(result))
+        return result
+
+    def _unload_ddagi(self, req, up_gh):
+        # 하역은 수확과 같은 팔(Ddagi)이라 _ddagi_lock 을 공유한다(동시 하달 직렬화).
+        with self._ddagi_lock:
+            return self._unload_ddagi_locked(req, up_gh)
+
+    def _unload_ddagi_locked(self, req, up_gh):
+        if not self._unload_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('Ddagi Unload 액션 서버 없음')
+            return None, 'Ddagi Unload 서버 없음'
+
+        self.get_logger().info('Ddagi 하역 하달(DCS→Ddagi): task=%d' % req.task_id)
+        self._wire('from_dcs', 'Unload(→Ddagi)', self._msg_to_dict(req))
+
+        last_fb = {'t': time.time()}   # 워치독 기준: 마지막 진행 소식(수락 시점부터 시작)
+
+        def on_fb(fb_msg):
+            fb = fb_msg.feedback
+            last_fb['t'] = time.time()
+            nf = Unload.Feedback()
+            nf.phase = fb.phase
+            self._wire('to_dcs', 'Unload(→Ddagi)/feedback', self._msg_to_dict(fb))
+            try:
+                up_gh.publish_feedback(nf)      # Ddagi 진행상황(phase) → ACS 로 중계
+                self._wire('from_dcs', 'Unload/feedback', self._msg_to_dict(nf))
+            except Exception:   # noqa: BLE001 - 상위가 이미 끝났으면 무시
+                pass
+
+        # goal 은 받은 것을 그대로 넘긴다(필드 복사 누락 방지). 하달 → 수락 대기.
+        holder = {}
+        acc_ev = threading.Event()
+        sfut = self._unload_client.send_goal_async(req, feedback_callback=on_fb)
+        sfut.add_done_callback(lambda f: (holder.__setitem__('gh', f.result()), acc_ev.set()))
+        acc_ev.wait(timeout=5.0)
+        gh = holder.get('gh')
+        if gh is None or not gh.accepted:
+            self.get_logger().error('Ddagi Unload goal 거부/무응답')
+            return None, 'Ddagi Unload goal 거부'
+
+        # 결과 대기. Feedback 무수신 워치독으로 멎음 감지 + ACS 취소 전파.
+        rholder = {}
+        res_ev = threading.Event()
+        gh.get_result_async().add_done_callback(
+            lambda f: (rholder.__setitem__('r', f.result().result), res_ev.set()))
+        cancel_sent = False
+        cancel_t = None
+        while not res_ev.wait(0.5):
+            now = time.time()
+            if up_gh.is_cancel_requested and not cancel_sent:
+                cancel_sent = True
+                cancel_t = now
+                self.get_logger().warn('ACS 취소 요청 → Ddagi 하역 취소 중계')
+                gh.cancel_goal_async()
+            if cancel_sent:
+                # 취소를 보냈으면 취소 응답(canceled result)까지만 기다린다.
+                if now - cancel_t > self._unload_fb_timeout:
+                    self.get_logger().warn('Ddagi 하역 취소 응답 timeout')
+                    return None, 'Ddagi 하역 취소 응답 timeout'
+            elif now - last_fb['t'] > self._unload_fb_timeout:
+                # 정상 하역 중엔 phase 마다 Feedback 이 온다 → 무소식이면 멎은 것.
+                self.get_logger().warn('Ddagi 하역 진행 무소식(watchdog) → 취소·실패')
+                gh.cancel_goal_async()
+                return None, 'Ddagi 하역 무응답(watchdog)'
+
+        r = rholder.get('r')
+        if r is None:
+            return None, 'Ddagi 하역 결과 없음'
+        self.get_logger().info('Ddagi 하역 종료: code=%d msg=%s' % (r.result_code, r.message))
+        self._wire('to_dcs', 'Unload(→Ddagi)/result', self._msg_to_dict(r))
         return r, ''
 
     @staticmethod

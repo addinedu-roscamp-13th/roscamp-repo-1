@@ -29,6 +29,8 @@ root(bare)로 띄운다 — ddago_navigate/ddago_telemetry launch 와 같은 규
   ros2 launch ddago_control ddago_dock.launch.py
   # 후진 갭 튜닝 (odom 실거리라 1cm = 0.01)
   ros2 launch ddago_control ddago_dock.launch.py reverse_distance:=0.14
+  # 디버그 로그 + 웹 스트림(뷰 전용) — http://<로봇ip>:8000/
+  ros2 launch ddago_control ddago_dock.launch.py debug:=true stream:=true
 
 goal 예 (ACS 가 DB 의 마커 정보로 채워 보낸다. 아래는 mid24 스테이션 A):
   ros2 action send_goal /ddago/dock automato_interfaces/action/Dock \\
@@ -53,6 +55,9 @@ def generate_launch_description():
     dry_run = LaunchConfiguration('dry_run')
     staging_distance = LaunchConfiguration('staging_distance')
     reverse_distance = LaunchConfiguration('reverse_distance')
+    debug = LaunchConfiguration('debug')
+    stream = LaunchConfiguration('stream')
+    stream_port = LaunchConfiguration('stream_port')
 
     return LaunchDescription([
         # 로그 표기용. ddago 는 자기 정체를 모르며 어느 로봇인지는 DCS 가 안다.
@@ -71,6 +76,12 @@ def generate_launch_description():
         DeclareLaunchArgument('staging_distance', default_value='0.24'),
         # 후진 거리. odom 실이동거리 기준이라 명령값 1cm = 실제 갭 1cm.
         DeclareLaunchArgument('reverse_distance', default_value='0.15'),
+        # 디버그: 매 제어주기 상세(phase·d·b·y·n·v·w·fps)를 DEBUG 로그로 출력.
+        DeclareLaunchArgument('debug', default_value='false'),
+        # 웹 스트리밍(뷰 전용 MJPEG). 켜면 http://<로봇ip>:<stream_port>/ 에서 본다.
+        # ⚠️ Pi4 부하가 있어 현장 확인용으로만 켤 것.
+        DeclareLaunchArgument('stream', default_value='false'),
+        DeclareLaunchArgument('stream_port', default_value='8000'),
 
         Node(
             package='ddago_control',
@@ -86,6 +97,9 @@ def generate_launch_description():
                 'dry_run': dry_run,
                 'staging_distance': staging_distance,
                 'reverse_distance': reverse_distance,
+                'debug': debug,
+                'stream': stream,
+                'stream_port': stream_port,
             }],
         ),
     ])

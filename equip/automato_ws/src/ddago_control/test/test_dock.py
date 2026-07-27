@@ -36,7 +36,7 @@ def make_cfg():
         'k_heading': 1.5, 'w_max': 0.5,
         'bearing_tol': math.radians(3.0), 'yaw_tol': math.radians(5.0),
         'face_timeout': 6.0, 'lost_timeout': 1.0, 'plan_timeout': 8.0,
-        'n_plan': 10, 'n_stage_floor': 8,
+        'plan_backup_max': 0.15, 'n_plan': 10, 'n_stage_floor': 8,
     }
     cfg['search_timeout'] = 1.1 * 2 * math.pi / cfg['search_w']
     return cfg
@@ -188,3 +188,55 @@ def test_lost_marker_far_returns_to_search():
 
 def _ang(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+# --- PLAN 능동 후진(코너 부족 대응) -------------------------------------
+# 보드가 바닥근처라 가까우면 아랫줄 코너가 화각을 벗어나 계획 코너수를 못 채운다.
+# 정지한 채 기다리면 장면이 안 변해 영영 못 채우므로, 가까울 때는 살짝 후진해
+# 보드를 화면에 다 넣는다. dock_pose.py 에서 --go 실주행으로 검증된 로직의 이식.
+
+def _plan_fsm():
+    fsm = make_fsm()
+    fsm.phase = 'CENTERING'
+    fsm._cl = 'PLAN'
+    return fsm
+
+
+def test_plan_backs_up_when_near_and_corners_insufficient():
+    """staging 근처에서 코너가 부족하면 정지 대기가 아니라 후진해야 한다."""
+    fsm = _plan_fsm()
+    # d=0.23(<staging+backup_max=0.39), n=6(<n_plan=10)
+    v, w = fsm.update(0.0, True, (0.23, math.radians(5), 0.0, 6),
+                      None, 0.0, (0.0, 0.0))
+    assert v < 0, '근접 코너부족이면 후진(장면을 넓혀 코너 확보)해야 한다'
+    assert fsm.phase == 'CENTERING' and fsm._cl == 'PLAN'
+
+
+def test_plan_far_insufficient_corners_waits():
+    """멀리서 코너가 부족하면 후진은 악화라 그냥 대기(정지)한다."""
+    fsm = _plan_fsm()
+    v, w = fsm.update(0.0, True, (0.50, 0.0, 0.0, 6), None, 0.0, (0.0, 0.0))
+    assert (v, w) == (0.0, 0.0), '멀면 후진하지 않고 대기'
+
+
+def test_plan_backup_reaches_limit_and_falls_back_to_approach():
+    """후진 한계(plan_backup_max)까지 갔는데도 코너를 못 채우면 접근으로 폴백."""
+    fsm = _plan_fsm()
+    x = 0.0
+    for i in range(400):
+        v, _w = fsm.update(i * DT, True, (0.23, 0.0, 0.0, 6),
+                           None, 0.0, (x, 0.0))
+        if fsm.phase == 'APPROACHING':
+            break
+        x += v * DT                      # v<0 → 뒤로 적분
+    assert fsm.phase == 'APPROACHING', '한계까지 후진해도 안 되면 ALIGN 접근 폴백'
+    assert abs(x) >= make_cfg()['plan_backup_max'] - 0.02
+
+
+def test_plan_backup_then_good_frame_plans():
+    """후진하다 코너가 충분해지면 그 시점 계획을 확정하고 TURN1 로 넘어간다."""
+    fsm = _plan_fsm()
+    fsm.update(0.0, True, (0.23, 0.0, 0.0, 6), None, 0.0, (0.0, 0.0))  # 후진
+    fsm.update(0.1, True, (0.30, math.radians(5), math.radians(20), 20),
+               PLAN, 0.0, (-0.03, 0.0))
+    assert fsm._cl == 'TURN1', '충분한 프레임을 얻으면 계획 확정'

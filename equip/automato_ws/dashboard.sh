@@ -11,6 +11,7 @@
 #   ./dashboard.sh test          # S1 순찰 1회 (ACS: /acs_sim/start_patrol)
 #   ./dashboard.sh harvest-move  # S2 E2 수확 이동+도킹 1회 (ACS: /acs_sim/start_harvest_move)
 #   ./dashboard.sh harvest       # S2 E3 수확 시작 1회 (도킹 성공 task 로 Harvest 하달)
+#   ./dashboard.sh unload        # S2 E6 하역 시작 1회 (도킹 성공 task 로 Unload 하달)
 #   ./dashboard.sh dock          # E4 도킹 goal 단발 하달 (ACS 역할: /{ROBOT_ID}/dock)
 #   ./dashboard.sh stop  <노드>  # 특정 노드만 내림  (dcs|acs|ddago|ddagi|dg_ai|rosbridge|web)
 #   ./dashboard.sh start <노드>  # 특정 노드만 올림
@@ -152,6 +153,17 @@ run_harvest() {
   bash -c "$SRC; ros2 service call /acs_sim/start_harvest std_srvs/srv/Trigger" 2>&1
 }
 
+# S2 E6 하역 시작 1회 실행 (acs_sim 의 start_unload 서비스 호출).
+#   예냉실 도킹 성공으로 게이트가 열린 마지막 task 로 Unload 를 하달한다.
+#   ACS→DCS(/{ROBOT_ID}/unload)→Ddagi(/ddagi/unload) 중계. Ddagi 시뮬이 하역 phase
+#   (GRIP_HANDLE→LIFT→WAIT→SHAKE→RETURN) Feedback 을 흘리고 result_code 로 마감 →
+#   DCS 가 그대로 되돌린다.
+# 결과를 바꾸려면 먼저 Ddagi 시뮬 모드를 바꾼다(기본 success):
+#   ros2 param set /ddagi_sim unload_mode grip_fail   # 또는 hang
+run_unload() {
+  bash -c "$SRC; ros2 service call /acs_sim/start_unload std_srvs/srv/Trigger" 2>&1
+}
+
 # E0 상시 모니터링: 시뮬 텔레메트리 발행 시작(상시)/중지.
 run_telemetry() {
   bash -c "$SRC; ros2 service call /ddago_sim/start_telemetry std_srvs/srv/Trigger; ros2 service call /ddagi_sim/start_telemetry std_srvs/srv/Trigger" 2>&1
@@ -189,9 +201,10 @@ case "${1:-}" in
   test)           run_test ;;
   harvest-move)   run_harvest_move ;;
   harvest)        run_harvest ;;
+  unload)         run_unload ;;
   telemetry)      run_telemetry ;;
   telemetry-stop) run_telemetry_stop ;;
   dock)           run_dock ;;
   logs)           logs ;;
-  *) echo "usage: $0 {up [--no-sim]|down|status|restart [--no-sim]|test|harvest-move|harvest|dock|telemetry|telemetry-stop|logs|stop <node>|start <node>}  # node: dcs|acs|ddago|ddagi|dg_ai|rosbridge|web"; exit 1 ;;
+  *) echo "usage: $0 {up [--no-sim]|down|status|restart [--no-sim]|test|harvest-move|harvest|unload|dock|telemetry|telemetry-stop|logs|stop <node>|start <node>}  # node: dcs|acs|ddago|ddagi|dg_ai|rosbridge|web"; exit 1 ;;
 esac

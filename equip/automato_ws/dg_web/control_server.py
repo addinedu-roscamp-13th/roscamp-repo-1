@@ -84,6 +84,37 @@ def _tail_filtered(path, keywords, n=12):
         return []
 
 
+_LOG_TS_RE = re.compile(r'\[(\d+\.\d+)\]')
+
+
+def _log_ts(line):
+    """ROS 로그 라인의 [<epoch>] 타임스탬프(초)를 추출. 없으면 None."""
+    m = _LOG_TS_RE.search(line)
+    return float(m.group(1)) if m else None
+
+
+def _tail_since(path, keywords, since, n=12):
+    """_tail_filtered 와 같되, ROS 로그 타임스탬프가 since(초) 이후인 INFO 라인만 반환한다.
+
+    /tmp/dash_*.log 는 실행 사이에 초기화되지 않으므로, 단순 keyword 매칭은 **이전 실행이
+    남긴 낡은 로그**(예: 지난 도킹의 'E3 진입 가능')를 잡아 게이트/판정이 오작동한다.
+    각 eval 이 시작 시각(t0)을 잡아 이 함수로 그 이후 라인만 보게 하면, 반복 실행에도
+    이번 실행의 로그만 판정에 쓴다. 타임스탬프 없는 라인(@@WIRE@@ 등)은 제외한다."""
+    out = []
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            for ln in f:
+                if not any(k in ln for k in keywords):
+                    continue
+                ts = _log_ts(ln)
+                if ts is None or ts < since:
+                    continue
+                out.append(ln.rstrip('\n'))
+    except OSError:
+        return []
+    return out[-n:]
+
+
 def _tail_bytes(path, nbytes=131072):
     try:
         with open(path, 'rb') as f:
@@ -246,19 +277,20 @@ def eval_e4():
     이탈)·final_yaw_error(스큐)는 ACS 가 도킹 품질을 판정하는 근거라 빠지면 안 된다.
     """
     clear_wire()   # 실행 시 메시지 초기화
+    t0 = time.time()   # 이번 실행 기준 시각 — 낡은 로그를 판정에서 배제(_tail_since)
     _trigger_dock()
 
     keys = ['도킹 지시 수신', '도킹 하달', '도킹 종료', '도킹 결과 전달']
 
     def done():
-        dcs = _tail_filtered('/tmp/dash_dcs.log', keys, n=12)
+        dcs = _tail_since('/tmp/dash_dcs.log', keys, t0, n=12)
         return (any('도킹 지시 수신' in l for l in dcs)      # ACS → DCS 접수
                 and any('도킹 하달' in l for l in dcs)        # DCS → DdaGo 중계
                 and any('도킹 종료' in l for l in dcs)        # DdaGo → DCS 결과
                 and any('도킹 결과 전달' in l for l in dcs))  # DCS → ACS 반환
 
     ok = _wait_until(done, 30)
-    dcs = _tail_filtered('/tmp/dash_dcs.log', keys, n=8)
+    dcs = _tail_since('/tmp/dash_dcs.log', keys, t0, n=8)
     if ok:
         # 성공이라면 code=0 이어야 한다(중계는 됐는데 도킹이 실패한 경우를 가른다).
         ok = any('code=0' in l for l in dcs if '도킹 결과 전달' in l)
@@ -279,20 +311,21 @@ def eval_s2e2():
     '경로 수신 → 도킹 지시 수신 → 도킹 결과 전달(code=0) → E3 진입 가능(도킹 성공)' 4단계가
     DCS 로그에 모두 남는지로 한다. 도킹이 실패하면 게이트가 열리지 않아 FAIL 로 갈린다."""
     clear_wire()   # 실행 시 메시지 초기화
+    t0 = time.time()   # 이번 실행 기준 시각 — 낡은 로그를 판정에서 배제(_tail_since)
     _trigger_harvest_move()
 
     open_key = 'E3 진입 가능(도킹 성공'   # 게이트 오픈(성공)만. '해제'(clear)와 구분된다.
     keys = ['경로 수신', '도킹 지시 수신', '도킹 결과 전달', open_key]
 
     def done():
-        dcs = _tail_filtered('/tmp/dash_dcs.log', keys, n=20)
+        dcs = _tail_since('/tmp/dash_dcs.log', keys, t0, n=20)
         return (any('경로 수신' in l for l in dcs)
                 and any('도킹 지시 수신' in l for l in dcs)
                 and any('도킹 결과 전달' in l and 'code=0' in l for l in dcs)
                 and any(open_key in l for l in dcs))
 
     ok = _wait_until(done, 40)
-    dcs = _tail_filtered('/tmp/dash_dcs.log', keys, n=10)
+    dcs = _tail_since('/tmp/dash_dcs.log', keys, t0, n=10)
     return ok, dcs or ['(DCS 로그 없음 — dcs·acs·ddago UP 확인)']
 
 
@@ -311,6 +344,7 @@ def eval_s2e3():
     수확 결과 전달(exit_reason=DEPLETED/FULL/MAX_ROUNDS_EXCEEDED) 이 DCS 로그에 남는지.
     도킹 안 된 task 로는 goal 이 거부(reject)돼 수확 하달이 없으므로 FAIL 로 갈린다."""
     clear_wire()   # 실행 시 메시지 초기화
+    t0 = time.time()   # 이번 실행 기준 시각 — 낡은 로그를 판정에서 배제(_tail_since)
 
     # 1) E2 이동+도킹으로 게이트를 연다
     _trigger_harvest_move()
@@ -318,35 +352,87 @@ def eval_s2e3():
 
     def docked():
         return any(open_key in l for l in
-                   _tail_filtered('/tmp/dash_dcs.log', [open_key], n=5))
+                   _tail_since('/tmp/dash_dcs.log', [open_key], t0, n=5))
 
     if not _wait_until(docked, 40):
-        dcs = _tail_filtered('/tmp/dash_dcs.log',
-                             ['경로 수신', '도킹 결과 전달', open_key], n=8)
+        dcs = _tail_since('/tmp/dash_dcs.log',
+                          ['경로 수신', '도킹 결과 전달', open_key], t0, n=8)
         return False, ['(E2 도킹 실패 — E3 는 도킹 성공이 선행돼야 함)'] + dcs
 
-    # 2) E3 수확 시작
+    # 2) E3 수확 시작. 게이트 오픈 로그(DCS)는 ACS 의 _last_docked_task 갱신보다 살짝
+    #    앞서므로, 곧바로 발사하면 ACS 가 낡은 task 로 수확을 보낼 수 있다. 짧게 정착 대기.
+    time.sleep(1.0)
+    t1 = time.time()   # 수확 단계 기준 시각(도킹 단계 로그와도 분리)
     _trigger_harvest()
     exits = ('exit=DEPLETED', 'exit=FULL', 'exit=MAX_ROUNDS_EXCEEDED')
     keys = ['수확 시작 수신', 'Ddagi 수확 하달', 'Ddagi 수확 종료', '수확 결과 전달']
 
     def done():
-        dcs = _tail_filtered('/tmp/dash_dcs.log', keys, n=20)
+        dcs = _tail_since('/tmp/dash_dcs.log', keys, t1, n=20)
         return (any('수확 시작 수신' in l for l in dcs)          # ACS → DCS 접수
                 and any('Ddagi 수확 하달' in l for l in dcs)      # DCS → Ddagi 중계
                 and any('수확 결과 전달' in l and any(e in l for e in exits)
                         for l in dcs))                            # DCS → ACS 정상 종료 반환
 
     ok = _wait_until(done, 40)
-    dcs = _tail_filtered('/tmp/dash_dcs.log', keys, n=10)
+    dcs = _tail_since('/tmp/dash_dcs.log', keys, t1, n=10)
+    return ok, dcs or ['(DCS 로그 없음 — dcs·acs·ddago·ddagi UP 확인)']
+
+
+def _trigger_unload():
+    """ACS 역할로 하역 시작(E6) 하달(dashboard.sh unload). 도킹 성공한 task 로
+    Unload 를 하달한다. 즉시 반환하고 하역 진행은 백그라운드(로그 폴링으로 판정)."""
+    subprocess.run(['bash', DASH, 'unload'], capture_output=True, text=True, timeout=60)
+
+
+def eval_s2e6():
+    """S2 E6 예냉실 하역(DG Unload 중계): 도킹 성공(is_docked)한 task 로 하역을 시작해
+    ACS→DCS→Ddagi 로 Unload 가 중계되고, phase Feedback·result 가 그대로 되돌아오는지.
+
+    하역도 도킹(게이트)이 선행돼야 하므로 이 테스트는 **E2(이동+도킹) → E6(하역)** 를
+    이어서 실행한다(E3 없이 도킹만으로 게이트가 열린다). 판정: 도킹 성공(E3 진입 가능) →
+    하역 시작 수신 → Ddagi 하역 하달 → 하역 결과 전달(code=0) 이 DCS 로그에 남는지.
+    도킹 안 된 task 로는 goal 이 거부(reject)돼 하역 하달이 없으므로 FAIL 로 갈린다."""
+    clear_wire()   # 실행 시 메시지 초기화
+    t0 = time.time()   # 이번 실행 기준 시각 — 낡은 로그를 판정에서 배제(_tail_since)
+
+    # 1) E2 이동+도킹으로 게이트를 연다(하역은 예냉실 도킹 성공이 선행)
+    _trigger_harvest_move()
+    open_key = 'E3 진입 가능(도킹 성공'
+
+    def docked():
+        return any(open_key in l for l in
+                   _tail_since('/tmp/dash_dcs.log', [open_key], t0, n=5))
+
+    if not _wait_until(docked, 40):
+        dcs = _tail_since('/tmp/dash_dcs.log',
+                          ['경로 수신', '도킹 결과 전달', open_key], t0, n=8)
+        return False, ['(도킹 실패 — E6 하역은 도킹 성공이 선행돼야 함)'] + dcs
+
+    # 2) E6 하역 시작. 게이트 오픈 로그(DCS)는 ACS 의 _last_docked_task 갱신보다 살짝
+    #    앞서므로, 곧바로 발사하면 ACS 가 낡은 task 로 하역을 보낼 수 있다. 짧게 정착 대기.
+    time.sleep(1.0)
+    t1 = time.time()   # 하역 단계 기준 시각(도킹 단계 로그와도 분리)
+    _trigger_unload()
+    keys = ['하역 시작 수신', 'Ddagi 하역 하달', 'Ddagi 하역 종료', '하역 결과 전달']
+
+    def done():
+        dcs = _tail_since('/tmp/dash_dcs.log', keys, t1, n=20)
+        return (any('하역 시작 수신' in l for l in dcs)          # ACS → DCS 접수
+                and any('Ddagi 하역 하달' in l for l in dcs)      # DCS → Ddagi 중계
+                and any('하역 결과 전달' in l and 'code=0' in l
+                        for l in dcs))                            # DCS → ACS 성공 반환
+
+    ok = _wait_until(done, 40)
+    dcs = _tail_since('/tmp/dash_dcs.log', keys, t1, n=10)
     return ok, dcs or ['(DCS 로그 없음 — dcs·acs·ddago·ddagi UP 확인)']
 
 
 EVALS = {'e0': eval_e0, 'e1': eval_e1, 'e2': eval_e2, 'e4': eval_e4,
-         's2e2': eval_s2e2, 's2e3': eval_s2e3}
+         's2e2': eval_s2e2, 's2e3': eval_s2e3, 's2e6': eval_s2e6}
 EVAL_NAMES = {'e0': 'E0 상시 모니터링', 'e1': 'E1 순찰 시작', 'e2': 'E2 체크·저장',
               'e4': 'E4 복귀·도킹', 's2e2': 'S2 E2 수확 이동·도킹',
-              's2e3': 'S2 E3 수확 대상 인식'}
+              's2e3': 'S2 E3 수확 대상 인식', 's2e6': 'S2 E6 예냉실 하역'}
 
 
 class Handler(BaseHTTPRequestHandler):
