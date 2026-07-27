@@ -7,10 +7,10 @@
   - client          ← 여기만 가짜(FakeNavigateClient)
 
 관측(observability)이 이 파일의 존재 이유다. 검증 대상 코드는 상태를 밖으로 내보내는
-창이 없다 — 예약표는 RoutingEngine 안의 dict 이고, 주행 상태는 _navigate() 의 지역변수다.
-그래서 '이미 공개돼 있는 것만' 써서 밖에서 들여다본다:
+창이 없다 — 예약표는 RoutingEngine 안의 dict 이고, 주행 상태는 RouteRunner.drive() 의
+지역변수다. 그래서 '이미 공개돼 있는 것만' 써서 밖에서 들여다본다:
   · 예약표   : engine.holder_of(cid) 를 통로마다 호출 (공개 API. 25통로×10Hz=250회/초라 무해)
-  · 블랙리스트: dispatcher._blacklist_active() — 밑줄 이름이지만 '읽기 전용 관찰'로만 쓴다.
+  · 블랙리스트: dispatcher.runner.blacklist_view() — 주행 엔진이 소유한 공개 관측 API.
                 검증 대상 코드를 고치지 않는 게 이 도구의 제1원칙이라 이쪽을 택했다.
   · 로봇 위치 : FakeRobot (가짜 로봇이 위치의 소스오브트루스)
   · 판단 근거 : 디스패처가 남기는 로그를 EventLog 로 받아 화면에 그대로 흘린다.
@@ -366,7 +366,9 @@ class VerifySim:
         snap = self.engine.reservation_snapshot()
         reservations = {str(cid): rid for cid, rid in snap["corridors"].items()}
         node_holders = {str(n): rid for n, rid in snap["nodes"].items()}
-        avoid = self.dispatcher.blacklist_view(self.engine)   # 락 1회로 끝낸다
+        # 블랙리스트는 주행 엔진(RouteRunner)이 소유한다 — 순찰·수확이 공유하는 상태라
+        # 디스패처가 아니라 runner 에게 묻는다.
+        avoid = self.dispatcher.runner.blacklist_view(self.engine)  # 락 1회로 끝낸다
 
         with self._lock:
             robots = []

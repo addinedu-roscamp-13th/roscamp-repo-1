@@ -20,8 +20,12 @@
   - 순찰 디스패치는 '로봇당 1 스레드'로 동시 실행 → 3대가 동시에 움직이며 통로를 놓고 경합.
     공유 통로 예약표는 routing_engine 이 락으로 보호한다.
 
-교통관제 알고리즘(세그먼트 예약·룩어헤드·막힘 우회)은 patrol_dispatcher.PatrolDispatcher
-로 분리했다(composition). 이 노드는 엔진/클라이언트를 만들어 넘기고 결과만 tasks 에 마감한다.
+동작 결정 로직은 composition 으로 세 조각에 나눠 분리했다. 이 노드는 엔진/클라이언트를
+만들어 넘기고 결과만 tasks 에 마감한다:
+  - route_runner.RouteRunner       : 목적지까지 예약하며 이동(세그먼트·룩어헤드·막힘 우회).
+                                     **하나만 만들어 아래 둘이 공유**한다(예약·회피 상태 일원화).
+  - patrol_dispatcher.PatrolDispatcher : 순찰 순서·촬영 판정·방문 마킹
+  - harvest_dispatcher.HarvestDispatcher : 수확 E2~E6 흐름
 """
 import os
 import threading
@@ -52,6 +56,7 @@ from automato_control_service.patrol_config import (
 from automato_control_service import patrol_notify
 from automato_control_service.harvest_dispatcher import HarvestDispatcher
 from automato_control_service.patrol_dispatcher import PatrolDispatcher
+from automato_control_service.route_runner import RouteRunner
 from automato_control_service.routing_engine import RoutingEngine
 from automato_control_service.telemetry_cache import TelemetryCache
 
@@ -82,11 +87,16 @@ class AutomatoControlNode(Node):
 
         # 교통관제 알고리즘(세그먼트 이동·통로 예약·룩어헤드·막힘 우회)은 별도 클래스로
         # 분리(composition). 노드는 필요한 것(logger·engine·client)을 넘겨주고 위임만 한다.
-        # wp_meta·블랙리스트는 디스패처가 소유하며, 그래프 로드 시 노드가 wp_meta 를 채운다.
-        self._dispatcher = PatrolDispatcher(self.get_logger())
-        # 수확(E2~E6)도 같은 composition 으로 분리. 순찰과 엔진·wp_meta 를 공유하고
+        # RouteRunner 는 **하나만 만들어 순찰·수확이 공유**한다 — wp_meta(좌표)와
+        # 블랙리스트(막힌 통로)가 갈리면 순찰이 막혔다고 판정한 통로로 수확 로봇이
+        # 그대로 들어간다. 예약표(engine)를 하나로 쓰는 것과 같은 이유다.
+        # wp_meta 는 runner 가 소유하며, 그래프 로드 시 노드가 채운다.
+        self._runner = RouteRunner(self.get_logger())
+        self._dispatcher = PatrolDispatcher(self.get_logger(), self._runner)
+        # 수확(E2~E6)도 같은 composition 으로 분리. 주행·엔진을 순찰과 공유하고
         # (교통관제 일관성) 흐름만 별도 클래스가 주관한다.
-        self._harvest_dispatcher = HarvestDispatcher(self.get_logger())
+        self._harvest_dispatcher = HarvestDispatcher(
+            self.get_logger(), self._runner)
 
         # 텔레메트리 상시 구독(1Hz) — 로봇별 /{robot_id}/telemetry
         self.declare_parameter("robot_ids", DEFAULT_ROBOT_IDS)
@@ -158,17 +168,16 @@ class AutomatoControlNode(Node):
                 self._engine = RoutingEngine(
                     routing_nodes, graph["corridors"],
                     reservation_ttl=RESERVATION_TTL_SEC)
-                # wp_meta 는 디스패처가 소유(세그먼트 하달 시 좌표/촬영 여부에 사용) → 여기서 채운다.
+                # wp_meta 는 runner 가 소유(세그먼트 하달 시 좌표/촬영 여부에 사용) →
+                # 여기서 채운다. runner 하나를 순찰·수확이 공유하므로 이 한 번으로 둘 다 반영된다.
                 # 이쪽은 짝까지 '전부' 넣는다 — 짝을 하달하려면 그 좌표와 yaw 가 필요하다.
-                self._dispatcher.wp_meta = {
+                self._runner.wp_meta = {
                     w["waypoint_id"]: {
                         "x": w["x"], "y": w["y"],
                         "yaw": w["yaw"], "capture": w["is_patrol_point"],
                     }
                     for w in graph["waypoints"]
                 }
-                # 수확 디스패처도 같은 좌표 메타를 공유한다(주행 골 구성에 필요).
-                self._harvest_dispatcher.wp_meta = self._dispatcher.wp_meta
                 # 부모 → 짝 맵. 디스패처가 부모 도착 직후 이 짝을 추가로 하달한다.
                 # 짝 관계는 정적이라 기동 시 1회만 만든다(DB 왕복 없음).
                 self._dispatcher.pair_of = {

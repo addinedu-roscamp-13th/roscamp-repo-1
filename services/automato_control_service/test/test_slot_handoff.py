@@ -5,7 +5,7 @@
 넘어가는 사이, 또는 다음 통로를 기다리며 서 있는 사이에 그 자리 예약이 끊기면 그
 틈으로 남이 들어온다. 여기서 지키는 것:
 
-  1. 구간(_navigate)과 구간 사이에 '서 있는 자리' 예약이 끊기지 않는다.
+  1. 구간(RouteRunner.drive)과 구간 사이에 '서 있는 자리' 예약이 끊기지 않는다.
   2. 순찰이 끝나면 자리를 정확히 반납한다(누수 없음).
   3. 서서 기다리는 동안 TTL 이 지나도 자리를 뺏기지 않는다(대기 중 하트비트).
   4. 순찰 시작 시점부터 출발 지점 자리를 쥔다.
@@ -27,8 +27,9 @@ from concurrent.futures import Future
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from automato_control_service import patrol_dispatcher as pd            # noqa: E402
+from automato_control_service import route_runner as rr                 # noqa: E402
 from automato_control_service.patrol_dispatcher import PatrolDispatcher  # noqa: E402
+from automato_control_service.route_runner import RouteRunner            # noqa: E402
 from automato_control_service.routing_engine import RoutingEngine        # noqa: E402
 
 WAYPOINTS = [4, 9, 12, 15]
@@ -120,10 +121,14 @@ class _Feedback:
 # ------------------------------- 픽스처 ------------------------------- #
 @pytest.fixture
 def fast_timing(monkeypatch):
-    """대기·하트비트를 짧게. from-import 로 바인딩된 모듈 상수를 직접 바꾼다."""
-    monkeypatch.setattr(pd, "RESERVE_WAIT_SEC", 0.4)
-    monkeypatch.setattr(pd, "RESERVE_POLL_SEC", 0.02)
-    monkeypatch.setattr(pd, "HEARTBEAT_SEC", 0.02)
+    """대기·하트비트를 짧게. from-import 로 바인딩된 모듈 상수를 직접 바꾼다.
+
+    ⚠️ 타깃은 route_runner 다(주행·예약 코드가 그쪽으로 옮겨갔다). patrol_dispatcher 를
+    패치하면 아무 에러 없이 그냥 안 먹어서, 테스트가 진짜 대기 시간을 다 기다린다.
+    """
+    monkeypatch.setattr(rr, "RESERVE_WAIT_SEC", 0.4)
+    monkeypatch.setattr(rr, "RESERVE_POLL_SEC", 0.02)
+    monkeypatch.setattr(rr, "HEARTBEAT_SEC", 0.02)
 
 
 def _make(ttl=60.0):
@@ -210,7 +215,7 @@ def test_standing_slot_survives_ttl_while_waiting(fast_timing):
     tb = threading.Thread(target=keep_b, daemon=True)
     tb.start()
     held = [engine.node_slot(9)]
-    ok = disp._reserve_with_wait(engine, 13, "dg_01", held)   # 0.4초간 대기 → 양보
+    ok = disp.runner._reserve_with_wait(engine, 13, "dg_01", held)   # 0.4초간 대기 → 양보
     stop_b.set()
     tb.join(timeout=1)
 
@@ -234,7 +239,7 @@ def test_standing_slot_lost_without_heartbeat(fast_timing):
 
     tb = threading.Thread(target=keep_b, daemon=True)
     tb.start()
-    disp._reserve_with_wait(engine, 13, "dg_01", None)        # held 없이
+    disp.runner._reserve_with_wait(engine, 13, "dg_01", None)        # held 없이
     stop_b.set()
     tb.join(timeout=1)
 
@@ -253,8 +258,8 @@ def test_passed_slots_released_while_driving(fast_timing):
     assert any("-" in ln for ln in freed), f"자리(음수)가 조기 반납되지 않았다: {freed}"
 
 
-def test_navigate_leaves_standing_slot_for_next_leg(fast_timing):
-    """불변식 1의 결정적 검증 — _navigate 가 끝나도 '서 있는 자리'는 남긴다.
+def test_drive_leaves_standing_slot_for_next_leg(fast_timing):
+    """불변식 1의 결정적 검증 — 한 구간 주행이 끝나도 '서 있는 자리'는 남긴다.
 
     구간과 구간 사이는 µs 단위라 시간 샘플링(위 watch 스레드)으로는 놓칠 수 있다.
     여기서는 한 구간을 끝낸 직후의 예약표를 직접 들여다본다:
@@ -264,7 +269,7 @@ def test_navigate_leaves_standing_slot_for_next_leg(fast_timing):
     engine, disp, _log = _make()
     client = FakeClient({"wp": 15})
 
-    outcome, node = disp._navigate(engine, client, 1, "dg_01", 15, 12, set())
+    outcome, node = disp._visit(engine, client, 1, "dg_01", 15, 12, set())
 
     assert (outcome, node) == ("arrived", 12)
     assert engine.holder_of(engine.node_slot(12)) == "dg_01", \
@@ -278,13 +283,13 @@ def test_next_leg_inherits_the_slot(fast_timing):
     engine, disp, _log = _make()
     client = FakeClient({"wp": 15})
 
-    disp._navigate(engine, client, 1, "dg_01", 15, 12, set())
+    disp._visit(engine, client, 1, "dg_01", 15, 12, set())
     assert engine.holder_of(engine.node_slot(12)) == "dg_01"
 
     # 남이 그 자리를 못 가로챈다 — 인계가 끊기지 않았다는 뜻
     assert engine.try_reserve(engine.node_slot(12), "dg_02") is False
 
-    outcome, node = disp._navigate(engine, client, 1, "dg_01", 12, 9, set())
+    outcome, node = disp._visit(engine, client, 1, "dg_01", 12, 9, set())
     assert (outcome, node) == ("arrived", 9)
     assert engine.holder_of(engine.node_slot(9)) == "dg_01"
     assert engine.holder_of(engine.node_slot(12)) is None
@@ -310,7 +315,7 @@ def test_passed_resources_releases_everything_behind(reached, expect_cids, expec
     하면서 남의 길만 막는다(실제로 다른 로봇이 못 움직이는 문제가 났다).
     """
     engine = RoutingEngine(WAYPOINTS, CORRIDORS)
-    freed = PatrolDispatcher._passed_resources(
+    freed = RouteRunner._passed_resources(
         engine, _SEG_START, _SEG_WPS, _SEG_CIDS, reached)
 
     expected = set(expect_cids) | {engine.node_slot(n) for n in expect_nodes}
@@ -321,5 +326,5 @@ def test_passed_resources_releases_everything_behind(reached, expect_cids, expec
 def test_passed_resources_unknown_node_releases_nothing():
     """모르는 노드(짝 촬영 id 등)면 아무것도 반납하지 않는다 — 안전한 쪽으로 실패."""
     engine = RoutingEngine(WAYPOINTS, CORRIDORS)
-    assert PatrolDispatcher._passed_resources(
+    assert RouteRunner._passed_resources(
         engine, _SEG_START, _SEG_WPS, _SEG_CIDS, 999) == []
