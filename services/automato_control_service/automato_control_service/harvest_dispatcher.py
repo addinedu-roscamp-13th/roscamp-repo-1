@@ -28,12 +28,19 @@ automato_node(ROS 표면)에서 '수확 동작 결정' 로직을 떼어낸 클�
       크래시에 실적이 통째로 날아간다.
 """
 
+from automato_control_service import docking
 from automato_control_service.patrol_config import SERVER_WAIT_SEC
 from automato_control_service.route_runner import RouteRunner
 
 # 최종 상태 — 노드가 tasks 에 마감한다(automato_db.set_task_status 의 유효값과 호환).
 STATUS_COMPLETED = "COMPLETED"
 STATUS_FAILED = "FAILED"
+
+# 실패 사유 — 노드가 task_failed 알림(문서 13번)에 그대로 싣는다.
+# 값은 patrol_notify.FAIL_REASONS 안에 있어야 한다(아니면 payload 생성이 ValueError).
+# reason=None 은 '알림 없이 tasks 만 FAILED 로 마감'이다 — 주행 실패(길 막힘·로봇 중단)는
+# 아직 시나리오2 문서에 알림 규격이 없어 지금은 로그만 남기고 통지하지 않는다.
+REASON_DOCK_FAILED = "DOCK_FAILED"
 
 
 class HarvestDispatcher:
@@ -51,23 +58,30 @@ class HarvestDispatcher:
         """waypoint_id -> {x,y,yaw,capture}. 실체는 runner 소유(주행 골에 좌표가 필요)."""
         return self.runner.wp_meta
 
-    def run_harvest(self, task_id, robot_id, harvest_point, engine, clients,
-                    start_wp=None):
+    def run_harvest(self, task_id, robot_id, harvest_point, marker, engine,
+                    clients, start_wp=None):
         """수확 task 하나를 E2~E6 순서로 처리하고 최종 상태를 돌려준다.
 
         harvest_point : 수확지 정보 dict — 노드가 automato_db.get_task_point 로 조회해 넘긴다.
                         {"task_point_id","point_type","waypoint_id","x","y","yaw"}
                         (설계노트 2: 미리 조회 가능한 것은 노드가 맡는다)
+        marker        : 수확지 ChArUco 보드 dict — 노드가 automato_db.get_dock_marker 로
+                        조회해 넘긴다. **None 이 정상적인 값**이다(실측값은 도킹 튜닝 후
+                        시드되므로 아직 비어 있을 수 있다) → 그 경우 도킹은 즉시 실패한다.
+                        harvest_point 와 다른 테이블(charuco_boards)에서 오므로 따로 받는다.
         engine        : 순찰과 공유하는 RoutingEngine(경로탐색+통로예약)
         clients       : 노드가 만든 액션 클라이언트 묶음
                         {"nav","dock","harvest","unload"} (robot_id 로 바인딩됨)
         start_wp      : 출발 노드(로봇 전용 충전소 진입노드).
 
-        반환: STATUS_COMPLETED | STATUS_FAILED  (노드가 tasks 에 마감)
+        반환: (status, reason)
+          status: STATUS_COMPLETED | STATUS_FAILED — 노드가 tasks 에 마감한다.
+          reason: 실패 사유(REASON_*) 또는 None. 노드가 이걸 보고 task_failed 알림을
+                  보낼지 정한다 — 디스패처는 '무슨 일이 있었는지'만 보고하고 HTTP 는
+                  모른 채로 남는다(순찰 run_patrol 과 같은 관례).
 
-        ⚠️ 지금은 E2 주행까지만 구현됐다. 도착해도 수확을 안 했으므로 FAILED 로 마감한다.
-        남은 순서:
-          ...     E2  ChArUco 도킹                             (clients['dock'])
+        ⚠️ 지금은 E2(주행+도킹)까지 구현됐다. 도킹까지 성공해도 수확을 안 했으므로
+        FAILED 로 마감한다. 남은 순서:
           outcome = E3~4 Harvest 액션(Ddagi 주관)+피드백 중계  (clients['harvest'])
           ...     E5  수확 실적 저장(콜백) + 예냉실 주행·도킹  (clients['nav'], clients['dock'])
           ...     E6  완료 처리 + (보너스) Unload 하역          (clients['unload'])
@@ -80,12 +94,12 @@ class HarvestDispatcher:
             # 안 걸러내면 Goal 마다 수락 타임아웃(30초)을 다 기다린 뒤에야 실패한다.
             self._log.warning(
                 f"[HARVEST] {robot_id} Navigate 액션 서버 미기동 → task {task_id} FAILED")
-            return STATUS_FAILED
+            return STATUS_FAILED, None
         if target is None or target not in self.wp_meta:
             self._log.error(
                 f"[HARVEST] 수확지 {label}(노드 {target})가 라우팅 그래프에 없다 "
                 f"→ task {task_id} FAILED")
-            return STATUS_FAILED
+            return STATUS_FAILED, None
         # 순찰과 달리 출발점 폴백을 두지 않는다. 순찰은 지점이 여러 개라 하나쯤 예약 없이
         # 가도 나머지가 이어지지만, 수확은 목적지가 하나뿐이라 출발점을 모르면 경로 예약
         # 자체가 성립하지 않고, 도착 직후 ChArUco 도킹이 붙어 위치가 어긋나면 그대로
@@ -94,7 +108,7 @@ class HarvestDispatcher:
             self._log.error(
                 f"[HARVEST] {robot_id} 출발 노드({start_wp}) 미상 → task {task_id} FAILED "
                 f"(robots.charge_point_id 확인 필요)")
-            return STATUS_FAILED
+            return STATUS_FAILED, None
 
         current = start_wp
         self._log.info(
@@ -110,16 +124,37 @@ class HarvestDispatcher:
                 self._log.warning(
                     f"[HARVEST] E2 주행 실패({outcome}) task={task_id} "
                     f"로봇 위치 {current} 목표 {target}({label}) → FAILED")
-                return STATUS_FAILED
+                return STATUS_FAILED, None
 
             self._log.info(
                 f"[HARVEST] E2 수확지 도착 task={task_id} robot={robot_id} "
                 f"위치 {current}({label})")
-            # TODO(E2 도킹~E6): 여기부터 도킹·수확·예냉실 이송이 붙는다.
+
+            # --- E2 ChArUco 도킹 — 순찰(충전소)·예냉실과 같은 절차라 docking 모듈 공용 ---
+            # heartbeat 가 핵심이다: 도킹은 마커 탐색~후진까지 수십 초 걸리는데 그동안
+            # 주행 하트비트가 멎어, 이걸 안 넘기면 RESERVATION_TTL_SEC(15초)에 걸려
+            # '지금 로봇이 서 있는 자리'가 회수되고 남이 그 지점으로 들어온다.
+            entry_slot = engine.node_slot(current)
+            success, code, msg = docking.dock(
+                self._log, task_id, robot_id, label, marker, clients["dock"],
+                heartbeat=(engine, [entry_slot], robot_id))
+            if not success:
+                self._log.warning(
+                    f"[HARVEST] E2 도킹 실패(code={code}) task={task_id} "
+                    f"{robot_id} @ {label}: {msg} → FAILED")
+                return STATUS_FAILED, REASON_DOCK_FAILED
+
+            # 순찰(복귀)은 도킹 성공 시 예약을 전부 해제하지만 수확은 놓지 않는다 —
+            # 로봇이 여기 붙어서 팔 작업을 이어가므로, 자리를 놓으면 남이 들어온다.
+            # 반납은 이 함수 맨 끝 finally 가 한다(수확 task 전체가 끝나는 시점).
+            self._log.info(
+                f"[HARVEST] E2 도킹 완료 task={task_id} {robot_id} @ {label} "
+                f"(자리 {entry_slot} 유지 — 수확 중 남이 들어오면 안 된다)")
+            # TODO(E3~E6): 여기부터 Harvest 액션·실적 저장·예냉실 이송이 붙는다.
             self._log.warning(
-                f"[HARVEST] 도킹~E6 미구현 → task {task_id} FAILED 로 마감 "
-                f"(수확지 도착까지는 성공)")
-            return STATUS_FAILED
+                f"[HARVEST] E3~E6 미구현 → task {task_id} FAILED 로 마감 "
+                f"(수확지 도킹까지는 성공)")
+            return STATUS_FAILED, None
         finally:
             # drive 는 '지금 서 있는 자리'를 일부러 남기고 나온다 — 다음 구간이 이어받아
             # 예약이 끊기는 순간을 없애기 위해서다. 수확은 아직 뒷단계가 없으므로 여기서

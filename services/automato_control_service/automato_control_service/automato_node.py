@@ -54,6 +54,7 @@ from automato_control_service.patrol_config import (
     SAVE_DETECTION_SRV,
 )
 from automato_control_service import docking
+from automato_control_service import harvest_dispatcher
 from automato_control_service import patrol_notify
 from automato_control_service.harvest_dispatcher import HarvestDispatcher
 from automato_control_service.patrol_dispatcher import PatrolDispatcher
@@ -244,6 +245,23 @@ class AutomatoControlNode(Node):
                 f"({tp['point_type']})")
         return tp
 
+    def _dock_marker_for(self, task_point_id: str):
+        """작업 지점의 ChArUco 보드 정보 dict. 없으면 None. (RP-123)
+
+        **None 이 정상적인 결과**다 — 마커 실측값(칸 크기·도킹 오프셋)은 현장 도킹 튜닝이
+        끝난 뒤 charuco_boards 에 시드되므로, 그 전까지는 비어 있다. 그래서 여기서 주행을
+        막지 않고 그대로 넘긴다: 로봇은 수확지까지 가고, 도킹 단계에서 '마커 없음'으로
+        실패한다(docking.dock 이 판정). 조회 실패도 같은 취급이다.
+        """
+        if self._db_pool is None:
+            return None
+        try:
+            return automato_db.get_dock_marker(self._db_pool, task_point_id)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f"{task_point_id} 도킹 마커 조회 실패(도킹 불가로 진행): {exc}")
+            return None
+
     def _action_client_for(self, robot_id: str, action_type,
                            suffix: str) -> ActionClient:
         """robot_id 의 특정 액션 클라이언트를 캐시에서 얻거나 만든다(/{robot_id}/{suffix}).
@@ -365,14 +383,17 @@ class AutomatoControlNode(Node):
 
         순찰 _patrol_job 과 같은 골격. 다른 점은 두 가지다:
           · 액션 클라이언트가 4종(Navigate/Dock/Harvest/Unload)이다.
-          · 수확지 진입노드를 여기서 조회해 넘긴다 — 디스패처는 DB 를 만지지 않는다는
-            경계(harvest_dispatcher 설계노트 2) 때문이다. 순찰이 start_wp 를 여기서
-            조회해 넘기는 것과 같은 관례다.
+          · 수확지 진입노드와 ChArUco 마커를 여기서 조회해 넘긴다 — 디스패처는 DB 를
+            만지지 않는다는 경계(harvest_dispatcher 설계노트 2) 때문이다. 순찰이
+            start_wp 를 여기서 조회해 넘기는 것과 같은 관례다.
         """
-        status = "FAILED"
+        status, reason = "FAILED", None
         try:
             engine = self._get_engine()
             harvest_point = self._task_point_for(harvest_location)
+            # 마커는 없을 수 있다(실측값은 도킹 튜닝 후 시드) → None 이어도 주행은 한다.
+            # 디스패처가 도착 후 '마커 없음 = 도킹 불가'로 판정한다.
+            marker = self._dock_marker_for(harvest_location)
             if engine is not None and harvest_point is not None:
                 clients = {
                     "nav": self._action_client_for(robot_id, Navigate, "navigate"),
@@ -380,22 +401,29 @@ class AutomatoControlNode(Node):
                     "harvest": self._action_client_for(robot_id, Harvest, "harvest"),
                     "unload": self._action_client_for(robot_id, Unload, "unload"),
                 }
-                status = self._harvest_dispatcher.run_harvest(
-                    task_id, robot_id, harvest_point, engine, clients,
+                status, reason = self._harvest_dispatcher.run_harvest(
+                    task_id, robot_id, harvest_point, marker, engine, clients,
                     start_wp=self._start_waypoint_for(robot_id))
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f"수확 디스패치 예외 task={task_id}: {exc}")
-            status = "FAILED"
+            status, reason = "FAILED", None
         if self._db_pool is not None:
             try:
                 automato_db.set_task_status(self._db_pool, task_id, status)
                 self.get_logger().info(f"수확 종료 task={task_id} → {status}")
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().error(f"tasks 종료 갱신 실패 task={task_id}: {exc}")
+        # 실패 사유가 있으면 관리자에게 알린다. 어떤 실패가 알림 대상인지는 노드가 정한다
+        # — 디스패처는 '무슨 일이 있었는지'만 보고하고 HTTP 는 모른다(순찰과 같은 관례).
+        if reason == harvest_dispatcher.REASON_DOCK_FAILED:
+            # 로봇은 수확지 진입 노드에 서 있다(도킹만 실패). 순찰의 충전소 도킹 실패와
+            # 상황이 같아 같은 규격을 쓰되, task_type 만 HARVEST 로 낸다.
+            self._notify_dock_failed(
+                task_id, robot_id, None, f"수확지 {harvest_location} 도킹 실패",
+                task_type="HARVEST")
         # TODO(E6): 수확 완료를 Web Service 로 통지 — 보낼 모듈(harvest_notify)은 이미
         # 있고 배선만 남았다. 완료 페이로드에 수확 실적(normal/discard/failed)이 들어가는데
         # 그 값이 E3~4 Harvest 액션 결과에서 나오므로, 그 단계가 붙어야 채울 수 있다.
-        # 실패 통지는 시나리오1 규격을 그대로 쓴다(patrol_notify.send_task_failed).
 
     def _report_task_result(self, task_id, robot_id, status, unvisited) -> None:
         """순찰 종료를 Web Service 로 알린다.
@@ -517,18 +545,23 @@ class AutomatoControlNode(Node):
                 f"→ 진입 노드 정지, DOCK_FAILED 알림")
             self._notify_dock_failed(task_id, robot_id, code, msg)
 
-    def _notify_dock_failed(self, task_id, robot_id, code, msg) -> None:
+    def _notify_dock_failed(self, task_id, robot_id, code, msg,
+                            task_type="PATROL") -> None:
         """도킹 N_dock 소진 시 작업 실패 알림(문서 E4 Dock 실패 · reason=DOCK_FAILED).
 
-        복귀 주행 자체는 성공했고 마지막 도킹만 실패한 상황이라 recovery_action=NONE
-        (로봇은 충전소 진입 노드에 서서 관리자 개입을 기다린다). tasks 상태는 이미 순찰
-        종료값(COMPLETED/PARTIAL)으로 마감돼 있어 여기서 바꾸지 않는다 — 순찰은 끝났고
-        뒷정리(도킹)만 실패한 것이다.
+        주행 자체는 성공했고 마지막 도킹만 실패한 상황이라 recovery_action=NONE
+        (로봇은 진입 노드에 서서 관리자 개입을 기다린다).
+
+        task_type 으로 순찰·수확이 갈린다 — 알림 규격은 같지만 tasks 마감이 다르다:
+          · PATROL: 상태는 이미 순찰 종료값(COMPLETED/PARTIAL)으로 마감돼 있고 여기서
+            바꾸지 않는다. 순찰은 끝났고 뒷정리(충전소 도킹)만 실패한 것이다.
+          · HARVEST: 도킹을 못 하면 수확 자체를 못 하므로 task 는 FAILED 다
+            (_harvest_job 이 이미 그렇게 마감한 뒤 이 알림을 보낸다).
         """
         now = datetime.now(timezone.utc)
         payload = patrol_notify.build_task_failed_payload(
             task_id=task_id, robot_id=robot_id, reason="DOCK_FAILED",
-            recovery_action="NONE", failed_at=now)
+            recovery_action="NONE", failed_at=now, task_type=task_type)
         patrol_notify.send_task_failed(
             self._web_url, payload, log=self.get_logger())
         self.get_logger().warn(
