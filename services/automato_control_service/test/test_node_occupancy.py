@@ -34,8 +34,8 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from automato_control_service import patrol_dispatcher as pd            # noqa: E402
-from automato_control_service.patrol_dispatcher import PatrolDispatcher  # noqa: E402
+from automato_control_service import route_runner as rr                 # noqa: E402
+from automato_control_service.route_runner import RouteRunner            # noqa: E402
 from automato_control_service.routing_engine import RoutingEngine        # noqa: E402
 
 WAYPOINTS = [3, 6, 7, 8, 10, 11, 13, 16]
@@ -73,18 +73,18 @@ class _Log:
 def fast_reserve(monkeypatch):
     """예약 대기를 짧게 줄인다(기본 30초를 그대로 기다릴 수는 없다).
 
-    모듈 상수를 직접 바꾸는 이유: patrol_dispatcher 가 from-import 로 값을 이미
+    모듈 상수를 직접 바꾸는 이유: route_runner 가 from-import 로 값을 이미
     바인딩해 두었기 때문에 patrol_config 를 고쳐도 반영되지 않는다.
     """
-    monkeypatch.setattr(pd, "RESERVE_WAIT_SEC", 0.15)
-    monkeypatch.setattr(pd, "RESERVE_POLL_SEC", 0.02)
+    monkeypatch.setattr(rr, "RESERVE_WAIT_SEC", 0.15)
+    monkeypatch.setattr(rr, "RESERVE_POLL_SEC", 0.02)
 
 
 @pytest.fixture
 def env():
     engine = RoutingEngine(WAYPOINTS, CORRIDORS, reservation_ttl=60.0)
     log = _Log()
-    return engine, PatrolDispatcher(log), log
+    return engine, RouteRunner(log), log
 
 
 def _occupy(engine, node, robot):
@@ -95,13 +95,13 @@ def _occupy(engine, node, robot):
 # --------------------------------------------------------------------------- #
 def test_segment_not_acquired_through_occupied_node(env, fast_reserve):
     """불변식 1 — 남이 서 있는 7번을 지나는 세그먼트는 확보되지 않는다(관통 금지)."""
-    engine, disp, _log = env
+    engine, runner, _log = env
     _occupy(engine, 7, "dg_01")
 
-    route = disp._plan_route(engine, 10, 8, set())
+    route = runner._plan_route(engine, 10, 8, set())
     assert route.nodes == (10, 7, 8)                  # 최단경로는 7 경유가 맞고
 
-    seg = disp._acquire_segment(engine, "dg_02", route.hops(), set())
+    seg = runner._acquire_segment(engine, "dg_02", route.hops(), set())
     assert seg is None, "7번에 남이 서 있는데 세그먼트를 확보했다(관통)"
 
 
@@ -110,10 +110,10 @@ def test_corridor_released_when_slot_unavailable(env, fast_reserve):
 
     안 뱉으면 '가지도 못하면서 길만 막는' 로봇이 되어 상대까지 묶인다.
     """
-    engine, disp, _log = env
+    engine, runner, _log = env
     _occupy(engine, 7, "dg_01")
 
-    disp._acquire_segment(engine, "dg_02", [(7, 11), (8, 10)], set())
+    runner._acquire_segment(engine, "dg_02", [(7, 11), (8, 10)], set())
     assert engine.holder_of(11) is None, "진입 통로를 쥔 채 놓지 않았다"
 
 
@@ -122,34 +122,34 @@ def test_occupied_node_is_avoided_wholesale(env, fast_reserve):
 
     통로 하나만 블랙리스트에 넣는 방식이면 우회로가 다른 통로로 같은 지점에 또 들어간다.
     """
-    engine, disp, _log = env
+    engine, runner, _log = env
     _occupy(engine, 7, "dg_01")
 
     attempt_block = set()
-    route = disp._plan_route(engine, 10, 8, attempt_block)
-    assert disp._acquire_segment(engine, "dg_02", route.hops(), attempt_block) is None
+    route = runner._plan_route(engine, 10, 8, attempt_block)
+    assert runner._acquire_segment(engine, "dg_02", route.hops(), attempt_block) is None
 
-    detour = disp._plan_route(engine, 10, 8, attempt_block)
+    detour = runner._plan_route(engine, 10, 8, attempt_block)
     assert detour is not None, "우회로가 있는데 경로를 못 찾았다"
     assert 7 not in detour.nodes, f"우회로가 또 7을 지난다: {detour.nodes}"
 
 
 def test_holder_keeps_its_slot(env, fast_reserve):
     """서 있던 로봇의 자리는 상대의 시도에 흔들리지 않는다."""
-    engine, disp, _log = env
+    engine, runner, _log = env
     _occupy(engine, 7, "dg_01")
 
-    route = disp._plan_route(engine, 10, 8, set())
-    disp._acquire_segment(engine, "dg_02", route.hops(), set())
+    route = runner._plan_route(engine, 10, 8, set())
+    runner._acquire_segment(engine, "dg_02", route.hops(), set())
     assert engine.holder_of(engine.node_slot(7)) == "dg_01"
 
 
 def test_free_node_is_acquired_with_its_slot(env, fast_reserve):
     """아무도 없으면 통로와 도착 자리를 '쌍으로' 함께 확보한다."""
-    engine, disp, _log = env
+    engine, runner, _log = env
 
-    route = disp._plan_route(engine, 10, 8, set())
-    seg = disp._acquire_segment(engine, "dg_02", route.hops(), set())
+    route = runner._plan_route(engine, 10, 8, set())
+    seg = runner._acquire_segment(engine, "dg_02", route.hops(), set())
 
     assert seg is not None
     seg_wps, seg_cids = seg
@@ -160,11 +160,11 @@ def test_free_node_is_acquired_with_its_slot(env, fast_reserve):
 
 def test_log_names_the_point_not_the_negative_id(env, fast_reserve):
     """로그가 '통로 -7' 이 아니라 '지점 7 자리' 로 읽혀야 사람이 원인을 안다."""
-    engine, disp, log = env
+    engine, runner, log = env
     _occupy(engine, 7, "dg_01")
 
-    route = disp._plan_route(engine, 10, 8, set())
-    disp._acquire_segment(engine, "dg_02", route.hops(), set())
+    route = runner._plan_route(engine, 10, 8, set())
+    runner._acquire_segment(engine, "dg_02", route.hops(), set())
 
     assert log.has("지점 7 자리"), f"로그에 지점이 안 드러난다: {log.lines}"
     assert not log.has("통로 -7"), "음수 자원 id 가 로그로 샜다"
@@ -172,10 +172,10 @@ def test_log_names_the_point_not_the_negative_id(env, fast_reserve):
 
 def test_blacklist_view_splits_corridors_and_points(env):
     """블랙리스트에 섞인 통로/자리를 화면 쪽으로 갈라서 내보낸다."""
-    engine, disp, _log = env
-    disp._blacklist_add(11)
-    disp._blacklist_add(engine.node_slot(7))
+    engine, runner, _log = env
+    runner._blacklist_add(11)
+    runner._blacklist_add(engine.node_slot(7))
 
-    view = disp.blacklist_view(engine)
+    view = runner.blacklist_view(engine)
     assert view["corridors"] == [11]
     assert view["nodes"] == [7]

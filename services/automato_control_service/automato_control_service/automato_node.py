@@ -20,15 +20,19 @@
   - 순찰 디스패치는 '로봇당 1 스레드'로 동시 실행 → 3대가 동시에 움직이며 통로를 놓고 경합.
     공유 통로 예약표는 routing_engine 이 락으로 보호한다.
 
-교통관제 알고리즘(세그먼트 예약·룩어헤드·막힘 우회)은 patrol_dispatcher.PatrolDispatcher
-로 분리했다(composition). 이 노드는 엔진/클라이언트를 만들어 넘기고 결과만 tasks 에 마감한다.
+동작 결정 로직은 composition 으로 세 조각에 나눠 분리했다. 이 노드는 엔진/클라이언트를
+만들어 넘기고 결과만 tasks 에 마감한다:
+  - route_runner.RouteRunner       : 목적지까지 예약하며 이동(세그먼트·룩어헤드·막힘 우회).
+                                     **하나만 만들어 아래 둘이 공유**한다(예약·회피 상태 일원화).
+  - patrol_dispatcher.PatrolDispatcher : 순찰 순서·촬영 판정·방문 마킹
+  - harvest_dispatcher.HarvestDispatcher : 수확 E2~E6 흐름
 """
 import os
 import threading
 import time
 from datetime import datetime, timezone
 
-from automato_interfaces.action import Dock, Navigate
+from automato_interfaces.action import Dock, Harvest, Navigate, Unload
 from automato_interfaces.msg import FleetTelemetry
 from automato_interfaces.srv import SaveDetection
 import rclpy
@@ -49,8 +53,13 @@ from automato_control_service.patrol_config import (
     RESERVATION_TTL_SEC,
     SAVE_DETECTION_SRV,
 )
+from automato_control_service import docking
+from automato_control_service import harvest_dispatcher
+from automato_control_service import harvest_notify
 from automato_control_service import patrol_notify
+from automato_control_service.harvest_dispatcher import HarvestDispatcher
 from automato_control_service.patrol_dispatcher import PatrolDispatcher
+from automato_control_service.route_runner import RouteRunner
 from automato_control_service.routing_engine import RoutingEngine
 from automato_control_service.telemetry_cache import TelemetryCache
 
@@ -58,24 +67,22 @@ from automato_control_service.telemetry_cache import TelemetryCache
 # --------------------------------------------------------------------------- #
 # 순찰 제어 노드
 # --------------------------------------------------------------------------- #
-class PatrolControlNode(Node):
+class AutomatoControlNode(Node):
     def __init__(self, **kwargs):
-        super().__init__("patrol_control_node", **kwargs)
+        super().__init__("automato_control_node", **kwargs)
         self.cache = TelemetryCache()
         self._db_pool = None                       # main()에서 주입
         # 순찰 종료·실패 알림을 보낼 Web Service base URL. 탐지 저장(detection_service)과
         # 같은 env 를 공유해 두 경로가 같은 백엔드를 가리키게 한다.
         self._web_url = os.environ.get(
             "AUTOMATO_WEB_SERVICE_URL", "http://localhost:8100")
-        # robot_id -> Navigate ActionClient.
+        # 'robot_id/suffix' -> ActionClient. 액션 4종(Navigate/Dock/Harvest/Unload)을
+        # 한 캐시로 관리한다 — 액션마다 dict 를 두면 락도 규칙도 갈라진다.
         # ⚠️ 이름 주의: rclpy.Node 는 서비스 클라이언트 목록을 self._clients(리스트)로
         # 보관하고 node.clients 프로퍼티로 노출한다. 여기에 self._clients 를 dict 로
         # 덮으면 executor 가 node.clients 를 순회할 때 dict 의 '키(robot_id 문자열)'가
         # 나와 죽는다("'str' object has no attribute ...", RP-76). → 반드시 다른 이름 사용.
         self._action_clients = {}
-        # robot_id -> Dock ActionClient (충전소 정밀 도킹, E4-6/7 · 22-1).
-        # Navigate 와 같은 캐시 규칙이며 같은 락으로 보호한다.
-        self._dock_clients = {}
         self._action_clients_lock = threading.Lock()
 
         # 라우팅/예약 엔진(공유 단일 인스턴스). 첫 순찰 때 그래프를 로드해 생성한다.
@@ -84,8 +91,16 @@ class PatrolControlNode(Node):
 
         # 교통관제 알고리즘(세그먼트 이동·통로 예약·룩어헤드·막힘 우회)은 별도 클래스로
         # 분리(composition). 노드는 필요한 것(logger·engine·client)을 넘겨주고 위임만 한다.
-        # wp_meta·블랙리스트는 디스패처가 소유하며, 그래프 로드 시 노드가 wp_meta 를 채운다.
-        self._dispatcher = PatrolDispatcher(self.get_logger())
+        # RouteRunner 는 **하나만 만들어 순찰·수확이 공유**한다 — wp_meta(좌표)와
+        # 블랙리스트(막힌 통로)가 갈리면 순찰이 막혔다고 판정한 통로로 수확 로봇이
+        # 그대로 들어간다. 예약표(engine)를 하나로 쓰는 것과 같은 이유다.
+        # wp_meta 는 runner 가 소유하며, 그래프 로드 시 노드가 채운다.
+        self._runner = RouteRunner(self.get_logger())
+        self._dispatcher = PatrolDispatcher(self.get_logger(), self._runner)
+        # 수확(E2~E6)도 같은 composition 으로 분리. 주행·엔진을 순찰과 공유하고
+        # (교통관제 일관성) 흐름만 별도 클래스가 주관한다.
+        self._harvest_dispatcher = HarvestDispatcher(
+            self.get_logger(), self._runner)
 
         # 텔레메트리 상시 구독(1Hz) — 로봇별 /{robot_id}/telemetry
         self.declare_parameter("robot_ids", DEFAULT_ROBOT_IDS)
@@ -157,9 +172,10 @@ class PatrolControlNode(Node):
                 self._engine = RoutingEngine(
                     routing_nodes, graph["corridors"],
                     reservation_ttl=RESERVATION_TTL_SEC)
-                # wp_meta 는 디스패처가 소유(세그먼트 하달 시 좌표/촬영 여부에 사용) → 여기서 채운다.
+                # wp_meta 는 runner 가 소유(세그먼트 하달 시 좌표/촬영 여부에 사용) →
+                # 여기서 채운다. runner 하나를 순찰·수확이 공유하므로 이 한 번으로 둘 다 반영된다.
                 # 이쪽은 짝까지 '전부' 넣는다 — 짝을 하달하려면 그 좌표와 yaw 가 필요하다.
-                self._dispatcher.wp_meta = {
+                self._runner.wp_meta = {
                     w["waypoint_id"]: {
                         "x": w["x"], "y": w["y"],
                         "yaw": w["yaw"], "capture": w["is_patrol_point"],
@@ -204,22 +220,76 @@ class PatrolControlNode(Node):
             self.get_logger().info(f"{robot_id} 순찰 시작 노드 = {wp}(전용 충전소)")
         return wp
 
-    def _client_for(self, robot_id: str) -> ActionClient:
+    def _task_point_for(self, task_point_id: str):
+        """작업 지점(수확지/예냉실)의 진입노드+좌표 dict. 실패 시 None. (RP-123)
+
+        수확 디스패처는 DB 를 만지지 않는 경계라, '미리 조회할 수 있는' 이 값은 노드가
+        읽어 넘긴다(_start_waypoint_for 와 같은 관례). 접수 API 가 이미 같은 조회로
+        위치를 검증했지만 여기서 다시 읽는다 — 접수와 디스패치는 스레드도 시점도 달라,
+        그 사이 지점이 바뀌었을 수 있고 API 는 waypoint_id 를 노드로 넘기지 않는다.
+        """
+        if self._db_pool is None:
+            self.get_logger().error(
+                f"DB 풀이 없어 작업 지점 {task_point_id} 를 조회할 수 없다")
+            return None
+        try:
+            tp = automato_db.get_task_point(self._db_pool, task_point_id)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f"작업 지점 {task_point_id} 조회 실패: {exc}")
+            return None
+        if tp is None:
+            self.get_logger().error(
+                f"작업 지점 {task_point_id} 가 task_points 에 없음")
+        else:
+            self.get_logger().info(
+                f"작업 지점 {task_point_id} → 진입노드 {tp['waypoint_id']} "
+                f"({tp['point_type']})")
+        return tp
+
+    def _dock_marker_for(self, task_point_id: str):
+        """작업 지점의 ChArUco 보드 정보 dict. 없으면 None. (RP-123)
+
+        **None 이 정상적인 결과**다 — 마커 실측값(칸 크기·도킹 오프셋)은 현장 도킹 튜닝이
+        끝난 뒤 charuco_boards 에 시드되므로, 그 전까지는 비어 있다. 그래서 여기서 주행을
+        막지 않고 그대로 넘긴다: 로봇은 수확지까지 가고, 도킹 단계에서 '마커 없음'으로
+        실패한다(docking.dock 이 판정). 조회 실패도 같은 취급이다.
+        """
+        if self._db_pool is None:
+            return None
+        try:
+            return automato_db.get_dock_marker(self._db_pool, task_point_id)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f"{task_point_id} 도킹 마커 조회 실패(도킹 불가로 진행): {exc}")
+            return None
+
+    def _action_client_for(self, robot_id: str, action_type,
+                           suffix: str) -> ActionClient:
+        """robot_id 의 특정 액션 클라이언트를 캐시에서 얻거나 만든다(/{robot_id}/{suffix}).
+
+        Navigate·Dock·Harvest·Unload 를 하나의 캐시로 관리한다. 키는 'robot_id/suffix'
+        (예: 'dg_01/navigate', 'dg_01/harvest') 라 액션끼리 안 겹친다.
+        """
+        key = f"{robot_id}/{suffix}"
         with self._action_clients_lock:
-            client = self._action_clients.get(robot_id)
+            client = self._action_clients.get(key)
             if client is None:
-                client = ActionClient(self, Navigate, f"/{robot_id}/navigate")
-                self._action_clients[robot_id] = client
+                client = ActionClient(self, action_type, f"/{robot_id}/{suffix}")
+                self._action_clients[key] = client
             return client
 
+    def _client_for(self, robot_id: str) -> ActionClient:
+        """순찰용 Navigate 액션 클라이언트(하위호환 이름)."""
+        return self._action_client_for(robot_id, Navigate, "navigate")
+
     def _dock_client_for(self, robot_id: str) -> ActionClient:
-        """robot_id 의 Dock 액션 클라이언트(/{robot_id}/dock). Navigate 와 같은 캐시 규칙."""
-        with self._action_clients_lock:
-            client = self._dock_clients.get(robot_id)
-            if client is None:
-                client = ActionClient(self, Dock, f"/{robot_id}/dock")
-                self._dock_clients[robot_id] = client
-            return client
+        """robot_id 의 Dock 액션 클라이언트(/{robot_id}/dock).
+
+        RP-116 은 Dock 전용 캐시(self._dock_clients)를 따로 뒀지만, 수확이 액션 4종
+        (Navigate/Dock/Harvest/Unload)을 쓰게 되면서 캐시를 액션마다 만들 수는 없어
+        범용 _action_client_for 로 합쳤다. 캐시가 하나면 락도 하나라 규칙이 단순하다.
+        """
+        return self._action_client_for(robot_id, Dock, "dock")
 
     def prewarm_clients(self, robot_ids) -> None:
         """알려진 로봇의 Navigate 액션 클라이언트를 executor spin 시작 전에 미리 만든다.
@@ -292,6 +362,176 @@ class PatrolControlNode(Node):
             else:  # FAILED_ABORTED
                 self.get_logger().warn(
                     f"순찰 FAILED task={task_id} {robot_id} 위치 {last_wp} — 자리 유지")
+
+    # ---------------------------- 수확 디스패치 진입점 (RP-123) ---------------------------- #
+    def start_harvest(self, task_id: int, robot_id: str,
+                      harvest_location: str) -> None:
+        """API(C1)가 호출. 수확 task 하나를 별도 스레드로 돌린다(순찰 start_patrol 과 대칭).
+
+        harvest_location: 수확 위치 task_point_id(예: 'HARVEST_01'). 예냉실은 디스패처가
+        내부에서 조회하므로 여기선 안 넘긴다.
+        """
+        t = threading.Thread(
+            target=self._harvest_job, args=(task_id, robot_id, harvest_location),
+            name=f"harvest-{robot_id}-{task_id}", daemon=True)
+        t.start()
+        self.get_logger().info(
+            f"수확 디스패치 시작: task={task_id} robot={robot_id} 목적지={harvest_location}")
+
+    def _harvest_job(self, task_id: int, robot_id: str,
+                     harvest_location: str) -> None:
+        """스레드 본체: 엔진·액션 클라이언트를 준비해 디스패처에 위임하고 tasks 에 마감.
+
+        순찰 _patrol_job 과 같은 골격. 다른 점은 두 가지다:
+          · 액션 클라이언트가 4종(Navigate/Dock/Harvest/Unload)이다.
+          · 수확지 진입노드와 ChArUco 마커를 여기서 조회해 넘긴다 — 디스패처는 DB 를
+            만지지 않는다는 경계(harvest_dispatcher 설계노트 2) 때문이다. 순찰이
+            start_wp 를 여기서 조회해 넘기는 것과 같은 관례다.
+        """
+        status, reason = "FAILED", None
+        try:
+            engine = self._get_engine()
+            harvest_point = self._task_point_for(harvest_location)
+            # 마커는 없을 수 있다(실측값은 도킹 튜닝 후 시드) → None 이어도 주행은 한다.
+            # 디스패처가 도착 후 '마커 없음 = 도킹 불가'로 판정한다.
+            marker = self._dock_marker_for(harvest_location)
+            # 예냉실은 **수확을 시작하기 전에** 확인한다. 갈 곳이 없는데 몇 분씩 토마토를
+            # 따는 건 낭비이고, DB 조회는 순식간이라 미리 해도 손해가 없다.
+            precool_point = self._precool_point()
+            precool_marker = (
+                self._dock_marker_for(precool_point["task_point_id"])
+                if precool_point else None)
+            if (engine is not None and harvest_point is not None
+                    and precool_point is not None):
+                clients = {
+                    "nav": self._action_client_for(robot_id, Navigate, "navigate"),
+                    "dock": self._action_client_for(robot_id, Dock, "dock"),
+                    "harvest": self._action_client_for(robot_id, Harvest, "harvest"),
+                    "unload": self._action_client_for(robot_id, Unload, "unload"),
+                }
+                status, reason = self._harvest_dispatcher.run_harvest(
+                    task_id, robot_id, harvest_point, marker, engine, clients,
+                    start_wp=self._start_waypoint_for(robot_id),
+                    on_progress=self._harvest_progress_reporter(
+                        task_id, robot_id),
+                    precool_point=precool_point,
+                    precool_marker=precool_marker,
+                    save_batch=self._harvest_batch_saver(task_id, robot_id),
+                    save_unload=self._unload_log_saver(task_id, robot_id),
+                    on_completed=self._harvest_completed_reporter(
+                        task_id, robot_id))
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f"수확 디스패치 예외 task={task_id}: {exc}")
+            status, reason = "FAILED", None
+        if self._db_pool is not None:
+            try:
+                automato_db.set_task_status(self._db_pool, task_id, status)
+                self.get_logger().info(f"수확 종료 task={task_id} → {status}")
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().error(f"tasks 종료 갱신 실패 task={task_id}: {exc}")
+        # 실패 사유가 있으면 관리자에게 알린다. 어떤 실패가 알림 대상인지는 노드가 정한다
+        # — 디스패처는 '무슨 일이 있었는지'만 보고하고 HTTP 는 모른다(순찰과 같은 관례).
+        if reason == harvest_dispatcher.REASON_DOCK_FAILED:
+            # 로봇은 수확지 진입 노드에 서 있다(도킹만 실패). 순찰의 충전소 도킹 실패와
+            # 상황이 같아 같은 규격을 쓰되, task_type 만 HARVEST 로 낸다.
+            self._notify_dock_failed(
+                task_id, robot_id, None, f"수확지 {harvest_location} 도킹 실패",
+                task_type="HARVEST")
+        # TODO(E6): 수확 완료를 Web Service 로 통지 — 보낼 모듈(harvest_notify)은 이미
+        # 있고 배선만 남았다. 완료 페이로드에 수확 실적(normal/discard/failed)이 들어가는데
+        # 그 값이 E3~4 Harvest 액션 결과에서 나오므로, 그 단계가 붙어야 채울 수 있다.
+
+    def _precool_point(self):
+        """예냉실 진입노드 dict. 없으면 None. (RP-123 E5)
+
+        수확지(_task_point_for)와 달리 id 를 받지 않는다 — 예냉실은 현재 1곳이라
+        point_type 으로 찾는다(여러 곳이 되면 automato_db 쪽이 선택 로직으로 확장된다).
+        """
+        if self._db_pool is None:
+            self.get_logger().error("DB 풀이 없어 예냉실을 조회할 수 없다")
+            return None
+        try:
+            pp = automato_db.get_precool_point(self._db_pool)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f"예냉실 조회 실패: {exc}")
+            return None
+        if pp is None:
+            self.get_logger().error(
+                "예냉실(point_type=PRECOOL)이 task_points 에 없다 — 수확을 시작하지 않는다")
+        else:
+            self.get_logger().info(
+                f"예냉실 {pp['task_point_id']} → 진입노드 {pp['waypoint_id']}")
+        return pp
+
+    def _harvest_batch_saver(self, task_id, robot_id):
+        """수확 실적을 harvest_batches 에 적고 batch_id 를 돌려주는 콜백을 만든다. (E5)
+
+        디스패처는 DB 를 모르므로 '이만큼 땄다'는 집계만 넘겨 오고, 저장은 여기서 한다.
+        예외를 삼키지 않고 그대로 올린다 — 디스패처가 로그로 남기고 이송을 계속할지
+        판단한다(실물 토마토는 되돌릴 수 없으므로 이송은 계속하는 쪽이다).
+        """
+        def _save(harvested: dict) -> int:
+            return automato_db.save_harvest_batch(
+                self._db_pool, task_id, robot_id,
+                normal_count=harvested["normal_count"],
+                discard_count=harvested["discard_count"],
+                failed_count=harvested["failed_count"],
+                exit_reason=harvested["exit_reason"])
+        return _save
+
+    def _unload_log_saver(self, task_id, robot_id):
+        """하역 입고를 unload_logs 에 적고 unload_id 를 돌려주는 콜백을 만든다. (E6)
+
+        수량은 수확 집계를 그대로 옮긴다 — 바구니 2개(수확품/폐기품)가 붙어 있어 한 번에
+        같이 입고된다. 하역이 **성공했을 때만** 디스패처가 이 콜백을 부른다.
+        """
+        def _save(harvested: dict) -> int:
+            return automato_db.save_unload_log(
+                self._db_pool, task_id, robot_id,
+                normal_qty=harvested["normal_count"],
+                discard_qty=harvested["discard_count"])
+        return _save
+
+    def _harvest_completed_reporter(self, task_id, robot_id):
+        """수확 완료를 Web Service 로 알리는 콜백을 만든다(E6).
+
+        1회 발송하고 실패해도 재시도하지 않는다 — 실적은 이미 tasks·harvest_batches 에
+        있어 화면을 새로 고치면 보인다(순찰 patrol_completed 와 같은 정책).
+        """
+        def _report(summary: dict) -> None:
+            payload = harvest_notify.build_completed_payload(
+                task_id=task_id, robot_id=robot_id,
+                batch_id=summary["batch_id"],
+                normal_count=summary["normal_count"],
+                discard_count=summary["discard_count"],
+                failed_count=summary["failed_count"],
+                exit_reason=summary["exit_reason"],
+                completed_at=datetime.now(timezone.utc))
+            harvest_notify.send_harvest_completed(
+                self._web_url, payload, log=self.get_logger())
+        return _report
+
+    def _harvest_progress_reporter(self, task_id, robot_id):
+        """수확 진행 상황을 Web Service 로 중계하는 콜백을 만든다(E4). (RP-123)
+
+        디스패처는 HTTP 를 모르므로 '진행이 있었다'는 사실만 이 콜백으로 알려 오고,
+        실제 발송은 여기서 한다. fire-and-forget 이라 실패해도 수확을 멈추지 않는다 —
+        놓쳐도 최종 실적은 DB(harvest_batches)에 남아 화면을 새로 고치면 보인다.
+
+        ⚠️ 이 콜백은 ROS executor 스레드에서 실행된다. 여기서 오래 붙들면 액션 피드백
+        처리가 밀리므로, 예외는 전부 삼키고 짧게 끝낸다.
+        """
+        def _report(progress: dict) -> None:
+            try:
+                payload = harvest_notify.build_progress_payload(
+                    task_id=task_id, robot_id=robot_id,
+                    reported_at=datetime.now(timezone.utc), **progress)
+                harvest_notify.send_harvest_progress(
+                    self._web_url, payload, log=self.get_logger())
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(
+                    f"수확 진행 통지 실패(무시) task={task_id}: {exc}")
+        return _report
 
     def _report_task_result(self, task_id, robot_id, status, unvisited) -> None:
         """순찰 종료를 Web Service 로 알린다.
@@ -393,9 +633,11 @@ class PatrolControlNode(Node):
 
         # 3) 도킹 — 진입 노드 자리를 쥔 채(하트비트로 TTL 방어), N_dock 재시도.
         entry_slot = engine.node_slot(target)
-        success, code, msg = self._dispatcher.dock(
-            task_id, robot_id, charge_point_id, marker, dock_client,
-            heartbeat=(engine, [entry_slot], robot_id))
+        # 도킹은 순찰·수확이 함께 쓰므로 디스패처가 아니라 docking 모듈이 소유한다
+        # (충전소·수확지·예냉실 모두 charuco_boards 한 행 + 같은 절차).
+        success, code, msg = docking.dock(
+            self.get_logger(), task_id, robot_id, charge_point_id, marker,
+            dock_client, heartbeat=(engine, [entry_slot], robot_id))
         if success:
             # 문서 E4 8번: Dock 성공 → 예약 전부 해제. 복귀 도착 후엔 진입 노드 자리 하나만
             # 남아 있어, 그것을 놓으면 이 로봇의 예약이 완전히 빈다.
@@ -411,18 +653,23 @@ class PatrolControlNode(Node):
                 f"→ 진입 노드 정지, DOCK_FAILED 알림")
             self._notify_dock_failed(task_id, robot_id, code, msg)
 
-    def _notify_dock_failed(self, task_id, robot_id, code, msg) -> None:
+    def _notify_dock_failed(self, task_id, robot_id, code, msg,
+                            task_type="PATROL") -> None:
         """도킹 N_dock 소진 시 작업 실패 알림(문서 E4 Dock 실패 · reason=DOCK_FAILED).
 
-        복귀 주행 자체는 성공했고 마지막 도킹만 실패한 상황이라 recovery_action=NONE
-        (로봇은 충전소 진입 노드에 서서 관리자 개입을 기다린다). tasks 상태는 이미 순찰
-        종료값(COMPLETED/PARTIAL)으로 마감돼 있어 여기서 바꾸지 않는다 — 순찰은 끝났고
-        뒷정리(도킹)만 실패한 것이다.
+        주행 자체는 성공했고 마지막 도킹만 실패한 상황이라 recovery_action=NONE
+        (로봇은 진입 노드에 서서 관리자 개입을 기다린다).
+
+        task_type 으로 순찰·수확이 갈린다 — 알림 규격은 같지만 tasks 마감이 다르다:
+          · PATROL: 상태는 이미 순찰 종료값(COMPLETED/PARTIAL)으로 마감돼 있고 여기서
+            바꾸지 않는다. 순찰은 끝났고 뒷정리(충전소 도킹)만 실패한 것이다.
+          · HARVEST: 도킹을 못 하면 수확 자체를 못 하므로 task 는 FAILED 다
+            (_harvest_job 이 이미 그렇게 마감한 뒤 이 알림을 보낸다).
         """
         now = datetime.now(timezone.utc)
         payload = patrol_notify.build_task_failed_payload(
             task_id=task_id, robot_id=robot_id, reason="DOCK_FAILED",
-            recovery_action="NONE", failed_at=now)
+            recovery_action="NONE", failed_at=now, task_type=task_type)
         patrol_notify.send_task_failed(
             self._web_url, payload, log=self.get_logger())
         self.get_logger().warn(
@@ -479,7 +726,7 @@ def main(args=None) -> None:
     from automato_control_service.patrol_api import create_app
 
     rclpy.init(args=args)
-    node = PatrolControlNode()
+    node = AutomatoControlNode()
 
     pool = automato_db.create_pool()
     node.set_db_pool(pool)

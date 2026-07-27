@@ -6,18 +6,18 @@
 patrol_e2e_sim.launch.py 몫이다.
 
 띄우는 것:
-  patrol_node                 순찰 오케스트레이터 + HTTP API   http://0.0.0.0:8200
+  automato_node                 순찰 오케스트레이터 + HTTP API   http://0.0.0.0:8200
   telemetry_ws_node           텔레메트리 WebSocket 방송        ws://0.0.0.0:8000/ws/telemetry
   fleet_telemetry_aggregator  QT 대시보드용 취합 발행          (기존 launch 재사용)
 
 HTTP·WebSocket 은 따로 켜지 않는다:
-  patrol_node·telemetry_ws_node 는 각자 프로세스 안에서 rclpy 노드(백그라운드 spin)와
+  automato_node·telemetry_ws_node 는 각자 프로세스 안에서 rclpy 노드(백그라운드 spin)와
   uvicorn(FastAPI, 메인 스레드)을 함께 돌린다. 그래서 이 노드를 launch 에 넣기만 하면
   HTTP·WS 서버가 자동으로 함께 뜬다. 포트는 환경변수로 바꿀 수 있다:
     ACS_API_PORT (기본 8200)   ACS_WS_PORT (기본 8000)
 
 ⚠️ 반드시 '리포 안에서' 실행한다:
-  patrol_node·telemetry_ws_node 는 DB(automato_db)에 붙는데, 접속문자열을
+  automato_node·telemetry_ws_node 는 DB(automato_db)에 붙는데, 접속문자열을
   ① 환경변수 DATABASE_URL → ② 없으면 '현재 작업 디렉터리(CWD)에서 위로 올라가며
   services/database/.env' 순으로 찾는다. ros2 launch 는 CWD 를 바꾸지 않으므로,
   리포 안에서 실행하면 노드가 그 CWD 를 물려받아 .env 를 그대로 찾는다(수동 ros2 run 과 동일).
@@ -63,9 +63,9 @@ def generate_launch_description():
             'robot_ids', default_value="['dg_01','dg_02','dg_03']",
             description="구독할 로봇 목록(세 노드 공유). 예: robot_ids:=\"['dg_01','dg_02']\""),
 
-        # ── patrol_node — 순찰 오케스트레이터 + HTTP API(기본 8200) ──
+        # ── automato_node — 순찰 오케스트레이터 + HTTP API(기본 8200) ──
         Node(
-            package=PKG, executable='patrol_node', output='screen',
+            package=PKG, executable='automato_node', output='screen',
             # 문자열 인자를 실제 리스트로 평가해 넘긴다(위 '타입 주의' 참고).
             parameters=[{'robot_ids': PythonExpression(robot_ids)}],
         ),

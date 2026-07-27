@@ -23,8 +23,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            # RP-78: 순찰 제어 노드 + 순찰 HTTP API(FastAPI)를 한 프로세스로 기동
-            'patrol_node = automato_control_service.patrol_node:main',
+            # RP-78/RP-123: ACS 제어 노드(순찰·수확) + HTTP API(FastAPI)를 한 프로세스로 기동
+            'automato_node = automato_control_service.automato_node:main',
             # RP-90: 텔레메트리 WebSocket 서버 — fleet 구독 → 1Hz 방송(독립 프로세스)
             'telemetry_ws_node = '
             'automato_control_service.telemetry_ws_node:main',

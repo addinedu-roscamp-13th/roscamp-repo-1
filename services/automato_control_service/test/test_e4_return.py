@@ -9,14 +9,14 @@
      - 갇힘 → FAILED_BLOCKED
      - 복귀 주행(drive_to_point): 전 구간 capture=false
      - 도킹(dock): 성공 / 마커 없음 / N_dock 재시도 후 실패
-  B. 오케스트레이션 (PatrolControlNode 의 _return_and_dock/_immobilize/_notify_dock_failed)
+  B. 오케스트레이션 (AutomatoControlNode 의 _return_and_dock/_immobilize/_notify_dock_failed)
      - 복귀+도킹 성공 → 예약 전부 해제
      - 도킹 실패 → DOCK_FAILED 알림, 진입 노드 자리 유지
      - 복귀 막힘 → IMMOBILIZED + BLOCKED_UNRECOVERABLE
      - 충전소 미등록 → 복귀 생략, 자리 반납
 
 가짜 액션 클라이언트를 여기에 직접 둔다(test_slot_handoff 와 같은 방침 — 검증 도구에
-의존하지 않는다). B 파트는 rclpy 를 쓰는 patrol_node 를 지연 import 해, ROS 가 없어도
+의존하지 않는다). B 파트는 rclpy 를 쓰는 automato_node 를 지연 import 해, ROS 가 없어도
 A 파트는 수집·실행된다.
 
 테스트 그래프(일직선):  22(충전소 진입) --c1-- 15 --c16-- 12 --c13-- 9(순찰) --c7-- 4(순찰)
@@ -33,7 +33,9 @@ from concurrent.futures import Future
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from automato_control_service import docking                              # noqa: E402
 from automato_control_service import patrol_dispatcher as pd              # noqa: E402
+from automato_control_service import route_runner as rr                   # noqa: E402
 from automato_control_service.patrol_dispatcher import PatrolDispatcher    # noqa: E402
 from automato_control_service.routing_engine import RoutingEngine          # noqa: E402
 
@@ -178,11 +180,18 @@ class FakeDockClient:
 # --------------------------------------------------------------------------- #
 @pytest.fixture
 def fast(monkeypatch):
-    """대기·하트비트·T_block 을 짧게(from-import 로 바인딩된 모듈 상수를 직접 바꾼다)."""
-    monkeypatch.setattr(pd, "RESERVE_WAIT_SEC", 0.1)
-    monkeypatch.setattr(pd, "RESERVE_POLL_SEC", 0.02)
-    monkeypatch.setattr(pd, "HEARTBEAT_SEC", 0.02)
-    monkeypatch.setattr(pd, "BLOCK_GIVEUP_SEC", 0.15)
+    """대기·하트비트·T_block 을 짧게(from-import 로 바인딩된 모듈 상수를 직접 바꾼다).
+
+    ⚠️ 상수마다 타깃 모듈이 다르다. 주행·예약은 route_runner, 도킹은 docking 이 각각
+    from-import 로 값을 이미 바인딩했다 — 엉뚱한 모듈에 패치하면 에러 없이 그냥 안 먹어
+    테스트가 실제 대기 시간을 다 기다린다(원인 찾기 어려운 종류).
+    """
+    monkeypatch.setattr(rr, "RESERVE_WAIT_SEC", 0.1)     # 주행 중 통로 예약 대기
+    monkeypatch.setattr(rr, "RESERVE_POLL_SEC", 0.02)
+    monkeypatch.setattr(rr, "HEARTBEAT_SEC", 0.02)       # 주행 결과 대기 하트비트
+    monkeypatch.setattr(docking, "HEARTBEAT_SEC", 0.02)  # 도킹 결과 대기 하트비트
+    monkeypatch.setattr(pd, "RESERVE_POLL_SEC", 0.02)    # 막힘 재시도 간격(_stranded)
+    monkeypatch.setattr(pd, "BLOCK_GIVEUP_SEC", 0.15)    # T_block
 
 
 def _make(ttl=60.0):
@@ -269,7 +278,7 @@ def test_dock_success(fast):
     """도킹 성공(result_code=0) → (True, 0, ...), 한 번만 하달."""
     engine, disp = _make()
     dock = FakeDockClient(code=0)
-    ok, code, _msg = disp.dock(1, "dg_01", "CHARGE_01", MARKER, dock)
+    ok, code, _msg = docking.dock(_Log(), 1, "dg_01", "CHARGE_01", MARKER, dock)
     assert ok is True and code == 0
     assert dock.calls == 1
 
@@ -278,7 +287,7 @@ def test_dock_marker_none_fails_without_moving(fast):
     """마커 미등록 → 즉시 실패, 로봇(Dock 서버)을 부르지 않는다."""
     engine, disp = _make()
     dock = FakeDockClient(code=0)
-    ok, code, _msg = disp.dock(1, "dg_01", "CHARGE_01", None, dock)
+    ok, code, _msg = docking.dock(_Log(), 1, "dg_01", "CHARGE_01", None, dock)
     assert ok is False and code is None
     assert dock.calls == 0
 
@@ -287,19 +296,19 @@ def test_dock_retries_then_fails(fast):
     """도킹이 계속 실패하면 N_dock 회 재시도 후 (False, code)."""
     engine, disp = _make()
     dock = FakeDockClient(code=1)              # 매번 마커 미검출
-    ok, code, _msg = disp.dock(1, "dg_01", "CHARGE_01", MARKER, dock)
+    ok, code, _msg = docking.dock(_Log(), 1, "dg_01", "CHARGE_01", MARKER, dock)
     assert ok is False and code == 1
-    assert dock.calls == pd.DOCK_RETRY_MAX
+    assert dock.calls == docking.DOCK_RETRY_MAX
 
 
 # =========================================================================== #
-# B. 오케스트레이션 (PatrolControlNode 의 복귀·도킹 시퀀스)
+# B. 오케스트레이션 (AutomatoControlNode 의 복귀·도킹 시퀀스)
 # =========================================================================== #
 class _FakeNode:
     """복귀·도킹 오케스트레이션 메서드를 언바운드로 호출하기 위한 최소 self."""
 
     def __init__(self, cls, dispatcher, nav_client, dock_client):
-        self._cls = cls                   # PatrolControlNode (형제 메서드 위임용)
+        self._cls = cls                   # AutomatoControlNode (형제 메서드 위임용)
         self._db_pool = object()          # truthy — 실제 DB 호출은 monkeypatch 로 대체
         self._dispatcher = dispatcher
         self._web_url = "http://web"
@@ -326,12 +335,12 @@ class _FakeNode:
 
 @pytest.fixture
 def orchestration(monkeypatch):
-    """patrol_node 를 지연 import 하고, DB·알림 함수를 기록용으로 갈아끼운다.
+    """automato_node 를 지연 import 하고, DB·알림 함수를 기록용으로 갈아끼운다.
 
     반환 dict 의 charge/marker 를 테스트가 미리 채운다. 나머지(immobilize/failed/events)
     에는 호출 기록이 쌓인다.
     """
-    from automato_control_service import patrol_node as pn
+    from automato_control_service import automato_node as pn
     rec = {"charge": None, "marker": None,
            "immobilize": [], "failed": [], "events": []}
 
@@ -354,7 +363,7 @@ def orchestration(monkeypatch):
 
     monkeypatch.setattr(pn.patrol_notify, "send_task_failed", _send_failed)
 
-    rec["_cls"] = pn.PatrolControlNode
+    rec["_cls"] = pn.AutomatoControlNode
     return rec
 
 
@@ -383,7 +392,7 @@ def test_return_and_dock_dock_failed_notifies(fast, orchestration):
 
     orchestration["_cls"]._return_and_dock(node, 1, "dg_01", engine, 4)
 
-    assert node._dock.calls == pd.DOCK_RETRY_MAX
+    assert node._dock.calls == docking.DOCK_RETRY_MAX
     assert any(p["reason"] == "DOCK_FAILED" for p in orchestration["failed"])
     # 관리자 개입 대기 — 진입 노드 자리는 놓지 않는다
     assert engine.holder_of(engine.node_slot(22)) == "dg_01"

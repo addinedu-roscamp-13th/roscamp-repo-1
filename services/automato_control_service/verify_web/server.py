@@ -57,7 +57,7 @@ SIM_SPIN_RPS = float(os.environ.get("VERIFY_SPIN_RPS", "0.9"))
 # ACS(8200)·텔레메트리 WS(8000)와 겹치지 않는 포트. 셋을 동시에 띄울 수 있어야 한다.
 PORT = int(os.environ.get("VERIFY_WEB_PORT", "8300"))
 
-# LIVE 모드가 들여다볼 실물 ACS 주소. ACS 는 0.0.0.0:8200 에 뜬다(patrol_node.main).
+# LIVE 모드가 들여다볼 실물 ACS 주소. ACS 는 0.0.0.0:8200 에 뜬다(automato_node.main).
 ACS_BASE = os.environ.get("ACS_BASE_URL", "http://127.0.0.1:8200")
 # 시작 모드. 기본이 SIM 인 이유 — 로봇이 없어도 항상 동작하는 쪽이 기본이어야 한다.
 START_MODE = os.environ.get("VERIFY_MODE", "SIM").upper()
@@ -102,7 +102,7 @@ def load_map(pool) -> dict:
     ★ 짝(pair) 처리가 중요하다:
       18(부모 10), 19(부모 13)은 '같은 자리에서 방향만 180° 돌려 한 번 더 찍는' 전용 행이라
       부모와 x·y 가 완전히 같고 corridors 에 등장하지 않는다. 그래서
-        - routing_nodes  : 짝을 뺀 것 (patrol_node 와 동일. 넣으면 고립 노드가 섞인다)
+        - routing_nodes  : 짝을 뺀 것 (automato_node 와 동일. 넣으면 고립 노드가 섞인다)
         - waypoints      : 짝까지 전부 (화면이 부모 위에 회전 표시를 그려야 하므로 좌표가 필요)
       두 벌을 따로 내려준다. 화면은 짝을 '별도 점'이 아니라 부모에 붙는 ↻ 배지로 그린다.
 
@@ -128,7 +128,7 @@ def load_map(pool) -> dict:
     for w in graph["waypoints"]:
         w["patrol_order"] = orders.get(w["waypoint_id"])
 
-    # patrol_node.py 와 동일한 규칙으로 라우팅 노드를 추린다(짝 제외).
+    # automato_node.py 와 동일한 규칙으로 라우팅 노드를 추린다(짝 제외).
     graph["routing_node_ids"] = [
         w["waypoint_id"] for w in graph["waypoints"] if w["pair_of"] is None]
     graph["pairs"] = [

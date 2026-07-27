@@ -80,7 +80,7 @@ def snapshot(node) -> dict:
 
         # --- 회피 중(블랙리스트): 막힘/양보로 재계획에서 잠시 빠진 통로/지점 ---
         try:
-            view = node._dispatcher.blacklist_view(engine)        # noqa: SLF001
+            view = node._runner.blacklist_view(engine)            # noqa: SLF001
             avoiding, avoiding_nodes = view["corridors"], view["nodes"]
         except Exception:                        # noqa: BLE001
             pass

@@ -42,7 +42,7 @@
 | PostgreSQL (docker) | 🖥️ 관제 PC | tasks/task_paths/snapshot 저장 |
 | **`fleet_aggregator` (테스트)** | 🖥️ 관제 PC | 로봇 텔레메트리 → `/automato/telemetry/fleet` 취합 |
 | **`fake_telemetry` (테스트)** | 🖥️ 관제 PC | 물리 로봇 없이 가짜 로봇 상태 발행 → **로봇 1대로 T3·T7** 검증 |
-| **ACS `patrol_node` (RP-78 본체)** | 🖥️ 관제 PC | 선정·기록·순찰 하달·교통관제 + HTTP API(:8200) |
+| **ACS `automato_node` (RP-78 본체)** | 🖥️ 관제 PC | 선정·기록·순찰 하달·교통관제 + HTTP API(:8200) |
 | 확인·명령 (`curl`, `ros2 topic/action`, `psql`) | 🖥️ 관제 PC | 사람이 보고 조작 |
 
 > **원칙:** 각 로봇은 자기 스택 3종(드라이버·텔레메트리·patrol_bridge)을 자기 RPi5에서 돌린다.
@@ -61,7 +61,7 @@
 │  (텔레메트리만 발행)       │             │   → /automato/telemetry/fleet 발행│
 │                            │             │            │                     │
 │ patrol_bridge (테스트,sim) │  Patrol     │            ▼                     │
-│   /dg_01/patrol 서버 ◀─────┼─────────────┼── ACS patrol_node (RP-78)         │
+│   /dg_01/patrol 서버 ◀─────┼─────────────┼── ACS automato_node (RP-78)         │
 │     └▶ "도착" 가짜 응답    │  액션 하달  │   - available/accept API (:8200)  │
 │        (로봇 정지)         │             │   - 로봇 선정·통로 예약·우회      │
 └───────────────────────────┘             │   - DB 기록 ─▶ PostgreSQL(docker) │
@@ -268,7 +268,7 @@ Step A 의 `alembic upgrade head` 가 자동으로 시드한다:
 - **0002** — waypoint 19개(순찰점 12 + 비순찰점 7). 순찰점만 `patrol_order` 1~12 를 가진다.
 - **0003** — 실제 맵 통로 19쌍(무방향 간선).
 
-> **⚠️ DB 데이터를 바꿨다면 ACS 재시작.** ACS(`patrol_node`)는 라우팅 그래프를 **첫 순찰 때 한 번
+> **⚠️ DB 데이터를 바꿨다면 ACS 재시작.** ACS(`automato_node`)는 라우팅 그래프를 **첫 순찰 때 한 번
 > 읽어 캐시**한다(성능 목적). 실행 중 DB 를 바꿔도 이미 로드했으면 옛 그래프를 계속 쓴다. Ctrl+C 후
 > 다시 띄우면 시작 로그 `라우팅 그래프 로드: 노드 N / 통로 M` 의 N/M 이 새 값으로 나온다.
 > 로봇은 좌표를 DB 에서 읽지 않으므로(ACS 가 Patrol Goal 에 실어 하달) 로봇 재배포는 불필요하다.
@@ -393,7 +393,7 @@ source /opt/ros/jazzy/setup.bash
 source ~/roscamp-repo-1/equip/automato_ws/install/setup.bash
 cd ~/roscamp-repo-1/services/automato_control_service
 source .venv-acs/bin/activate
-python3 -m automato_control_service.patrol_node
+python3 -m automato_control_service.automato_node
 #   → "라우팅 그래프 로드: 노드 N / 통로 M" 로그가 뜨면 DB 그래프 적재 OK
 #   → HTTP API 는 :8200 (변경: ACS_API_PORT=8200)
 ```
@@ -420,7 +420,7 @@ python3 -m automato_control_service.patrol_node
 
 ```bash
 # 🖥️ [관제 PC]
-ros2 node list                          # patrol_control_node, fleet_aggregator, 로봇 노드들 보임
+ros2 node list                          # automato_control_node, fleet_aggregator, 로봇 노드들 보임
 ros2 topic hz /automato/telemetry/fleet # 약 1Hz 로 흐르면 취합 OK
 ros2 topic echo /automato/telemetry/fleet --once   # ddagos[] 에 로봇들 보임
 ros2 action list | grep patrol          # /dg_01/patrol (+02/03) 보이면 bridge OK
@@ -669,7 +669,7 @@ cd ~/roscamp-repo-1/services/database && docker compose down
 | 로봇 좌표가 (0,0)/odom 기준 | Nav2(amcl) 안 띄움 — 이 문서에선 **정상** | 좌표는 가용·선정 판정에 안 쓰이므로 무시해도 된다 |
 | interfaces 임포트/타입 에러 | Patrol.action 재빌드 안 함 | 관제 PC·로봇 **양쪽** `colcon build --packages-select automato_interfaces` |
 | 로봇에 옛 Patrol.action / `~/automato_ws/automato_ws/` 중첩 생김 | rsync 경로 끝 슬래시 누락 or 미실행 | 2-3(2) 슬래시(`.../automato_ws/`) 확인, `cat .../Patrol.action` 으로 검증 후 재빌드 |
-| 데이터 새로 시드했는데 순찰이 옛 그래프로 돔 | ACS 가 그래프를 캐시(첫 순찰 때 1회 로드) | ACS(`patrol_node`) **재시작** → 로그 `라우팅 그래프 로드: 노드 N/통로 M` 새 값 확인(3장 ⚠️ 주의) |
+| 데이터 새로 시드했는데 순찰이 옛 그래프로 돔 | ACS 가 그래프를 캐시(첫 순찰 때 1회 로드) | ACS(`automato_node`) **재시작** → 로그 `라우팅 그래프 로드: 노드 N/통로 M` 새 값 확인(3장 ⚠️ 주의) |
 
 ---
 

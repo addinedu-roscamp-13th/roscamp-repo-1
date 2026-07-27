@@ -329,7 +329,7 @@ cd ~/roscamp-repo-1/services/database && docker compose ps    # healthy
 ```bash
 cd ~/roscamp-repo-1/services/automato_control_service
 source .venv-acs/bin/activate          # RP-78/79 문서에서 만든 ACS 전용 venv
-python3 -m automato_control_service.patrol_node
+python3 -m automato_control_service.automato_node
 ```
 
 기대 로그:

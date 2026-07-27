@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """검증 웹 — 시뮬 세계. '진짜' 엔진·디스패처를 가짜 로봇으로 굴리고 상태를 관찰한다.
 
-여기가 4단계의 본체다. 구성은 patrol_node.py 와 의도적으로 똑같다:
+여기가 4단계의 본체다. 구성은 automato_node.py 와 의도적으로 똑같다:
   - RoutingEngine   ← 짝(pair)을 뺀 노드 + corridors 로 구성 (진짜 코드, 무수정)
   - PatrolDispatcher← wp_meta 는 짝까지 전부, pair_of 맵 주입 (진짜 코드, 무수정)
   - client          ← 여기만 가짜(FakeNavigateClient)
 
 관측(observability)이 이 파일의 존재 이유다. 검증 대상 코드는 상태를 밖으로 내보내는
-창이 없다 — 예약표는 RoutingEngine 안의 dict 이고, 주행 상태는 _navigate() 의 지역변수다.
-그래서 '이미 공개돼 있는 것만' 써서 밖에서 들여다본다:
+창이 없다 — 예약표는 RoutingEngine 안의 dict 이고, 주행 상태는 RouteRunner.drive() 의
+지역변수다. 그래서 '이미 공개돼 있는 것만' 써서 밖에서 들여다본다:
   · 예약표   : engine.holder_of(cid) 를 통로마다 호출 (공개 API. 25통로×10Hz=250회/초라 무해)
-  · 블랙리스트: dispatcher._blacklist_active() — 밑줄 이름이지만 '읽기 전용 관찰'로만 쓴다.
+  · 블랙리스트: dispatcher.runner.blacklist_view() — 주행 엔진이 소유한 공개 관측 API.
                 검증 대상 코드를 고치지 않는 게 이 도구의 제1원칙이라 이쪽을 택했다.
   · 로봇 위치 : FakeRobot (가짜 로봇이 위치의 소스오브트루스)
   · 판단 근거 : 디스패처가 남기는 로그를 EventLog 로 받아 화면에 그대로 흘린다.
@@ -85,7 +85,7 @@ class VerifySim:
     def __init__(self, pool, *, speed_mps: float = 0.06, spin_rps: float = 0.9):
         graph = automato_db.load_graph(pool)
 
-        # patrol_node.py 와 동일: 짝은 라우팅 그래프에서 뺀다(통로가 없어 고립 노드가 된다).
+        # automato_node.py 와 동일: 짝은 라우팅 그래프에서 뺀다(통로가 없어 고립 노드가 된다).
         routing_nodes = [w for w in graph["waypoints"] if w["pair_of"] is None]
         self.engine = RoutingEngine(
             routing_nodes, graph["corridors"], reservation_ttl=RESERVATION_TTL_SEC)
@@ -126,7 +126,7 @@ class VerifySim:
         for rid, wp in self._charge_nodes(pool).items():
             self.add_robot(rid, wp)
 
-        # 죽은 예약 주기 회수. 실 ACS 는 patrol_node 의 ROS 타이머가 같은 일을 하는데,
+        # 죽은 예약 주기 회수. 실 ACS 는 automato_node 의 ROS 타이머가 같은 일을 하는데,
         # 엔진 인스턴스를 소유한 주체가 서로 다르므로(저쪽은 ACS, 여기는 이 시뮬)
         # 각자 자기 엔진을 청소해야 한다.
         self._reap_stop = threading.Event()
@@ -366,7 +366,9 @@ class VerifySim:
         snap = self.engine.reservation_snapshot()
         reservations = {str(cid): rid for cid, rid in snap["corridors"].items()}
         node_holders = {str(n): rid for n, rid in snap["nodes"].items()}
-        avoid = self.dispatcher.blacklist_view(self.engine)   # 락 1회로 끝낸다
+        # 블랙리스트는 주행 엔진(RouteRunner)이 소유한다 — 순찰·수확이 공유하는 상태라
+        # 디스패처가 아니라 runner 에게 묻는다.
+        avoid = self.dispatcher.runner.blacklist_view(self.engine)  # 락 1회로 끝낸다
 
         with self._lock:
             robots = []

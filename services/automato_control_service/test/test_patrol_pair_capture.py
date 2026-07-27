@@ -35,6 +35,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from automato_control_service.patrol_dispatcher import PatrolDispatcher  # noqa: E402
+from automato_control_service.route_runner import RouteRunner            # noqa: E402
 from automato_control_service.routing_engine import RoutingEngine  # noqa: E402
 
 # 라우팅 그래프 — 짝(99)은 노드로도 통로로도 등장하지 않는다.
@@ -233,16 +234,16 @@ def test_start_wp_가_주어지면_그_노드에서_출발한다():
 # 그 외 노드는 '가는 방향(다음 노드 쪽)'을 향하게 해 불필요한 회전을 없앤다.
 def test__travel_yaw_는_다음_노드_쪽을_향한다():
     coords = [(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)]
-    assert PatrolDispatcher._travel_yaw(coords, 0) == math.atan2(1.0, 1.0)   # 다음(1,1)
-    assert PatrolDispatcher._travel_yaw(coords, 1) == math.atan2(-1.0, 1.0)  # 다음(2,0)
+    assert RouteRunner._travel_yaw(coords, 0) == math.atan2(1.0, 1.0)   # 다음(1,1)
+    assert RouteRunner._travel_yaw(coords, 1) == math.atan2(-1.0, 1.0)  # 다음(2,0)
     # 마지막 노드는 다음이 없으므로 '오던 방향'을 유지한다.
-    assert PatrolDispatcher._travel_yaw(coords, 2) == math.atan2(-1.0, 1.0)
+    assert RouteRunner._travel_yaw(coords, 2) == math.atan2(-1.0, 1.0)
 
 
 def test__travel_yaw_같은자리거나_한점이면_0():
     """두 점이 같으면(짝 등) 진행 방향 계산이 불가 → 0.0 폴백."""
-    assert PatrolDispatcher._travel_yaw([(1.0, 2.0), (1.0, 2.0)], 0) == 0.0
-    assert PatrolDispatcher._travel_yaw([(5.0, 5.0)], 0) == 0.0
+    assert RouteRunner._travel_yaw([(1.0, 2.0), (1.0, 2.0)], 0) == 0.0
+    assert RouteRunner._travel_yaw([(5.0, 5.0)], 0) == 0.0
 
 
 def test_통과노드는_0이_아니라_진행방향으로_하달된다():
@@ -250,7 +251,7 @@ def test_통과노드는_0이_아니라_진행방향으로_하달된다():
     d = _make_dispatcher()
     client = FakeClient()
     # 1=(0,0) 통과점, 2=(1,2) 촬영점. capture_ids 에 2 만 넣는다.
-    d._dispatch_segment(client, 1, [1, 2], {2})
+    d.runner._dispatch_segment(client, 1, [1, 2], {2})
     _ids, _caps, goal = client.sent[0]
     passthru, capture = goal.waypoints[0], goal.waypoints[1]
     assert passthru.capture is False and capture.capture is True

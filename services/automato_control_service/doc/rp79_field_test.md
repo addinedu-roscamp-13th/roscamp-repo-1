@@ -93,7 +93,7 @@ source .venv-acs/bin/activate   # (RP-78 문서 2-4에서 만든 venv)
 # 이미지 저장 위치와 목 서버 주소를 지정해 기동
 DETECTION_IMAGE_ROOT=/tmp/automato_detections \
 AUTOMATO_WEB_SERVICE_URL=http://localhost:8100 \
-python3 -m automato_control_service.patrol_node
+python3 -m automato_control_service.automato_node
 #   → 로그에 "탐지 저장 서비스 준비: /automato/save_detection" 가 떠야 한다
 ```
 
