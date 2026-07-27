@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """검증 웹 — 시뮬 세계. '진짜' 엔진·디스패처를 가짜 로봇으로 굴리고 상태를 관찰한다.
 
-여기가 4단계의 본체다. 구성은 patrol_node.py 와 의도적으로 똑같다:
+여기가 4단계의 본체다. 구성은 automato_node.py 와 의도적으로 똑같다:
   - RoutingEngine   ← 짝(pair)을 뺀 노드 + corridors 로 구성 (진짜 코드, 무수정)
   - PatrolDispatcher← wp_meta 는 짝까지 전부, pair_of 맵 주입 (진짜 코드, 무수정)
   - client          ← 여기만 가짜(FakeNavigateClient)
@@ -85,7 +85,7 @@ class VerifySim:
     def __init__(self, pool, *, speed_mps: float = 0.06, spin_rps: float = 0.9):
         graph = automato_db.load_graph(pool)
 
-        # patrol_node.py 와 동일: 짝은 라우팅 그래프에서 뺀다(통로가 없어 고립 노드가 된다).
+        # automato_node.py 와 동일: 짝은 라우팅 그래프에서 뺀다(통로가 없어 고립 노드가 된다).
         routing_nodes = [w for w in graph["waypoints"] if w["pair_of"] is None]
         self.engine = RoutingEngine(
             routing_nodes, graph["corridors"], reservation_ttl=RESERVATION_TTL_SEC)
@@ -126,7 +126,7 @@ class VerifySim:
         for rid, wp in self._charge_nodes(pool).items():
             self.add_robot(rid, wp)
 
-        # 죽은 예약 주기 회수. 실 ACS 는 patrol_node 의 ROS 타이머가 같은 일을 하는데,
+        # 죽은 예약 주기 회수. 실 ACS 는 automato_node 의 ROS 타이머가 같은 일을 하는데,
         # 엔진 인스턴스를 소유한 주체가 서로 다르므로(저쪽은 ACS, 여기는 이 시뮬)
         # 각자 자기 엔진을 청소해야 한다.
         self._reap_stop = threading.Event()

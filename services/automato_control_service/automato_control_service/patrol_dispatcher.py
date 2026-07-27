@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """RP-78 교통관제 — 순찰 세그먼트 이동·통로 예약·룩어헤드·막힘 우회 (composition 분리).
 
-patrol_node(ROS 표면)에서 '동작 결정' 로직을 떼어낸 클래스. rclpy 노드를 직접
+automato_node(ROS 표면)에서 '동작 결정' 로직을 떼어낸 클래스. rclpy 노드를 직접
 참조하지 않고, 필요한 것(logger, 라우팅 engine, Navigate 액션 client)을 인자로 받아
 동작한다 → ROS 를 안 띄우고 fake engine/client 로 단위 테스트할 수 있다.
 

@@ -7,7 +7,7 @@ ACS 가 로봇별로 구독한 상태를 WebSocket 클라이언트(Automato Web 
 RP-114 로 입력이 /{robot_id}/telemetry(RobotTelemetry, 로봇 수만큼)로 바뀌었다.
 옛 /automato/telemetry/fleet 는 팀원의 DG 이전이 끝날 때까지 함께 구독한다.
 
-실행 구조(기존 patrol_node 와 동일한 골격 — 두 세계가 한 프로세스에 공존):
+실행 구조(기존 automato_node 와 동일한 골격 — 두 세계가 한 프로세스에 공존):
   - [백그라운드 스레드]  rclpy 노드가 spin → fleet 구독 콜백이 FleetCache 에 최신 상태를 씀(writer)
   - [메인 스레드]        uvicorn(FastAPI) 이벤트 루프 → 1Hz 방송 코루틴이 FleetCache 를 읽음(reader)
   - FleetCache 는 두 세계를 잇는 다리. writer(스레드)와 reader(asyncio)가 서로 다른
@@ -163,7 +163,7 @@ class TelemetryNode(Node):
 
 # --------------------------------------------------------------------------- #
 # 조립 루트 — rclpy 노드(백그라운드 spin) + uvicorn/FastAPI(메인, WebSocket)를 함께 띄운다.
-# patrol_node.main() 과 동일한 골격: spin 은 백그라운드, uvicorn(이벤트 루프)은 메인.
+# automato_node.main() 과 동일한 골격: spin 은 백그라운드, uvicorn(이벤트 루프)은 메인.
 # --------------------------------------------------------------------------- #
 def main(args=None) -> None:
     import os

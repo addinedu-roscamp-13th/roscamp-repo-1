@@ -41,7 +41,7 @@
 | 라벨 | 실제 위치 | 이번에 띄우는 것 |
 | --- | --- | --- |
 | 🤖 **[로봇 PC]** | dg_01 로봇의 RPi5 (`ssh pinky@<로봇IP>`) | 로봇 드라이버, Nav2, `telemetry_publisher`, `patrol_server`, 더미 카메라 |
-| 🖥️ **[로컬 PC]** | 관제/개발 노트북 | DB, ACS(`patrol_node`), `fleet_telemetry_aggregator`, 순찰 트리거 |
+| 🖥️ **[로컬 PC]** | 관제/개발 노트북 | DB, ACS(`automato_node`), `fleet_telemetry_aggregator`, 순찰 트리거 |
 
 > **네트워크 전제.** 두 기기가 **같은 무선망 + 같은 `ROS_DOMAIN_ID`** 여야 서로 보인다.
 > 확인: 양쪽에서 `echo $ROS_DOMAIN_ID` 값이 같은지(비어 있으면 둘 다 0). 다르면
@@ -193,14 +193,14 @@ source ~/roscamp-repo-1/equip/automato_ws/install/setup.bash
 cd ~/roscamp-repo-1/services/database && docker compose ps    # healthy
 ```
 
-### ② ACS(patrol_node) — 🖥️ 로컬
+### ② ACS(automato_node) — 🖥️ 로컬
 
-`patrol_node` 한 프로세스에 **순찰 API(:8200) + 텔레메트리 구독 + `save_detection` 서비스**가 함께 뜬다.
+`automato_node` 한 프로세스에 **순찰 API(:8200) + 텔레메트리 구독 + `save_detection` 서비스**가 함께 뜬다.
 
 ```bash
 cd ~/roscamp-repo-1/services/automato_control_service
 source .venv-acs/bin/activate
-python3 -m automato_control_service.patrol_node
+python3 -m automato_control_service.automato_node
 ```
 
 기대 로그:

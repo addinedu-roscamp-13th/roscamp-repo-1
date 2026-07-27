@@ -3,7 +3,7 @@
 
 이 파일은 "DB에 무엇을 어떻게 쓰고 읽는가"만 담당한다(순수 데이터 계층).
 가용 판정/로봇 선정 같은 '판단'은 API 계층(patrol_api.py)이,
-로봇에 명령을 내리는 '동작'은 노드(patrol_node.py)가 맡는다.
+로봇에 명령을 내리는 '동작'은 노드(automato_node.py)가 맡는다.
 
 배경 지식(왜 이렇게 나눴나):
   - ROS2/로봇 코드와 DB 코드가 한 파일에 섞이면 테스트·디버깅이 어렵다.
@@ -505,7 +505,7 @@ def get_patrol_start_waypoint(pool: ConnectionPool, robot_id: str):
     """robot_id 의 전용 충전소 진입 노드(waypoint_id)를 돌려준다. 없으면 None.
 
     None 이 나오는 경우: 그런 로봇이 없거나, charge_point_id 가 비어 있음.
-    호출부(patrol_node)는 None 이면 설정 상수 PATROL_START_WAYPOINT_ID 로 폴백한다
+    호출부(automato_node)는 None 이면 설정 상수 PATROL_START_WAYPOINT_ID 로 폴백한다
     — 충전소가 아직 등록되지 않은 로봇 때문에 순찰 전체가 막히지는 않게 한다.
     """
     with pool.connection() as conn:

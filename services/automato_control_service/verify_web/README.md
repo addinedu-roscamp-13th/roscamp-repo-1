@@ -89,7 +89,7 @@ cd ~/roscamp-repo-1/services/automato_control_service
 source /opt/ros/jazzy/setup.bash
 source ~/roscamp-repo-1/equip/automato_ws/install/setup.bash
 source install/setup.bash
-python3 -m automato_control_service.patrol_node      # → 0.0.0.0:8200
+python3 -m automato_control_service.automato_node      # → 0.0.0.0:8200
 
 # ── 터미널 2: 검증 웹 ──
 #   (소싱은 SIM 과 동일)

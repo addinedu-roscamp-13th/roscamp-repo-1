@@ -77,7 +77,7 @@ ros2 launch automato_control_service patrol_e2e_sim.launch.py
 
 ```bash
 cd ~/roscamp-repo-1        # ★ 리포 안에서 실행할 것
-ros2 run automato_control_service patrol_node
+ros2 run automato_control_service automato_node
 ```
 
 > **왜 리포 안에서?** ACS는 DB 접속 문자열을 **현재 디렉터리에서 위로 올라가며**

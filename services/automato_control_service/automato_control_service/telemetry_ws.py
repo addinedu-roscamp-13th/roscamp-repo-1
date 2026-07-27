@@ -2,7 +2,7 @@
 """RP-90  E0 텔레메트리 WebSocket 앱 계층 — 가용판정·커넥션 관리·방송을 담당한다.
 
 telemetry_ws_node.py 가 '동작(ROS 구독 + 실행 조립)'을, 이 파일이 'WebSocket 쪽 로직'을
-맡는다(patrol 의 patrol_node.py ↔ patrol_api.py 분리와 동일한 관례).
+맡는다(patrol 의 automato_node.py ↔ patrol_api.py 분리와 동일한 관례).
 
 이 파일은 여러 조각으로 나눠 만든다(RP-90 구현 순서):
   ② judge_robot_availability ← 지금 이 조각(가용 여부·사유 판정, 외부의존 없는 순수 함수)

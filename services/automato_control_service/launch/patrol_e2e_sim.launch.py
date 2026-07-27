@@ -2,7 +2,7 @@
 """시나리오1 E1 E2E 시뮬 스탠드인 일괄 기동 — 물리 로봇 없이 순찰 접수~주행을 돌린다.
 
 ⚠️ 여기서 뜨는 노드는 전부 '테스트 스탠드인'이다(실제 로봇/DG Control Service 아님).
-   ACS 본체(patrol_node)는 일부러 빼 두었다 — 아래 '왜 ACS는 따로 띄우나' 참고.
+   ACS 본체(automato_node)는 일부러 빼 두었다 — 아래 '왜 ACS는 따로 띄우나' 참고.
 
 띄우는 것 (robots 인자에 적은 로봇마다 2개 + 공통 1개):
   로봇마다  fake_telemetry   : /ddago/telemetry 1Hz 발행 (가짜 DdaGo 상태)
@@ -13,7 +13,7 @@
   # 터미널 1 — 스탠드인 일괄
   ros2 launch automato_control_service patrol_e2e_sim.launch.py
   # 터미널 2 — ACS 본체
-  ros2 run automato_control_service patrol_node
+  ros2 run automato_control_service automato_node
   # 터미널 3 — 접수
   curl -X POST localhost:8200/internal/v1/tasks/patrol \\
        -H 'Content-Type: application/json' -d '{"robot_selection":"auto","robot_id":null}'
@@ -37,8 +37,8 @@
      sim_seconds:=6.0 으로 느리게        (기본 하트비트 5초보다 길게)
      ACS_HEARTBEAT_SEC=0.3 ros2 run ...  (ACS 쪽 틱을 잘게; 실물 튜닝값은 안 건드림)
 
-왜 ACS(patrol_node)는 이 launch에 없나:
-  ① patrol_node 는 DB 접속 문자열을 '실행한 디렉터리에서 위로 올라가며' services/database/.env
+왜 ACS(automato_node)는 이 launch에 없나:
+  ① automato_node 는 DB 접속 문자열을 '실행한 디렉터리에서 위로 올라가며' services/database/.env
      를 찾아 얻는다. 별도 터미널에서 리포 안에 서서 띄우는 편이 사고가 없다.
   ② FastAPI(uvicorn) 로그와 스탠드인 로그가 한 화면에 섞이면 API 응답 확인이 어렵다.
   ③ 코드를 고쳐 ACS만 재기동하는 일이 잦은데, 그때마다 가짜 로봇까지 다시 뜨면 느리다.

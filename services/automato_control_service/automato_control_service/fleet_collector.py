@@ -10,7 +10,7 @@
 로그도 두지 않는다(순수 계층). 흐름 로그는 이걸 쓰는 노드 쪽에서 남긴다.
 
 세 노드가 각자 이 모듈을 써서 각자 구독한다(중계 노드를 두지 않는다):
-  - patrol_node          가용 판정·DB 배정 스냅샷
+  - automato_node          가용 판정·DB 배정 스냅샷
   - telemetry_ws_node    웹서비스용 축약본 WebSocket 방송
   - fleet_telemetry_aggregator  QT 용 원본 취합 발행
 ROS2 토픽은 다중 구독자를 전제로 한 브로드캐스트라 구독자가 늘어도 발행자 부담이 거의 없고,

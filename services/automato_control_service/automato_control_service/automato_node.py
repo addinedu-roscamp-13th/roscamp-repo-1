@@ -58,9 +58,9 @@ from automato_control_service.telemetry_cache import TelemetryCache
 # --------------------------------------------------------------------------- #
 # 순찰 제어 노드
 # --------------------------------------------------------------------------- #
-class PatrolControlNode(Node):
+class AutomatoControlNode(Node):
     def __init__(self, **kwargs):
-        super().__init__("patrol_control_node", **kwargs)
+        super().__init__("automato_control_node", **kwargs)
         self.cache = TelemetryCache()
         self._db_pool = None                       # main()에서 주입
         # 순찰 종료·실패 알림을 보낼 Web Service base URL. 탐지 저장(detection_service)과
@@ -321,7 +321,7 @@ def main(args=None) -> None:
     from automato_control_service.patrol_api import create_app
 
     rclpy.init(args=args)
-    node = PatrolControlNode()
+    node = AutomatoControlNode()
 
     pool = automato_db.create_pool()
     node.set_db_pool(pool)

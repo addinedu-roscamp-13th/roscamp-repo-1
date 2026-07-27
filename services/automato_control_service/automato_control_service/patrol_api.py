@@ -67,7 +67,7 @@ def judge_robot(robot_id: str, entry: Optional[dict], has_active_task: bool,
                 stale_sec: float = STALE_SEC) -> dict:
     """로봇 1대의 가용 여부와 (불가 시) 사유를 판정해 응답 dict로 만든다.
 
-    entry: 노드 캐시의 해당 로봇 항목(없으면 None). 형태는 patrol_node.TelemetryCache 참고.
+    entry: 노드 캐시의 해당 로봇 항목(없으면 None). 형태는 automato_node.TelemetryCache 참고.
     operational_status: robots.operational_status ('NORMAL'|'IMMOBILIZED'|'MAINTENANCE').
       기본값을 두지 않는다 — 호출부가 빠뜨리면 '조용히 가용'으로 통과해 갇힌 로봇이
       다시 배정된다. 필수 인자면 그 자리에서 TypeError 로 드러난다.
@@ -136,7 +136,7 @@ def select_auto(judged: list) -> Optional[str]:
 def create_app(node, pool) -> FastAPI:
     """노드(텔레메트리 캐시/디스패치)와 DB 풀을 주입받아 FastAPI 앱을 만든다.
 
-    node: patrol_node.PatrolControlNode  (node.cache, node.start_patrol 사용)
+    node: automato_node.AutomatoControlNode  (node.cache, node.start_patrol 사용)
     pool: psycopg_pool.ConnectionPool
     """
     app = FastAPI(title="Automato Control Service — Patrol (RP-78)")
