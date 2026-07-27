@@ -58,6 +58,9 @@ HARVEST_POINT = {"task_point_id": "HARVEST_01", "point_type": "HARVEST",
                  "waypoint_id": 4, "x": 1.2, "y": 0.0, "yaw": 0.0}
 # 노드(_dock_marker_for)가 automato_db.get_dock_marker 로 읽어 넘겨주는 모양 그대로.
 # 실제 시드 전에는 None 이 올 수 있고, 그때 도킹은 시도조차 하지 않는다(아래 테스트).
+# 예냉실 — 수확지(4)에서 되돌아오는 자리(12)에 있다고 둔다.
+PRECOOL_POINT = {"task_point_id": "PRECOOL_01", "point_type": "PRECOOL",
+                 "waypoint_id": 12, "x": 3.6, "y": 0.0, "yaw": 0.0}
 MARKER = {"marker_id": "31", "dictionary": "DICT_5X5_1000",
           "squares_x": 6, "squares_y": 5,
           "square_size_m": 0.024, "marker_size_m": 0.018,
@@ -549,3 +552,107 @@ def test_도킹_실패하면_수확까지_가지_않는다(fast_timing):
     assert harv.calls == 0, "도킹에 실패했는데 수확을 시켰다"
     assert status == STATUS_FAILED
     assert reason == REASON_DOCK_FAILED
+
+
+# ------------------------ E5 실적 저장 + 예냉실 이송 ------------------------ #
+def _e5(disp, engine, clients, save_batch=None, precool=PRECOOL_POINT,
+        precool_marker=MARKER):
+    """E5 까지 가는 호출(예냉실 정보와 저장 콜백을 함께 넘긴다)."""
+    return disp.run_harvest(
+        1, "dg_01", HARVEST_POINT, MARKER, engine, clients, start_wp=15,
+        precool_point=precool, precool_marker=precool_marker,
+        save_batch=save_batch)
+
+
+def test_실적을_이송_전에_적는다(fast_timing):
+    """E5 의 핵심 순서 — 예냉실로 출발하기 전에 장부를 남긴다.
+
+    이송은 분 단위라 그 사이 로봇·프로세스가 죽을 수 있다. 그때 아직 안 적었으면
+    애써 딴 실적이 통째로 사라진다(바구니엔 있는데 시스템은 모르는 상태).
+    """
+    engine, disp, log, nav, dock, harv = _make()
+    seen = {}
+
+    def save(harvested):
+        # 저장이 불린 시점에 '아직 예냉실로 출발하지 않았어야' 한다.
+        seen["dispatch_count"] = len(nav.dispatched)
+        seen["harvested"] = harvested
+        return 77
+
+    _e5(disp, engine, _clients(nav, dock, harv), save_batch=save)
+
+    assert "harvested" in seen, "실적 저장 콜백이 불리지 않았다"
+    assert seen["harvested"]["normal_count"] == 5
+    # 수확지까지의 주행 하달 횟수 그대로여야 한다(예냉실 하달이 아직 없다).
+    after = len(nav.dispatched)
+    assert seen["dispatch_count"] < after, \
+        "예냉실로 출발한 뒤에 실적을 적었다 — 이송 중 사고나면 실적이 사라진다"
+    assert log.has("batch_id=77"), f"batch_id 가 로그에 안 남았다: {log.lines}"
+
+
+def test_예냉실까지_이송하고_도킹한다(fast_timing):
+    """수확지 → 예냉실 이동 후 도킹. 도킹은 수확지·예냉실 두 번 일어난다."""
+    engine, disp, log, nav, dock, harv = _make()
+
+    _e5(disp, engine, _clients(nav, dock, harv), save_batch=lambda h: 1)
+
+    assert nav.dispatched[-1][-1] == 12, \
+        f"예냉실(12)까지 못 갔다: {nav.dispatched}"
+    assert dock.calls == 2, f"도킹이 두 번(수확지·예냉실) 일어나야 한다: {dock.calls}"
+    assert dock.goal.task_point_id == "PRECOOL_01", "마지막 도킹이 예냉실이 아니다"
+    assert log.has("E5 예냉실 도킹 완료"), f"완료 로그가 없다: {log.lines}"
+    assert _no_reservations(engine), "이송이 끝났는데 예약이 남았다"
+
+
+def test_실적_저장이_실패해도_이송은_계속한다(fast_timing):
+    """토마토는 이미 바구니에 있고 딴 순간부터 상한다 — 기록 문제로 냉장을 미루면
+    실물을 버린다. 되돌릴 수 없는 쪽은 실물이다."""
+    engine, disp, log, nav, dock, harv = _make()
+
+    def save_broken(_harvested):
+        raise RuntimeError("DB 연결 끊김")
+
+    _e5(disp, engine, _clients(nav, dock, harv), save_batch=save_broken)
+
+    assert nav.dispatched[-1][-1] == 12, "저장 실패로 이송까지 멈췄다"
+    assert log.has("수확 실적 저장 실패"), f"실패가 로그에 안 남았다: {log.lines}"
+
+
+def test_예냉실이_그래프에_없으면_이송_실패(fast_timing):
+    """갈 곳이 없으면 이송은 못 하지만, 실적은 이미 저장돼 있어야 한다."""
+    engine, disp, log, nav, dock, harv = _make()
+    saved = []
+    ghost = dict(PRECOOL_POINT, waypoint_id=999)
+
+    status, _reason = _e5(disp, engine, _clients(nav, dock, harv),
+                          save_batch=lambda h: saved.append(h) or 5,
+                          precool=ghost)
+
+    assert status == STATUS_FAILED
+    assert saved, "이송이 불가능해도 수확 실적은 남아야 한다"
+    assert _no_reservations(engine)
+
+
+def test_예냉실_도킹_실패는_DOCK_FAILED(fast_timing):
+    """예냉실 마커가 없으면 도킹 못 한다 → 관리자 통지가 나가야 한다."""
+    engine, disp, _log, nav, dock, harv = _make()
+
+    status, reason = _e5(disp, engine, _clients(nav, dock, harv),
+                         save_batch=lambda h: 3, precool_marker=None)
+
+    assert status == STATUS_FAILED
+    assert reason == REASON_DOCK_FAILED
+    assert _no_reservations(engine), "도킹 실패 뒤에도 예약이 남았다"
+
+
+def test_수확이_실패하면_이송도_저장도_없다(fast_timing):
+    """못 땄으면 적을 것도 나를 것도 없다."""
+    engine, disp, _log, nav, dock, harv = _make(
+        harvest=FakeHarvest(status=GoalStatus.STATUS_ABORTED))
+    saved = []
+
+    _e5(disp, engine, _clients(nav, dock, harv),
+        save_batch=lambda h: saved.append(h) or 1)
+
+    assert saved == [], "수확이 중단됐는데 실적을 적었다"
+    assert nav.dispatched[-1][-1] == 4, "수확 실패인데 예냉실로 갔다"

@@ -71,7 +71,8 @@ class HarvestDispatcher:
         return self.runner.wp_meta
 
     def run_harvest(self, task_id, robot_id, harvest_point, marker, engine,
-                    clients, start_wp=None, on_progress=None):
+                    clients, start_wp=None, on_progress=None,
+                    precool_point=None, precool_marker=None, save_batch=None):
         """수확 task 하나를 E2~E6 순서로 처리하고 최종 상태를 돌려준다.
 
         harvest_point : 수확지 정보 dict — 노드가 automato_db.get_task_point 로 조회해 넘긴다.
@@ -88,6 +89,13 @@ class HarvestDispatcher:
         on_progress   : 수확 진행 상황을 받을 콜백(dict). 노드가 이걸 Web Service 로
                         중계한다 — 이 클래스는 HTTP 를 모른 채로 남아야 ROS·DB·네트워크
                         없이 단위테스트가 된다(설계노트 2 와 같은 이유).
+        precool_point : 예냉실 진입노드 dict(get_precool_point). 수확지와 같은 규약이고,
+                        **수확을 시작하기 전에** 노드가 조회해 넘긴다 — 갈 곳이 없는데
+                        몇 분씩 토마토를 따는 건 낭비다.
+        precool_marker: 예냉실 ChArUco 보드 dict. 없으면(None) 예냉실 도킹만 실패한다.
+        save_batch    : 수확 실적을 저장하는 콜백. 집계 dict 를 받아 batch_id 를 돌려준다.
+                        이 클래스가 DB 를 모르는 채로 남기 위한 통로다(on_progress 와 같은
+                        이유). 반환된 batch_id 는 E6 완료 통지에 실린다.
 
         반환: (status, reason)
           status: STATUS_COMPLETED | STATUS_FAILED — 노드가 tasks 에 마감한다.
@@ -181,10 +189,53 @@ class HarvestDispatcher:
                 f"[HARVEST] E3~4 수확 종료 task={task_id} {robot_id} "
                 f"정상 {harvested['normal_count']} / 폐기 {harvested['discard_count']} "
                 f"/ 실패 {harvested['failed_count']} (사유 {harvested['exit_reason']})")
-            # TODO(E5~E6): 실적 저장(콜백) → 예냉실 주행·도킹 → 하역·완료 통지.
+
+            # --- E5-1 실적 저장 — 예냉실로 '출발하기 전에' 남긴다 ---
+            # 순서가 핵심이다. 예냉실 이송은 분 단위이고 그 사이 로봇·프로세스가 죽을 수
+            # 있는데, 그때 아직 안 적었으면 애써 딴 실적이 통째로 사라진다(바구니엔 있는데
+            # 시스템은 모르는 상태). 먼저 적어두면 이송이 실패해도 개수는 남는다.
+            batch_id = self._save_batch(save_batch, task_id, harvested)
+
+            # --- E5-2 예냉실까지 이송 + 도킹 ---
+            precool_wp = (precool_point or {}).get("waypoint_id")
+            precool_label = (precool_point or {}).get("task_point_id", "?")
+            if precool_wp is None or precool_wp not in self.wp_meta:
+                self._log.error(
+                    f"[HARVEST] 예냉실({precool_label}/노드 {precool_wp})이 라우팅 "
+                    f"그래프에 없다 → task {task_id} 이송 불가 FAILED "
+                    f"(수확 실적 batch_id={batch_id} 은 저장됨)")
+                return STATUS_FAILED, None
+
+            self._log.info(
+                f"[HARVEST] E5 예냉실 이송 시작 task={task_id} {robot_id} "
+                f"{current} → {precool_wp}({precool_label})")
+            # 수확지 → 예냉실. 여기도 훅 없이 부른다(촬영·짝 없는 평범한 주행).
+            # 수확지 자리는 drive 가 출발하며 이어받아 반납한다.
+            outcome, current = self.runner.drive(
+                engine, clients["nav"], task_id, robot_id, current, precool_wp)
+            if outcome != "arrived":
+                self._log.warning(
+                    f"[HARVEST] E5 예냉실 이송 실패({outcome}) task={task_id} "
+                    f"로봇 위치 {current} → FAILED")
+                return STATUS_FAILED, None
+
+            precool_slot = engine.node_slot(current)
+            success, code, msg = docking.dock(
+                self._log, task_id, robot_id, precool_label, precool_marker,
+                clients["dock"], heartbeat=(engine, [precool_slot], robot_id))
+            if not success:
+                self._log.warning(
+                    f"[HARVEST] E5 예냉실 도킹 실패(code={code}) task={task_id} "
+                    f"{robot_id} @ {precool_label}: {msg} → FAILED")
+                return STATUS_FAILED, REASON_DOCK_FAILED
+
+            self._log.info(
+                f"[HARVEST] E5 예냉실 도킹 완료 task={task_id} {robot_id} "
+                f"@ {precool_label}")
+            # TODO(E6): 하역(Unload) + 완료 통지. batch_id 를 완료 페이로드에 싣는다.
             self._log.warning(
-                f"[HARVEST] E5~E6 미구현 → task {task_id} FAILED 로 마감 "
-                f"(수확까지는 성공)")
+                f"[HARVEST] E6 미구현 → task {task_id} FAILED 로 마감 "
+                f"(예냉실 도킹까지는 성공, batch_id={batch_id})")
             return STATUS_FAILED, None
         finally:
             # drive 는 '지금 서 있는 자리'를 일부러 남기고 나온다 — 다음 구간이 이어받아
@@ -193,6 +244,27 @@ class HarvestDispatcher:
             engine.release(engine.node_slot(current), robot_id)
             self._log.info(
                 f"[HARVEST] task={task_id} 지점 {current} 자리 반납")
+
+    def _save_batch(self, save_batch, task_id, harvested):
+        """수확 실적을 콜백으로 저장하고 batch_id 를 돌려준다. 실패해도 None 만 낸다.
+
+        저장이 실패해도 **예냉실 이송은 멈추지 않는다.** 토마토는 이미 바구니에 있고
+        딴 순간부터 상하기 시작하므로, 기록 문제로 냉장을 미루면 실물을 버리게 된다.
+        기록은 로그로 남겨 나중에 사람이 복구할 수 있다 — 둘 중 되돌릴 수 없는 쪽은
+        실물이다.
+        """
+        if save_batch is None:
+            return None
+        try:
+            batch_id = save_batch(harvested)
+            self._log.info(
+                f"[HARVEST] E5 수확 실적 저장 task={task_id} batch_id={batch_id}")
+            return batch_id
+        except Exception as exc:  # noqa: BLE001
+            self._log.error(
+                f"[HARVEST] E5 수확 실적 저장 실패 task={task_id}: {exc} "
+                f"— 이송은 계속한다(실적: {harvested})")
+            return None
 
     # ---------------------------- E3~E4 수확 ---------------------------- #
     def _run_harvest_action(self, task_id, robot_id, harvest_client,

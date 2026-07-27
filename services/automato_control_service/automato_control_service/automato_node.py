@@ -395,7 +395,14 @@ class AutomatoControlNode(Node):
             # 마커는 없을 수 있다(실측값은 도킹 튜닝 후 시드) → None 이어도 주행은 한다.
             # 디스패처가 도착 후 '마커 없음 = 도킹 불가'로 판정한다.
             marker = self._dock_marker_for(harvest_location)
-            if engine is not None and harvest_point is not None:
+            # 예냉실은 **수확을 시작하기 전에** 확인한다. 갈 곳이 없는데 몇 분씩 토마토를
+            # 따는 건 낭비이고, DB 조회는 순식간이라 미리 해도 손해가 없다.
+            precool_point = self._precool_point()
+            precool_marker = (
+                self._dock_marker_for(precool_point["task_point_id"])
+                if precool_point else None)
+            if (engine is not None and harvest_point is not None
+                    and precool_point is not None):
                 clients = {
                     "nav": self._action_client_for(robot_id, Navigate, "navigate"),
                     "dock": self._action_client_for(robot_id, Dock, "dock"),
@@ -406,7 +413,10 @@ class AutomatoControlNode(Node):
                     task_id, robot_id, harvest_point, marker, engine, clients,
                     start_wp=self._start_waypoint_for(robot_id),
                     on_progress=self._harvest_progress_reporter(
-                        task_id, robot_id))
+                        task_id, robot_id),
+                    precool_point=precool_point,
+                    precool_marker=precool_marker,
+                    save_batch=self._harvest_batch_saver(task_id, robot_id))
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f"수확 디스패치 예외 task={task_id}: {exc}")
             status, reason = "FAILED", None
@@ -427,6 +437,44 @@ class AutomatoControlNode(Node):
         # TODO(E6): 수확 완료를 Web Service 로 통지 — 보낼 모듈(harvest_notify)은 이미
         # 있고 배선만 남았다. 완료 페이로드에 수확 실적(normal/discard/failed)이 들어가는데
         # 그 값이 E3~4 Harvest 액션 결과에서 나오므로, 그 단계가 붙어야 채울 수 있다.
+
+    def _precool_point(self):
+        """예냉실 진입노드 dict. 없으면 None. (RP-123 E5)
+
+        수확지(_task_point_for)와 달리 id 를 받지 않는다 — 예냉실은 현재 1곳이라
+        point_type 으로 찾는다(여러 곳이 되면 automato_db 쪽이 선택 로직으로 확장된다).
+        """
+        if self._db_pool is None:
+            self.get_logger().error("DB 풀이 없어 예냉실을 조회할 수 없다")
+            return None
+        try:
+            pp = automato_db.get_precool_point(self._db_pool)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f"예냉실 조회 실패: {exc}")
+            return None
+        if pp is None:
+            self.get_logger().error(
+                "예냉실(point_type=PRECOOL)이 task_points 에 없다 — 수확을 시작하지 않는다")
+        else:
+            self.get_logger().info(
+                f"예냉실 {pp['task_point_id']} → 진입노드 {pp['waypoint_id']}")
+        return pp
+
+    def _harvest_batch_saver(self, task_id, robot_id):
+        """수확 실적을 harvest_batches 에 적고 batch_id 를 돌려주는 콜백을 만든다. (E5)
+
+        디스패처는 DB 를 모르므로 '이만큼 땄다'는 집계만 넘겨 오고, 저장은 여기서 한다.
+        예외를 삼키지 않고 그대로 올린다 — 디스패처가 로그로 남기고 이송을 계속할지
+        판단한다(실물 토마토는 되돌릴 수 없으므로 이송은 계속하는 쪽이다).
+        """
+        def _save(harvested: dict) -> int:
+            return automato_db.save_harvest_batch(
+                self._db_pool, task_id, robot_id,
+                normal_count=harvested["normal_count"],
+                discard_count=harvested["discard_count"],
+                failed_count=harvested["failed_count"],
+                exit_reason=harvested["exit_reason"])
+        return _save
 
     def _harvest_progress_reporter(self, task_id, robot_id):
         """수확 진행 상황을 Web Service 로 중계하는 콜백을 만든다(E4). (RP-123)
