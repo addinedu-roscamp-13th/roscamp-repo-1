@@ -28,7 +28,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from automato_interfaces.action import Navigate
+from automato_interfaces.action import Dock, Navigate
 from automato_interfaces.msg import FleetTelemetry
 from automato_interfaces.srv import SaveDetection
 import rclpy
@@ -73,6 +73,9 @@ class PatrolControlNode(Node):
         # 덮으면 executor 가 node.clients 를 순회할 때 dict 의 '키(robot_id 문자열)'가
         # 나와 죽는다("'str' object has no attribute ...", RP-76). → 반드시 다른 이름 사용.
         self._action_clients = {}
+        # robot_id -> Dock ActionClient (충전소 정밀 도킹, E4-6/7 · 22-1).
+        # Navigate 와 같은 캐시 규칙이며 같은 락으로 보호한다.
+        self._dock_clients = {}
         self._action_clients_lock = threading.Lock()
 
         # 라우팅/예약 엔진(공유 단일 인스턴스). 첫 순찰 때 그래프를 로드해 생성한다.
@@ -209,6 +212,15 @@ class PatrolControlNode(Node):
                 self._action_clients[robot_id] = client
             return client
 
+    def _dock_client_for(self, robot_id: str) -> ActionClient:
+        """robot_id 의 Dock 액션 클라이언트(/{robot_id}/dock). Navigate 와 같은 캐시 규칙."""
+        with self._action_clients_lock:
+            client = self._dock_clients.get(robot_id)
+            if client is None:
+                client = ActionClient(self, Dock, f"/{robot_id}/dock")
+                self._dock_clients[robot_id] = client
+            return client
+
     def prewarm_clients(self, robot_ids) -> None:
         """알려진 로봇의 Navigate 액션 클라이언트를 executor spin 시작 전에 미리 만든다.
 
@@ -242,38 +254,54 @@ class PatrolControlNode(Node):
         알고리즘은 self._dispatcher.run_patrol 에 넘긴다.
         """
         unvisited = []
+        last_wp = None
+        engine = None
         try:
             engine = self._get_engine()
             if engine is None:
-                status = "FAILED"
+                status = "FAILED_ABORTED"
             else:
                 client = self._client_for(robot_id)
-                status, unvisited = self._dispatcher.run_patrol(
+                status, unvisited, last_wp = self._dispatcher.run_patrol(
                     task_id, robot_id, waypoints, engine, client,
                     start_wp=self._start_waypoint_for(robot_id))
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f"디스패치 예외 task={task_id}: {exc}")
-            status = "FAILED"
+            status = "FAILED_ABORTED"
+        # run_patrol 의 status 는 후속 처리를 가르려 4가지로 세분된다(COMPLETED /
+        # COMPLETED_PARTIAL / FAILED_ABORTED / FAILED_BLOCKED). DB tasks.status 는 세 값만
+        # 허용하므로 FAILED_* 는 모두 'FAILED' 로 마감한다.
+        db_status = status if status in ("COMPLETED", "COMPLETED_PARTIAL") else "FAILED"
         if self._db_pool is not None:
             try:
-                automato_db.set_task_status(self._db_pool, task_id, status)
-                self.get_logger().info(f"순찰 종료 task={task_id} → {status}")
+                automato_db.set_task_status(self._db_pool, task_id, db_status)
+                self.get_logger().info(
+                    f"순찰 종료 task={task_id} → {status}(DB:{db_status})")
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().error(f"tasks 종료 갱신 실패 task={task_id}: {exc}")
         # tasks 마감과 별개로 Web Service 에 순찰 결과를 알린다(E2 9-1/12/13).
         # 이 스레드는 순찰이 이미 끝난 자리라, 여기서 동기로 보내도 순찰 루프를 막지 않는다.
         self._report_task_result(task_id, robot_id, status, unvisited)
+        # 복귀·도킹: 정상 종료(E4)와 막힘 확정(22-1)은 모두 전용 충전소로 복귀한다.
+        # 순찰은 마지막 자리를 '쥔 채' 넘겼다(run_patrol) → 복귀가 그 자리를 이어받아 도킹
+        # 후 해제한다. FAILED_ABORTED(로봇 중단/서버·디스패치 이상)는 복귀하지 않고 자리를
+        # 유지한다(로봇이 그 자리에 물리적으로 서 있으므로 놓으면 남이 들어와 겹친다).
+        if engine is not None and last_wp is not None:
+            if status in ("COMPLETED", "COMPLETED_PARTIAL", "FAILED_BLOCKED"):
+                self._return_and_dock(task_id, robot_id, engine, last_wp)
+            else:  # FAILED_ABORTED
+                self.get_logger().warn(
+                    f"순찰 FAILED task={task_id} {robot_id} 위치 {last_wp} — 자리 유지")
 
     def _report_task_result(self, task_id, robot_id, status, unvisited) -> None:
         """순찰 종료를 Web Service 로 알린다.
 
         COMPLETED/COMPLETED_PARTIAL → patrol_completed(E2 9-1). summary(탐지 평균치)를
                                       DB 에서 집계해 싣는다.
-        FAILED                      → event_logs 영구 기록(E2 12) + task_failed(E2 13).
-
-        지금 ACS 가 내는 FAILED 는 전부 로봇/통신/디스패치 이상이라(막힘 복귀 22-1 은
-        아직 없음) reason=HARDWARE_ERROR, recovery_action=NONE 으로 보낸다. 막힘(BLOCKED)
-        이라고 보내면 나중에 22-1 을 붙일 때 진짜 막힘과 구분되지 않는다.
+        FAILED_BLOCKED  → 통로 막힘(22-1). event_logs(TRAFFIC_CONTROL) + task_failed
+                          (reason=BLOCKED, recovery_action=RETURN_TO_CHARGER). 이후 복귀.
+        FAILED_ABORTED  → 로봇 중단/서버·디스패치 이상. event_logs(HARDWARE_ERROR) +
+                          task_failed(reason=HARDWARE_ERROR, recovery_action=NONE).
         """
         now = datetime.now(timezone.utc)
         if status in ("COMPLETED", "COMPLETED_PARTIAL"):
@@ -293,22 +321,152 @@ class PatrolControlNode(Node):
             patrol_notify.send_patrol_completed(
                 self._web_url, payload, log=self.get_logger())
             return
-        # FAILED — 영구 기록 먼저, 그다음 알림.
+        # 실패 — 막힘(22-1)과 그 외를 사유로 가른다. 영구 기록 먼저, 그다음 알림.
+        if status == "FAILED_BLOCKED":
+            event_type, reason, recovery = (
+                "TRAFFIC_CONTROL", "BLOCKED", "RETURN_TO_CHARGER")
+            evt_msg = (f"task {task_id} {robot_id} 통로 막힘으로 순찰 중단 "
+                       f"→ 충전소 복귀")
+        else:  # FAILED_ABORTED
+            event_type, reason, recovery = (
+                "HARDWARE_ERROR", "HARDWARE_ERROR", "NONE")
+            evt_msg = f"task {task_id} 순찰 실패 (로봇 {robot_id})"
         if self._db_pool is not None:
             try:
                 automato_db.save_event_log(
                     self._db_pool, robot_id=robot_id, task_id=task_id,
-                    event_type="HARDWARE_ERROR", severity="CRITICAL",
-                    message=f"task {task_id} 순찰 실패 (로봇 {robot_id})",
-                    created_at=now)
+                    event_type=event_type, severity="CRITICAL",
+                    message=evt_msg, created_at=now)
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().error(
                     f"event_logs 기록 실패 task={task_id}: {exc}")
         payload = patrol_notify.build_task_failed_payload(
-            task_id=task_id, robot_id=robot_id, reason="HARDWARE_ERROR",
+            task_id=task_id, robot_id=robot_id, reason=reason,
+            recovery_action=recovery, failed_at=now)
+        patrol_notify.send_task_failed(
+            self._web_url, payload, log=self.get_logger())
+
+    # ---------------------------- E4 복귀·도킹 오케스트레이션 ---------------------------- #
+    def _return_and_dock(self, task_id, robot_id, engine, last_wp) -> None:
+        """E4: 순찰을 마친 로봇을 전용 충전소로 복귀시키고 도킹한다(같은 task_id 유지).
+
+        순찰이 '쥔 채' 넘긴 마지막 자리(last_wp)를 복귀 주행이 이어받아 충전소 진입 노드
+        까지 가고, 도킹 성공 시점에 그 자리까지 한 번에 해제한다(문서 E4 8번). 복귀는 새
+        task 를 만들지 않는다 — 끝난 순찰의 task_id 를 그대로 쓴다(그 task 의 뒷정리).
+
+        실패 세 갈래(충전소 미등록/복귀 막힘/도킹 실패)는 지금은 자리·로그만 정리한다.
+        task_failed(DOCK_FAILED)·22-2 현장 정지(operational_status=IMMOBILIZED)는
+        6·7단계에서 이 자리에 채운다.
+        """
+        # 1) 전용 충전소 + 도킹 마커 조회.
+        charge, marker = None, None
+        if self._db_pool is not None:
+            try:
+                charge = automato_db.get_charge_point(self._db_pool, robot_id)
+                if charge is not None:
+                    marker = automato_db.get_dock_marker(
+                        self._db_pool, charge["task_point_id"])
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().error(f"충전소/마커 조회 실패 task={task_id}: {exc}")
+        if charge is None or charge["waypoint_id"] not in self._dispatcher.wp_meta:
+            self.get_logger().warn(
+                f"{robot_id} 전용 충전소 미등록/그래프에 없음 → 복귀 생략, 자리 반납 "
+                f"task={task_id}")
+            engine.release(engine.node_slot(last_wp), robot_id)
+            return
+
+        target = charge["waypoint_id"]
+        charge_point_id = charge["task_point_id"]
+        nav_client = self._client_for(robot_id)
+        dock_client = self._dock_client_for(robot_id)
+
+        # 2) 복귀 주행 — 순찰 마지막 자리를 이어받아 충전소 진입 노드까지(촬영 없음).
+        outcome, pos = self._dispatcher.drive_to_point(
+            task_id, robot_id, last_wp, target, engine, nav_client)
+        if outcome != "arrived":
+            # 복귀 경로마저 막힘(skipped) 또는 중단(aborted) → 22-2 현장 정지.
+            self.get_logger().warn(
+                f"복귀 주행 실패({outcome}) task={task_id} {robot_id} 위치 {pos} "
+                f"→ 현장 정지(22-2)")
+            self._immobilize(task_id, robot_id, engine, pos)
+            return
+
+        # 3) 도킹 — 진입 노드 자리를 쥔 채(하트비트로 TTL 방어), N_dock 재시도.
+        entry_slot = engine.node_slot(target)
+        success, code, msg = self._dispatcher.dock(
+            task_id, robot_id, charge_point_id, marker, dock_client,
+            heartbeat=(engine, [entry_slot], robot_id))
+        if success:
+            # 문서 E4 8번: Dock 성공 → 예약 전부 해제. 복귀 도착 후엔 진입 노드 자리 하나만
+            # 남아 있어, 그것을 놓으면 이 로봇의 예약이 완전히 빈다.
+            engine.release(entry_slot, robot_id)
+            self.get_logger().info(
+                f"복귀·도킹 완료 task={task_id} {robot_id} @ {charge_point_id} "
+                f"— 예약 전부 해제")
+        else:
+            # 도킹 N_dock 소진/마커 없음 → 진입 노드에 정지, 관리자 개입 대기.
+            # 로봇이 진입 노드에 물리적으로 서 있으므로 자리는 놓지 않는다.
+            self.get_logger().warn(
+                f"도킹 실패(code={code}) task={task_id} {robot_id}: {msg} "
+                f"→ 진입 노드 정지, DOCK_FAILED 알림")
+            self._notify_dock_failed(task_id, robot_id, code, msg)
+
+    def _notify_dock_failed(self, task_id, robot_id, code, msg) -> None:
+        """도킹 N_dock 소진 시 작업 실패 알림(문서 E4 Dock 실패 · reason=DOCK_FAILED).
+
+        복귀 주행 자체는 성공했고 마지막 도킹만 실패한 상황이라 recovery_action=NONE
+        (로봇은 충전소 진입 노드에 서서 관리자 개입을 기다린다). tasks 상태는 이미 순찰
+        종료값(COMPLETED/PARTIAL)으로 마감돼 있어 여기서 바꾸지 않는다 — 순찰은 끝났고
+        뒷정리(도킹)만 실패한 것이다.
+        """
+        now = datetime.now(timezone.utc)
+        payload = patrol_notify.build_task_failed_payload(
+            task_id=task_id, robot_id=robot_id, reason="DOCK_FAILED",
             recovery_action="NONE", failed_at=now)
         patrol_notify.send_task_failed(
             self._web_url, payload, log=self.get_logger())
+        self.get_logger().warn(
+            f"DOCK_FAILED 알림 발송 task={task_id} {robot_id} (code={code}): {msg}")
+
+    def _immobilize(self, task_id, robot_id, engine, pos) -> None:
+        """22-2 현장 정지: 충전소 복귀조차 실패한 로봇을 IMMOBILIZED 로 세운다(문서 22-2).
+
+        이 값은 사람이 로봇을 물리적으로 옮긴 뒤 NORMAL 로 되돌려야 풀린다(E1 가용 조건 1).
+        '모든 예약 해제'는 갇힌 로봇의 예약이 다른 로봇들의 길을 영구히 막지 않게 하기
+        위함이다 — 이 로봇을 배정에서 빼는 일은 nav_status 가 아니라 IMMOBILIZED 축이
+        따로 보장하므로, 예약을 놓아도 다시 배정 후보로 올라오지 않는다.
+        """
+        now = datetime.now(timezone.utc)
+        # 1) 예약 해제 — 복귀 주행 실패 후엔 서 있는 자리 하나만 쥐고 있다(_navigate 가
+        #    나머지를 이미 반납). 그것까지 놓아 교통관제 데드락을 막는다.
+        engine.release(engine.node_slot(pos), robot_id)
+        # 2) operational_status = IMMOBILIZED + 3) event_logs 영구 기록.
+        if self._db_pool is not None:
+            try:
+                automato_db.set_operational_status(
+                    self._db_pool, robot_id, "IMMOBILIZED")
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().error(
+                    f"IMMOBILIZED 설정 실패 task={task_id} {robot_id}: {exc}")
+            try:
+                automato_db.save_event_log(
+                    self._db_pool, robot_id=robot_id, task_id=task_id,
+                    event_type="TRAFFIC_CONTROL", severity="CRITICAL",
+                    message=(f"task {task_id} {robot_id} 충전소 복귀 실패 "
+                             f"→ 현장 정지(IMMOBILIZED). 관리자 개입 필요"),
+                    created_at=now)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().error(
+                    f"event_logs 기록 실패 task={task_id}: {exc}")
+        # 4) task_failed 알림 — 복귀조차 불가라 recovery_action=NONE(그 자리 정지).
+        payload = patrol_notify.build_task_failed_payload(
+            task_id=task_id, robot_id=robot_id, reason="BLOCKED_UNRECOVERABLE",
+            recovery_action="NONE", failed_at=now)
+        patrol_notify.send_task_failed(
+            self._web_url, payload, log=self.get_logger())
+        self.get_logger().error(
+            f"현장 정지(22-2) task={task_id} {robot_id} 위치 {pos} "
+            f"— IMMOBILIZED, 관리자 개입 대기")
 
 
 # --------------------------------------------------------------------------- #

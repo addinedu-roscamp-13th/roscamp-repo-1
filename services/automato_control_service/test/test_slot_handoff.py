@@ -142,7 +142,8 @@ def _slots_of(engine, robot_id):
 
 # --------------------------------------------------------------------------- #
 def test_slot_never_drops_between_segments(fast_timing):
-    """불변식 1·2 — 순찰 내내 자리를 하나는 쥐고 있고, 끝나면 정확히 반납한다."""
+    """불변식 1·2 — 순찰 내내 자리를 하나는 쥐고 있고, 끝나면 통로는 반납하되 마지막
+    자리는 복귀 주행에 인계한다(RP-116: run_patrol 이 더는 마지막 자리를 반납하지 않음)."""
     engine, disp, log = _make()
     robot = {"wp": 15}
     client = FakeClient(robot, drive_delay=0.01)
@@ -168,7 +169,7 @@ def test_slot_never_drops_between_segments(fast_timing):
 
     t = threading.Thread(target=watch, daemon=True)
     t.start()
-    result, _unvisited = disp.run_patrol(
+    result, _unvisited, _last = disp.run_patrol(
         1, "dg_01", [{"waypoint_id": 12}, {"waypoint_id": 9}, {"waypoint_id": 4}],
         engine, client, start_wp=15)
     stop.set()
@@ -176,7 +177,10 @@ def test_slot_never_drops_between_segments(fast_timing):
 
     assert result == "COMPLETED"
     assert not gaps, f"자리 예약이 {len(gaps)}회 끊겼다(그 틈에 남이 들어온다): {gaps}"
-    assert _slots_of(engine, "dg_01") == set(), "순찰이 끝났는데 자리가 남았다"
+    # RP-116 이후: 순찰이 끝나면 '통로'는 반납하되 '서 있는 마지막 자리'는 쥔 채 넘긴다
+    # (복귀 주행이 이어받아 도킹 성공 시점에 해제). 예전엔 run_patrol 이 이 자리까지
+    # 반납했지만, 그러면 복귀가 자리를 다시 잡기 전 찰나에 남이 그 지점으로 들어올 수 있었다.
+    assert _slots_of(engine, "dg_01") == {4}, "순찰이 넘긴 마지막 자리(4)가 유지되지 않았다"
     assert engine.reservation_snapshot()["corridors"] == {}, "통로 예약이 누수됐다"
 
 
