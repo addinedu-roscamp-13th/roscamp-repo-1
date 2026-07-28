@@ -33,7 +33,13 @@ from ddagi_harvest.detector import TomatoDetector       # noqa: E402
 MAX_CAPACITY = 7          # 정상품(NORMAL) 바구니 용량 — NORMAL 7개면 만차 후 종료.
                           # 폐기품(DISCARD)은 별도 바구니라 이 용량에 세지 않는다.
 MAX_ATTEMPTS = 30         # 총 시도 상한(무한루프 방지)
-MAX_RETRY = 2             # 한 자리 파지 실패 재시도 횟수(넘으면 제외)
+MAX_RETRY = 3             # 한 자리 파지 실패 재시도 횟수(넘으면 제외)
+
+# 파지 우선순위 기준.
+#   'base_x'  : base 기준 x(팔 정면 거리)가 작은 것부터 — 팔에 가까운 것 우선(기본)
+#   'depth'   : 카메라 depth(광축 방향 거리)가 작은 것부터 — 화면 앞쪽 우선
+#   'base_z'  : 낮은 것부터 — 아래 열매를 먼저 비워 위 열매를 안 건드림
+SORT_KEY = "base_x"
 RETRY_Z_BUMP = 8.0        # 재시도마다 목표 z를 이만큼(mm) 위로 — 같은 실패 반복 방지(너무 아래 잡던 것 보정)
 EXCLUDE_RADIUS = 25.0     # 실패/수확한 자리 반경(mm) 내 재검출은 같은 것으로 보고 건너뜀.
                           # TF 노이즈(~10mm)보단 크고, 토마토 간격(~30mm+)보단 작게.
@@ -95,9 +101,13 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
                 done.append(a["base"])
                 print(f"  ✓ [검증] {pos} 사라짐+파지 — {a['grade']} 수확 확정 "
                       f"(NORMAL {harvested['NORMAL']}/{max_capacity})")
-            else:                                                # 사라짐+미파지 = 낙과/유실
-                done.append(a["base"])
-                print(f"  ⚠ [검증] {pos} 사라졌으나 미파지 — 낙과/유실로 보고 카운트 제외")
+            else:
+                # 사라짐 + 미파지. 정말 떨어졌을 수도 있지만, YOLO 검출은 프레임마다
+                # 흔들려 '한 프레임 미검출'을 사라짐으로 오판할 수 있다. 여기서 done 에
+                # 넣으면 아직 달린 열매를 영구 제외하게 되므로 **아무 것도 기록하지 않는다**.
+                # 정말 떨어졌으면 다음 검출에 안 나오고, 남아 있으면 자연히 재시도된다.
+                print(f"  ⚠ [검증] {pos} 사라졌으나 미파지 — 낙과 또는 검출 흔들림."
+                      f" 제외하지 않고 다음 배치에서 재확인")
         prev.clear()
 
     while attempts < max_attempts:
@@ -111,20 +121,30 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
         batch = [t for t in detections
                  if not _near_any(t["base"], done + excluded, exclude_radius)]
         if not batch:
-            print("남은 토마토 없음 — 수확 종료")
+            if detections:      # 검출은 됐지만 전부 수확완료/제외 자리 → 구분해 알린다
+                print(f"검출 {len(detections)}개가 모두 수확완료·제외 자리 "
+                      f"(제외 {len(excluded)}건) — 수확 종료")
+            else:
+                print("검출 0개 — 수확 종료")
             break
-        # 카메라 우선순위: 카메라 depth 가까운(앞쪽) 것부터 — 앞을 치우면 뒤 가림이 풀림.
-        # depth_cm 없는 검출기(테스트용)는 베이스 3D 거리로 폴백.
-        batch.sort(key=lambda t: t.get("depth_cm", _dist(t["base"], (0.0, 0.0, 0.0))))
-        print(f"\n[배치] 검출 {len(batch)}개 — 카메라 depth 가까운 순(파지 우선순위):")
+        keyfn = {"base_x": lambda t: t["base"][0],
+                 "base_z": lambda t: t["base"][2],
+                 "depth": lambda t: t.get("depth_cm", 1e9)}[SORT_KEY]
+        label = {"base_x": "base x 가까운 순(팔 정면 거리)",
+                 "base_z": "낮은 순(base z)",
+                 "depth": "카메라 depth 가까운 순"}[SORT_KEY]
+        batch.sort(key=keyfn)
+        print(f"\n[배치] 검출 {len(batch)}개 — {label} (파지 우선순위):")
         for i, t in enumerate(batch):
             dc = t.get("depth_cm")
-            dtxt = f"depth {dc:.1f}cm" if dc is not None \
-                else f"거리 {_dist(t['base'], (0.0, 0.0, 0.0)):.0f}mm"
             print(f"   {i + 1}. {t.get('color', '?')}/{t['grade']} "
-                  f"base={[round(c, 1) for c in t['base']]}  {dtxt}")
+                  f"base={[round(c, 1) for c in t['base']]}  x={t['base'][0]:.0f}mm"
+                  + (f"  depth {dc:.1f}cm" if dc is not None else ""))
 
-        projected = harvested["NORMAL"]      # 이번 배치에서 성공 가정한 NORMAL 누계(만차 방지)
+        # 이번 배치에서 '실제로 물린' NORMAL 누계 — 만차 초과 파지를 막는 용도.
+        # ⚠ 시도 수를 세면 안 된다: 실패도 카운트돼 한 배치가 max_capacity 번 시도에서
+        #   잘리고, 정렬 뒤쪽(팔에서 먼 쪽) 열매가 매번 시도조차 못 받는다(실측 확인).
+        projected = harvested["NORMAL"]
         for t in batch:
             if attempts >= max_attempts:
                 break
@@ -150,12 +170,14 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
                     # 이 파지여부 + 재검출 '사라짐'을 함께 본다(줄기 건드려 떨군 것 배제).
                     grabbed = pk.pick(arm, target, t["grade"])
                 except RuntimeError as e:
-                    print(f"    예외(도달 불가 등): {e}")
-                    grabbed = False
+                    # 도달 불가는 기하학적 사실이라 재시도해도 같다 → 즉시 제외.
+                    print(f"    ✗ {e}\n    → 재시도 없이 제외(도달 불가)")
+                    excluded.append(b)
+                    continue
                 if not grabbed:
                     print("    (그리퍼 미파지 — 사라져도 수확 카운트 안 함)")
             prev.append({"base": b, "grade": t["grade"], "grabbed": grabbed})
-            if t["grade"] == "NORMAL":
+            if t["grade"] == "NORMAL" and grabbed:   # 물린 것만 센다(실패는 용량 안 씀)
                 projected += 1
 
     if prev:                                 # 마지막 배치 검증 (관측 1회 더)
@@ -186,10 +208,10 @@ def main() -> int:
     arm = NetworkArm(ip)
     if weights:
         print(f"검출기: YOLO ({weights})")
-        det = YoloDetector(weights)
+        det = YoloDetector(weights, angles_provider=arm.get_angles)
     else:
         print("검출기: 색 목업(MockColorDetector) — 실모델 쓰려면 WEIGHTS=경로")
-        det = MockColorDetector()
+        det = MockColorDetector(angles_provider=arm.get_angles)
     try:
         if not dry:
             print("\n!! 팔이 자동으로 여러 번 움직입니다. 반경 확보!")

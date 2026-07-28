@@ -176,8 +176,10 @@ class NetworkArm(ArmBackend):
     # **timeout 전체(15s)를 낭비**한다(팔은 이미 2초에 멈췄는데). 도달 불가면 아예 안
     # 움직이는데도 15초를 기다린다. 그래서 async send_* + '실제 정지 감지'로 바꿨다.
     poll_dt = 0.12            # 위치 폴링 간격(s)
-    stall_polls = 3           # 이만큼 연속 '안 움직임'이면 정지로 판정
+    stall_polls = 4           # 이만큼 연속 '안 움직임'이면 정지로 판정
     move_start_timeout = 1.2  # 이 시간 안에 안 움직이면 도달 불가로 보고 즉시 종료
+    post_move_settle = 0.25   # 정지 감지 후 정착 대기 — 서보가 목표로 마지막 수 mm를
+                              # 좁히는 구간을 잘라먹으면 그리퍼가 허공에서 닫힌다
 
     def _wait_until_stopped(self, kind: str, tol: float, timeout: float):
         """이동 명령 후 정지까지 대기. (움직였나, 마지막 위치) 반환.
@@ -202,6 +204,9 @@ class NetworkArm(ArmBackend):
                     break                       # 움직였다가 멈춤 = 도착
             elif time.time() - t0 > self.move_start_timeout:
                 break                           # 아예 안 움직임 = 도달 불가(즉시 종료)
+        if started:
+            time.sleep(self.post_move_settle)   # 마지막 수 mm 정착 대기
+            prev = self._call(getter) or prev
         return started, prev
 
     def move_coords(self, coords, speed=30, mode=1):

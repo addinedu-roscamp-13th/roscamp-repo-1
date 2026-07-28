@@ -10,7 +10,8 @@ tf_transform 으로 base 좌표를 구한다. 'p' 로 그 좌표에 pick()을 �
 키/마우스:
   (마우스 좌클릭)  그 픽셀의 토마토를 목표로 → camera·base 좌표 표시
   h  그랩점으로 이동(겨냥 확인, 안 잡음)   g  게이지+조그(TF/오프셋 실측)
-  t  수확 준비 자세 티칭(드래그)   a  접근 경로 티칭(pre-grasp+grasp 드래그 저장)
+  t  수확 준비 자세 티칭(드래그)   w  측면별 손목 자세 티칭(grasp 1회)
+  a  접근 경로 티칭(pre-grasp+grasp — 구버전, 지금은 w 를 쓴다)
   o  관측자세로 복귀   p  파지만(바구니X, 확인후)   b  전체 수확(바구니 투하까지)
   q  종료
 
@@ -25,6 +26,8 @@ import numpy as np
 import pyrealsense2 as rs
 
 APPROACHES_FILE = "taught_approaches.json"   # 'a' 접근경로 티칭 저장(위치별 접근 모델용)
+PAIRS_FILE = "observe_tf_pairs.json"         # 'g'→'x' 게이지 측정 쌍(camera→flange) 누적
+WRIST_FILE = "wrist_ori.json"                # 'w' 측면별 손목 자세 티칭 누적
 
 W, H, FPS = 640, 480, 30
 _click = {"uv": None}
@@ -98,12 +101,27 @@ def main():
                     d = ds[len(ds) // 2]  # 중앙값
                     cam = [c * 1000 for c in
                            rs.rs2_deproject_pixel_to_point(intr, [u, v], d)]
-                    base = tf.camera_to_base_at_observe(cam)
+                    ang = arm.get_angles() or None   # 명령각이 아닌 실측각 기준
+                    base = [float(v) + pk.TCP_CORRECTION[i]
+                            for i, v in enumerate(tf.observe_cam_to_flange(cam))]
                     target = {"uv": (u, v), "cam": cam, "base": base}
                     print(f"\n클릭 ({u},{v}) depth중앙값={d*100:.1f}cm "
                           f"(유효 {len(ds)}/121, 범위 {ds[0]*100:.1f}~{ds[-1]*100:.1f}cm)")
                     print(f"  camera = [{cam[0]:.1f}, {cam[1]:.1f}, {cam[2]:.1f}]")
-                    print(f"  base   = [{base[0]:.1f}, {base[1]:.1f}, {base[2]:.1f}]  ← 'p'로 파지\n")
+                    print(f"  base   = [{base[0]:.1f}, {base[1]:.1f}, {base[2]:.1f}]")
+                    z = pk.zone_of(base[1])
+                    if z is None:
+                        print("  구역   = (줄기 미설정 — 진입 방향 분기 꺼짐)\n")
+                    else:
+                        zname = {(0, -1): "우-오 (우측줄기의 오른쪽)",
+                                 (0, 1): "우-왼 (우측줄기의 왼쪽)",
+                                 (1, -1): "좌-오 (좌측줄기의 오른쪽)",
+                                 (1, 1): "좌-왼 (좌측줄기의 왼쪽)"}[z]
+                        side = "오른쪽에서 진입" if z[1] < 0 else "왼쪽에서 진입"
+                        stem = pk.STEM_REFS_Y[z[0]]
+                        print(f"  구역   = {zname}  → {side}")
+                        print(f"           (기준 줄기 y={stem:.1f}, 열매 y={base[1]:.1f})")
+                        print("  ⚠ 눈으로 본 좌우와 다르면 STEM_REFS_Y 재측정 필요\n")
 
             img = np.asanyarray(color.get_data()).copy()
             dimg = cv2.applyColorMap(
@@ -114,6 +132,13 @@ def main():
                 b = target["base"]
                 cv2.putText(img, f"base [{b[0]:.0f},{b[1]:.0f},{b[2]:.0f}]",
                             (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                _z = pk.zone_of(b[1])
+                if _z is not None:
+                    _tag = {(0, -1): "R-stem RIGHT", (0, 1): "R-stem LEFT",
+                            (1, -1): "L-stem RIGHT", (1, 1): "L-stem LEFT"}[_z]
+                    _dir = "enter from RIGHT" if _z[1] < 0 else "enter from LEFT"
+                    cv2.putText(img, f"{_tag} / {_dir}", (10, 48),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2)
             cv2.putText(img, "click | o:observe h:hover p:pick b:pick+basket q:quit",
                         (10, H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             cv2.imshow("tf verify", np.hstack([img, dimg]))
@@ -187,6 +212,22 @@ def main():
                 print(f"  계산 base     = {[round(c,1) for c in target['base']]}")
                 print(f"  TF 오차(실제-계산) = {err}   ← 이 값 보내줘")
                 print(f"  보정된 실제 base   = {corrected}\n")
+                # 관측자세 변환 피팅용 쌍 저장: camera 좌표 → '손끝이 닿는 flange'
+                # (이 flange 가 곧 파지 때 명령할 좌표. TCP·DESCEND·처짐이 모두 포함됨)
+                pair = {"camera": [round(c, 1) for c in target["cam"]],
+                        "flange": [round(jog[i], 1) for i in range(3)],
+                        "ori": [round(jog[i], 1) for i in range(3, 6)]}
+                try:
+                    with open(PAIRS_FILE) as f:
+                        pairs = json.load(f)
+                except Exception:
+                    pairs = []
+                pairs.append(pair)
+                with open(PAIRS_FILE, "w") as f:
+                    json.dump(pairs, f, indent=2, ensure_ascii=False)
+                print(f"  [저장 #{len(pairs)}] camera={pair['camera']} → flange={pair['flange']}")
+                print(f"    → {PAIRS_FILE} (5~6점 모이면 fit_observe_tf.py 로 변환 피팅)")
+                jog = gauge0 = None   # 게이지 종료 — 다음 조작이 옛 좌표를 움직이지 않게
             elif k == ord("t"):
                 # 수확 준비 자세(STAGING_ANGLES) 티칭 — 드래그로 잡아 각도 캡처.
                 print("\n수확 준비 자세 티칭 — 서보 풉니다. 팔을 '베드 위·접근 준비'")
@@ -200,6 +241,43 @@ def main():
                           f"   ← 이 값 보내줘 (pick.py에 박음)\n")
                 else:
                     print("  각도 못 읽음 — 다시\n")
+            elif k == ord("w"):
+                # 손목 자세 티칭 — grasp 자세 하나만 잡는다(pre-grasp 는 계산됨).
+                # 여기서 얻는 것: ① 그 측면의 손목 자세(rx,ry,rz) ② 자세별 flange 보정
+                #   (= 티칭 flange − 피팅 flange. 두 고정 자세 사이 차이라 상수)
+                if not target:
+                    print("먼저 토마토를 클릭하세요"); continue
+                z = pk.zone_of(target["base"][1])
+                zt = ({(0, -1): "우-오", (0, 1): "우-왼",
+                       (1, -1): "좌-오", (1, 1): "좌-왼"}[z] if z else "?")
+                print(f"\n[손목 자세 티칭] 구역 {zt} "
+                      f"({'오른쪽에서 진입' if z and z[1] < 0 else '왼쪽에서 진입'})")
+                print("  서보 풉니다 — 팔 받치기! 이 열매를 '그 방향에서 감싸 무는'")
+                print("  자세(손목 각도 + 손끝 위치)로 잡고 창에서 아무 키.")
+                arm.release_servos()
+                cv2.waitKey(0)
+                g = arm.get_coords()
+                arm.focus_servos()
+                if not g:
+                    print("  좌표 못 읽음 — 다시\n"); continue
+                fit_fl = pk.flange_target(target["base"])   # 피팅이 준 flange(기준 자세)
+                delta = [round(g[i] - fit_fl[i], 1) for i in range(3)]
+                rec = {"zone": list(z) if z else None, "zone_name": zt,
+                       "base": [round(c, 1) for c in target["base"]],
+                       "grasp": [round(c, 1) for c in g],
+                       "fit_flange": [round(c, 1) for c in fit_fl],
+                       "delta": delta}
+                try:
+                    with open(WRIST_FILE) as f:
+                        recs = json.load(f)
+                except Exception:
+                    recs = []
+                recs.append(rec)
+                with open(WRIST_FILE, "w") as f:
+                    json.dump(recs, f, indent=2, ensure_ascii=False)
+                print(f"  [저장 #{len(recs)}] 자세(rx,ry,rz)={[round(c,1) for c in g[3:6]]}")
+                print(f"    flange 보정 = {delta}  (기준자세 대비)")
+                print(f"    → {WRIST_FILE}\n")
             elif k == ord("a"):
                 # 접근 경로 티칭 — 클릭한 토마토에 대해 pre-grasp·grasp 자세를 드래그로
                 # 잡아 {base, pregrasp, grasp} 저장. 여러 위치 모아 위치별 접근모델 산출.

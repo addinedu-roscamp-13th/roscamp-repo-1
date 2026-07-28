@@ -42,7 +42,7 @@ DEFAULT_EULER_ORDER = "ZYX"
 # 관측자세에서의 get_coords (base←joint6). observe_setup.py 로 확정, 2026-07-24.
 # pick.OBSERVE_ANGLES 와 반드시 짝(같은 자세). 관측자세를 바꾸면 이 값도 다시 딴다.
 # 검출은 항상 이 고정 자세에서 하므로, camera→base 는 이 한 값으로 계산된다.
-OBSERVE_COORDS = [-111.9, -31.7, 304.3, -105.7, 1.9, -79.4]
+OBSERVE_COORDS = [-144.1, -51.9, 253.3, -93.7, -3.0, -87.3]
 
 
 # ---- 회전/변환 기본 ---------------------------------------------------------- #
@@ -119,7 +119,7 @@ def camera_to_base(p_camera_mm, arm_coords,
 # --------------------------------------------------------------------------- #
 
 # pick.OBSERVE_ANGLES 와 반드시 짝(같은 관측자세). 관측자세 바꾸면 같이 갱신.
-OBSERVE_ANGLES = [-8.9, 55.0, 1.6, -73.2, 19.2, -3.7]
+OBSERVE_ANGLES = [-3.2, 87.2, -26.4, -64.5, 5.6, -3.4]
 
 # 실측 TF 보정 (관측자세 고정). 이 팔의 관절 0점(엔코더 영점) 미세 오차 때문에
 # 명령각(OBSERVE_ANGLES)과 실제 자세가 조금 달라, URDF FK 결과가 계통적으로 어긋난다.
@@ -128,7 +128,13 @@ OBSERVE_ANGLES = [-8.9, 55.0, 1.6, -73.2, 19.2, -3.7]
 #   측정 3점(camera x=-28.6/+16.9/+139) 오차 y=+50/+60/+65, x=+5/-5/-20, z=+15/+15/+10
 #   → 평균 보정 [-6.7, 58.3, 13.3]. 잔차 ~±1.3cm(회전 성분) — 파지 허용범위.
 #   근본해결은 팔 J1~J6 0점 재캘리(하지만 모든 티칭좌표 무효화 → 마감 후로).
-TF_OBSERVE_CORRECTION_MM = np.array([-6.7, 58.3, 13.3])
+# 2026-07-28 재측정 — 새 관측자세 + 실측각 FK 기준, 게이지 조그 1점.
+#   측정: 실제-계산 = [-15.0, 60.0, 25.0]
+# 주목: y≈+60 은 종전 관측자세(+58.3)와 거의 같다. 자세를 크게 바꿨는데(J2 55→87,
+# J3 1.6→-26) y 오차가 그대로란 건, 이 성분이 '자세 드리프트'가 아니라 핸드아이/TCP
+# 사슬의 고정 오차일 가능성을 시사한다(추후 조사 대상). x·z 는 자세에 따라 변했다.
+# ⚠ 1점 측정이라 위치 의존 성분은 미분리 — 좌/우 끝에서 잔차가 남을 수 있다.
+TF_OBSERVE_CORRECTION_MM = np.array([-15.0, 60.0, 25.0])
 
 # mycobot_280_pi.urdf 의 base→joint6 관절 사슬 (j1..j5). (xyz[m], rpy[rad]) 고정변환
 # + z축 관절회전. 자세한 값은 calib/2_TF핸드아이/handeye_ws/urdf/ 참조.
@@ -177,6 +183,38 @@ def camera_to_base_at_observe(p_camera_mm, observe_angles=None) -> np.ndarray:
     관측자세 실측 상수 보정(TF_OBSERVE_CORRECTION_MM)을 더해 반환한다.
     """
     return camera_to_base_fk(p_camera_mm, observe_angles) + TF_OBSERVE_CORRECTION_MM
+
+
+# --------------------------------------------------------------------------- #
+# 관측자세 camera → flange 직접 변환 (터치 실측 피팅).
+#
+# 검출은 항상 고정 관측자세에서만 하므로 FK·핸드아이의 곱은 하나의 고정 변환이다.
+# 그 변환을 캘리 값으로 조립하는 대신, '손끝이 열매에 닿는 flange 좌표'를 직접 측정해
+# 강체(회전+이동)로 피팅했다. 이 방식이 흡수하는 것:
+#   · 핸드아이 캘리 오차 / 카메라 마운트 미세 이동
+#   · URDF FK 와 pymycobot send_coords 프레임 차(실측 ~8mm)
+#   · 손끝-플랜지(TCP) 추정 오차, 서보 처짐의 계통 성분
+# 측정이 '우리가 실제로 명령하는 프레임'에 있으므로 결과를 그대로 send_coords 하면 된다.
+#
+# fit_observe_tf.py, 6점 실측(2026-07-28):
+#   자체 잔차 평균 5.9mm / 최대 7.9mm,  LOO 교차검증 평균 9.2mm / 최대 13.4mm
+#   affine(12DOF)은 자체 3.3mm 였지만 LOO 14.9mm 로 악화 + 특이값 0.55 붕괴 → 과적합,
+#   그래서 rigid 채택. 남는 ~9mm 는 팔 반복정확도(저가 팔의 물리 한계).
+# ⚠ 관측자세를 바꾸거나 카메라를 건드리면 이 변환은 무효 → 재측정.
+OBSERVE_CAM2FLANGE_R = np.array([
+    [-0.046961, +0.036223, +0.998240],
+    [-0.998348, -0.034809, -0.045703],
+    [+0.033092, -0.998737, +0.037797],
+])
+OBSERVE_CAM2FLANGE_T = np.array([-272.13, +24.09, +280.12])
+
+
+def observe_cam_to_flange(p_camera_mm) -> np.ndarray:
+    """관측자세 camera(optical) 좌표 → 손끝이 그 열매에 닿는 flange 좌표(mm).
+
+    이 값이 곧 send_coords 목표다(TCP·처짐·DESCEND 보정 불필요 — 측정에 포함됨).
+    """
+    return OBSERVE_CAM2FLANGE_R @ np.asarray(p_camera_mm, float) + OBSERVE_CAM2FLANGE_T
 
 
 def gripper_tip_offset_base(arm_coords,

@@ -55,18 +55,33 @@ def _apply(rec: dict, base, key: str) -> list:
 
 # 이 거리(mm) 안에 시연점이 있을 때만 taught 접근을 쓴다. 없으면 None → pick 이
 # 고정 접근으로 폴백. '문제 구역(오른쪽 끝 등)만 국소 티칭'하고 나머지는 고정 접근 유지.
-LOCAL_RADIUS_MM = 45.0
+#
+# 45 → 30 으로 축소(2026-07-28). 45 에서는 한 구역의 시연이 **옆 구역까지 넘어와**
+# 엉뚱한 자세를 적용했다. 실측: 좌측줄-왼쪽편(y≈143~152) 목표 4/5 가 38~42mm 떨어진
+# 좌측줄-오른쪽편 시연(rz -58~-70)에 스냅 → 그 구역에 의도한 진입과 다르게 움직였다.
+# 30 이면 그 오염이 사라지고(0/5), 정상 동작 중이던 구역들은 최근접 10~16mm 라 유지된다.
+# 시연이 없는 구역은 고정 접근으로 폴백 — '잘못된 스타일'보다 '기본값'이 안전하다.
+LOCAL_RADIUS_MM = 30.0
 
 
-def plan(base, taught: list | None = None, max_dist: float = LOCAL_RADIUS_MM):
-    """base[x,y,z] → (pregrasp_flange6, grasp_flange6). 가까운 시연 없으면 None.
+def plan(base, taught: list | None = None, max_dist: float = LOCAL_RADIUS_MM,
+         zone_fn=None):
+    """base[x,y,z] → (pregrasp_flange6, grasp_flange6). 맞는 시연 없으면 None.
 
-    3D 최근접 시연점의 (오프셋+자세)를 정합된 한 쌍으로 적용한다. 단, 최근접 시연이
-    max_dist 보다 멀면 None(그 위치엔 시연이 없다고 보고 고정 접근으로 폴백).
+    zone_fn(base) 가 주어지면 **같은 구역의 시연만** 후보로 본다(줄기 기준 좌/우).
+    거리만 보면 옆 구역 시연이 넘어와 엉뚱한 진입 자세를 적용하는 오염이 생긴다.
+    구역이 강제되면 거리 제한은 보조 역할이라 넉넉해도 안전하다.
+    그다음 3D 최근접 시연의 (오프셋+자세)를 정합된 한 쌍으로 적용한다.
     """
     pts = taught if taught is not None else load()
     if not pts:
         return None
+    if zone_fn is not None:
+        z = zone_fn(base)
+        if z is not None:
+            pts = [r for r in pts if zone_fn(r["base"]) == z]
+            if not pts:
+                return None
     rec = min(pts, key=lambda r: _dist2(base, r))
     if _dist2(base, rec) > max_dist * max_dist:
         return None

@@ -67,6 +67,24 @@ def _median_depth(depth, u: int, v: int, win: int = _DEPTH_WIN) -> float:
 
 
 class TomatoDetector(ABC):
+    """검출기 공통. angles_provider 로 '검출 순간의 실제 관절각'을 받는다.
+
+    TF(camera→base)는 URDF FK 로 base←joint6 를 구하는데, 그 입력이 명령값
+    OBSERVE_ANGLES 이면 팔이 그 각도에 못 미칠 때 모든 base 가 통째로 어긋난다
+    (실측: J1~J4 가 매번 1~1.5° 미달 → base 5~7mm 편차). 검출 시점의 get_angles 를
+    쓰면 이 오차가 자동으로 상쇄되고, 이후 드리프트에도 스스로 따라간다.
+    """
+
+    angles_provider = None      # 콜러블() -> [j1..j6] 또는 None(상수 OBSERVE_ANGLES 사용)
+
+    def _observe_angles(self):
+        if self.angles_provider is None:
+            return None
+        try:
+            return self.angles_provider() or None
+        except Exception:
+            return None
+
     @abstractmethod
     def detect(self) -> list[dict]:
         """현재 관측 시점의 토마토 리스트. 관측자세에서 호출해야 base 가 맞다."""
@@ -81,7 +99,9 @@ class MockColorDetector(TomatoDetector):
     include_discard=False 면 초록(미숙)은 검출에서 제외(익은 것만 수확).
     """
 
-    def __init__(self, include_discard: bool = False, min_area: int = _MIN_AREA):
+    def __init__(self, include_discard: bool = False, min_area: int = _MIN_AREA,
+                 angles_provider=None):
+        self.angles_provider = angles_provider
         self.include_discard = include_discard
         self.min_area = min_area
         self._rs, self.pipe, self.align = _open_realsense()
@@ -93,6 +113,7 @@ class MockColorDetector(TomatoDetector):
         if not depth or not color:
             return []
         intr = color.profile.as_video_stream_profile().get_intrinsics()
+        ang = self._observe_angles()   # 검출 순간의 실제 관절각(없으면 상수)
         img = np.asanyarray(color.get_data())
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
@@ -127,7 +148,8 @@ class MockColorDetector(TomatoDetector):
                     continue
                 cam = [c_ * 1000 for c_ in
                        self._rs.rs2_deproject_pixel_to_point(intr, [u, v], d)]
-                base = [float(x) for x in tf.camera_to_base_at_observe(cam)]
+                base = [float(v) + pk.TCP_CORRECTION[i]
+                        for i, v in enumerate(tf.observe_cam_to_flange(cam))]
                 if not pk.in_workspace(base):
                     continue
                 out.append({"base": base, "grade": grade, "uv": (u, v),
@@ -162,7 +184,8 @@ class YoloDetector(TomatoDetector):
     _BOX_DEPTH_FRAC = 0.25   # depth 샘플 창을 박스 절반폭의 이 비율로(중앙부만)
 
     def __init__(self, weights: str, conf: float = 0.4,
-                 class_map: dict | None = None):
+                 class_map: dict | None = None, angles_provider=None):
+        self.angles_provider = angles_provider
         from ultralytics import YOLO
         self.model = YOLO(weights)
         self.conf = conf
@@ -180,6 +203,7 @@ class YoloDetector(TomatoDetector):
         if not depth or not color:
             return []
         intr = color.profile.as_video_stream_profile().get_intrinsics()
+        ang = self._observe_angles()   # 검출 순간의 실제 관절각(없으면 상수)
         img = np.asanyarray(color.get_data())
 
         res = self.model(img, conf=self.conf, verbose=False)[0]
@@ -197,7 +221,8 @@ class YoloDetector(TomatoDetector):
                 continue
             cam = [c_ * 1000 for c_ in
                    self._rs.rs2_deproject_pixel_to_point(intr, [u, v], d)]
-            base = [float(x) for x in tf.camera_to_base_at_observe(cam)]
+            base = [float(v) + pk.TCP_CORRECTION[i]
+                    for i, v in enumerate(tf.observe_cam_to_flange(cam))]
             if not pk.in_workspace(base):
                 continue
             out.append({"base": base, "grade": grade, "uv": (u, v),
