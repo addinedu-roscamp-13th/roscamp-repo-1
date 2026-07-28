@@ -14,6 +14,8 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
         ('share/' + package_name + '/rviz', glob('rviz/*.rviz')),
+        ('share/' + package_name + '/config/reflective_dock',
+            glob('config/reflective_dock/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
