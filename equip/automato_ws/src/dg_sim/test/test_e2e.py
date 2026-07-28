@@ -15,9 +15,11 @@ import time
 
 import pytest
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.parameter import Parameter
 
+from automato_interfaces.action import Dock
 from dg_control.dcs_node import DcsNode
 from dg_sim import dg_ai_sim
 from dg_sim.acs_sim import AcsSim
@@ -122,16 +124,92 @@ def test_fleet_telemetry(system):
     assert len(acs.last_fleet.ddagis) >= 1, 'ddagi 텔레메트리 취합 안 됨'
 
 
-# ============================ S2 E2 수확 이동 + 도킹 ============================
-HARVEST_WP = 4     # 수확 위치까지 노드 수
-HARVEST_SEG = 2    # 구간 크기 → 2회에 나눠 하달
-
-
 def _wait(cond, timeout=20.0, step=0.1):
     deadline = time.time() + timeout
     while time.time() < deadline and not cond():
         time.sleep(step)
     return cond()
+
+
+def _ddago_tel(acs):
+    """DCS 가 취합해 ACS 로 올린 fleet 텔레메트리에서 ddago 항목 1개(없으면 None)."""
+    fleet = acs.last_fleet
+    if fleet is None or not fleet.ddagos:
+        return None
+    return fleet.ddagos[0]
+
+
+def test_nav_status_returns_to_idle(system):
+    """E0/E1 회귀: 주행이 끝나면 nav_status 가 IDLE 로 돌아와 다음 작업을 받을 수 있다.
+
+    예전엔 nav_status 를 task_id 에서 유도해(task_id != 0 → NAVIGATING) 주행이 끝나도
+    '작업 중'이 내려가지 않았다. DCS 가용 판정이 nav_status=='IDLE' 을 AND 조건으로
+    요구하므로(telemetry_ws/patrol_api) 로봇이 영영 ROBOT_BUSY 로 남아, 시뮬을 껐다
+    켜야만 두 번째 작업을 받을 수 있었다.
+
+    반대로 task_id 는 goal 이 끝나도 유지되어야 한다 — 실물(ddago_control/
+    telemetry_publisher)이 지키는 규약으로, 구간 사이마다 0 이 되면 QT 화면이 깜빡이고
+    복귀 주행(같은 task_id 재사용) 추적이 끊긴다.
+    """
+    acs = system['acs']
+
+    task1 = acs.send_patrol(num_waypoints=NUM_WP, seg_size=SEG)
+    assert _wait(lambda: acs.patrol_done, timeout=30.0), '1차 순찰 미완료'
+
+    # 주행 종료 → '움직이는 중' 표시가 내려간다(텔레메트리 1Hz + DCS 취합 지연 감안)
+    idle = _wait(lambda: _ddago_tel(acs) is not None
+                 and _ddago_tel(acs).nav_status == 'IDLE', timeout=8.0)
+    tel = _ddago_tel(acs)
+    assert idle, ('주행 종료 후에도 nav_status 가 IDLE 로 복귀하지 않음: %s'
+                  % (tel.nav_status if tel else None))
+
+    # task_id 는 마지막 값 그대로 유지(0 으로 되돌리지 않는다)
+    assert tel.task_id == task1, 'task_id 가 유지되지 않음: %d (기대 %d)' % (tel.task_id, task1)
+
+    # 두 번째 작업을 실제로 받아 완주한다(재시작 없이)
+    task2 = acs.send_patrol(num_waypoints=NUM_WP, seg_size=SEG)
+    assert task2 != task1, '두 번째 순찰이 발행되지 않음(ROBOT_BUSY 로 막힘)'
+    assert _wait(lambda: acs.patrol_done, timeout=30.0), '2차 순찰 미완료'
+    assert acs.last_result.result_code == 0, acs.last_result.message
+
+
+def test_dock_sets_task_id(system):
+    """도킹 goal 도 텔레메트리 task_id 를 갱신한다 — 실물 dock_server 가
+    /ddago/current_task 로 알리는 것과 같은 규약. 주행 없이 도킹만 하달해 확인한다.
+
+    nav_status 는 도킹 중에도 IDLE 이다(실물도 마찬가지 — 도킹 기동은 Nav2 goal 이 아니라
+    dock_server 가 cmd_vel 을 직접 내므로 Nav2 상태에 안 잡힌다). 도킹 중 배차를 막는 것은
+    nav_status 가 아니라 DB 의 활성 task 다.
+    """
+    acs = system['acs']
+    cli = ActionClient(acs, Dock, '/ddago/dock')
+    assert cli.wait_for_server(timeout_sec=5.0), 'ddago_sim Dock 서버 없음'
+    try:
+        goal = Dock.Goal()
+        goal.task_id = 4242              # 순찰 task_id 와 겹치지 않는 값
+        goal.task_point_id = 'HARVEST_01'
+
+        send_fut = cli.send_goal_async(goal)
+        assert _wait(send_fut.done, timeout=10.0), 'Dock goal 응답 없음'
+        gh = send_fut.result()
+        assert gh.accepted, 'Dock goal 거부'
+
+        res_fut = gh.get_result_async()
+        assert _wait(res_fut.done, timeout=20.0), 'Dock 결과 미수신'
+        assert res_fut.result().result.result_code == 0
+    finally:
+        cli.destroy()
+
+    assert _wait(lambda: _ddago_tel(acs) is not None
+                 and _ddago_tel(acs).task_id == 4242, timeout=8.0), \
+        '도킹 task_id 가 텔레메트리에 실리지 않음: %s' % (
+            _ddago_tel(acs).task_id if _ddago_tel(acs) else None)
+    assert _ddago_tel(acs).nav_status == 'IDLE', '도킹은 nav_status 를 바꾸지 않아야 한다'
+
+
+# ============================ S2 E2 수확 이동 + 도킹 ============================
+HARVEST_WP = 4     # 수확 위치까지 노드 수
+HARVEST_SEG = 2    # 구간 크기 → 2회에 나눠 하달
 
 
 def test_harvest_move_and_dock(system):
