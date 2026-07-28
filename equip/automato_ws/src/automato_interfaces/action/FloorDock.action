@@ -1,0 +1,46 @@
+# RP-126: DdaGo(주행 로봇) 바닥 H 마커 정밀 후진 도킹 — FloorDock Action.
+#   ACS  -> DCS   : /{robot_id}/floor_dock
+#   DCS  -> DdaGo : /ddago/floor_dock      (로봇 쪽은 네임스페이스를 붙이지 않는다)
+#
+# ChArUco 보드 도킹(Dock.action)과 별개의 방식이다. 여기서는 **바닥에 그린 청색 H자
+# 테이프**를 전면 카메라로 보고 후면을 스테이션(벽)에 붙인다(후진 도킹).
+#
+# 마커는 **마커리스**다(ID·딕셔너리·보드 없음). 마커의 '실측 크기' 역할은 바닥 평면
+# 제약(ground homography)이 대신한다 — 카메라 높이/틸트가 고정이면 바닥 위 점은
+# 픽셀<->바닥(m) 1:1 대응이므로 H 네 꼭짓점만으로 중심/방향/거리를 얻는다.
+# 그래서 goal 에 마커 파라미터가 필요 없다. H 기하·바닥 캘리브는 노드 파라미터로 둔다.
+#
+# 기동 순서 (feedback.phase 값과 1:1):
+#   SEARCH     제자리 회전하며 H 탐색
+#   CENTERLINE 중심선 위로 이동 (turn-drive-turn, 개루프 odom)
+#   ALIGN/FACE 재검출 + 정면/중심선 미세정렬
+#   STAGED     스테이징 완료(정지)
+#   TURN       제자리 180도 회전 (후면이 벽을 향하게)
+#   REVERSE    후진 접붙임 (odom 실이동거리, 벽 기준 목표 갭)
+#
+# ⚠️ 안전: bringup 에 cmd_vel 워치독이 없다. 노드는 종료·취소·실패 어느 경로로 빠져도
+#    반드시 0 속도를 반복 발행한다. 첫 투입은 dry_run:=true 로 명령만 확인 후 실주행.
+# 실패 시 재시도는 ACS 가 관장한다.
+
+# ---------- Goal ----------
+int64   task_id
+string  task_point_id      # 도킹 대상 작업 지점 (예: 'CHARGE_01')
+
+# 목표 정차(옵션). 0 이면 노드 파라미터 기본값을 쓴다.
+float32 wall_gap_m         # 목표 후면~벽 간격 [m]  (0 → 노드 기본 wall_gap_target)
+float32 lateral_offset_m   # 도크 중심선 대비 횡 오프셋 [m] (+왼쪽, 0 → 노드 기본 lateral_offset)
+---
+# ---------- Result ----------
+int32   result_code        # 0: 성공, 1: 마커 미검출, 2: 정차 오차 초과, 3: 중단, 4: 정렬 실패
+float32 final_wall_gap_m   # 최종 후면~벽 간격(추정) [m]
+
+# 오차를 축별로 나눠 남긴다(후진 도킹 오차는 앞뒤=갭·좌우=중심선이탈·스큐가 겹친다).
+float32 final_lateral_m    # 좌우: 도크 중심선에서 벗어난 거리 [m] (sigma=bearing-yaw 기반)
+float32 final_yaw_error    # 스큐: 도크면 대비 최종 틀어짐 [rad]
+
+string  message
+---
+# ---------- Feedback ----------
+string  phase              # SEARCH / CENTERLINE / ALIGN / FACE / STAGED / TURN / REVERSE / DONE
+bool    marker_detected
+float32 distance_to_wall_m # 카메라 기준 벽까지 거리 [m] (표시용 d)

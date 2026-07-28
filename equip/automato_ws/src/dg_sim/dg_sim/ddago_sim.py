@@ -5,6 +5,8 @@
 
 담당(시퀀스 다이어그램, 2026-07-14 개정):
   E0    DdagoTelemetry 1Hz 발행                  /ddago/telemetry
+        - nav_status 는 주행 중에만 NAVIGATING, 끝나면 IDLE 로 복귀(실물과 같은 규약).
+          task_id 는 반대로 goal 이 끝나도 유지한다. 자세한 이유는 __init__ 주석 참고.
   E1/E2 Navigate 액션 서버 (DCS ← )              /ddago/navigate
         - goal(Waypoint[] 경로) 접수 → waypoint 마다 feedback(current_waypoint_id,
           waypoint_index) → 배열 끝까지 주행 → result(result_code=0, last_waypoint_id)
@@ -68,7 +70,16 @@ class DdagoSim(Node):
         self._frames = self._load_frames()   # [(name, Image), ...] waypoint별 프레임
 
         # 현재 위치/상태(텔레메트리용)
+        # task_id 와 nav_status 는 **별개로** 관리한다(실물 ddago_control 과 같은 규약).
+        #   task_id    : goal 을 받을 때 갱신하고 goal 이 끝나도 0 으로 되돌리지 않는다(latched).
+        #                ACS 가 한 task 를 여러 구간 goal 로 쪼개 하달하므로 구간 사이마다 0 이
+        #                되면 QT 화면이 깜빡이고 복귀 주행 추적이 끊긴다.
+        #   nav_status : "지금 움직이는 중인가"만 답하는 일시 상태 → 주행이 끝나면 IDLE 로
+        #                돌아와야 한다. DCS 가용 판정이 nav_status=='IDLE' 을 AND 조건으로
+        #                요구하므로(telemetry_ws/patrol_api), 여기서 안 돌리면 로봇이 영영
+        #                ROBOT_BUSY 로 남아 두 번째 작업을 못 받는다.
         self._task_id = 0
+        self._nav_status = 'IDLE'
         self._x, self._y, self._yaw = 0.0, 0.0, 0.0
         # 텔레메트리는 실행(트리거) 시에만 발행. auto_telemetry=true면 상시.
         self._tel_until = float('inf') if self.get_parameter('auto_telemetry').value else 0.0
@@ -134,7 +145,7 @@ class DdagoSim(Node):
         msg = DdagoTelemetry()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.task_id = self._task_id
-        msg.nav_status = 'NAVIGATING' if self._task_id else 'IDLE'
+        msg.nav_status = self._nav_status
         msg.is_charging = False
         msg.x, msg.y, msg.yaw = self._x, self._y, self._yaw
         msg.battery_percent = 85.0
@@ -147,55 +158,61 @@ class DdagoSim(Node):
         goal = goal_handle.request
         wps = list(goal.waypoints)
         self._task_id = goal.task_id
+        self._nav_status = 'NAVIGATING'
         self.get_logger().info('DdaGo 구간 주행 시작: task=%d waypoints=%s'
                                % (goal.task_id, [w.waypoint_id for w in wps]))
 
         last_wp = wps[0].waypoint_id if wps else -1
         code = 0
-        for idx, wp in enumerate(wps):
-            if goal_handle.is_cancel_requested:
-                self.get_logger().warn('취소 요청 → 구간 중단 (last_wp=%d)' % last_wp)
-                code = 2
-                break
+        try:
+            for idx, wp in enumerate(wps):
+                if goal_handle.is_cancel_requested:
+                    self.get_logger().warn('취소 요청 → 구간 중단 (last_wp=%d)' % last_wp)
+                    code = 2
+                    break
 
-            # 이동 흉내: move_delay 동안 feedback 여러 번 발행 후 도착(처리 시간 시뮬)
-            steps = 3
-            per = self.move_delay / steps if self.move_delay > 0 else 0.0
-            for i in range(steps):
-                fb = Navigate.Feedback()
-                fb.current_waypoint_id = wp.waypoint_id
-                fb.waypoint_index = idx
-                fb.current_x = wp.x * (i + 1) / steps
-                fb.current_y = wp.y * (i + 1) / steps
-                fb.current_yaw = 0.0
-                goal_handle.publish_feedback(fb)
-                if per:
-                    time.sleep(per)
+                # 이동 흉내: move_delay 동안 feedback 여러 번 발행 후 도착(처리 시간 시뮬)
+                steps = 3
+                per = self.move_delay / steps if self.move_delay > 0 else 0.0
+                for i in range(steps):
+                    fb = Navigate.Feedback()
+                    fb.current_waypoint_id = wp.waypoint_id
+                    fb.waypoint_index = idx
+                    fb.current_x = wp.x * (i + 1) / steps
+                    fb.current_y = wp.y * (i + 1) / steps
+                    fb.current_yaw = 0.0
+                    goal_handle.publish_feedback(fb)
+                    if per:
+                        time.sleep(per)
 
-            # 도착
-            self._x, self._y, self._yaw = wp.x, wp.y, 0.0
-            last_wp = wp.waypoint_id
+                # 도착
+                self._x, self._y, self._yaw = wp.x, wp.y, 0.0
+                last_wp = wp.waypoint_id
 
-            # capture==true 노드에서만 촬영·분석요청(E2 3단계). 나머지는 통과만 한다.
-            # 분석요청은 비동기라 이동을 막지 않는다(fire-and-forget).
-            if wp.capture:
-                threading.Thread(target=self._request_analyze,
-                                 args=(goal.task_id, wp.waypoint_id), daemon=True).start()
+                # capture==true 노드에서만 촬영·분석요청(E2 3단계). 나머지는 통과만 한다.
+                # 분석요청은 비동기라 이동을 막지 않는다(fire-and-forget).
+                if wp.capture:
+                    threading.Thread(target=self._request_analyze,
+                                     args=(goal.task_id, wp.waypoint_id), daemon=True).start()
+                else:
+                    self.get_logger().info('wp=%d 통과(capture=false)' % wp.waypoint_id)
+
+            result = Navigate.Result()
+            result.result_code = code
+            result.last_waypoint_id = int(last_wp)
+            if code == 2:
+                result.message = '중단'
+                goal_handle.canceled()
             else:
-                self.get_logger().info('wp=%d 통과(capture=false)' % wp.waypoint_id)
-
-        result = Navigate.Result()
-        result.result_code = code
-        result.last_waypoint_id = int(last_wp)
-        if code == 2:
-            result.message = '중단'
-            goal_handle.canceled()
-        else:
-            result.message = '구간 완주'
-            goal_handle.succeed()
-        self.get_logger().info('DdaGo 구간 종료: task=%d code=%d last_wp=%d'
-                               % (goal.task_id, code, last_wp))
-        return result
+                result.message = '구간 완주'
+                goal_handle.succeed()
+            self.get_logger().info('DdaGo 구간 종료: task=%d code=%d last_wp=%d'
+                                   % (goal.task_id, code, last_wp))
+            return result
+        finally:
+            # 완주·취소·예외 어느 경로로 끝나든 '움직이는 중' 표시를 내린다. task_id 는
+            # 유지(다음 구간 goal 이 같은 task 로 이어진다).
+            self._nav_status = 'IDLE'
 
     # ---- E2 분석 요청 (→ DCS) ----
     # ---- E4-6 Dock (DCS ← ) : 실기동 대신 phase 만 흘려 중계를 검증 ----
@@ -214,6 +231,11 @@ class DdagoSim(Node):
     def _dock_execute(self, goal_handle):
         req = goal_handle.request
         mode = self.dock_mode      # 실행 시점의 모드(테스트가 케이스마다 바꾼다)
+        # 실물 dock_server 도 도킹 goal 을 받으면 /ddago/current_task 로 task_id 를 알린다
+        # → 텔레메트리의 task_id 를 같이 맞춘다. 반면 nav_status 는 건드리지 않는다:
+        # 도킹 기동은 Nav2 goal 이 아니라 dock_server 가 cmd_vel 을 직접 내는 것이라
+        # 실물도 도킹 중 nav_status 는 IDLE 이다(가용 판정은 DB 의 활성 task 가 막는다).
+        self._task_id = req.task_id
         self.get_logger().info(
             '도킹 goal 수신: task=%d point=%s marker=%s %dx%d sq=%.3f mk=%.3f mode=%s'
             % (req.task_id, req.task_point_id, req.marker_id,
