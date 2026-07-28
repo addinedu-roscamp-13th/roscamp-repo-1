@@ -27,6 +27,8 @@ setup(
             'telemetry_publisher = ddago_control.telemetry_publisher:main',
             'navigate_server = ddago_control.navigate_server:main',
             'dock_server = ddago_control.dock_server:main',
+            'floor_dock_server = ddago_control.floor_dock_server:main',
+            'floor_dock_repeat_client = ddago_control.floor_dock_repeat_client:main',
             'camera_node = ddago_control.camera_node:main',
             'reflective_detector = ddago_control.reflective_dock.detector_node:main',
             'reflective_dock = ddago_control.reflective_dock.dock_controller:main',
