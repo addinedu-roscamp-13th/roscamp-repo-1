@@ -39,6 +39,11 @@ TCP_FLANGE_MM = np.array([-3.2, -10.3, 109.2])
 # 팀 arm_tf_bridge 기본값과 동일하게 ZYX 로 둔다(=Rz@Ry@Rx).
 DEFAULT_EULER_ORDER = "ZYX"
 
+# 관측자세에서의 get_coords (base←joint6). observe_setup.py 로 확정, 2026-07-24.
+# pick.OBSERVE_ANGLES 와 반드시 짝(같은 자세). 관측자세를 바꾸면 이 값도 다시 딴다.
+# 검출은 항상 이 고정 자세에서 하므로, camera→base 는 이 한 값으로 계산된다.
+OBSERVE_COORDS = [-111.9, -31.7, 304.3, -105.7, 1.9, -79.4]
+
 
 # ---- 회전/변환 기본 ---------------------------------------------------------- #
 
@@ -103,6 +108,75 @@ def camera_to_base(p_camera_mm, arm_coords,
     p_cam = np.array([*p_camera_mm, 1.0])
     T = base_from_flange_T(arm_coords, euler_order) @ handeye_T()
     return (T @ p_cam)[:3]
+
+
+# --------------------------------------------------------------------------- #
+# URDF 순기구학(FK)으로 base→joint6 구하기.
+# get_coords + 오일러 방식은 pymycobot 프레임과 URDF joint6 프레임이 달라 크게
+# 어긋난다(실측 확인: z 211mm 오차). 건수님이 ROS TF(URDF FK)를 쓴 이유. 여기선
+# mycobot_280_pi.urdf 의 base→joint6 사슬(j1..j5)을 직접 계산해 같은 프레임을 쓴다.
+# 검증: FK 방식 z 오차 3mm (오일러 방식 211mm 대비).
+# --------------------------------------------------------------------------- #
+
+# pick.OBSERVE_ANGLES 와 반드시 짝(같은 관측자세). 관측자세 바꾸면 같이 갱신.
+OBSERVE_ANGLES = [-8.9, 55.0, 1.6, -73.2, 19.2, -3.7]
+
+# 실측 TF 보정 (관측자세 고정). 이 팔의 관절 0점(엔코더 영점) 미세 오차 때문에
+# 명령각(OBSERVE_ANGLES)과 실제 자세가 조금 달라, URDF FK 결과가 계통적으로 어긋난다.
+# 검출은 항상 이 고정 관측자세에서만 하므로, 그 자세에서 실측한 상수 보정벡터를
+# camera→base 결과에 더해 흡수한다. (tf_verify 게이지 측정 3점 평균, 2026-07-25)
+#   측정 3점(camera x=-28.6/+16.9/+139) 오차 y=+50/+60/+65, x=+5/-5/-20, z=+15/+15/+10
+#   → 평균 보정 [-6.7, 58.3, 13.3]. 잔차 ~±1.3cm(회전 성분) — 파지 허용범위.
+#   근본해결은 팔 J1~J6 0점 재캘리(하지만 모든 티칭좌표 무효화 → 마감 후로).
+TF_OBSERVE_CORRECTION_MM = np.array([-6.7, 58.3, 13.3])
+
+# mycobot_280_pi.urdf 의 base→joint6 관절 사슬 (j1..j5). (xyz[m], rpy[rad]) 고정변환
+# + z축 관절회전. 자세한 값은 calib/2_TF핸드아이/handeye_ws/urdf/ 참조.
+_URDF_J6_CHAIN = [
+    ([0, 0, 0.13956], [0, 0, 0]),
+    ([0, 0, -0.001], [0, 1.5708, -1.5708]),
+    ([-0.1104, 0, 0], [0, 0, 0]),
+    ([-0.096, 0, 0.06462], [0, 0, -1.5708]),
+    ([0, -0.07318, -0.001], [1.5708, -1.5708, 0]),
+]
+
+
+def _R_rad(axis: str, rad: float) -> np.ndarray:
+    c, s = np.cos(rad), np.sin(rad)
+    if axis == "X":
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+    if axis == "Y":
+        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+
+def fk_base_to_joint6(angles_deg) -> np.ndarray:
+    """URDF 순기구학으로 T(base←joint6) (mm). angles_deg = [j1..j5(..)]."""
+    M = np.eye(4)
+    for (xyz, rpy), a in zip(_URDF_J6_CHAIN, angles_deg[:5]):
+        R = (_R_rad("Z", rpy[2]) @ _R_rad("Y", rpy[1]) @ _R_rad("X", rpy[0])
+             @ _R_rad("Z", np.radians(a)))
+        Tj = np.eye(4)
+        Tj[:3, :3] = R
+        Tj[:3, 3] = np.array(xyz) * 1000.0
+        M = M @ Tj
+    return M
+
+
+def camera_to_base_fk(p_camera_mm, observe_angles=None) -> np.ndarray:
+    """camera(optical) → base, base←joint6를 URDF FK로 (주 경로)."""
+    ang = observe_angles if observe_angles is not None else OBSERVE_ANGLES
+    p_cam = np.array([*p_camera_mm, 1.0])
+    return (fk_base_to_joint6(ang) @ handeye_T() @ p_cam)[:3]
+
+
+def camera_to_base_at_observe(p_camera_mm, observe_angles=None) -> np.ndarray:
+    """검출은 고정 관측자세에서 하므로 관측자세 관절각으로 바로 변환하는 편의 함수.
+
+    AI가 준 토마토 camera 좌표 → base 좌표. 실전 파이프라인의 주 경로 (FK 기반).
+    관측자세 실측 상수 보정(TF_OBSERVE_CORRECTION_MM)을 더해 반환한다.
+    """
+    return camera_to_base_fk(p_camera_mm, observe_angles) + TF_OBSERVE_CORRECTION_MM
 
 
 def gripper_tip_offset_base(arm_coords,
