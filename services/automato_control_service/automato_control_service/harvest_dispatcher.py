@@ -9,7 +9,7 @@ automato_node(ROS 표면)에서 '수확 동작 결정' 로직을 떼어낸 클�
 수확 로봇이 같은 통로를 놓고 경합하므로, 예약표가 하나여야 교통관제가 성립한다.
 
 수확 task 하나의 전 생애:
-  E2   수확지까지 주행 + ChArUco 도킹
+  E2   수확지까지 주행 + 바닥 H 마커(floor) 도킹
   E3~4 Harvest 액션(Ddagi 주관) — 진행 피드백 중계, 최종 집계 수신
   E5   수확 실적 저장 + 예냉실까지 주행 + 도킹
   E6   완료 처리 + (보너스) 바구니 하역
@@ -20,7 +20,7 @@ automato_node(ROS 표면)에서 '수확 동작 결정' 로직을 떼어낸 클�
   (1) ✅ 주행 재사용 — RouteRunner 로 추출 완료(C-1). E2/E5 주행은 self.runner.drive 를
       쓴다. 촬영·짝이 없는 평범한 주행이라 DriveHooks 를 안 넘기면 된다(기본값).
   (2) ✅ DB 경계 — 이 클래스는 DB 를 직접 만지지 않는다. 미리 조회할 수 있는 것
-      (수확지·예냉실 진입노드, ChArUco 마커)은 **노드가 조회해 인자로 넘긴다** — 순찰이
+      (수확지·예냉실 진입노드)은 **노드가 조회해 인자로 넘긴다** — 순찰이
       start_wp 를 노드에서 받는 것과 같은 관례이고, 덕분에 단위테스트에 DB 가 필요 없다.
       반대로 '도중에 생기는' 저장 2건(E5 harvest_batches, E6 unload_logs)은 결과가 나와야
       값이 생기므로 나중에 **콜백**으로 받는다. 반환값으로 미루면 안 되는 이유: E5 실적은
@@ -72,22 +72,20 @@ class HarvestDispatcher:
         """waypoint_id -> {x,y,yaw,capture}. 실체는 runner 소유(주행 골에 좌표가 필요)."""
         return self.runner.wp_meta
 
-    def run_harvest(self, task_id, robot_id, harvest_point, marker, engine,
+    def run_harvest(self, task_id, robot_id, harvest_point, engine,
                     clients, start_wp=None, on_progress=None,
-                    precool_point=None, precool_marker=None, save_batch=None,
+                    precool_point=None, save_batch=None,
                     save_unload=None, on_completed=None):
         """수확 task 하나를 E2~E6 순서로 처리하고 최종 상태를 돌려준다.
 
         harvest_point : 수확지 정보 dict — 노드가 automato_db.get_task_point 로 조회해 넘긴다.
                         {"task_point_id","point_type","waypoint_id","x","y","yaw"}
                         (설계노트 2: 미리 조회 가능한 것은 노드가 맡는다)
-        marker        : 수확지 ChArUco 보드 dict — 노드가 automato_db.get_dock_marker 로
-                        조회해 넘긴다. **None 이 정상적인 값**이다(실측값은 도킹 튜닝 후
-                        시드되므로 아직 비어 있을 수 있다) → 그 경우 도킹은 즉시 실패한다.
-                        harvest_point 와 다른 테이블(charuco_boards)에서 오므로 따로 받는다.
         engine        : 순찰과 공유하는 RoutingEngine(경로탐색+통로예약)
-        clients       : 노드가 만든 액션 클라이언트 묶음
-                        {"nav","dock","harvest","unload"} (robot_id 로 바인딩됨)
+        clients       : 노드가 만든 액션 클라이언트 묶음(robot_id 로 바인딩됨).
+                        {"nav","harvest","unload"} + "dock_for"(method→도킹 클라이언트).
+                        수확지·예냉실은 바닥 H 마커(floor) 도킹이라 마커 조회가 없다 —
+                        docking.method_for(task_point_id) 로 방식을 골라 dock_for 로 얻는다.
         start_wp      : 출발 노드(로봇 전용 충전소 진입노드).
         on_progress   : 수확 진행 상황을 받을 콜백(dict). 노드가 이걸 Web Service 로
                         중계한다 — 이 클래스는 HTTP 를 모른 채로 남아야 ROS·DB·네트워크
@@ -95,7 +93,6 @@ class HarvestDispatcher:
         precool_point : 예냉실 진입노드 dict(get_precool_point). 수확지와 같은 규약이고,
                         **수확을 시작하기 전에** 노드가 조회해 넘긴다 — 갈 곳이 없는데
                         몇 분씩 토마토를 따는 건 낭비다.
-        precool_marker: 예냉실 ChArUco 보드 dict. 없으면(None) 예냉실 도킹만 실패한다.
         save_batch    : 수확 실적을 저장하는 콜백. 집계 dict 를 받아 batch_id 를 돌려준다.
                         이 클래스가 DB 를 모르는 채로 남기 위한 통로다(on_progress 와 같은
                         이유). 반환된 batch_id 는 E6 완료 통지에 실린다.
@@ -113,7 +110,7 @@ class HarvestDispatcher:
         ⚠️ 지금은 E2(주행+도킹)까지 구현됐다. 도킹까지 성공해도 수확을 안 했으므로
         FAILED 로 마감한다. 남은 순서:
           outcome = E3~4 Harvest 액션(Ddagi 주관)+피드백 중계  (clients['harvest'])
-          ...     E5  수확 실적 저장(콜백) + 예냉실 주행·도킹  (clients['nav'], clients['dock'])
+          ...     E5  수확 실적 저장(콜백) + 예냉실 주행·도킹  (clients['nav'], clients['dock_for'])
           ...     E6  완료 처리 + (보너스) Unload 하역          (clients['unload'])
         """
         target = (harvest_point or {}).get("waypoint_id")
@@ -132,7 +129,7 @@ class HarvestDispatcher:
             return STATUS_FAILED, None
         # 순찰과 달리 출발점 폴백을 두지 않는다. 순찰은 지점이 여러 개라 하나쯤 예약 없이
         # 가도 나머지가 이어지지만, 수확은 목적지가 하나뿐이라 출발점을 모르면 경로 예약
-        # 자체가 성립하지 않고, 도착 직후 ChArUco 도킹이 붙어 위치가 어긋나면 그대로
+        # 자체가 성립하지 않고, 도착 직후 바닥 H 마커 도킹이 붙어 위치가 어긋나면 그대로
         # 도킹 실패가 된다. 로봇별 충전소는 DB(robots.charge_point_id)에 있어야 한다.
         if start_wp is None or start_wp not in self.wp_meta:
             self._log.error(
@@ -160,13 +157,15 @@ class HarvestDispatcher:
                 f"[HARVEST] E2 수확지 도착 task={task_id} robot={robot_id} "
                 f"위치 {current}({label})")
 
-            # --- E2 ChArUco 도킹 — 순찰(충전소)·예냉실과 같은 절차라 docking 모듈 공용 ---
+            # --- E2 바닥 H 마커(floor) 도킹 — 순찰(충전소)·예냉실과 같은 절차라 공용 ---
             # heartbeat 가 핵심이다: 도킹은 마커 탐색~후진까지 수십 초 걸리는데 그동안
             # 주행 하트비트가 멎어, 이걸 안 넘기면 RESERVATION_TTL_SEC(15초)에 걸려
             # '지금 로봇이 서 있는 자리'가 회수되고 남이 그 지점으로 들어온다.
             entry_slot = engine.node_slot(current)
+            method = docking.method_for(label)         # HARVEST_* → floor
             success, code, msg = docking.dock(
-                self._log, task_id, robot_id, label, marker, clients["dock"],
+                self._log, task_id, robot_id, label, method,
+                clients["dock_for"](method),
                 heartbeat=(engine, [entry_slot], robot_id))
             if not success:
                 self._log.warning(
@@ -227,9 +226,11 @@ class HarvestDispatcher:
                 return STATUS_FAILED, None
 
             precool_slot = engine.node_slot(current)
+            precool_method = docking.method_for(precool_label)   # PRECOOL_* → floor
             success, code, msg = docking.dock(
-                self._log, task_id, robot_id, precool_label, precool_marker,
-                clients["dock"], heartbeat=(engine, [precool_slot], robot_id))
+                self._log, task_id, robot_id, precool_label, precool_method,
+                clients["dock_for"](precool_method),
+                heartbeat=(engine, [precool_slot], robot_id))
             if not success:
                 self._log.warning(
                     f"[HARVEST] E5 예냉실 도킹 실패(code={code}) task={task_id} "
