@@ -400,7 +400,7 @@ def do_check() -> None:
                "동작이 의도와 달라질 수 있으니 재티칭을 권합니다.")
 
 
-def do_shake(arm, base_angles, cfg: dict) -> None:
+def do_shake(arm, base_angles, cfg: dict, watch=None, samples=None) -> None:
     """손목 관절을 ±진폭으로 왕복시켜 남은 열매를 털어낸다.
 
     그리퍼는 건드리지 않는다 — 흔드는 중에 손잡이를 놓으면 바구니가 떨어진다.
@@ -427,7 +427,17 @@ def do_shake(arm, base_angles, cfg: dict) -> None:
     for _ in range(cycles):
         for p in (hi_pose, lo_pose):
             arm.move_angles_nowait(p, speed)
-            time.sleep(dwell)
+            if watch is None:
+                time.sleep(dwell)
+                continue
+            # 측정 모드: 같은 스레드에서 반주기 동안 각도를 훑는다. 별도 스레드로 읽으면
+            # 소켓 요청이 뒤섞이고(응답 혼선) 명령이 그 뒤에 줄을 서 털기 자체가 느려진다
+            # — 실측에서 2초짜리 동작이 13초가 됐다.
+            t_end = time.time() + dwell
+            while time.time() < t_end:
+                a = arm.get_angles()
+                if isinstance(a, (list, tuple)) and len(a) > watch:
+                    samples.append(a[watch])
     # 마지막만 도달까지 기다린다 — 다음 스텝이 흔들리는 도중에 시작되면 안 된다.
     arm.move_angles(clamp_angles(base_angles)[0], speed)
     print(f"      완료 {time.time() - t0:.1f}s")
@@ -455,36 +465,24 @@ def do_shaketest(arm) -> None:
     time.sleep(0.6)
     watch = int((SHAKE_PATTERN or [{"joint": SHAKE_JOINT}])[0]["joint"]) - 1
 
-    print(f"\n{'반주기':>6} {'명령진폭':>8} {'실측 p-p':>9} {'도달률':>7} {'흔든총량':>9}")
+    print(f"\n{'반주기':>6} {'명령진폭':>8} {'실측 p-p':>9} {'도달률':>7} {'흔든총량':>9} {'소요':>6}")
     best = None
+    cmd_pp = 2 * sum(float(p["amp"]) for p in SHAKE_PATTERN
+                     if int(p["joint"]) - 1 == watch) or 2 * SHAKE_AMPLITUDE
     for dwell in (0.35, 0.28, 0.22, 0.18, 0.14, 0.10):
-        cfg = {"cycles": 3, "dwell": dwell}
-        cmd_pp = 2 * sum(float(p["amp"]) for p in SHAKE_PATTERN
-                         if int(p["joint"]) - 1 == watch) or 2 * SHAKE_AMPLITUDE
-        seen = []
-        t_end = time.time() + 3 * 2 * dwell + 0.5
-        import threading
-        stop = threading.Event()
-
-        def sampler():
-            while not stop.is_set():
-                a = arm.get_angles()
-                if a:
-                    seen.append(a[watch])
-        th = threading.Thread(target=sampler, daemon=True)
-        th.start()
-        do_shake(arm, base, cfg)
-        stop.set()
-        th.join(timeout=1.0)
-
+        seen: list = []
+        t0 = time.time()
+        do_shake(arm, base, {"cycles": 3, "dwell": dwell}, watch=watch, samples=seen)
+        el = time.time() - t0
         if len(seen) < 4:
             print(f"{dwell:>6.2f} {cmd_pp:>8.1f} {'측정실패':>9}")
             continue
         pp = max(seen) - min(seen)
         ratio = pp / cmd_pp if cmd_pp else 0
-        # '흔든 총량' = 진폭 × 왕복 횟수/초. 진폭만 크거나 빠르기만 해선 안 털린다.
+        # '흔든 총량' = 진폭 × 왕복/초. 진폭만 크거나 빠르기만 해선 안 털린다.
         agitation = pp / (2 * dwell)
-        print(f"{dwell:>6.2f} {cmd_pp:>8.1f} {pp:>9.1f} {ratio:>6.0%} {agitation:>9.1f}")
+        print(f"{dwell:>6.2f} {cmd_pp:>8.1f} {pp:>9.1f} {ratio:>6.0%} "
+              f"{agitation:>9.1f} {el:>5.1f}s  (표본 {len(seen)})")
         if best is None or agitation > best[1]:
             best = (dwell, agitation, pp)
         time.sleep(0.4)

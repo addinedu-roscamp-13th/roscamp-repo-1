@@ -172,16 +172,22 @@ class NetworkArm(ArmBackend):
 
     def __init__(self, ip, port=9010, move_timeout=15, connect_timeout=5):
         import socket
+        import threading
         self._sock = socket.create_connection((ip, port), timeout=connect_timeout)
         self._sock.settimeout(move_timeout + 10)
         self._f = self._sock.makefile("rwb")
         self.move_timeout = move_timeout
+        # 소켓 하나에 '요청 한 줄 -> 응답 한 줄'이 오가는 프로토콜이라 두 스레드가
+        # 동시에 부르면 **응답이 뒤섞인다**. 실제로 털기 측정에서 get_angles 요청에
+        # send_angles 의 반환값(int)이 돌아와 TypeError 가 났다. 호출을 직렬화한다.
+        self._lock = threading.Lock()
 
     def _call(self, method, *args):
         import json
-        self._f.write((json.dumps({"m": method, "a": list(args)}) + "\n").encode())
-        self._f.flush()
-        resp = json.loads(self._f.readline().decode())
+        with self._lock:
+            self._f.write((json.dumps({"m": method, "a": list(args)}) + "\n").encode())
+            self._f.flush()
+            resp = json.loads(self._f.readline().decode())
         if not resp.get("ok"):
             raise RuntimeError(f"arm_server 오류({method}): {resp.get('err')}")
         return resp.get("r")
