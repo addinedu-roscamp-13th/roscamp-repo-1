@@ -21,6 +21,8 @@ Goal 파싱 · Feedback 발행 · 취소 처리 · Result 매핑.
     detector    ros | yolo | mock | list  (기본 ros = /ai/detect_tomatoes 호출)
     weights     detector=yolo 일 때 .pt 경로
     max_rounds  촬영-수확 라운드 상한 (기본 5)
+    dry_run     true 면 파지 없이 관측·검출·마커만 (배치 잡기·모델 비교용).
+                실행 중 변경 가능: ros2 param set /ddagi_harvest_node dry_run true
 
 하드웨어 없이 전 경로(Goal→Feedback→Result) 검증:
     ros2 run ddagi_harvest harvest_node --ros-args -p arm:=fake -p detector:=list
@@ -67,6 +69,10 @@ class HarvestActionServer(Node):
         self.declare_parameter("detector", "ros")
         self.declare_parameter("weights", "")
         self.declare_parameter("max_rounds", hv.MAX_ROUNDS)
+        # 파지 없이 관측·검출·마커만. 열매 배치를 잡거나 모델을 비교할 때 실제 수확을
+        # 돌리지 않고 rviz 로 검출 결과와 파지 순서를 먼저 확인하기 위한 것.
+        # 실행 중에도 바꿀 수 있다: ros2 param set /ddagi_harvest_node dry_run true
+        self.declare_parameter("dry_run", False)
 
         self._arm = None
         self._detector = None
@@ -171,8 +177,10 @@ class HarvestActionServer(Node):
             result.message = "다른 수확이 진행 중"
             return result
 
+        dry = bool(self.get_parameter("dry_run").value)   # Goal 마다 다시 읽는다
         self.get_logger().info(
-            f"수확 시작 task_id={req.task_id} max_capacity={max_capacity}")
+            f"수확 시작 task_id={req.task_id} max_capacity={max_capacity}"
+            + ("  [DRY RUN — 파지 없이 검출만]" if dry else ""))
         detector = None
         try:
             arm = self._ensure_arm()
@@ -195,7 +203,7 @@ class HarvestActionServer(Node):
                 mp.show_detections(batch, getattr(detector, "last_skipped", None))
 
             summary = hv.harvest(
-                arm, detector,
+                arm, detector, dry_run=dry,
                 max_capacity=max_capacity,
                 max_rounds=self.get_parameter("max_rounds").value,
                 on_progress=on_progress,

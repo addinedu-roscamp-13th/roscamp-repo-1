@@ -38,6 +38,8 @@ def generate_launch_description():
                               description="detector:=yolo 일 때 .pt 경로"),
         DeclareLaunchArgument("max_rounds", default_value="5",
                               description="촬영-수확 라운드 상한"),
+        DeclareLaunchArgument("dry_run", default_value="false",
+                              description="파지 없이 검출·마커만 (배치 잡기용)"),
     ]
 
     node = Node(
@@ -53,6 +55,7 @@ def generate_launch_description():
             "detector": LaunchConfiguration("detector"),
             "weights": LaunchConfiguration("weights"),
             "max_rounds": LaunchConfiguration("max_rounds"),
+            "dry_run": LaunchConfiguration("dry_run"),
         }],
     )
     return LaunchDescription(args + [node])
