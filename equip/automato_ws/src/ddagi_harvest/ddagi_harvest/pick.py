@@ -22,6 +22,7 @@ import time
 
 from ddagi_harvest import approach_model
 from ddagi_harvest.arm_backend import ArmBackend
+from ddagi_harvest.log import log, warn
 
 # ---- 튜닝 상수 (실물에서 확정) --------------------------------------------- #
 # 기본 그리퍼 자세 (rx,ry,rz). AI 기울기값이 오면 pick(orientation=...)로 덮어쓴다.
@@ -175,7 +176,7 @@ def _try_move(arm, coords, speed, mode, quiet=False) -> bool:
         return True
     except RuntimeError as e:
         if not quiet:
-            print(f"  (건너뜀) {e}")
+            log(f"  (건너뜀) {e}")
         return False
 
 
@@ -221,7 +222,7 @@ def move_with_ori_fallback(arm, xyz, ori, speed, mode):
         try:
             arm.move_coords(list(xyz) + list(cand), speed, mode)
             if i:
-                print(f"    (자세 대안 #{i} 사용: ry{cand[1] - ori[1]:+.0f}"
+                log(f"    (자세 대안 #{i} 사용: ry{cand[1] - ori[1]:+.0f}"
                       f" rz{cand[2] - ori[2]:+.0f})")
             return cand
         except RuntimeError:
@@ -437,7 +438,7 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
         s = int(entry_sign(target_xyz[1]))
         _m = zone_is_ambiguous(target_xyz[1])
         if _m < ZONE_MARGIN_MM:
-            print(f"    ⚠ 줄기 경계에서 {_m:.1f}mm — 좌우 판정 불확실"
+            warn(f"    ⚠ 줄기 경계에서 {_m:.1f}mm — 좌우 판정 불확실"
                   f"({'오른쪽' if s < 0 else '왼쪽'}에서 진입). 반대면 STEM_REFS_Y 조정")
         ori = (list(orientation) if orientation is not None
                else list(ORI_BY_ZONE.get(z, GRIPPER_ORI)))
@@ -452,7 +453,7 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
 
     # 그랩점(approach)은 반드시 도달 가능해야 파지가 성립한다. 범위 밖이면 거부.
     if not in_workspace(approach):
-        print(f"  [거부] 접근점 {[round(c,1) for c in approach[:3]]} 가동범위 밖 — 목표/TF 확인")
+        log(f"  [거부] 접근점 {[round(c,1) for c in approach[:3]]} 가동범위 밖 — 목표/TF 확인")
         return False
 
     # 0) 관측→공통 staging(정면 unfold, 안전) → J1만 목표 방향으로 수평 aim
@@ -486,15 +487,15 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
         else:
             if REQUIRE_STANDOFF:
                 if i == 0:
-                    print("  standoff 도달불가 — 이 자세 후보 건너뜀")
+                    log("  standoff 도달불가 — 이 자세 후보 건너뜀")
                 continue          # 손목을 못 세우면 진입하지 않는다(옆 열매 보호)
             if i == 0:
-                print("  standoff 도달불가 — 손목 세팅 없이 직접 진입(옆 열매 주의)")
+                log("  standoff 도달불가 — 손목 세팅 없이 직접 진입(옆 열매 주의)")
         # 손목이 이미 목표 자세인 상태에서 순수 병진 진입
         if _try_move(arm, grasp_xyz + cand, APPROACH_SPEED, 0, quiet=True):
             entered = True
             if i:
-                print(f"    (자세 대안 #{i} 사용: ry{cand[1] - ori[1]:+.0f}"
+                log(f"    (자세 대안 #{i} 사용: ry{cand[1] - ori[1]:+.0f}"
                       f" rz{cand[2] - ori[2]:+.0f})")
             ori = cand                           # 후퇴도 같은 자세로
             break
@@ -510,14 +511,14 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
     cur = arm.get_coords() or []
     if cur:
         derr = [round(cur[i] - approach[i], 1) for i in range(3)]
-        print(f"    도착오차 {derr} mm (목표기준) "
+        log(f"    도착오차 {derr} mm (목표기준) "
               f"명령 {[round(c, 1) for c in grasp_cmd[:3]]}")
     arm.close_gripper(GRIP_SPEED)
     time.sleep(SETTLE)
     # 이 값은 참고·튜닝용(캐노피 안이라 잎·줄기 접촉으로 오염될 수 있음).
     # 실제 판정은 아래 '상승 후 확인'(1차)과 바구니 투하 직전(최종)에서 한다.
     grip_val = arm.gripper_value()
-    print(f"    그리퍼값 {grip_val} (임계 {GRIP_THRESHOLD}) → "
+    log(f"    그리퍼값 {grip_val} (임계 {GRIP_THRESHOLD}) → "
           f"{'파지O' if grip_val > GRIP_THRESHOLD else '파지X'} (참고)")
 
     # 3) 후퇴(직선 우선, 관절 폴백) — 파지물을 접근축 역방향으로 곧게 뺀다.
@@ -534,7 +535,7 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
     time.sleep(SETTLE)
     val = arm.gripper_value()
     held = val > GRIP_THRESHOLD
-    print(f"    [후퇴 후 확인] 그리퍼값 {val} (임계 {GRIP_THRESHOLD}) → "
+    log(f"    [후퇴 후 확인] 그리퍼값 {val} (임계 {GRIP_THRESHOLD}) → "
           f"{'파지O — 수확' if held else '빈손X — 상승·바구니 생략'}")
     if not held:
         # 상승도 생략한다 — 다음 동작(다음 pick 의 staging 이동, 또는 관측 복귀)이
@@ -556,15 +557,15 @@ if __name__ == "__main__":
     # FakeArm으로 시퀀스 흐름 검증 (하드웨어 불필요)
     from ddagi_harvest.arm_backend import make_arm
 
-    print("=== 파지 성공 시나리오 (grip_result=39 > 임계값) ===")
+    log("=== 파지 성공 시나리오 (grip_result=39 > 임계값) ===")
     arm = make_arm("fake", grip_result=39)
     ok = pick(arm, [150.0, -40.0, 250.0], "NORMAL")
-    print(f"결과: {'성공' if ok else '실패'}  (명령 {len(arm.log)}개)\n")
+    log(f"결과: {'성공' if ok else '실패'}  (명령 {len(arm.log)}개)\n")
 
-    print("=== 파지 실패 시나리오 (grip_result=0, 빈 그리퍼) ===")
+    log("=== 파지 실패 시나리오 (grip_result=0, 빈 그리퍼) ===")
     arm2 = make_arm("fake", grip_result=0)
     ok2 = pick(arm2, [150.0, -40.0, 250.0], "NORMAL")
-    print(f"결과: {'성공' if ok2 else '실패(투하 스킵 확인)'}  (명령 {len(arm2.log)}개)")
+    log(f"결과: {'성공' if ok2 else '실패(투하 스킵 확인)'}  (명령 {len(arm2.log)}개)")
 
     assert ok and not ok2, "FAIL: 성공/실패 판정이 기대와 다름"
-    print("\nPASS — 파지 시퀀스 흐름 검증 통과")
+    log("\nPASS — 파지 시퀀스 흐름 검증 통과")

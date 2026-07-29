@@ -39,6 +39,7 @@ from rclpy.node import Node
 
 from automato_interfaces.action import Harvest
 from ddagi_harvest import harvest as hv
+from ddagi_harvest import log as L
 from ddagi_harvest import pick as pk
 from ddagi_harvest.arm_backend import FakeArm, NetworkArm
 from ddagi_harvest.detector import (ListDetector, MockColorDetector, RosDetector,
@@ -67,6 +68,12 @@ class HarvestActionServer(Node):
         self._arm = None
         self._detector = None
         self._busy = threading.Lock()   # 팔은 1대 — Goal 동시 실행을 막는다
+
+        # 파지·루프의 진단 출력을 노드 로거로 돌린다. print 는 터미널이 아닐 때
+        # 블록 버퍼링돼 프로세스가 끝나야 쏟아지는데, 액션 서버는 터미널이 없어
+        # 실패 원인을 실시간으로 볼 수 없다(실측: 4분 30초 수확에 로그 868바이트).
+        lg = self.get_logger()
+        L.set_sink(info=lg.info, warning=lg.warning, err=lg.error)
 
         # 액션 실행 콜백 안에서 AI 서비스 응답을 동기 대기하므로 둘 다 Reentrant 여야
         # 한다. 단일 스레드 실행기면 실행 콜백이 실행기를 점유해 응답이 영영 안 온다.
