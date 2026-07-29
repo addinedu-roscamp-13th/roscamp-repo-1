@@ -10,6 +10,7 @@ IK 해가 매번 달라져 경로가 튀는 문제를 피하려면 관절각 재
     확인:  python3 ddagi_harvest/teach_unload.py show
     검사:  python3 ddagi_harvest/teach_unload.py check
     재생:  python3 ddagi_harvest/teach_unload.py run
+    털기튜닝: python3 ddagi_harvest/teach_unload.py shaketest
 
 티칭은 두 모드를 오간다. **드래그로 대충 잡고 조그로 다듬는다.**
 
@@ -84,7 +85,14 @@ WAIT_SEC = 3.0            # 'w' 스텝 기본 대기 (Unload.action 의 shake_de
 # 경로가 튀므로 관절각으로만 흔든다.
 #   J5(손목 피치) = 바구니를 위아래로 까딱 → 남은 열매가 굴러 나온다
 #   J6(손목 회전) = 비틀기. 손잡이가 하나뿐이라 바구니가 돌아갈 수 있어 권하지 않는다
-SHAKE_JOINT = 5           # 1-indexed (J5)
+# 여러 관절을 함께 흔들면 바구니가 훨씬 격하게 요동친다. sign 이 반대면 반대 위상으로
+# 움직여 손목이 꺾이는 동시에 팔꿈치가 반대로 가 흔들림이 커진다.
+# 비우면 SHAKE_JOINT 하나만 쓴다.
+SHAKE_PATTERN = [
+    {"joint": 5, "amp": 15.0, "sign": +1},   # 손목 피치 — 바구니를 까딱
+    {"joint": 4, "amp": 8.0, "sign": -1},    # 팔꿈치 반대 위상 — 진폭을 키운다
+]
+SHAKE_JOINT = 5           # 1-indexed (J5). SHAKE_PATTERN 이 비었을 때 쓰인다
 SHAKE_AMPLITUDE = 12.0    # ±도. 크면 그리퍼가 손잡이를 놓칠 수 있으니 올릴 땐 단계적으로
 SHAKE_CYCLES = 4
 SHAKE_SPEED = 100         # 최대. 털려면 반전 자체가 빨라야 한다
@@ -398,26 +406,94 @@ def do_shake(arm, base_angles, cfg: dict) -> None:
     그리퍼는 건드리지 않는다 — 흔드는 중에 손잡이를 놓으면 바구니가 떨어진다.
     진폭을 키우기 전에 반드시 낮은 값으로 확인할 것.
     """
-    j = int(cfg.get("joint", SHAKE_JOINT)) - 1        # 0-indexed
-    amp = float(cfg.get("amplitude", SHAKE_AMPLITUDE))
+    pattern = cfg.get("pattern") or SHAKE_PATTERN or [
+        {"joint": int(cfg.get("joint", SHAKE_JOINT)),
+         "amp": float(cfg.get("amplitude", SHAKE_AMPLITUDE)), "sign": +1}]
     cycles = int(cfg.get("cycles", SHAKE_CYCLES))
     speed = int(cfg.get("speed", SHAKE_SPEED))
     dwell = float(cfg.get("dwell", SHAKE_DWELL))
-    print(f"    털기: J{j + 1} ±{amp:.1f}° × {cycles}회 "
-          f"(속도 {speed}, 반주기 {dwell}s)")
+    desc = " + ".join(f"J{p['joint']}±{p['amp']:.0f}°" for p in pattern)
+    print(f"    털기: {desc} × {cycles}회 (속도 {speed}, 반주기 {dwell}s)")
 
+    def pose(sign):
+        a = list(base_angles)
+        for p in pattern:
+            a[int(p["joint"]) - 1] += sign * int(p.get("sign", 1)) * float(p["amp"])
+        return clamp_angles(a)[0]
+
+    lo_pose, hi_pose = pose(-1), pose(+1)
     # 도달을 기다리지 않고 반대로 꺾는다. 그래야 왕복이 이어져 '진동'이 된다.
     t0 = time.time()
     for _ in range(cycles):
-        for sign in (+1, -1):
-            a = list(base_angles)
-            a[j] += sign * amp
-            a, _ = clamp_angles(a)
-            arm.move_angles_nowait(a, speed)
+        for p in (hi_pose, lo_pose):
+            arm.move_angles_nowait(p, speed)
             time.sleep(dwell)
     # 마지막만 도달까지 기다린다 — 다음 스텝이 흔들리는 도중에 시작되면 안 된다.
     arm.move_angles(clamp_angles(base_angles)[0], speed)
     print(f"      완료 {time.time() - t0:.1f}s")
+
+
+def do_shaketest(arm) -> None:
+    """반주기(dwell)를 바꿔가며 **실제로 몇 도나 움직이는지** 측정한다.
+
+    명령 진폭이 곧 실제 진폭이 아니다. 반주기가 짧으면 서보가 목표까지 못 가고
+    반대로 꺾여, 명령 15° 인데 실제로는 3~4° 만 흔들리는 일이 생긴다("탈탈"이 아니라
+    잔진동으로 보이는 원인). 진폭과 주파수는 서로를 깎아먹으므로 곱(=흔든 총량)이
+    가장 큰 조합을 실측으로 찾는다.
+    """
+    steps = load()["steps"]
+    idx = next((i for i, s in enumerate(steps) if s.get("act") == "shake"), None)
+    if idx is None:
+        raise SystemExit("'털기' 스텝이 없습니다. 먼저 teach 로 s 를 기록하세요.")
+    base, _ = clamp_angles(steps[idx]["angles"])
+    print(f"털기 스텝 {idx + 1} 자세에서 측정합니다: {[round(a, 1) for a in base]}")
+    print("!! 바구니를 걸고 팔 반경을 비우세요. 팔이 그 자세로 이동한 뒤 흔듭니다.")
+    if input("시작할까요? (y/N) ").strip().lower() != "y":
+        raise SystemExit("취소됨")
+
+    arm.move_angles(base, SPEED)
+    time.sleep(0.6)
+    watch = int((SHAKE_PATTERN or [{"joint": SHAKE_JOINT}])[0]["joint"]) - 1
+
+    print(f"\n{'반주기':>6} {'명령진폭':>8} {'실측 p-p':>9} {'도달률':>7} {'흔든총량':>9}")
+    best = None
+    for dwell in (0.35, 0.28, 0.22, 0.18, 0.14, 0.10):
+        cfg = {"cycles": 3, "dwell": dwell}
+        cmd_pp = 2 * sum(float(p["amp"]) for p in SHAKE_PATTERN
+                         if int(p["joint"]) - 1 == watch) or 2 * SHAKE_AMPLITUDE
+        seen = []
+        t_end = time.time() + 3 * 2 * dwell + 0.5
+        import threading
+        stop = threading.Event()
+
+        def sampler():
+            while not stop.is_set():
+                a = arm.get_angles()
+                if a:
+                    seen.append(a[watch])
+        th = threading.Thread(target=sampler, daemon=True)
+        th.start()
+        do_shake(arm, base, cfg)
+        stop.set()
+        th.join(timeout=1.0)
+
+        if len(seen) < 4:
+            print(f"{dwell:>6.2f} {cmd_pp:>8.1f} {'측정실패':>9}")
+            continue
+        pp = max(seen) - min(seen)
+        ratio = pp / cmd_pp if cmd_pp else 0
+        # '흔든 총량' = 진폭 × 왕복 횟수/초. 진폭만 크거나 빠르기만 해선 안 털린다.
+        agitation = pp / (2 * dwell)
+        print(f"{dwell:>6.2f} {cmd_pp:>8.1f} {pp:>9.1f} {ratio:>6.0%} {agitation:>9.1f}")
+        if best is None or agitation > best[1]:
+            best = (dwell, agitation, pp)
+        time.sleep(0.4)
+
+    if best:
+        print(f"\n권장 dwell = {best[0]:.2f}  (실측 진폭 {best[2]:.1f}°, "
+              f"흔든총량 {best[1]:.1f}°/s)")
+        print(f"unload_path.json 의 shake 에 \"dwell\": {best[0]} 를 넣으세요.")
+    arm.move_angles(base, SPEED)
 
 
 def do_run(arm) -> None:
@@ -487,13 +563,13 @@ def main() -> int:
     if mode == "check":
         do_check()
         return 0
-    if mode not in ("teach", "run"):
+    if mode not in ("teach", "run", "shaketest"):
         print(__doc__)
         return 1
     print(f"팔 연결 {ARM_IP}:9010")
     arm = NetworkArm(ARM_IP)
     try:
-        (do_teach if mode == "teach" else do_run)(arm)
+        {"teach": do_teach, "run": do_run, "shaketest": do_shaketest}[mode](arm)
     finally:
         arm.close()
     return 0
