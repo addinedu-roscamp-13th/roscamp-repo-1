@@ -215,6 +215,7 @@ def do_teach(arm) -> None:
     joint = 5           # 조그 대상 관절(1-indexed). 손목부터 시작 — 여기가 제일 까다롭다
     step_deg = 2.0
     target: list | None = None   # 조그 모드에서 '명령한' 각도
+    holding = False              # 지금 손잡이를 쥐고 있는가 (드래그 전환 시 재파지용)
 
     def show_jog():
         print(f"    J{joint}={target[joint - 1]:7.2f}°  "
@@ -243,8 +244,20 @@ def do_teach(arm) -> None:
                 print("\n⚠ 드래그로 전환합니다 — 팔이 처집니다. 받치고 아무 키나 누르세요.")
                 getch()
                 arm.release_servos()
+                # release_all_servos 는 **그리퍼 서보까지** 푼다. 손잡이를 쥔 채로
+                # 드래그로 넘어가면 그리퍼가 벌어져 바구니를 놓친다(실측). 관절이
+                # 풀린 직후 그리퍼만 다시 물린다 — 그리퍼 명령은 관절과 별개라
+                # 팔은 계속 자유롭게 끌 수 있다.
+                if holding:
+                    time.sleep(0.3)
+                    arm.close_gripper(GRIPPER_SPEED)
+                    time.sleep(0.5)
+                    v = arm.gripper_value()
+                    print(f"    그리퍼 재파지 — 값 {v} "
+                          + ("(유지)" if v and v > 6 else "⚠ (놓쳤을 수 있음)"))
                 mode, target = "drag", None
-                print("[드래그] 서보 해제됨.")
+                print("[드래그] 관절 서보 해제됨"
+                      + (" (그리퍼는 물고 있음)" if holding else "") + ".")
                 continue
 
             # ---- 조그 조작 ------------------------------------------------ #
@@ -316,11 +329,13 @@ def do_teach(arm) -> None:
                 arm.close_gripper(GRIPPER_SPEED)
                 time.sleep(0.5)
                 v = arm.gripper_value()
+                holding = True
                 print(f"    그리퍼 닫음 — 값 {v} "
                       + ("(손잡이 물림)" if v and v > 6 else "⚠ (빈손일 수 있음)"))
             elif act == "open":
                 arm.open_gripper(GRIPPER_SPEED)
                 time.sleep(0.5)
+                holding = False
                 print("    그리퍼 열음 — 바구니를 받쳐 주세요")
 
             steps.append({"angles": angles, "act": act, "mode": mode})
