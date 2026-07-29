@@ -67,6 +67,14 @@ PATH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # 재생 속도 — 짐을 들고 움직이므로 파지 속도(30)보다도 낮게 시작한다.
 SPEED = 25
 JOG_SPEED = 30            # 조그 1회 이동 속도. 몇 도씩만 움직이므로 낮게 둔다
+
+# ---- 첫 이동 보호 ---------------------------------------------------------- #
+# 재생을 시작하는 자세가 정해져 있지 않다. 현재 어디에 있든 1번 웨이포인트로 한 번에
+# 가는데, 그 자리가 바구니 근처면 팔이 예냉실·바구니를 훑고 지나간다(파지에서 staging
+# 을 둔 것과 같은 이유). 그래서 **1번은 반드시 안전한 준비 자세**여야 하고, 현재 자세와
+# 많이 다르면 경고 후 감속해서 간다.
+FIRST_MOVE_SPEED = 15     # 첫 이동만 느리게 — 경로가 예측 불가능한 유일한 구간이다
+FIRST_MOVE_WARN_DEG = 25  # 어느 관절이든 이만큼 넘게 벌어지면 확인을 받는다
 SETTLE = 0.4              # 스텝 후 정착 대기(s)
 GRIPPER_SPEED = 60
 WAIT_SEC = 3.0            # 'w' 스텝 기본 대기 (Unload.action 의 shake_delay_sec)
@@ -304,6 +312,14 @@ def do_teach(arm) -> None:
 
     if not steps:
         raise SystemExit("기록된 자세가 없습니다.")
+
+    # 1번이 곧 '준비 자세'다. 파지 지점이 1번이면 재생 시작 자세가 어디든 거기로
+    # 직행하므로 팔이 예냉실·바구니를 훑는다(파지에서 staging 을 둔 것과 같은 이유).
+    if steps[0].get("act") == "grip":
+        print("\n⚠ 1번 웨이포인트가 곧바로 '손잡이 파지'입니다.")
+        print("  재생은 현재 자세가 어디든 1번으로 직행하고, 그 경로는 팔이 정합니다.")
+        print("  → 팔을 편 안전한 **준비 자세**를 앞에 하나 추가하는 것을 권합니다"
+              " (u 로 되돌린 뒤 SPACE 로 준비 자세부터 기록).")
     with open(PATH_FILE, "w", encoding="utf-8") as fp:
         json.dump({"speed": SPEED, "shake": {"joint": SHAKE_JOINT,
                                              "amplitude": SHAKE_AMPLITUDE,
@@ -366,6 +382,22 @@ def do_run(arm) -> None:
     print(f"기록된 자세 {len(steps)}개를 재생합니다 (속도 {speed}).")
     describe(steps)
     print("\n!! 바구니를 걸고, 팔 반경의 장애물을 치우세요. 중단은 Ctrl+C.")
+
+    # 첫 이동 점검 — 여기가 유일하게 '어디서 출발할지 모르는' 구간이다.
+    cur = read_stable(arm, tries=2, tol=1.5, gap=0.2)
+    first, _ = clamp_angles(steps[0]["angles"])
+    if cur:
+        diffs = [(i + 1, abs(c - f)) for i, (c, f) in enumerate(zip(cur, first))]
+        worst = max(diffs, key=lambda d: d[1])
+        print(f"\n현재 자세 → 1번 웨이포인트: 최대 차이 J{worst[0]} {worst[1]:.1f}°")
+        if worst[1] > FIRST_MOVE_WARN_DEG:
+            print("  ⚠ 첫 이동이 큽니다. 그 사이 경로는 팔이 알아서 정하므로 예냉실·"
+                  "바구니를 훑을 수 있습니다.")
+            print("  " + ", ".join(f"J{j}:{d:.0f}°" for j, d in diffs if d > 5))
+            print(f"  → 첫 이동만 속도 {FIRST_MOVE_SPEED} 로 갑니다. 손을 대고 계세요.")
+    else:
+        print("\n⚠ 현재 각도를 읽지 못했습니다 — 첫 이동 거리를 확인할 수 없습니다.")
+
     if input("시작할까요? (y/N) ").strip().lower() != "y":
         raise SystemExit("취소됨")
 
@@ -378,9 +410,11 @@ def do_run(arm) -> None:
                 print(f"    [clamp] step {i} 한계초과 조정: {note}")
             ph = phase_of(s, i - 1, steps)
             act = s.get("act")
+            spd = FIRST_MOVE_SPEED if i == 1 else speed
             print(f"  step {i}/{len(steps)} [{ph}]"
-                  + (f" — {_ACT_LABEL[act]}" if act else ""))
-            arm.move_angles(angles, speed)
+                  + (f" — {_ACT_LABEL[act]}" if act else "")
+                  + (f"  (첫 이동, 속도 {spd})" if i == 1 else ""))
+            arm.move_angles(angles, spd)
             time.sleep(SETTLE)
 
             if act == "grip":
