@@ -32,7 +32,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from automato_interfaces.action import Dock, Harvest, Navigate, Unload
+from automato_interfaces.action import Harvest, Navigate, Unload
 from automato_interfaces.msg import FleetTelemetry
 from automato_interfaces.srv import SaveDetection
 import rclpy
@@ -282,14 +282,18 @@ class AutomatoControlNode(Node):
         """순찰용 Navigate 액션 클라이언트(하위호환 이름)."""
         return self._action_client_for(robot_id, Navigate, "navigate")
 
-    def _dock_client_for(self, robot_id: str) -> ActionClient:
-        """robot_id 의 Dock 액션 클라이언트(/{robot_id}/dock).
+    def _dock_client(self, robot_id: str, method: str):
+        """도킹 방식(method)에 맞는 액션 클라이언트(/{robot_id}/{suffix}). 미정의면 None.
 
-        RP-116 은 Dock 전용 캐시(self._dock_clients)를 따로 뒀지만, 수확이 액션 4종
-        (Navigate/Dock/Harvest/Unload)을 쓰게 되면서 캐시를 액션마다 만들 수는 없어
-        범용 _action_client_for 로 합쳤다. 캐시가 하나면 락도 하나라 규칙이 단순하다.
+        방식→(액션 타입, suffix) 매핑은 docking.action_spec 한 곳에서 온다
+        (charuco→dock / floor→floor_dock / reflective→reflective_dock). 지점마다 도킹
+        기술이 달라 액션 타입이 다르므로, 범용 _action_client_for 에 타입만 바꿔 넘긴다.
         """
-        return self._action_client_for(robot_id, Dock, "dock")
+        spec = docking.action_spec(method)
+        if spec is None:
+            return None
+        action_type, suffix = spec
+        return self._action_client_for(robot_id, action_type, suffix)
 
     def prewarm_clients(self, robot_ids) -> None:
         """알려진 로봇의 Navigate 액션 클라이언트를 executor spin 시작 전에 미리 만든다.
@@ -392,30 +396,25 @@ class AutomatoControlNode(Node):
         try:
             engine = self._get_engine()
             harvest_point = self._task_point_for(harvest_location)
-            # 마커는 없을 수 있다(실측값은 도킹 튜닝 후 시드) → None 이어도 주행은 한다.
-            # 디스패처가 도착 후 '마커 없음 = 도킹 불가'로 판정한다.
-            marker = self._dock_marker_for(harvest_location)
             # 예냉실은 **수확을 시작하기 전에** 확인한다. 갈 곳이 없는데 몇 분씩 토마토를
             # 따는 건 낭비이고, DB 조회는 순식간이라 미리 해도 손해가 없다.
             precool_point = self._precool_point()
-            precool_marker = (
-                self._dock_marker_for(precool_point["task_point_id"])
-                if precool_point else None)
             if (engine is not None and harvest_point is not None
                     and precool_point is not None):
                 clients = {
                     "nav": self._action_client_for(robot_id, Navigate, "navigate"),
-                    "dock": self._action_client_for(robot_id, Dock, "dock"),
+                    # 수확지·예냉실은 바닥 H 마커(floor) 도킹이다. 도킹 방식→클라이언트는
+                    # 디스패처가 지점별로 docking.method_for 로 골라 dock_for(method) 를 부른다.
+                    "dock_for": lambda method: self._dock_client(robot_id, method),
                     "harvest": self._action_client_for(robot_id, Harvest, "harvest"),
                     "unload": self._action_client_for(robot_id, Unload, "unload"),
                 }
                 status, reason = self._harvest_dispatcher.run_harvest(
-                    task_id, robot_id, harvest_point, marker, engine, clients,
+                    task_id, robot_id, harvest_point, engine, clients,
                     start_wp=self._start_waypoint_for(robot_id),
                     on_progress=self._harvest_progress_reporter(
                         task_id, robot_id),
                     precool_point=precool_point,
-                    precool_marker=precool_marker,
                     save_batch=self._harvest_batch_saver(task_id, robot_id),
                     save_unload=self._unload_log_saver(task_id, robot_id),
                     on_completed=self._harvest_completed_reporter(
@@ -598,16 +597,14 @@ class AutomatoControlNode(Node):
         task_failed(DOCK_FAILED)·22-2 현장 정지(operational_status=IMMOBILIZED)는
         6·7단계에서 이 자리에 채운다.
         """
-        # 1) 전용 충전소 + 도킹 마커 조회.
-        charge, marker = None, None
+        # 1) 전용 충전소 조회. 충전소는 반사테이프(reflective) 도킹이라 마커 조회가 없다
+        #    (마커리스). 좌표도 진입 노드 waypoint_id 만 있으면 wp_meta 에서 얻는다.
+        charge = None
         if self._db_pool is not None:
             try:
                 charge = automato_db.get_charge_point(self._db_pool, robot_id)
-                if charge is not None:
-                    marker = automato_db.get_dock_marker(
-                        self._db_pool, charge["task_point_id"])
             except Exception as exc:  # noqa: BLE001
-                self.get_logger().error(f"충전소/마커 조회 실패 task={task_id}: {exc}")
+                self.get_logger().error(f"충전소 조회 실패 task={task_id}: {exc}")
         if charge is None or charge["waypoint_id"] not in self._dispatcher.wp_meta:
             self.get_logger().warn(
                 f"{robot_id} 전용 충전소 미등록/그래프에 없음 → 복귀 생략, 자리 반납 "
@@ -617,8 +614,9 @@ class AutomatoControlNode(Node):
 
         target = charge["waypoint_id"]
         charge_point_id = charge["task_point_id"]
+        method = docking.method_for(charge_point_id)   # CHARGE_* → reflective
         nav_client = self._client_for(robot_id)
-        dock_client = self._dock_client_for(robot_id)
+        dock_client = self._dock_client(robot_id, method)
 
         # 2) 복귀 주행 — 순찰 마지막 자리를 이어받아 충전소 진입 노드까지(촬영 없음).
         outcome, pos = self._dispatcher.drive_to_point(
@@ -633,10 +631,10 @@ class AutomatoControlNode(Node):
 
         # 3) 도킹 — 진입 노드 자리를 쥔 채(하트비트로 TTL 방어), N_dock 재시도.
         entry_slot = engine.node_slot(target)
-        # 도킹은 순찰·수확이 함께 쓰므로 디스패처가 아니라 docking 모듈이 소유한다
-        # (충전소·수확지·예냉실 모두 charuco_boards 한 행 + 같은 절차).
+        # 도킹은 순찰·수확이 함께 쓰므로 디스패처가 아니라 docking 모듈이 소유한다.
+        # 충전소는 반사테이프(reflective) 방식 — 마커 정보 없이 task_point_id 만 싣는다.
         success, code, msg = docking.dock(
-            self.get_logger(), task_id, robot_id, charge_point_id, marker,
+            self.get_logger(), task_id, robot_id, charge_point_id, method,
             dock_client, heartbeat=(engine, [entry_slot], robot_id))
         if success:
             # 문서 E4 8번: Dock 성공 → 예약 전부 해제. 복귀 도착 후엔 진입 노드 자리 하나만

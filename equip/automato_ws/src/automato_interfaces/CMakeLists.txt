@@ -32,6 +32,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   # E4-6/E2 22-1 충전소 정밀 후진 도킹
   "action/Dock.action"        # ACS→DG /{robot_id}/dock, DG→DdaGo /ddago/dock  (charuco)
   "action/ReflectiveDock.action"  # ACS→DG /{robot_id}/reflective_dock, DG→DdaGo /ddago/reflective_dock  (반사테이프)
+  "action/FloorDock.action"   # ACS→DG /{robot_id}/floor_dock, DG→DdaGo /ddago/floor_dock  (바닥 H 마커)
   # ===== 시나리오 2: 수확 및 예냉실 이동 =====
   # E3 토마토 검출 (Ddagi ↔ DG AI Service, ROS2 Service) — 이미지 없이 좌표만
   "msg/Tomato.msg"            # DetectTomatoes 응답 원소 (검출 토마토 1개, camera_link 좌표)
