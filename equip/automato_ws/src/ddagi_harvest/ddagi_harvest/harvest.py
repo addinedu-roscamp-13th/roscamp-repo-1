@@ -78,7 +78,8 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
             max_capacity: int = MAX_CAPACITY, max_attempts: int = MAX_ATTEMPTS,
             exclude_radius: float = EXCLUDE_RADIUS, max_retry: int = MAX_RETRY,
             dry_run: bool = False, max_rounds: int = MAX_ROUNDS,
-            on_progress=None, should_cancel=None) -> dict:
+            on_progress=None, should_cancel=None,
+            on_detect=None, on_target=None) -> dict:
     """검출→파지 루프 1회 수확 세션. 결과 요약 dict 반환.
 
     ROS2 액션 서버(harvest_node)에서도 이 함수를 그대로 쓴다. 그래서 ROS 의존을
@@ -89,6 +90,10 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
           True 면 진행 중인 배치를 중단하고 exit_reason='CANCELED' 로 종료한다.
           파지 도중이 아니라 '파지 1건이 끝난 경계'에서만 검사한다 — 팔이 열매를
           문 채로 멈추면 사람이 빼줘야 한다.
+      on_detect(batch) -> None
+          제외 필터를 통과하고 정렬까지 끝난 배치. rviz 마커 발행에 쓴다.
+      on_target(base_mm, grade) -> None
+          지금 파지하러 가는 열매. 재시도 보정(z bump)이 반영된 실제 목표다.
 
     **카메라 검증** 방식: 그리퍼 값은 줄기·잎을 물어도 '성공'으로 오판하므로, 성공
     집계를 위치값이 아니라 **재검출로 확인**한다 — 직전 배치에서 시도한 토마토가 다음
@@ -179,6 +184,8 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
                  "base_z": "낮은 순(base z)",
                  "depth": "카메라 depth 가까운 순"}[SORT_KEY]
         batch.sort(key=keyfn)
+        if on_detect is not None:            # 정렬 뒤에 넘긴다 — 마커의 번호가 파지 순서
+            on_detect(batch)
         log(f"\n[배치] 검출 {len(batch)}개 — {label} (파지 우선순위):")
         for i, t in enumerate(batch):
             dc = t.get("depth_cm")
@@ -206,6 +213,8 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
             if retries:                      # 재시도면 z를 조금 위로 보정
                 target[2] += RETRY_Z_BUMP * retries
             attempts += 1
+            if on_target is not None:        # 재시도 z 보정이 반영된 실제 목표
+                on_target(target, t["grade"])
             log(f"  [시도 {attempts}] {t.get('color', '?')}/{t['grade']} "
                   f"base={[round(c, 1) for c in target]}"
                   + (f"  (재시도 {retries}회, z+{RETRY_Z_BUMP * retries:.0f})"

@@ -44,6 +44,8 @@ from ddagi_harvest import pick as pk
 from ddagi_harvest.arm_backend import FakeArm, NetworkArm
 from ddagi_harvest.detector import (ListDetector, MockColorDetector, RosDetector,
                                     YoloDetector)
+from ddagi_harvest import markers as mk
+from ddagi_harvest.markers import MarkerPublisher
 
 ACTION_NAME = "/ddagi/harvest"      # 로봇 세트 내부라 {robot_id} 네임스페이스 없음
 
@@ -74,6 +76,15 @@ class HarvestActionServer(Node):
         # 실패 원인을 실시간으로 볼 수 없다(실측: 4분 30초 수확에 로그 868바이트).
         lg = self.get_logger()
         L.set_sink(info=lg.info, warning=lg.warning, err=lg.error)
+
+        # rviz 마커 — 검출 결과와 현재 목표를 3D 로. 실패해도 수확은 계속되어야 하므로
+        # 여기서 죽지 않는다(시각화는 부가 기능이지 수확의 전제가 아니다).
+        try:
+            self._markers = MarkerPublisher(self)
+            lg.info(f"rviz 마커 발행: {mk.TOPIC}  (Fixed Frame = {mk.FRAME_ID})")
+        except Exception as exc:
+            self._markers = None
+            lg.warning(f"마커 발행 비활성 — {exc}")
 
         # 액션 실행 콜백 안에서 AI 서비스 응답을 동기 대기하므로 둘 다 Reentrant 여야
         # 한다. 단일 스레드 실행기면 실행 콜백이 실행기를 점유해 응답이 영영 안 온다.
@@ -161,12 +172,15 @@ class HarvestActionServer(Node):
                 fb.remaining_in_round = int(remaining)
                 goal_handle.publish_feedback(fb)
 
+            mp = self._markers
             summary = hv.harvest(
                 arm, detector,
                 max_capacity=max_capacity,
                 max_rounds=self.get_parameter("max_rounds").value,
                 on_progress=on_progress,
                 should_cancel=lambda: goal_handle.is_cancel_requested,
+                on_detect=(mp.show_detections if mp else None),
+                on_target=(mp.show_target if mp else None),
             )
         except Exception as exc:                       # 팔·검출 예외 → abort
             self.get_logger().error(f"수확 실패: {exc}")
