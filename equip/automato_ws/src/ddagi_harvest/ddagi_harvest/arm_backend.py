@@ -43,6 +43,15 @@ class ArmBackend(ABC):
     def gripper_value(self) -> int:
         """현재 그리퍼 값."""
 
+    def move_angles_nowait(self, angles, speed: int = 30) -> None:
+        """도달을 기다리지 않고 명령만 던진다.
+
+        진동(털기)처럼 **도달 전에 반대로 꺾어야** 하는 동작용이다. 동기 이동은
+        매번 정지를 확인하고 정착까지 기다리므로, 그걸로 왕복시키면 '떠는' 게 아니라
+        '한 번씩 서면서 끄덕이는' 동작이 된다. 기본 구현은 동기 이동으로 폴백한다.
+        """
+        self.move_angles(angles, speed)
+
     # 편의 래퍼
     def open_gripper(self, speed: int = 50) -> None:
         self.gripper(100, speed)
@@ -83,6 +92,10 @@ class FakeArm(ArmBackend):
     def move_angles(self, angles, speed=30):
         self._angles = list(angles)
         self._rec("move_angles", [round(a, 1) for a in angles], f"spd={speed}")
+
+    def move_angles_nowait(self, angles, speed=30):
+        self._angles = list(angles)
+        self._rec("move_angles_nowait", [round(a, 1) for a in angles], f"spd={speed}")
 
     def get_coords(self):
         return list(self._coords)
@@ -125,6 +138,9 @@ class RealArm(ArmBackend):
 
     def move_angles(self, angles, speed=30):
         self.mc.sync_send_angles(list(angles), speed, timeout=self.move_timeout)
+
+    def move_angles_nowait(self, angles, speed=30):
+        self.mc.send_angles(list(angles), speed)
 
     def get_coords(self):
         return self.mc.get_coords()
@@ -227,6 +243,10 @@ class NetworkArm(ArmBackend):
     def move_angles(self, angles, speed=30):
         self._call("send_angles", list(angles), speed)
         self._wait_until_stopped("angles", 0.5, self.move_timeout)
+
+    def move_angles_nowait(self, angles, speed=30):
+        # 정지 감지를 건너뛴다. 털기처럼 도달 전에 반대로 꺾어야 하는 동작 전용.
+        self._call("send_angles", list(angles), speed)
 
     def get_coords(self):
         return self._call("get_coords")

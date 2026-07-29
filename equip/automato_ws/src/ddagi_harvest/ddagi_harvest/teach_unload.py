@@ -85,9 +85,14 @@ WAIT_SEC = 3.0            # 'w' 스텝 기본 대기 (Unload.action 의 shake_de
 #   J5(손목 피치) = 바구니를 위아래로 까딱 → 남은 열매가 굴러 나온다
 #   J6(손목 회전) = 비틀기. 손잡이가 하나뿐이라 바구니가 돌아갈 수 있어 권하지 않는다
 SHAKE_JOINT = 5           # 1-indexed (J5)
-SHAKE_AMPLITUDE = 8.0     # ±도. 작게 시작할 것 — 크면 그리퍼가 손잡이를 놓친다
-SHAKE_CYCLES = 3
-SHAKE_SPEED = 55          # 이동보다 빠르게(털어야 하므로) 그러나 최대치는 피한다
+SHAKE_AMPLITUDE = 12.0    # ±도. 크면 그리퍼가 손잡이를 놓칠 수 있으니 올릴 땐 단계적으로
+SHAKE_CYCLES = 4
+SHAKE_SPEED = 100         # 최대. 털려면 반전 자체가 빨라야 한다
+# ⚠ 반주기 대기(s). **도달을 기다리지 않고** 이만큼만 두고 반대로 꺾는다. 동기 이동으로
+# 왕복시키면 매번 완전히 서고 정착까지 기다려(정지감지 4회 폴링 + 0.25s) '떠는' 게
+# 아니라 '한 번씩 서면서 끄덕이는' 동작이 된다 — 실제로 그렇게 보였다.
+# 짧을수록 격해진다. 너무 짧으면 진폭이 안 나오고 제자리에서 떨기만 한다.
+SHAKE_DWELL = 0.18
 
 # 반복 테스트에서 검증된 명령 한계(arm_util.py). 드래그 티칭은 이보다 넓게 꺾인다 —
 # 손으로 J3 를 155° 까지 끌 수 있지만 명령은 150° 에서 거부된다.
@@ -381,15 +386,23 @@ def do_shake(arm, base_angles, cfg: dict) -> None:
     j = int(cfg.get("joint", SHAKE_JOINT)) - 1        # 0-indexed
     amp = float(cfg.get("amplitude", SHAKE_AMPLITUDE))
     cycles = int(cfg.get("cycles", SHAKE_CYCLES))
-    print(f"    털기: J{j + 1} ±{amp:.1f}° × {cycles}회")
-    for c in range(cycles):
+    speed = int(cfg.get("speed", SHAKE_SPEED))
+    dwell = float(cfg.get("dwell", SHAKE_DWELL))
+    print(f"    털기: J{j + 1} ±{amp:.1f}° × {cycles}회 "
+          f"(속도 {speed}, 반주기 {dwell}s)")
+
+    # 도달을 기다리지 않고 반대로 꺾는다. 그래야 왕복이 이어져 '진동'이 된다.
+    t0 = time.time()
+    for _ in range(cycles):
         for sign in (+1, -1):
             a = list(base_angles)
             a[j] += sign * amp
             a, _ = clamp_angles(a)
-            arm.move_angles(a, SHAKE_SPEED)
-        print(f"      {c + 1}/{cycles}")
-    arm.move_angles(clamp_angles(base_angles)[0], SHAKE_SPEED)   # 원 자세로
+            arm.move_angles_nowait(a, speed)
+            time.sleep(dwell)
+    # 마지막만 도달까지 기다린다 — 다음 스텝이 흔들리는 도중에 시작되면 안 된다.
+    arm.move_angles(clamp_angles(base_angles)[0], speed)
+    print(f"      완료 {time.time() - t0:.1f}s")
 
 
 def do_run(arm) -> None:
