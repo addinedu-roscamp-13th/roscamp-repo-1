@@ -65,12 +65,15 @@ class DriveHooks:
     안 되는데 에러도 안 나는 종류의 버그가 된다. 메서드면 오타가 즉시 드러난다.
     """
 
-    def build_goal(self, seg_wps):
-        """예약 확보한 노드 목록 → (하달 배열, 촬영 대상 id 집합, 촬영 대상 부모 목록).
+    def build_goal(self, seg_wps, seg_start):
+        """예약 확보한 노드 목록 → (하달 배열, 촬영 대상 id 집합, 방문마킹 대상 목록).
 
         기본: 경로를 그대로 하달하고 아무것도 찍지 않는다.
-        순찰은 여기서 촬영 판정과 짝(같은 자리·반대 방향) 끼워넣기를 한다 →
-        그래서 하달 배열 길이가 seg_wps 와 달라질 수 있다(예약 계산은 계속 seg_wps 기준).
+        seg_start: 이 세그먼트에 진입하기 직전 서 있던 노드. 순찰의 방향 게이트가
+        '첫 노드에 어느 방향으로 도착하는가'를 계산할 때 그 이전 위치로 쓴다.
+        순찰은 여기서 방향 게이트로 촬영을 판정하고, 짝(같은 자리·반대 방향)을 그 자리의
+        촬영 대상으로 바꿔 넣는다 → 하달 배열의 id 가 seg_wps 와 달라질 수 있다(예약
+        계산은 계속 seg_wps 기준).
         """
         return list(seg_wps), set(), []
 
@@ -188,9 +191,10 @@ class RouteRunner:
                 seg = None
                 seg_start = current                # 이 세그먼트 진입 노드(피드백 판정 기준)
                 reached = (seg_wps[-1] == target)  # 세그먼트 끝이 목표인가(도착 판정)
-                # 하달 배열은 예약 경로(seg_wps)를 훅이 가공한 것이라 길이가 다를 수 있다
-                # (순찰은 짝을 끼워 넣는다). 예약·진행도 계산은 계속 seg_wps 기준으로 한다.
-                hadal, cap_ids, cap_parents = hooks.build_goal(seg_wps)
+                # 하달 배열은 예약 경로(seg_wps)를 훅이 가공한 것이라 id 가 다를 수 있다
+                # (순찰은 짝을 그 자리 촬영 대상으로 바꿔 넣는다). 예약·진행도 계산은 계속
+                # seg_wps 기준으로 한다. seg_start(진입 직전 노드)는 방향 게이트용으로 넘긴다.
+                hadal, cap_ids, cap_parents = hooks.build_goal(seg_wps, seg_start)
 
                 # 2) 주행 중 훅 2개: 조기 반납(피드백) + 룩어헤드(다음 구간 선예약).
                 look = {"seg": None}

@@ -14,15 +14,26 @@ route_runner.RouteRunner 로 떼어냈다 — 시나리오2 수확도 같은 규
   - 무엇을 '방문했다'로 칠지(_mark_visited)
 이 순찰 고유 로직은 _PatrolHooks 를 통해 RouteRunner.drive 안으로 주입된다.
 """
+import math
 import time
 
 from automato_control_service.patrol_config import (
     BLOCK_GIVEUP_SEC,
+    CAPTURE_DIR_GATE_DEG,
     PATROL_START_WAYPOINT_ID,
     RESERVE_POLL_SEC,
     SERVER_WAIT_SEC,
 )
 from automato_control_service.route_runner import DriveHooks, RouteRunner
+
+# 촬영 방향 게이트를 라디안으로 (설정은 사람이 읽기 쉬운 도(°)로 둔다).
+_CAPTURE_DIR_GATE_RAD = math.radians(CAPTURE_DIR_GATE_DEG)
+
+
+def _norm_angle(a):
+    """각도를 -pi ~ pi 로 접는다. 짝은 부모와 정반대(예: 1.57 ↔ -1.57)라, 접지 않으면
+    두 방향의 차이가 -3.14 로 나와 '거의 같은 방향'으로 오판할 수 있다."""
+    return math.atan2(math.sin(a), math.cos(a))
 
 
 class _PatrolHooks(DriveHooks):
@@ -41,9 +52,9 @@ class _PatrolHooks(DriveHooks):
         self._robot_id = robot_id
         self._visited = visited
 
-    def build_goal(self, seg_wps):
-        """예약한 경로에 촬영 판정과 짝을 얹어 실제 하달 배열을 만든다."""
-        return self._d._build_segment_goal(seg_wps, self._visited)
+    def build_goal(self, seg_wps, seg_start):
+        """예약한 경로에 방향 게이트 촬영 판정을 얹어 실제 하달 배열을 만든다."""
+        return self._d._build_segment_goal(seg_wps, self._visited, seg_start)
 
     def on_segment_done(self, hadal, capture_ids, parents, last_wp, code):
         """촬영이 끝난 지점을 방문 완료로 올린다(짝이 있으면 짝까지 끝나야 인정)."""
@@ -54,32 +65,13 @@ class _PatrolHooks(DriveHooks):
         """짝 id 로 온 보고를 부모 id 로 되돌린다(짝은 라우팅 그래프에 없다)."""
         return self._d._parent_of(wp)
 
-    def finalize(self, target, held):
-        """도착했는데 촬영이 남았으면, 이동 없이 촬영만 다시 하달한다.
-
-        촬영(짝이 있으면 제자리 회전 촬영까지)은 보통 마지막 세그먼트의 하달 배열 안에서
-        이미 끝나고 방문 마킹도 마쳤다. 다만 두 경우엔 도달했는데도 촬영이 남는다:
-          ① 마지막 배열이 짝 바로 앞에서 끊겼다(부모만 찍고 반대쪽을 못 찍음)
-          ② 이미 목표 지점에 서 있어(current == target) drive 가 한 번도 안 움직였다
-             — sweep 재시도가 여기 해당한다
-        로봇이 그 자리에 서 있으므로 이동 없이 촬영만 다시 하달한다. 쥐고 있는
-        자원(held)은 아직 반납 전이고 하트비트로 유지되므로 회전하는 동안 남이 못 들어온다.
-        """
-        if target in self._visited:
-            return
-        d = self._d
-        hadal, cap_ids, cap_parents = d._build_segment_goal(
-            [target], self._visited)
-        if not cap_ids:
-            return
-        d._log.info(
-            f"촬영 미완 지점 {target} 재하달 task={self._task_id} "
-            f"(이동 없음, 촬영={sorted(cap_ids)})")
-        code, last_wp = d.runner._dispatch_segment(
-            self._client, self._task_id, hadal, cap_ids,
-            heartbeat=(self._engine, held, self._robot_id))
-        d._mark_visited(
-            hadal, cap_ids, cap_parents, last_wp, code, self._visited)
+    # finalize 는 기본(DriveHooks, 아무것도 안 함)을 그대로 쓴다.
+    # 옛날에는 '도착했는데 짝 촬영이 남았으면 제자리에서 다시 하달'했다. 그 시절 짝은
+    # 부모와 같은 자리라 제자리 회전만 하면 됐다. 지금은 방향 게이트가 '지나는 방향에
+    # 맞는 것만' 찍고, 좌표가 갈라진 짝은 반대로 지날 때 찍힌다. 제자리 재하달은 진행
+    # 방향이 없어 무엇을 찍을지 정할 수 없고, 자칫 180° 회전을 유발한다. 그래서 뺐다.
+    # 촬영은 세그먼트 주행 중(방향이 확실할 때)에만 일어나고, 못 찍은 지점은 sweep 이
+    # '다시 지나가며(방향 있음)' 재시도한다.
 
 
 class PatrolDispatcher:
@@ -120,7 +112,7 @@ class PatrolDispatcher:
 
     # ---------------------------- 순찰 본체 ---------------------------- #
     def run_patrol(self, task_id, robot_id, waypoints, engine, client,
-                   start_wp=None) -> tuple:
+                   start_wp=None, entry_wp=None) -> tuple:
         """순찰 지점을 순서대로 방문. 반환: (status, unvisited_waypoint_ids, last_wp).
 
         last_wp: 순찰이 끝난 시점 로봇이 서 있는 노드. 이 자리 예약을 '쥔 채로' 반환하고
@@ -154,9 +146,13 @@ class PatrolDispatcher:
         # 미설정/미상이면 옛 동작으로 폴백: 첫 지점만 예약 없이 직행(이 구간은 통로 보호 없음).
         # start_wp(로봇별, DB 유도)가 우선이고, 없을 때만 전역 설정 상수를 쓴다.
         start = start_wp if start_wp is not None else PATROL_START_WAYPOINT_ID
+        # entry_wp 가 주어지면(실배포) 충전기 탈출+진입 노드 경유를 한다. 없으면(테스트·
+        # 시뮬) 로봇이 이미 start 노드에 서 있다고 보고 곧장 순찰한다.
+        lead_in = False
         if start and start in self.wp_meta:
             current = start
             remaining = targets
+            lead_in = entry_wp is not None
             self._log.info(f"순찰 시작 노드 {start} 에서 출발 task={task_id}")
         else:
             self._log.warn(
@@ -172,7 +168,7 @@ class PatrolDispatcher:
                     f"첫 지점 {current} 자리를 남(로봇 "
                     f"{engine.holder_of(engine.node_slot(current))})이 쥐고 있다")
             hadal, cap_ids, cap_parents = self._build_segment_goal(
-                [current], visited)
+                [current], visited, None)
             code, last_wp = self.runner._dispatch_segment(
                 client, task_id, hadal, cap_ids)
             if code != 0:
@@ -199,6 +195,12 @@ class PatrolDispatcher:
         # 서로 넘겨준다). 마지막 한 장은 순찰 전체를 소유하는 이 함수가 반납해야 하므로
         # 어떤 경로로 빠져나가든 finally 를 지나게 감싼다.
         try:
+            # 충전기 탈출(언도킹) + 순찰 진입 노드까지. entry_wp 가 주어질 때만 한다.
+            if lead_in:
+                outcome, current = self._lead_in(
+                    engine, client, task_id, robot_id, current, entry_wp)
+                if outcome == "aborted":
+                    return "FAILED_ABORTED", [], current
             for target in remaining:
                 outcome, current = self._visit(
                     engine, client, task_id, robot_id, current, target, visited)
@@ -239,22 +241,56 @@ class PatrolDispatcher:
             self._log.info(
                 f"순찰 종료 task={task_id} 지점 {current} 자리 유지 → 복귀에 인계")
 
+    def _lead_in(self, engine, client, task_id, robot_id, current, entry_wp):
+        """순찰 목표를 돌기 전, 충전기에서 빠져나와 진입 노드까지 간다.
+        반환: (outcome, 현재 노드). outcome 'arrived' | 'aborted'.
+
+        ① 언도킹 — 로봇은 충전기 '안'에 도킹돼 있고 ACS 는 current(전용 충전소의 진입
+           노드)에 서 있다고 가정한다. 그대로 첫 목표로 출발하면 로봇이 15cm 충전 공간
+           안에서 크게 돌 수 있다(도킹 방향과 첫 이동 방향이 벌어질 때). 먼저 진입 노드
+           '그 자리'로 한 스텝만 하달해 정면으로 빠져나오게 한다. 도킹 방향 정면에 진입
+           노드가 있으면 회전 없이 직진이다. current 자리는 위에서 이미 예약했다.
+        ② 진입 노드 — 첫 촬영 목표로 갈 때 '최단 경로'가 반대 방향에서 접근해 촬영이
+           방향 게이트에 막히는 것을 피하려, 지정 진입 노드를 먼저 거친다. 여기서는
+           촬영하지 않는다(훅 없는 평범한 주행). 지정이 없거나 이미 그 노드면 생략한다.
+        """
+        # ① 언도킹: [current] 한 노드만 하달(촬영 없음). 좌표는 wp_meta[current] 를 쓴다.
+        hadal, cap_ids, _ = self._build_segment_goal([current], set(), None)
+        code, _last = self.runner._dispatch_segment(client, task_id, hadal, cap_ids)
+        if code != 0:
+            self._log.warn(
+                f"언도킹 하달 실패 task={task_id} 노드 {current} code={code}")
+            return "aborted", current
+        self._log.info(f"언도킹 완료 task={task_id} → 노드 {current}")
+
+        # ② 진입 노드까지 촬영 없이 이동(hooks 안 넘김 = 기본 주행).
+        if entry_wp and entry_wp in self.wp_meta and entry_wp != current:
+            self._log.info(f"순찰 진입 노드 {entry_wp} 경유 task={task_id}")
+            outcome, current = self.runner.drive(
+                engine, client, task_id, robot_id, current, entry_wp)
+            if outcome == "aborted":
+                return "aborted", current
+        return "arrived", current
+
     def _visit(self, engine, client, task_id, robot_id, current, target, visited):
         """순찰 지점 하나를 방문한다. 반환: (outcome, 도달한 노드).
 
         RouteRunner.drive 를 감싸며 '방문했다'의 판정만 맡는다:
-          · 오는 길에 이미 찍힌 지점이면 이동조차 하지 않는다. 문서 20번 판정식대로면
-            다시 가도 미방문이 아니라 촬영하지 않으므로 순수한 헛걸음이다.
+          · 오는 길에 이미 찍힌 지점이면 이동조차 하지 않는다(방향 게이트가 지나는 김에
+            찍었을 수 있다). 다시 가도 촬영하지 않으므로 순수한 헛걸음이다.
+          · 짝(18·19)은 corridors 에 없어 그리로는 경로 탐색이 안 된다. 경로는 부모 노드
+            (같은 자리)로 찾고, 촬영은 방향 게이트가 세그먼트 주행 중에 짝으로 바꿔 찍는다.
           · 촬영 대상이 아닌 목표(순찰 지점이 아닌 노드)는 도달만으로 방문으로 친다.
-            촬영이 방문의 근거인 지점은 _mark_visited 가 이미 넣어 준다.
+            촬영이 방문의 근거인 지점은 _mark_visited 가 넣어 준다.
         """
         if target in visited:
             self._log.info(
                 f"지점 {target} 은 오는 길에 이미 촬영됨 → 목표에서 제외 task={task_id}")
             return "arrived", current
+        route_target = self._parent_of(target)   # 짝이면 부모 노드로, 아니면 그대로
         hooks = _PatrolHooks(self, engine, client, task_id, robot_id, visited)
         outcome, current = self.runner.drive(
-            engine, client, task_id, robot_id, current, target, hooks)
+            engine, client, task_id, robot_id, current, route_target, hooks)
         if (outcome == "arrived"
                 and not self.wp_meta.get(target, {}).get("capture")):
             visited.add(target)
@@ -295,7 +331,9 @@ class PatrolDispatcher:
         for t in targets:
             if t in visited:
                 continue
-            if engine.find_path(current, t, blocked=corridors,
+            # 짝(18·19)은 그래프에 없다 → 부모 노드(같은 자리)로 도달 가능성을 본다.
+            node = self._parent_of(t)
+            if engine.find_path(current, node, blocked=corridors,
                                 blocked_nodes=nodes) is not None:
                 return True
         return False
@@ -325,81 +363,116 @@ class PatrolDispatcher:
         return self.runner.drive(
             engine, client, task_id, robot_id, current, target)
 
-    # ---------------------------- 촬영 판정(문서 E2 20번) ---------------------------- #
-    def _build_segment_goal(self, seg_wps, visited):
-        """예약 확보한 노드 목록 → (하달 배열, 촬영 대상 id 집합, 촬영 대상 부모 목록).
+    # ---------------------------- 촬영 판정(방향 게이트, RP-EX) ---------------------------- #
+    def _build_segment_goal(self, seg_wps, visited, seg_start):
+        """예약 확보한 노드 목록 → (하달 배열, 촬영 id 집합, 방문마킹 대상 목록).
 
         이 함수는 '순찰 경로일 때'만 불린다 — _PatrolHooks.build_goal 을 통해서만 들어오고,
         복귀(E4)·실패 복귀(22-1)·수확 주행은 애초에 훅을 안 넘겨 여기 오지 않는다.
-        (예전에는 allow_capture=False 로 촬영 판정을 '껐'지만, 촬영 로직이 drive 밖으로
-        나간 뒤로는 끄고 말 것이 없다 — 안 넘기면 그만이라 플래그를 없앴다.)
 
-        촬영 여부는 문서 판정식을 **노드마다** 적용한다:
-            capture = (순찰 지점) AND (이번 task 에서 미방문)
-        '배열의 마지막 하나만' 이 아니다 — 우회 경로가 아직 안 찍은 순찰 지점을 지나가면
-        지나는 김에 찍어야 나중에 그 지점을 목표로 다시 오지 않는다.
+        노드마다 '지나는 방향'을 보고 무엇을 찍을지 정한다(방향 게이트):
+          · 노드 자신의 촬영 방향이 진행 방향과 맞으면(≤게이트, 미방문) 그 노드를 찍는다.
+          · 아니면 그 자리의 반대 방향 촬영(짝)이 진행 방향과 맞으면 짝을 찍는다.
+            짝은 하달 배열에 '짝 id'로 넣는다 — 좌표·yaw 가 짝 것이라 로봇이 그 자세로 선다
+            (예약은 부모 자리 그대로 → 예약 경로 seg_wps 는 안 건드린다).
+          · 둘 다 아니면 통과(capture=false). 반대 방향으로 지날 때 찍히므로 헛것이 아니다.
 
-        짝(같은 자리·반대 촬영 방향)이 있는 노드는 문서 20-1 대로 **바로 뒤에 연달아**
-        끼워 넣는다. 촬영 카메라가 로봇 한쪽에 고정돼 있어 통로를 한 번 지나면 한쪽 베드만
-        찍히기 때문이다. 로봇은 직전 원소와 좌표가 같으면 주행이 아니라 제자리 회전(Spin)
-        으로 분기하므로 Goal 을 한 번 더 보낼 필요가 없다. 짝은 corridors 에 없어 통로
-        예약도 필요 없다 — 부모 자리를 그대로 쓴다.
+        왜 방향을 보나: 카메라가 로봇 옆 한쪽에 고정돼 있어, 통로를 지나는 방향이 곧 어느
+        베드를 찍느냐다. 방향을 안 보면 반대로 지날 때도 찍으라고 해 '제자리 180° 뒤돌아
+        찍기'(좁은 통로에서 물리적으로 불가능)를 유발한다.
 
-        짝에 별도 waypoint_id 를 주는 이유는 사진마다 고유 식별자가 남아야 detection_logs
-        와 병해충 알림이 '어느 지점의 어느 방향'인지 특정할 수 있기 때문이다.
+        seg_start: 이 세그먼트 진입 직전 노드(첫 노드의 진입 방향 계산용). None 이면
+        진행 방향을 알 수 없어 아무것도 안 찍고 통과시킨다(언도킹·폴백의 단일 노드 하달).
 
-        세 번째 반환값(부모 목록)은 방문 마킹용이다. 짝 자신은 순찰 지점이 아니라
-        방문 큐에 넣지 않는다.
+        세 번째 반환값(방문마킹 대상)은 이번에 촬영한 id 들이다 — 노드든 짝이든 '찍은 것'을
+        방문 완료로 올린다(각 촬영이 독립 목표라 부모-짝 묶음 판정이 없다).
         """
         hadal, capture_ids, parents = [], set(), []
-        for wp in seg_wps:
-            hadal.append(wp)
-            meta = self.wp_meta.get(wp, {})
-            if not (meta.get("capture") and wp not in visited):
-                continue                    # 순찰 지점이 아니거나 이미 찍음 → 통과만
-            capture_ids.add(wp)
-            parents.append(wp)
-            pair = self.pair_of.get(wp)
-            if pair is None:
-                continue                    # 짝 없는 지점 — 한 방향만 찍고 끝
-            if pair not in self.wp_meta:
-                self._log.warn(
-                    f"짝 {pair}(부모 {wp}) 좌표를 그래프에서 못 찾음 → 한쪽만 촬영")
+        for i, wp in enumerate(seg_wps):
+            travel = self._travel_dir(seg_wps, i, seg_start)
+            shot = self._pick_capture(wp, travel, visited)
+            if shot is None:
+                hadal.append(wp)            # 통과 (capture=false, 노드 그대로)
                 continue
-            hadal.append(pair)
-            capture_ids.add(pair)
+            hadal.append(shot)              # 노드 자신 또는 짝의 id(좌표가 딸려온다)
+            capture_ids.add(shot)
+            parents.append(shot)
         return hadal, capture_ids, parents
 
-    def _mark_visited(self, hadal, capture_ids, parents, last_wp, code, visited):
-        """이번 하달에서 '촬영까지 끝난' 순찰 지점을 방문 완료로 올린다.
+    def _travel_dir(self, seg_wps, i, seg_start):
+        """seg_wps[i] 에 도착할 때의 진행 방향(rad). 못 구하면 None.
 
-        문서 20-1: 방문 마킹은 **짝의 촬영이 끝난 뒤** 부모 id 로 한다. 부모를 찍은 시점에
-        마킹해버리면 그 직후 재계획이 끼어들었을 때 짝이 '이미 방문한 지점의 짝'이 되어
-        영구 미촬영으로 남는다.
+        직전 노드(첫 노드면 seg_start)에서 이 노드로 향하는 방향이다. 로봇은 실제로 그
+        방향을 보고 이 노드에 도착하므로(navigate_server 가 이동 방향으로 정렬), 게이트가
+        이 값을 기준으로 '지금 방향으로 찍을 수 있나'를 판정하면 로봇 동작과 일치한다.
+        """
+        prev = seg_wps[i - 1] if i > 0 else seg_start
+        if prev is None:
+            return None
+        a = self.wp_meta.get(prev)
+        b = self.wp_meta.get(seg_wps[i])
+        if not a or not b:
+            return None
+        dx, dy = b["x"] - a["x"], b["y"] - a["y"]
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return None                     # 두 점이 겹침(이례적) → 방향 불명
+        return math.atan2(dy, dx)
+
+    def _pick_capture(self, node, travel, visited):
+        """이 노드를 지날 때 찍을 대상: 노드 자신 id / 짝 id / None(통과).
+
+        travel(진행 방향)이 None 이면 방향을 몰라 아무것도 안 찍는다 — 엉뚱한 방향으로
+        찍느니 방향이 확실한 다음 기회에 찍는 편이 안전하다.
+        """
+        if travel is None:
+            return None
+        meta = self.wp_meta.get(node, {})
+        if (meta.get("capture") and node not in visited
+                and self._dir_ok(meta.get("yaw"), travel)):
+            return node                     # 후보 ① 노드 자신
+        pair = self.pair_of.get(node)       # 후보 ② 짝(같은 자리, 반대 방향)
+        if pair is not None and pair not in visited:
+            pmeta = self.wp_meta.get(pair)
+            if pmeta is None:
+                self._log.warn(
+                    f"짝 {pair}(부모 {node}) 좌표를 그래프에서 못 찾음 → 건너뜀")
+            elif self._dir_ok(pmeta.get("yaw"), travel):
+                return pair
+        return None
+
+    @staticmethod
+    def _dir_ok(shoot_yaw, travel):
+        """찍을 방향과 진행 방향의 차이가 게이트 이내인가(= 180° 뒤돌기가 아닌가)."""
+        if shoot_yaw is None:
+            return False
+        return abs(_norm_angle(shoot_yaw - travel)) <= _CAPTURE_DIR_GATE_RAD
+
+    def _mark_visited(self, hadal, capture_ids, parents, last_wp, code, visited):
+        """이번 하달에서 '촬영까지 끝난' 대상을 방문 완료로 올린다.
+
+        parents 는 이번에 촬영한 id(노드 또는 짝)다. 각 촬영이 독립 목표라 옛날처럼
+        '부모+짝이 다 끝나야 인정'하는 묶음 판정이 없다 — 찍었으면 그 id 를 방문으로 친다.
 
         code == 0 이면 배열을 끝까지 소화한 것이라 전부 인정한다. 중간에 끊겼으면 로봇이
-        실제로 도달한 last_wp 까지만 인정하고, 짝이 있는 지점은 그 짝도 도달 범위 안에
-        있어야 마킹한다.
+        실제로 도달한 last_wp(그래프 노드)까지만 인정한다. 하달 배열에는 짝 id 가 들어
+        있을 수 있고 last_wp 는 그래프 노드(부모)로 정규화돼 오므로, 둘을 같은 그래프
+        노드로 비교해 도달 범위를 찾는다.
         """
         if code == 0:
             done = set(hadal)
         elif last_wp is None:
             return
         else:
-            try:
-                j = hadal.index(last_wp)
-            except ValueError:
-                return                      # 배열 밖 노드 → 판정 불가, 아무것도 안 함
+            j = None
+            for idx, h in enumerate(hadal):
+                if h == last_wp or self._parent_of(h) == last_wp:
+                    j = idx                 # 같은 그래프 노드의 마지막 위치까지 도달
+            if j is None:
+                return
             done = set(hadal[:j + 1])
         for wp in parents:
-            if wp not in done:
-                continue
-            pair = self.pair_of.get(wp)
-            if pair is not None and pair in capture_ids and pair not in done:
-                self._log.warn(
-                    f"부모 {wp} 는 찍었으나 짝 {pair} 미촬영 → 방문 미완으로 남김")
-                continue
-            visited.add(wp)
+            if wp in done:
+                visited.add(wp)
 
     def _parent_of(self, wp):
         """짝 id 면 부모 id 로 바꾼다(짝이 아니면 그대로).

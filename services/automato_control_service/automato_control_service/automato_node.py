@@ -49,6 +49,7 @@ from automato_control_service.fleet_collector import (
     subscribe_per_robot,
 )
 from automato_control_service.patrol_config import (
+    PATROL_ENTRY_WAYPOINT_ID,
     REAP_INTERVAL_SEC,
     RESERVATION_TTL_SEC,
     SAVE_DETECTION_SRV,
@@ -334,7 +335,8 @@ class AutomatoControlNode(Node):
                 client = self._client_for(robot_id)
                 status, unvisited, last_wp = self._dispatcher.run_patrol(
                     task_id, robot_id, waypoints, engine, client,
-                    start_wp=self._start_waypoint_for(robot_id))
+                    start_wp=self._start_waypoint_for(robot_id),
+                    entry_wp=PATROL_ENTRY_WAYPOINT_ID)
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f"디스패치 예외 task={task_id}: {exc}")
             status = "FAILED_ABORTED"
