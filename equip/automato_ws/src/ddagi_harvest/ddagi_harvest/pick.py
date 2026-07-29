@@ -49,16 +49,16 @@ RETREAT_OFFSET = [-45.0, 0.0, 0.0]        # 그립 후 후퇴 — **순수 후�
 #   열매 y < 줄기 y → 줄기의 '오른쪽'에 달림 → 오른쪽 바깥에서 진입 (PREGRASP y = -)
 # 값은 tf_verify 로 각 줄기를 클릭해 실측한 base y 를 넣는다. 비워두면(빈 리스트)
 # 종전 동작(항상 왼쪽 진입) 그대로 — 값이 채워질 때만 방향 분기가 켜진다.
-# tf_verify 클릭 실측 — 베드 테두리에 그리퍼가 막혀 두 줄기를 가운데로 모은 뒤 재측정
-# (2026-07-28 저녁): 우측 줄기 base=[272.7, 13.6, 295.3], 좌측 줄기 base=[278.5, 107.9, 309.9]
-#   줄기 간격 110.5 → 94.3mm 로 좁아짐.
-# 이 값은 camera→flange 피팅 좌표계 기준이라 별도 보정 없이 그대로 쓴다
-# (종전 [22.7, 133.2] 은 옛 TF 체계에서 잰 값 + 보정을 얹은 것이었다).
+# tf_verify 클릭 실측(2026-07-28) — 맨 줄기 중간 높이를 정확히 클릭해 재측정.
+#   우측 줄기 base=[266.1, 23.7, 350.6],  좌측 줄기 base=[283.3, 117.0, 353.3]
+#   간격 93.3mm. 종전 [13.6, 107.9] 는 열매·잎을 클릭했는지 10mm 낮게 잡혀,
+#   좌측 열매 무리(y 104~119) 한가운데를 갈라 진입 방향이 뒤집히는 일이 있었다.
+# 이 값은 camera→flange 피팅 좌표계 기준이라 별도 보정 없이 그대로 쓴다.
 # 검증법: tf_verify 에서 열매를 클릭하면 구역·진입방향이 표시된다. 눈으로 본 좌우와
-#   다르면 이 값을 조정한다(줄기를 다시 클릭해 재측정하는 게 가장 정확).
+#   다르면 조정한다. 줄기까지 ZONE_MARGIN_MM 안이면 '판정 불확실' 경고가 뜬다.
 # ⚠ 식물을 옮기면 여기와 J1 조준(AIM_J1_LEFT)만 재확인하면 된다. camera→flange 피팅과
 #   손목 자세(ORI_BY_ZONE)는 식물 위치와 무관하므로 그대로 유효하다.
-STEM_REFS_Y: list[float] = [13.6, 107.9]
+STEM_REFS_Y: list[float] = [23.7, 117.0]
 # 속도(1~100). 사이클 시간의 대부분이 이동이라 여기가 최대 레버. 정밀이 필요한 구간만
 # 중간 속도로 두고, 자세 경유·상승·바구니 같은 '이동만 하는' 구간은 빠르게.
 # 파지 구간(수확준비→pre-grasp→그랩점→후퇴)은 30 고정 — 파지율이 9/28 로 가장 좋았던
@@ -66,6 +66,8 @@ STEM_REFS_Y: list[float] = [13.6, 107.9]
 APPROACH_SPEED = 30       # 수확준비·J1 aim·pre-grasp·그랩점 진입
 RETREAT_SPEED = 30        # 후퇴·안전 상승
 TRANSIT_SPEED = 85        # 바구니 왕복·관측 복귀 — 파지 정확도와 무관해 빠르게
+BASKET_DROP_SPEED = 25    # 바구니 '접근↔놓기' 구간만 감속 — 빠르면 열매가 튀어 나가거나
+                          # 바구니를 친다. 이동(staging→바구니)은 TRANSIT 로 빠르게 유지.
 GRIP_THRESHOLD = 6                    # 닫은 뒤 값이 이보다 크면 파지 성공(토마토 걸림).
                                       # 실측(gripper_check, 2026-07-27): 빈손=0, 작은토마토=12
                                       # → 중간 6. 큰 토마토는 12↑라 자동 통과. 그리퍼 재캘리 금지
@@ -188,10 +190,14 @@ ORI_FALLBACK_DELTAS = [
     (0, 0), (0, -15), (0, 15), (-10, 0), (10, 0),
     (0, -30), (0, 30), (-10, -15), (10, 15),
 ]
-# 자세 후보를 몇 개까지 시도할지 — 후보마다 'standoff + 진입' 쌍이라 비용이 있어 제한.
-ORI_FALLBACK_TRIES = 5
+# 자세 후보를 몇 개까지 시도할지 — 후보마다 'standoff + 진입' 쌍이라 비용이 크다.
+# 1 = 대안 없이 그 구역 자세만. 실측 근거: 자세 대안이 쓰인 3건 모두 잎을 물고 실패
+# (파지값 85·92·1)했고, 반면 최악 30회 이동시도(~45초)를 서서 소모했다. 실패는 다음
+# 배치에서 재시도하는 편이 낫다 — 그 사이 옆 열매가 빠져 도달성이 달라진다.
+ORI_FALLBACK_TRIES = 1
 # 손목을 세팅할 standoff 의 접근축 후퇴량(mm). -45 가 IK 안 풀리면 짧은 쪽으로.
-STANDOFF_BACKOFFS = [-45.0, -30.0, -20.0]
+# -20 은 열매 20mm 앞이라 이미 캐노피 안이고 '미리 손목을 세우는' 의미가 없어 뺐다.
+STANDOFF_BACKOFFS = [-45.0, -35.0]
 # standoff 를 하나도 못 잡으면 그 열매를 **포기**한다(직접 진입 금지).
 # 실측 근거: 손목을 못 세우고 들어간 3건에서 잎·가지를 물어(파지값 26·92·95) 놓쳤고,
 # 그 과정에서 옆 열매가 여러 개 떨어져 수확 대상 자체가 사라졌다. 하나를 포기해
@@ -235,6 +241,12 @@ def move_observe(arm: ArmBackend, speed: int = TRANSIT_SPEED) -> None:
 def move_staging(arm: ArmBackend, speed: int = TRANSIT_SPEED) -> None:
     """수확 준비 자세로 (관측→접근 사이 경유). 이후부터 직선(mode=1) 접근."""
     arm.move_angles(STAGING_ANGLES, speed)
+
+
+# 줄기 기준선에서 이 거리(mm) 안이면 좌우 판정이 불확실하다 — 좌표 잡음이 ±5~9mm 라
+# 경계에서 몇 mm 차이는 동전 던지기다. 실측 사고: 열매 y=109.7 / 줄기 107.9 (차이 1.8mm)
+# 가 반대편으로 분류돼 왼쪽에서 진입했다. 경고를 남겨 눈으로 잡을 수 있게 한다.
+ZONE_MARGIN_MM = 15.0
 
 
 def zone_of(target_y: float):
@@ -337,6 +349,13 @@ ARRIVAL_COMP_BY_ZONE = {
 #   왼쪽편은 그 값으로도 파지에 성공했으므로, 새 자세가 더 나쁘면 해당 구역만 복구한다.
 
 
+def zone_is_ambiguous(target_y: float) -> float:
+    """줄기 기준선까지의 거리(mm). ZONE_MARGIN_MM 미만이면 좌우 판정이 불확실."""
+    if not STEM_REFS_Y:
+        return 1e9
+    return min(abs(target_y - s) for s in STEM_REFS_Y)
+
+
 def entry_sign(target_y: float) -> float:
     """진입 쪽 부호 — standoff 를 열매의 어느 쪽에 둘지. 줄기 미설정이면 +1(종전)."""
     z = zone_of(target_y)
@@ -372,20 +391,21 @@ def drop_to_basket(arm: ArmBackend, grade: str, speed: int = TRANSIT_SPEED) -> b
     approach = BASKET_APPROACH_ANGLES   # 공용 (NORMAL/DISCARD 공통)
     drop = BASKET_DROP_ANGLES.get(grade, BASKET_DROP_ANGLES["NORMAL"])
 
-    # ① 놓기 좋은 접근 포지션 (바구니 위)
+    # ① 놓기 좋은 접근 포지션 (바구니 위) — 여기까지는 빠르게
     arm.move_angles(approach, speed)
     time.sleep(SETTLE)
 
-    # ③ 바구니에 놓기 (놓기 직전 재확인은 제거 — 상승 후 게이트가 이미 빈손을 걸러
-    #    바구니행을 막으므로 중복이고, 픽당 1~2초가 사이클에 크게 누적된다)
-    arm.move_angles(drop, speed)
+    # ② 바구니에 놓기 — 이 구간만 감속(빠르면 열매가 튀거나 바구니를 친다).
+    #    놓기 직전 재확인은 제거(상승 후 게이트가 이미 빈손을 걸러 중복이고 픽당 1~2초).
+    arm.move_angles(drop, BASKET_DROP_SPEED)
     time.sleep(SETTLE)
     arm.open_gripper(GRIP_SPEED)
     time.sleep(SETTLE)
 
     # ③ 바구니에서 빠져나오기 — 놓기 자세(바구니 안)에서 곧장 관측으로 가면 바구니 벽을
     #    친다. 접근 자세(바구니 위)로 먼저 복귀해 이후 큰 이동이 바구니 위에서 시작되게.
-    arm.move_angles(approach, speed)
+    #    바구니 안에서 빠져나오는 구간이라 여기도 감속.
+    arm.move_angles(approach, BASKET_DROP_SPEED)
     return True
 
 
@@ -415,6 +435,10 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
         # 자세만 바꾸면 손끝 위치가 어긋나므로 자세별 flange 보정을 같이 더한다.
         z = zone_of(target_xyz[1])
         s = int(entry_sign(target_xyz[1]))
+        _m = zone_is_ambiguous(target_xyz[1])
+        if _m < ZONE_MARGIN_MM:
+            print(f"    ⚠ 줄기 경계에서 {_m:.1f}mm — 좌우 판정 불확실"
+                  f"({'오른쪽' if s < 0 else '왼쪽'}에서 진입). 반대면 STEM_REFS_Y 조정")
         ori = (list(orientation) if orientation is not None
                else list(ORI_BY_ZONE.get(z, GRIPPER_ORI)))
         d = (FLANGE_DELTA_BY_ZONE.get(z, [0.0, 0.0, 0.0])
@@ -500,25 +524,29 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
     if not _try_move(arm, retreat, RETREAT_SPEED, mode=1):
         _try_move(arm, retreat, RETREAT_SPEED, mode=0)
 
-    # 4) 안전 상승 — staging 높이(캐노피 위)로 복귀. 낮은 retreat 자세에서 곧장
-    #    큰 이동(바구니/관측)을 하면 J1 스윙이 캐노피를 훑는다. 여기서 먼저 올라오면
-    #    이후 어떤 큰 이동이든 캐노피 위에서 시작 → 옆 열매 안 침. (aimed = step 0의 조준 staging)
-    arm.move_angles(aimed, RETREAT_SPEED)
-
-    # 5) 파지 판정(1차 게이트) — 캐노피 위에서 동일 닫힘 명령 재차 + 값 읽기.
-    #    여기서 빈손이면 **바구니 왕복을 건너뛴다**(사이클 시간 절약). 파지 직후 값은
-    #    잎·줄기 접촉으로 오염될 수 있어 이 지점 값을 판정에 쓴다(캐노피 밖 = 깨끗).
+    # 4) 파지 판정 — **후퇴 직후** 그리퍼를 동일 명령으로 다시 조여 값을 읽는다.
+    #    여기서 판정해야 실패를 즉시 알고 곧장 다음 열매로 넘어갈 수 있다. 상승까지
+    #    하고 나서 알면 빠져나왔다 다시 들어가는 왕복이 생긴다.
+    #    신뢰도: 45mm 곧게 빼는 후퇴 자체가 식물에 붙은 잎·가지를 떼어내는 필터라
+    #    (실측: 파지값 80·92·67 이 후퇴·상승 후 0) 여기서 살아남으면 떼어낸 열매다.
+    #    파지 직후 값은 손가락이 옆 열매·줄기에 닿아 오염될 수 있어 쓰지 않는다.
     arm.close_gripper(GRIP_SPEED)
     time.sleep(SETTLE)
-    lift_val = arm.gripper_value()
-    held = lift_val > GRIP_THRESHOLD
-    print(f"    [상승 후 확인] 그리퍼값 {lift_val} (임계 {GRIP_THRESHOLD}) → "
-          f"{'파지O' if held else '빈손X — 바구니 생략'}")
+    val = arm.gripper_value()
+    held = val > GRIP_THRESHOLD
+    print(f"    [후퇴 후 확인] 그리퍼값 {val} (임계 {GRIP_THRESHOLD}) → "
+          f"{'파지O — 수확' if held else '빈손X — 상승·바구니 생략'}")
     if not held:
+        # 상승도 생략한다 — 다음 동작(다음 pick 의 staging 이동, 또는 관측 복귀)이
+        # 모두 캐노피 위로 올라가는 관절 이동이라 그것이 안전하게 빼준다.
         return False
 
-    # 6) 바구니 투하 (검증 모드면 생략). 투하 직전 재확인이 최종 게이트 —
-    #    이송 중 떨어졌으면 거기서 빈손으로 잡혀 False.
+    # 5) 안전 상승 — staging 높이(캐노피 위)로. 낮은 retreat 자세에서 곧장 바구니로
+    #    가면 J1 스윙이 캐노피를 훑는다. 여기서 올라오면 이후 큰 이동이 캐노피 위에서
+    #    시작된다. (aimed = step 0 의 조준 staging)
+    arm.move_angles(aimed, RETREAT_SPEED)
+
+    # 6) 바구니 투하 (검증 모드면 생략)
     if to_basket:
         return drop_to_basket(arm, grade)
     return True

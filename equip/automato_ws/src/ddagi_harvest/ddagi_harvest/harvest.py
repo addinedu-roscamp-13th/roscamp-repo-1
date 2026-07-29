@@ -54,9 +54,16 @@ def _near_any(base, spots, radius: float) -> bool:
     return any(_dist(base, s) < radius for s in spots)
 
 
-def _grid_key(base) -> tuple:
-    """10mm 격자 키 — 재검출 시 같은 토마토 실패횟수 누적용."""
-    return (round(base[0] / 10), round(base[1] / 10), round(base[2] / 10))
+def _find_fail(fails: list, base, radius: float):
+    """실패 기록 중 이 자리와 같은 것으로 볼 항목을 찾는다(없으면 None).
+
+    ⚠ 예전엔 10mm 격자 키로 셌는데, 좌표 잡음(±5mm)에 키가 바뀌면 실패 횟수가 리셋돼
+    같은 열매를 무한 재시도했다(실측: y 6.7/4.5/4.3/5.3 → 키 1/0/0/1). 근접 매칭이 안전.
+    """
+    for rec in fails:
+        if _dist(base, rec["base"]) < radius:
+            return rec
+    return None
 
 
 def harvest(arm: ArmBackend, detector: TomatoDetector,
@@ -73,56 +80,57 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
     배치 방식: 관측자세에서 한 번 검출 → 그 배치를 연속 파지(파지 사이 관측 복귀 없음).
     실패 자리는 max_retry 회까지 재시도(재시도마다 z 위로 보정) 후 제외. 만차는 NORMAL 기준.
     """
+    # 수확 확정 = 파지 후 '상승 후 확인'을 통과한 것(=바구니에 넣은 것). 만차 기준.
     harvested = {"NORMAL": 0, "DISCARD": 0}
-    done: list[list] = []           # 검증으로 확정된 성공 자리(제외)
     excluded: list[list] = []       # 재시도 소진해 제외한 자리
-    fail_count: dict = {}           # 격자키 → 실패 횟수
+    fails: list[dict] = []          # [{base, n}] 실패 자리와 횟수(근접 매칭)
     prev: list[dict] = []           # 직전 배치에서 시도한 {base, grade} (다음 검출로 검증)
     attempts = 0
 
     def verify(detections: list) -> None:
-        """직전 배치 시도들을 현재 검출과 비교 — 사라졌으면 성공, 남아있으면 실패."""
+        """직전 배치의 **실패분**만 재검출과 대조해 재시도/제외를 정한다.
+
+        성공은 여기서 세지 않는다 — 파지 후 '상승 후 확인'(그리퍼 재확인)을 통과하면
+        그 시점에 확정한다. 상승 동작이 식물에 붙은 잎·가지를 자연스럽게 걸러내므로
+        (실측: 파지값 80·92·67 이 모두 상승 후 0), 거기서 살아남았으면 떼어낸 열매다.
+        거기서 바구니까지는 놓치지 않는다. 반면 재검출은 가려져 있던 뒤 열매를 보고
+        성공을 실패로 오판한 사례가 있었다.
+        """
         if not prev:
             return
-        print(f"\n[검증] 관측자세 재검출({len(detections)}개)로 직전 배치 "
-              f"{len(prev)}건 확인 — 사라짐+파지=수확, 남아있음=실패")
+        print(f"\n[검증] 재검출 {len(detections)}개로 실패분 {len(prev)}건 확인 "
+              f"— 아직 있으면 재시도, 사라졌으면 낙과")
         cur = [t["base"] for t in detections]
         for a in prev:
             pos = [round(c, 1) for c in a["base"]]
-            if _near_any(a["base"], cur, exclude_radius):        # 아직 보임 = 실패
-                k = _grid_key(a["base"])
-                fail_count[k] = fail_count.get(k, 0) + 1
-                tail = ("제외" if fail_count[k] >= max_retry else "재시도 예정")
-                if fail_count[k] >= max_retry:
+            if _near_any(a["base"], cur, exclude_radius):        # 아직 있음 = 재시도
+                rec = _find_fail(fails, a["base"], exclude_radius)
+                if rec is None:
+                    rec = {"base": a["base"], "n": 0}
+                    fails.append(rec)
+                rec["n"] += 1
+                tail = ("제외" if rec["n"] >= max_retry else "재시도 예정")
+                if rec["n"] >= max_retry:
                     excluded.append(a["base"])
-                print(f"  ✗ [검증] {pos} 아직 있음 — 실패 {fail_count[k]}회, {tail}")
-            elif a.get("grabbed"):                               # 사라짐+파지 = 진짜 수확
-                harvested[a["grade"]] += 1
-                done.append(a["base"])
-                print(f"  ✓ [검증] {pos} 사라짐+파지 — {a['grade']} 수확 확정 "
-                      f"(NORMAL {harvested['NORMAL']}/{max_capacity})")
+                print(f"  ✗ {pos} 아직 있음 — 실패 {rec['n']}회, {tail}")
             else:
-                # 사라짐 + 미파지. 정말 떨어졌을 수도 있지만, YOLO 검출은 프레임마다
-                # 흔들려 '한 프레임 미검출'을 사라짐으로 오판할 수 있다. 여기서 done 에
-                # 넣으면 아직 달린 열매를 영구 제외하게 되므로 **아무 것도 기록하지 않는다**.
-                # 정말 떨어졌으면 다음 검출에 안 나오고, 남아 있으면 자연히 재시도된다.
-                print(f"  ⚠ [검증] {pos} 사라졌으나 미파지 — 낙과 또는 검출 흔들림."
-                      f" 제외하지 않고 다음 배치에서 재확인")
+                # 못 물었는데 사라짐 = 건드려 떨어뜨렸거나 검출 흔들림.
+                # 기록하지 않는다 — 정말 떨어졌으면 다음 검출에 안 나오고,
+                # 남아 있으면 자연히 재시도된다.
+                print(f"  ⚠ {pos} 사라졌으나 미파지 — 낙과 또는 검출 흔들림")
         prev.clear()
 
-    while attempts < max_attempts:
+    full = False
+    while attempts < max_attempts and not full:
         pk.move_observe(arm)                 # 검출은 관측자세에서만(FK 가정)
         time.sleep(SETTLE)
         detections = detector.detect()
         verify(detections)                   # 직전 배치 결과를 재검출로 확정
-        if harvested["NORMAL"] >= max_capacity:
-            print(f"\n만차(정상품 {max_capacity}개) — 종료. 실전이면 바구니 비움 요청.")
-            break
         batch = [t for t in detections
-                 if not _near_any(t["base"], done + excluded, exclude_radius)]
+                 if not _near_any(t["base"], excluded, exclude_radius)]
         if not batch:
             if detections:      # 검출은 됐지만 전부 수확완료/제외 자리 → 구분해 알린다
-                print(f"검출 {len(detections)}개가 모두 수확완료·제외 자리 "
+                print(f"검출 {len(detections)}개가 모두 제외 자리 "
                       f"(제외 {len(excluded)}건) — 수확 종료")
             else:
                 print("검출 0개 — 수확 종료")
@@ -141,19 +149,16 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
                   f"base={[round(c, 1) for c in t['base']]}  x={t['base'][0]:.0f}mm"
                   + (f"  depth {dc:.1f}cm" if dc is not None else ""))
 
-        # 이번 배치에서 '실제로 물린' NORMAL 누계 — 만차 초과 파지를 막는 용도.
-        # ⚠ 시도 수를 세면 안 된다: 실패도 카운트돼 한 배치가 max_capacity 번 시도에서
-        #   잘리고, 정렬 뒤쪽(팔에서 먼 쪽) 열매가 매번 시도조차 못 받는다(실측 확인).
-        projected = harvested["NORMAL"]
         for t in batch:
             if attempts >= max_attempts:
                 break
-            if t["grade"] == "NORMAL" and projected >= max_capacity:
-                continue                     # NORMAL 만차 예상 — 더 안 땀(DISCARD는 계속)
+            if harvested[t["grade"]] >= max_capacity:
+                continue                     # 그 등급 바구니가 이미 참
             b = t["base"]
-            if _near_any(b, done + excluded, exclude_radius):
+            if _near_any(b, excluded, exclude_radius):
                 continue
-            retries = fail_count.get(_grid_key(b), 0)
+            _fr = _find_fail(fails, b, exclude_radius)
+            retries = _fr["n"] if _fr else 0
             target = list(b)
             if retries:                      # 재시도면 z를 조금 위로 보정
                 target[2] += RETRY_Z_BUMP * retries
@@ -170,15 +175,28 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
                     # 이 파지여부 + 재검출 '사라짐'을 함께 본다(줄기 건드려 떨군 것 배제).
                     grabbed = pk.pick(arm, target, t["grade"])
                 except RuntimeError as e:
-                    # 도달 불가는 기하학적 사실이라 재시도해도 같다 → 즉시 제외.
-                    print(f"    ✗ {e}\n    → 재시도 없이 제외(도달 불가)")
-                    excluded.append(b)
-                    continue
+                    # 진입 불가(standoff 확보 실패) — 즉시 포기하되 **영구 제외는 안 한다**.
+                    # 다음 배치에는 옆 열매가 빠져 도달성이 달라질 수 있어 재시도 가치가
+                    # 있고, 실패 판정 자체는 재검출이 해준다(prev 에 미파지로 기록).
+                    print(f"    ✗ {e}\n    → 이번엔 건너뜀, 다음 배치에서 재시도")
+                    grabbed = False
                 if not grabbed:
                     print("    (그리퍼 미파지 — 사라져도 수확 카운트 안 함)")
-            prev.append({"base": b, "grade": t["grade"], "grabbed": grabbed})
-            if t["grade"] == "NORMAL" and grabbed:   # 물린 것만 센다(실패는 용량 안 씀)
-                projected += 1
+            if grabbed:
+                # 상승 후 확인을 통과 = 떼어낸 열매를 들고 있다 → 수확 확정.
+                harvested[t["grade"]] += 1
+                # 성공 자리를 별도 목록에 넣지 않는다 — 떼어냈으면 다음 검출에 안 나오고,
+                # 그게 곧 제외다. 목록으로 막으면 (a) 25mm 안의 이웃 열매가 영구 스킵되고
+                # (b) 뒤에 가려 있다가 드러난 열매를 못 따게 된다.
+                print(f"    ✓ 수확 확정 — {t['grade']} "
+                      f"(NORMAL {harvested['NORMAL']}/{max_capacity}, "
+                      f"DISCARD {harvested['DISCARD']}/{max_capacity})")
+                if harvested[t["grade"]] >= max_capacity:
+                    print(f"\n만차: {t['grade']} 바구니 {max_capacity}개 — 수확 종료")
+                    full = True
+                    break
+            else:
+                prev.append({"base": b, "grade": t["grade"]})   # 실패분만 재검출로 확인
 
     if prev:                                 # 마지막 배치 검증 (관측 1회 더)
         pk.move_observe(arm)
