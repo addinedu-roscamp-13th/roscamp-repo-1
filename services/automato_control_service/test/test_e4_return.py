@@ -24,6 +24,7 @@ A 파트는 수집·실행된다.
 실행:
   PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest test/test_e4_return.py -v
 """
+import math
 import os
 import sys
 import threading
@@ -50,7 +51,12 @@ CORRIDORS = [
     {"corridor_id": 7,  "a": 9,  "b": 4},
 ]
 # 9·4 만 순찰 지점(capture=True). 22 는 충전소 진입, 15·12 는 경유 노드.
-WP_META = {n: {"x": n * 0.3, "y": 0.0, "yaw": 0.0, "capture": n in (9, 4)}
+# 노드가 x축 위에 있어 순찰은 15→9→4 로 '서쪽(-x, yaw=π)'으로 지난다. 촬영 방향
+# 게이트(RP-EX)는 '지나는 방향과 촬영 방향이 맞을 때만' 찍으므로, 순찰 지점 9·4 의
+# 촬영 방향을 접근 방향(π)에 맞춰 둔다(0=동쪽이면 게이트가 막아 미방문이 된다).
+WP_META = {n: {"x": n * 0.3, "y": 0.0,
+               "yaw": (math.pi if n in (9, 4) else 0.0),
+               "capture": n in (9, 4)}
            for n in NODES}
 
 MARKER = {"marker_id": "24", "dictionary": "DICT_5X5_1000",

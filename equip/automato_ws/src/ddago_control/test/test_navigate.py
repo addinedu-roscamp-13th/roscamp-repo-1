@@ -88,7 +88,8 @@ class _Harness:
             cancel_callback=lambda _gh: CancelResponse.ACCEPT,
             callback_group=self.cbg)
 
-        # 가짜 Nav2 Spin 액션 서버 (제자리 회전 — 짝 노드용)
+        # 가짜 Nav2 Spin 액션 서버. 서버는 띄워 두되 **호출되면 안 된다** —
+        # 제자리 회전 분기가 실수로 되살아나는 것을 잡기 위한 함정이다.
         self._spin_server = ActionServer(
             self.helper, Spin, 'spin',
             execute_callback=self._spin_execute,
@@ -115,8 +116,8 @@ class _Harness:
         self.nav_goals.append(goal_handle.request)
 
         # 실제 Nav2 처럼 현재 위치 피드백을 준다. 목표 자세를 그대로 실어 보내
-        # "도착했다"를 흉내내면, 서버의 _last_pose 캐시가 목표 yaw 로 갱신된다
-        # (Spin 의 상대각 계산이 이 값을 기준으로 하므로 중요).
+        # "도착했다"를 흉내내면 서버의 _last_pose 캐시가 갱신된다 — TF 가 없는
+        # 이 환경에서 도착 보고 좌표가 그 캐시로 채워지는 경로를 검증하게 된다.
         fb = NavigateToPose.Feedback()
         fb.current_pose.header.frame_id = 'map'
         fb.current_pose.pose = goal_handle.request.pose.pose
@@ -338,14 +339,20 @@ def test_missing_frame_does_not_fail_navigation(harness):
 
 
 # --------------------------------------------------------------------------- #
-# 4) 짝 노드 — 제자리 회전 (E2 20-1)
+# 4) 제자리 회전은 하지 않는다 / TF 없을 때의 폴백
 # --------------------------------------------------------------------------- #
-def test_same_position_spins_instead_of_driving(harness):
-    """직전과 좌표가 같으면 주행이 아니라 제자리 회전으로 처리한다."""
+def test_never_spins_even_for_same_position(harness):
+    """좌표가 같아도 Spin 으로 분기하지 않는다.
+
+    예전에는 '직전과 같은 자리면 Nav2 Spin' 으로 짝 노드를 처리했으나, 그 제자리
+    180° 회전이 물리적으로 불가능함이 현장에서 확인됐다(45° 지점에서 옆으로 8.49cm
+    가 필요한데 통로 여유가 7.5cm). 실수로 되살아나지 않도록 못을 박는다.
+    가짜 Spin 서버는 그대로 띄워 두었으므로, 호출되면 spin_goals 에 잡힌다.
+    """
     harness.enable_camera()
     wps = [
-        _wp(10, 1.2, 3.4, yaw=1.57, capture=True),    # 주행 후 촬영
-        _wp(18, 1.2, 3.4, yaw=-1.57, capture=True),   # 짝 — 제자리 회전 후 촬영
+        _wp(10, 1.2, 3.4, yaw=1.57, capture=True),
+        _wp(18, 1.2, 3.4, yaw=-1.57, capture=True),
     ]
 
     _gh, result_future = harness.send_navigate(wps)
@@ -355,29 +362,31 @@ def test_same_position_spins_instead_of_driving(harness):
     assert result.result_code == 0
     assert result.last_waypoint_id == 18
 
-    assert len(harness.nav_goals) == 1, '같은 자리로 다시 주행하면 안 된다'
-    assert len(harness.spin_goals) == 1, '짝 노드는 Spin 으로 처리해야 한다'
+    assert len(harness.spin_goals) == 0, 'Spin 분기가 되살아났다'
+    assert len(harness.nav_goals) == 2, '모든 waypoint 는 주행으로 처리한다'
     # 양쪽 다 촬영 대상이므로 분석요청은 2회
     assert _wait_until(lambda: len(harness.analyze_requests) >= 2, timeout=3.0)
     assert [r.waypoint_id for r in harness.analyze_requests] == [10, 18]
 
 
-def test_spin_target_yaw_is_relative_and_normalized(harness):
-    """Spin.target_yaw 는 절대 방향이 아니라 (목표 - 현재)를 -pi~pi 로 접은 값이다."""
-    wps = [
-        _wp(10, 1.2, 3.4, yaw=1.57),
-        _wp(18, 1.2, 3.4, yaw=-1.57),
-    ]
+def test_goal_yaw_falls_back_to_target_yaw_without_tf(harness):
+    """TF(map→base)를 못 읽으면 목표 yaw 를 그대로 Nav2 에 넘긴다.
+
+    정밀 주행은 '가는 방향'을 Nav2 에 주고 방향 맞추기를 도착 후로 미루는데, 그러려면
+    현재 위치를 알아야 한다. 위치를 모르면 방향을 계산할 수 없으므로 예전 방식(목표
+    yaw 그대로)으로 되돌아간다 — 사진 구도는 나빠지지만 주행은 계속되어야 한다.
+    이 테스트 환경에는 TF 발행자가 없으므로 그 폴백 경로가 그대로 검증된다.
+    """
+    wps = [_wp(10, 1.2, 3.4, yaw=1.57)]
 
     _gh, result_future = harness.send_navigate(wps)
     assert _wait_until(result_future.done, timeout=15.0)
-    assert len(harness.spin_goals) == 1
+    assert result_future.result().result.result_code == 0
 
-    # 가짜 Nav2 가 목표 자세를 피드백으로 돌려주므로 현재 yaw 는 1.57 로 캐시된다.
-    expected = math.atan2(math.sin(-1.57 - 1.57), math.cos(-1.57 - 1.57))
-    assert harness.spin_goals[0].target_yaw == pytest.approx(expected, abs=1e-3)
-    # 절대값(-1.57)을 그대로 실어 보내는 실수를 잡아낸다.
-    assert abs(harness.spin_goals[0].target_yaw - (-1.57)) > 1.0
+    assert len(harness.nav_goals) == 1
+    q = harness.nav_goals[0].pose.pose.orientation
+    yaw = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
+    assert yaw == pytest.approx(1.57, abs=1e-3)
 
 
 # --------------------------------------------------------------------------- #

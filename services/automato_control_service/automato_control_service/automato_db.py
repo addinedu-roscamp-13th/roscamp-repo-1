@@ -245,16 +245,18 @@ _UPDATE_INPROGRESS = (
 # 순찰점(is_patrol_point)을 patrol_order 순으로 매번 직접 조회한다.
 # point_index 는 0부터 '연속' 재부여(ROW_NUMBER-1) — patrol_order 에 구멍이 있어도 촘촘히.
 #
-# ⚠️ pair_waypoint_id IS NULL 이 이 쿼리의 핵심이다.
-#   짝(pair) 지점은 '같은 자리에서 방향만 다른 촬영 전용 행'이라 corridors 에 등장하지 않는다.
-#   is_patrol_point 만으로 거르면 짝이 독립 순찰 지점으로 잡히는데, 통로가 없으니 경로 탐색이
-#   실패해 그 지점 촬영이 통째로 건너뛰어진다. 짝은 디스패처가 부모 도착 직후에 끼워 넣는다.
+# ⚠️ 짝(pair) 지점도 목표에 포함한다(RP-EX). 예전에는 pair_waypoint_id IS NULL 로 짝을
+#   제외하고 '부모 도착 직후 제자리 회전으로 끼워 넣기'로 처리했으나, 그 제자리 180° 회전이
+#   좁은 통로에서 물리적으로 불가능함이 확인됐다. 이제 짝은 부모와 좌표가 6~8cm 갈라진
+#   '반대 방향으로 지날 때 찍는' 독립 목표다(각자 patrol_order 를 가진다).
+#   짝은 corridors 에 없어 find_path(current, 짝) 이 실패하므로, 디스패처가 경로 탐색만은
+#   부모 노드로 돌린다(_visit 의 _parent_of). 촬영은 '지나는 방향에 맞을 때'만 한다(방향 게이트).
 _SELECT_PATROL_WAYPOINTS = (
     "SELECT ROW_NUMBER() OVER (ORDER BY patrol_order) - 1 AS point_index, "
     "       waypoint_id, x_coord, y_coord "
     "  FROM waypoints "
     " WHERE is_patrol_point = TRUE "
-    "   AND pair_waypoint_id IS NULL "
+    "   AND patrol_order IS NOT NULL "
     " ORDER BY patrol_order"
 )
 
