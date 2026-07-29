@@ -24,6 +24,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ddagi_harvest import pick as pk       # noqa: E402
 from ddagi_harvest import tf_transform as tf  # noqa: E402
+from ddagi_harvest.log import warn          # noqa: E402
 
 W, H, FPS = 640, 480, 30
 
@@ -76,6 +77,11 @@ class TomatoDetector(ABC):
     """
 
     angles_provider = None      # 콜러블() -> [j1..j6] 또는 None(상수 OBSERVE_ANGLES 사용)
+
+    # 직전 detect() 에서 '검출은 됐는데 수확 대상이 아니라 뺀' 것들. 각 항목에
+    # skip_reason 이 들어 있다. 마커·로그로 보여주기 위한 것이라 파지 루프는 안 본다.
+    # (구현체가 detect() 안에서 새 리스트로 갈아끼운다 — 이 클래스 속성은 기본값)
+    last_skipped: list = []
 
     def _observe_angles(self):
         if self.angles_provider is None:
@@ -208,11 +214,10 @@ class YoloDetector(TomatoDetector):
 
         res = self.model(img, conf=self.conf, verbose=False)[0]
         out: list[dict] = []
+        self.last_skipped = []      # 이번 프레임에서 '보고도 안 딴' 것 (진단·마커용)
         for box in res.boxes:
             cls_name = self.model.names[int(box.cls[0])]
             action, grade = self.class_map.get(cls_name, ("skip", None))
-            if action != "harvest":
-                continue
             x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
             u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
             win = max(2, int(min(x2 - x1, y2 - y1) * self._BOX_DEPTH_FRAC))
@@ -223,11 +228,29 @@ class YoloDetector(TomatoDetector):
                    self._rs.rs2_deproject_pixel_to_point(intr, [u, v], d)]
             base = [float(v) + pk.TCP_CORRECTION[i]
                     for i, v in enumerate(tf.observe_cam_to_flange(cam))]
-            if not pk.in_workspace(base):
+            rec = {"base": base, "grade": grade, "uv": (u, v),
+                   "depth_cm": d * 100, "color": cls_name,
+                   "conf": float(box.conf[0])}
+
+            # '검출은 됐는데 안 딴' 두 경우를 기록한다. 조용히 continue 하면 rviz 에
+            # 아무것도 안 떠서 "AI 가 못 본 건지, 보고도 뺀 건지" 구분이 안 된다
+            # (실측: 노란 열매를 놓았는데 마커에 안 떠 정렬 버그로 오인했다).
+            if action != "harvest":
+                rec["skip_reason"] = f"클래스 '{cls_name}' = 수확 대상 아님"
+                self.last_skipped.append(rec)
                 continue
-            out.append({"base": base, "grade": grade, "uv": (u, v),
-                        "depth_cm": d * 100, "color": cls_name,
-                        "conf": float(box.conf[0])})
+            if not pk.in_workspace(base):
+                rec["skip_reason"] = "작업공간 밖"
+                self.last_skipped.append(rec)
+                continue
+            out.append(rec)
+
+        if self.last_skipped:
+            by = {}
+            for s in self.last_skipped:
+                by[s["skip_reason"]] = by.get(s["skip_reason"], 0) + 1
+            warn("  [검출] 보고도 제외한 것: "
+                 + ", ".join(f"{k} {v}개" for k, v in by.items()))
         return out
 
     def close(self) -> None:

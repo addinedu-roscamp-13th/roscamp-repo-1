@@ -188,13 +188,19 @@ class HarvestActionServer(Node):
                 goal_handle.publish_feedback(fb)
 
             mp = self._markers
+
+            def on_detect(batch):
+                # 검출기가 방금 뺀 것들도 같이 그린다 — '보고도 안 딴' 것이 화면에
+                # 안 보이면 원인을 파지 순서 쪽에서 찾게 된다.
+                mp.show_detections(batch, getattr(detector, "last_skipped", None))
+
             summary = hv.harvest(
                 arm, detector,
                 max_capacity=max_capacity,
                 max_rounds=self.get_parameter("max_rounds").value,
                 on_progress=on_progress,
                 should_cancel=lambda: goal_handle.is_cancel_requested,
-                on_detect=(mp.show_detections if mp else None),
+                on_detect=(on_detect if mp else None),
                 on_target=(mp.show_target if mp else None),
             )
         except Exception as exc:                       # 팔·검출 예외 → abort

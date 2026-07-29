@@ -26,6 +26,8 @@ _COLOR = {                # r, g, b, a
     "DISCARD": (0.55, 0.55, 0.55, 0.95),   # 폐기품 — 회색
 }
 _TARGET_COLOR = (0.20, 0.75, 0.35, 0.45)   # 현재 파지 목표 — 초록 반투명
+_SKIP_COLOR = (1.00, 0.75, 0.10, 0.80)     # 보고도 안 딴 것 — 주황. 구가 아니라
+                                           # 정육면체로 그려 모양만으로도 구분된다
 _ZONE_COLOR = (0.35, 0.70, 1.00, 0.95)     # 성공 실측 대역 — 하늘색 선(와이어프레임)
 
 # 2026-07-29 실측: 열매 13개 중 성공 7개가 전부 이 대역 안이었다(x 246~266,
@@ -137,13 +139,31 @@ class MarkerPublisher:
         m.action = Marker.DELETEALL
         self._publish([m])
 
-    def show_detections(self, batch: list) -> None:
-        """이번 라운드의 (제외 필터를 통과한) 검출 목록을 그린다."""
+    def show_detections(self, batch: list, skipped: list | None = None) -> None:
+        """이번 라운드의 검출을 그린다.
+
+        skipped 는 '보고도 안 딴' 것 — 안 그리면 rviz 가 조용해서 AI 가 못 본 건지
+        보고도 뺀 건지 구분이 안 된다(실측: 노란 열매가 안 떠서 정렬 버그로 오인).
+        """
         from visualization_msgs.msg import Marker
         self.clear()
         out = []
         if self._show_zone:
             out.append(self._zone_marker())
+
+        for j, s in enumerate(skipped or []):
+            cu = self._new("skipped", j, Marker.CUBE)     # 구가 아닌 정육면체 = 대상 아님
+            self._set_xyz(cu, s["base"])
+            cu.scale.x = cu.scale.y = cu.scale.z = TOMATO_D * 0.8
+            self._set_color(cu, _SKIP_COLOR)
+            out.append(cu)
+            lb = self._new("skip_labels", j, Marker.TEXT_VIEW_FACING)
+            self._set_xyz(lb, [s["base"][0], s["base"][1], s["base"][2] - 28.0])
+            lb.scale.z = 0.015
+            self._set_color(lb, _SKIP_COLOR)
+            lb.text = f"skip: {s.get('color', '?')}"
+            out.append(lb)
+
         for i, t in enumerate(batch):
             grade = t.get("grade", "NORMAL")
             s = self._new("tomatoes", i, Marker.SPHERE)
