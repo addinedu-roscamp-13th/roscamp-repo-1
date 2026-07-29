@@ -21,7 +21,6 @@ setup(
     entry_points={
         'console_scripts': [
             'telemetry_publisher = ddagi_control.telemetry_publisher:main',
-            'harvest_server = ddagi_control.harvest_server:main',
         ],
     },
 )
