@@ -33,6 +33,7 @@ setup(
             'floor_dock_repeat_client = ddago_control.floor_dock_repeat_client:main',
             'camera_node = ddago_control.camera_node:main',
             'reflective_detector = ddago_control.reflective_dock.detector_node:main',
+            'reflective_dock_server = ddago_control.reflective_dock_server:main',
             'reflective_dock = ddago_control.reflective_dock.dock_controller:main',
         ],
     },
