@@ -281,30 +281,69 @@ def test_drive_to_point_arrives_without_capture(fast):
 
 
 def test_dock_success(fast):
-    """도킹 성공(result_code=0) → (True, 0, ...), 한 번만 하달."""
+    """반사테이프(reflective) 도킹 성공(result_code=0) → (True, 0, ...), 한 번만 하달."""
     engine, disp = _make()
     dock = FakeDockClient(code=0)
-    ok, code, _msg = docking.dock(_Log(), 1, "dg_01", "CHARGE_01", MARKER, dock)
+    ok, code, _msg = docking.dock(
+        _Log(), 1, "dg_01", "CHARGE_01", docking.METHOD_REFLECTIVE, dock)
     assert ok is True and code == 0
     assert dock.calls == 1
-
-
-def test_dock_marker_none_fails_without_moving(fast):
-    """마커 미등록 → 즉시 실패, 로봇(Dock 서버)을 부르지 않는다."""
-    engine, disp = _make()
-    dock = FakeDockClient(code=0)
-    ok, code, _msg = docking.dock(_Log(), 1, "dg_01", "CHARGE_01", None, dock)
-    assert ok is False and code is None
-    assert dock.calls == 0
 
 
 def test_dock_retries_then_fails(fast):
     """도킹이 계속 실패하면 N_dock 회 재시도 후 (False, code)."""
     engine, disp = _make()
     dock = FakeDockClient(code=1)              # 매번 마커 미검출
-    ok, code, _msg = docking.dock(_Log(), 1, "dg_01", "CHARGE_01", MARKER, dock)
+    ok, code, _msg = docking.dock(
+        _Log(), 1, "dg_01", "CHARGE_01", docking.METHOD_REFLECTIVE, dock)
     assert ok is False and code == 1
     assert dock.calls == docking.DOCK_RETRY_MAX
+
+
+def test_method_for_maps_point_to_method():
+    """task_point_id → 도킹 방식 매핑(단일 출처). 모르는 지점은 None."""
+    assert docking.method_for("CHARGE_01") == docking.METHOD_REFLECTIVE
+    assert docking.method_for("CHARGE_03") == docking.METHOD_REFLECTIVE
+    assert docking.method_for("HARVEST_01") == docking.METHOD_FLOOR
+    assert docking.method_for("HARVEST_02") == docking.METHOD_FLOOR
+    assert docking.method_for("PRECOOL_01") == docking.METHOD_FLOOR
+    assert docking.method_for("MYSTERY_01") is None
+
+
+def test_dock_unknown_method_fails_without_moving(fast):
+    """방식이 안 잡히는 지점(method=None) → 즉시 실패, 로봇을 부르지 않는다.
+
+    charuco 폴백을 없앴으므로 '모르는 지점'은 조용히 도킹하지 않고 명시적으로 막힌다.
+    """
+    engine, disp = _make()
+    dock = FakeDockClient(code=0)
+    method = docking.method_for("MYSTERY_01")          # None
+    ok, code, _msg = docking.dock(
+        _Log(), 1, "dg_01", "MYSTERY_01", method, dock)
+    assert ok is False and code is None
+    assert dock.calls == 0
+
+
+def test_dock_charuco_success(fast):
+    """휴면 charuco 방식도 마커가 있으면 도킹된다(방식 분기·Goal 조립 회귀 방지)."""
+    engine, disp = _make()
+    dock = FakeDockClient(code=0)
+    ok, code, _msg = docking.dock(
+        _Log(), 1, "dg_01", "CHARGE_01", docking.METHOD_CHARUCO, dock,
+        marker=MARKER)
+    assert ok is True and code == 0
+    assert dock.calls == 1
+
+
+def test_dock_charuco_marker_none_fails_without_moving(fast):
+    """charuco 인데 마커 미등록 → 즉시 실패, 로봇(Dock 서버)을 부르지 않는다."""
+    engine, disp = _make()
+    dock = FakeDockClient(code=0)
+    ok, code, _msg = docking.dock(
+        _Log(), 1, "dg_01", "CHARGE_01", docking.METHOD_CHARUCO, dock,
+        marker=None)
+    assert ok is False and code is None
+    assert dock.calls == 0
 
 
 # =========================================================================== #
@@ -328,7 +367,7 @@ class _FakeNode:
     def _client_for(self, robot_id):
         return self._nav
 
-    def _dock_client_for(self, robot_id):
+    def _dock_client(self, robot_id, method):
         return self._dock
 
     # _return_and_dock 이 부르는 형제 메서드는 실제 구현으로 위임한다(self=이 가짜 노드).
@@ -343,17 +382,15 @@ class _FakeNode:
 def orchestration(monkeypatch):
     """automato_node 를 지연 import 하고, DB·알림 함수를 기록용으로 갈아끼운다.
 
-    반환 dict 의 charge/marker 를 테스트가 미리 채운다. 나머지(immobilize/failed/events)
-    에는 호출 기록이 쌓인다.
+    반환 dict 의 charge 를 테스트가 미리 채운다. 나머지(immobilize/failed/events)에는
+    호출 기록이 쌓인다. (충전소는 반사테이프 도킹이라 마커 조회가 없다 → get_dock_marker 패치 불필요)
     """
     from automato_control_service import automato_node as pn
-    rec = {"charge": None, "marker": None,
+    rec = {"charge": None,
            "immobilize": [], "failed": [], "events": []}
 
     monkeypatch.setattr(pn.automato_db, "get_charge_point",
                         lambda pool, rid: rec["charge"])
-    monkeypatch.setattr(pn.automato_db, "get_dock_marker",
-                        lambda pool, tpid: rec["marker"])
     monkeypatch.setattr(pn.automato_db, "set_operational_status",
                         lambda pool, rid, st: rec["immobilize"].append((rid, st)))
 
@@ -377,7 +414,6 @@ def test_return_and_dock_success_releases_all(fast, orchestration):
     """복귀+도킹 성공 → 이 로봇의 예약이 전부 비고, 도킹은 한 번만."""
     engine, disp = _make()
     orchestration["charge"] = CHARGE
-    orchestration["marker"] = MARKER
     node = _FakeNode(orchestration["_cls"], disp,FakeNavClient({"wp": 4}), FakeDockClient(code=0))
 
     orchestration["_cls"]._return_and_dock(node, 1, "dg_01", engine, 4)
@@ -393,7 +429,6 @@ def test_return_and_dock_dock_failed_notifies(fast, orchestration):
     """복귀는 됐으나 도킹이 N_dock 소진 → DOCK_FAILED 알림 + 진입 노드 자리 유지."""
     engine, disp = _make()
     orchestration["charge"] = CHARGE
-    orchestration["marker"] = MARKER
     node = _FakeNode(orchestration["_cls"], disp,FakeNavClient({"wp": 4}), FakeDockClient(code=1))
 
     orchestration["_cls"]._return_and_dock(node, 1, "dg_01", engine, 4)
@@ -408,7 +443,6 @@ def test_return_and_dock_blocked_immobilizes(fast, orchestration):
     """복귀 경로마저 막힘 → 22-2 현장 정지(IMMOBILIZED + BLOCKED_UNRECOVERABLE)."""
     engine, disp = _make()
     orchestration["charge"] = CHARGE
-    orchestration["marker"] = MARKER
     engine.try_reserve(16, "dg_02")            # 15-12 통로 점유 → 22 로 가는 길 차단
     node = _FakeNode(orchestration["_cls"], disp,FakeNavClient({"wp": 4}), FakeDockClient(code=0))
 
