@@ -21,6 +21,7 @@ Goal 파싱 · Feedback 발행 · 취소 처리 · Result 매핑.
     detector    ros | yolo | mock | list  (기본 ros = /ai/detect_tomatoes 호출)
     weights     detector=yolo 일 때 .pt 경로
     max_rounds  촬영-수확 라운드 상한 (기본 5)
+    conf        YOLO 신뢰도 임계 (기본 0.4). 낮추면 더 잡히고 오검출도 는다
     dry_run     true 면 파지 없이 관측·검출·마커만 (배치 잡기·모델 비교용).
                 실행 중 변경 가능: ros2 param set /ddagi_harvest_node dry_run true
 
@@ -73,6 +74,10 @@ class HarvestActionServer(Node):
         # 돌리지 않고 rviz 로 검출 결과와 파지 순서를 먼저 확인하기 위한 것.
         # 실행 중에도 바꿀 수 있다: ros2 param set /ddagi_harvest_node dry_run true
         self.declare_parameter("dry_run", False)
+        # YOLO 신뢰도 임계. 낮추면 놓치던 열매가 잡히지만 오검출도 는다. 검출기는
+        # Goal 마다 새로 만들므로 노드를 재시작하지 않고 바꿔가며 dry run 할 수 있다:
+        #   ros2 param set /ddagi_harvest_node conf 0.25
+        self.declare_parameter("conf", 0.4)
 
         self._arm = None
         self._detector = None
@@ -161,7 +166,10 @@ class HarvestActionServer(Node):
             weights = os.path.expanduser(str(weights))
             if not os.path.isfile(weights):
                 raise RuntimeError(f"가중치 파일이 없다: {weights}")
-            return YoloDetector(weights, angles_provider=arm.get_angles)
+            conf = float(self.get_parameter("conf").value)
+            self.get_logger().info(f"YOLO conf={conf}  weights={weights}")
+            return YoloDetector(weights, conf=conf,
+                                angles_provider=arm.get_angles)
         return MockColorDetector(angles_provider=arm.get_angles)
 
     # ---- 실행 ------------------------------------------------------------ #

@@ -20,6 +20,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 DEFAULT_VENV_PYTHON = "/home/cornerstone/venv/automato/bin/python3"
 
@@ -40,6 +41,8 @@ def generate_launch_description():
                               description="촬영-수확 라운드 상한"),
         DeclareLaunchArgument("dry_run", default_value="false",
                               description="파지 없이 검출·마커만 (배치 잡기용)"),
+        DeclareLaunchArgument("conf", default_value="0.4",
+                              description="YOLO 신뢰도 임계 (낮추면 더 잡히고 오검출도 는다)"),
     ]
 
     node = Node(
@@ -56,6 +59,7 @@ def generate_launch_description():
             "weights": LaunchConfiguration("weights"),
             "max_rounds": LaunchConfiguration("max_rounds"),
             "dry_run": LaunchConfiguration("dry_run"),
+            "conf": ParameterValue(LaunchConfiguration("conf"), value_type=float),
         }],
     )
     return LaunchDescription(args + [node])
