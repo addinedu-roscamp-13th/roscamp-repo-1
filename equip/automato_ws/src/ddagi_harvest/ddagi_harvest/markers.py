@@ -117,6 +117,16 @@ class MarkerPublisher:
         self._last_n = len(batch)
         self._publish(out)
 
+    def show_idle(self) -> None:
+        """대기 중에도 성공 대역만 계속 쏜다.
+
+        수확이 돌 때만 발행하면 Goal 전에 rviz 가 완전히 비어 있어, '연결이 안 된
+        건지 아직 안 보낸 건지' 구분이 안 된다(실제로 ROS_DOMAIN_ID 불일치를 빈 화면
+        으로 오인한 적이 있다). 상자가 보이면 토픽·프레임·도메인이 다 맞았다는 뜻이다.
+        """
+        if self._show_zone:
+            self._publish([self._zone_marker()])
+
     def show_target(self, base_mm, grade: str = "NORMAL") -> None:
         """지금 파지하러 가는 열매를 크게 강조한다."""
         from visualization_msgs.msg import Marker

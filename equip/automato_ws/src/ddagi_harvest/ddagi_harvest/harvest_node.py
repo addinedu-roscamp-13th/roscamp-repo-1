@@ -81,6 +81,10 @@ class HarvestActionServer(Node):
         # 여기서 죽지 않는다(시각화는 부가 기능이지 수확의 전제가 아니다).
         try:
             self._markers = MarkerPublisher(self)
+            # 대기 중에도 성공 대역을 계속 쏜다 — Goal 전에 rviz 가 비어 있으면
+            # '연결이 안 된 건지 아직 안 보낸 건지' 구분이 안 된다. 상자가 보이면
+            # 토픽·프레임·ROS_DOMAIN_ID 가 다 맞았다는 뜻이라 진단이 된다.
+            self._idle_timer = self.create_timer(2.0, self._tick_idle)
             lg.info(f"rviz 마커 발행: {mk.TOPIC}  (Fixed Frame = {mk.FRAME_ID})")
         except Exception as exc:
             self._markers = None
@@ -96,6 +100,11 @@ class HarvestActionServer(Node):
             callback_group=ReentrantCallbackGroup(),
         )
         self.get_logger().info(f"Ddagi 수확 액션 서버 시작: {ACTION_NAME}")
+
+    def _tick_idle(self) -> None:
+        # 수확 중에는 검출·목표 마커가 이미 나가므로 건드리지 않는다.
+        if self._markers is not None and not self._busy.locked():
+            self._markers.show_idle()
 
     # ---- Goal 수락/취소 ------------------------------------------------- #
 
