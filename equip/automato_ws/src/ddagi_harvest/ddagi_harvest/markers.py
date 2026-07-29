@@ -26,9 +26,7 @@ _COLOR = {                # r, g, b, a
     "DISCARD": (0.55, 0.55, 0.55, 0.95),   # 폐기품 — 회색
 }
 _TARGET_COLOR = (0.20, 0.75, 0.35, 0.45)   # 현재 파지 목표 — 초록 반투명
-_ZONE_COLOR = (0.30, 0.55, 0.95, 0.22)     # 성공 실측 대역 — 파랑 반투명.
-# x 두께가 20mm(246~266) 뿐이라 옆에서 보면 얇은 판이다. alpha 0.10 은 실물에서
-# 거의 안 보였다 — 열매 마커를 가리지 않는 선에서 조금 올렸다.
+_ZONE_COLOR = (0.35, 0.70, 1.00, 0.95)     # 성공 실측 대역 — 하늘색 선(와이어프레임)
 
 # 2026-07-29 실측: 열매 13개 중 성공 7개가 전부 이 대역 안이었다(x 246~266,
 # z 270~355). 밖은 standoff 확보 실패나 빈손으로 끝났다. 열매를 어디에 달아야
@@ -89,15 +87,39 @@ class MarkerPublisher:
         m.color.r, m.color.g, m.color.b, m.color.a = rgba
 
     def _zone_marker(self):
+        """성공 대역을 **와이어프레임**으로 그린다.
+
+        반투명 CUBE 로 그렸더니 실물 rviz 에서 안 보였다 — x 두께가 20mm(246~266)
+        뿐인 얇은 판이라 어느 각도에서도 면이 거의 안 잡히고, 알파를 올리면 이번엔
+        안에 든 열매 마커를 가린다. 선은 두께와 무관하게 보이고 속이 비어 있어
+        열매를 가리지 않는다.
+        """
+        from geometry_msgs.msg import Point
         from visualization_msgs.msg import Marker
-        m = self._new("zone", 0, Marker.CUBE)
         z = SUCCESS_ZONE_MM
-        mid = {k: (v[0] + v[1]) / 2000.0 for k, v in z.items()}
-        m.pose.position.x, m.pose.position.y, m.pose.position.z = mid["x"], mid["y"], mid["z"]
-        m.scale.x = (z["x"][1] - z["x"][0]) / 1000.0
-        m.scale.y = (z["y"][1] - z["y"][0]) / 1000.0
-        m.scale.z = (z["z"][1] - z["z"][0]) / 1000.0
+        x0, x1 = (v / 1000.0 for v in z["x"])
+        y0, y1 = (v / 1000.0 for v in z["y"])
+        z0, z1 = (v / 1000.0 for v in z["z"])
+
+        def P(x, y, zz):
+            p = Point()
+            p.x, p.y, p.z = float(x), float(y), float(zz)
+            return p
+
+        # 아래면 4변 + 위면 4변 + 기둥 4개 = 12 모서리 (LINE_LIST 는 점 2개가 선 1개)
+        edges = []
+        for (a, b) in ((z0, z0), (z1, z1)):
+            edges += [(P(x0, y0, a), P(x1, y0, b)), (P(x1, y0, a), P(x1, y1, b)),
+                      (P(x1, y1, a), P(x0, y1, b)), (P(x0, y1, a), P(x0, y0, b))]
+        for (cx, cy) in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+            edges.append((P(cx, cy, z0), P(cx, cy, z1)))
+
+        m = self._new("zone", 0, Marker.LINE_LIST)
+        m.scale.x = 0.004                    # 선 굵기 4mm
         self._set_color(m, _ZONE_COLOR)
+        for a, b in edges:
+            m.points.append(a)
+            m.points.append(b)
         return m
 
     def _publish(self, markers) -> None:
