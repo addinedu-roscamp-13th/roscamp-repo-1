@@ -46,6 +46,10 @@ class MarkerPublisher:
         self._show_zone = show_zone
         self._last_n = 0
         self._publish_static_tf()
+        # 기동 시 한 번 지운다. rviz 는 발행자가 죽어도 마커를 남겨 두므로, 노드를
+        # 재시작하면 이전 세션의 검출 결과가 그대로 떠 있다 — "새로 띄웠는데 화면이
+        # 안 바뀐다"로 보인다. 지금 이 노드가 그린 것만 보이게 만든다.
+        self.clear()
 
     def _publish_static_tf(self) -> None:
         """world -> ddagi_base 항등 변환을 한 번 쏜다.
