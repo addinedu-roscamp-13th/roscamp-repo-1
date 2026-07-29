@@ -193,6 +193,14 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
                   f"base={[round(c, 1) for c in t['base']]}  x={t['base'][0]:.0f}mm"
                   + (f"  depth {dc:.1f}cm" if dc is not None else ""))
 
+        if dry_run:
+            # 1라운드만 보고 멈춘다. 예전엔 파지를 '성공'으로 치고 계속 돌아 순식간에
+            # 만차로 끝나서, rviz 에서 검출 결과를 보기도 전에 마커가 지워졌다.
+            # dry run 의 목적은 '무엇을 어떤 순서로 딸지'를 눈으로 확인하는 것이다.
+            log("\n[DRY RUN] 검출·순서만 표시하고 종료 — 마커는 화면에 남는다")
+            exit_reason = "DRY_RUN"
+            break
+
         for idx, t in enumerate(batch):
             progress(len(batch) - idx)       # 이번 라운드 잔여 개수
             if attempts >= max_attempts:
@@ -252,6 +260,13 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
                     break
             else:
                 prev.append({"base": b, "grade": t["grade"]})   # 실패분만 재검출로 확인
+
+    if exit_reason == "DRY_RUN":
+        # 관측 자세로 되돌리지 않는다 — 되돌리면 카메라가 움직여 방금 띄운 마커와
+        # 실제 장면이 어긋나 보인다. 어차피 팔은 이미 관측 자세에 있다.
+        return {"normal_count": 0, "discard_count": 0, "failed_count": 0,
+                "exit_reason": "DRY_RUN", "rounds": round_no, "attempts": 0,
+                "total": 0, "harvested": harvested, "excluded": 0}
 
     if attempts >= max_attempts and not full and not canceled:
         # 라운드 상한과 별개인 내부 안전장치. 스펙에 대응 값이 없어 '점검 필요'로 묶는다.
