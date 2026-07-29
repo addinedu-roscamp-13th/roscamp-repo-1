@@ -43,9 +43,11 @@ IK 해가 매번 달라져 경로가 튀는 문제를 피하려면 관절각 재
 빈 팔로 가르친 자세로 바구니를 들면 예냉실 입구보다 낮게 도달할 수 있다. 티칭할 때
 바구니를 걸어두면 자세가 기하학적으로 맞고, 재생 후 실제 도달 높이만 확인하면 된다.
 
-■ 그리퍼는 티칭 중에 닫아둘 것
-'g' 는 재생 시점에 닫으라는 표시일 뿐, 티칭 중에는 손잡이를 물고 있어야 이후 자세가
-바구니 무게를 반영한다.
+■ 'g' 를 누르면 티칭 중에도 실제로 그리퍼가 닫힌다
+표시만 남기면 손잡이를 안 쥔 채로 이후 자세를 가르치게 되고, 그러면 바구니 무게가
+자세에 반영되지 않는다. 'g' 이후의 웨이포인트는 **짐을 든 상태로** 가르치게 된다.
+그래서 손잡이 파지 지점은 조그 모드에서 정확히 맞춘 뒤 'g' 를 누르는 것이 좋다 —
+드래그로 대충 잡고 닫으면 손잡이를 빗겨 문다.
 """
 from __future__ import annotations
 
@@ -143,9 +145,12 @@ def phase_of(step: dict, idx: int, steps: list) -> str:
         return "SHAKE"
     if act == "open":
         return "RETURN"
-    gripped = any(s.get("act") == "grip" for s in steps[:idx])
-    released = any(s.get("act") == "open" for s in steps[:idx])
-    if released:
+    before = steps[:idx]
+    gripped = any(s.get("act") == "grip" for s in before)
+    # 쏟기(wait)나 털기(shake)를 지났으면 그 뒤 이동은 '되돌리는 중'이다. 손잡이를
+    # 아직 쥐고 있어도 LIFT 가 아니다 — 바구니를 제자리에 놓으러 가는 구간이다.
+    poured = any(s.get("act") in ("wait", "shake", "open") for s in before)
+    if poured:
         return "RETURN"
     return "LIFT" if gripped else "GRIP_HANDLE"
 
@@ -273,6 +278,21 @@ def do_teach(arm) -> None:
                 print("  [실패] 각도를 읽지 못했습니다. 다시 시도하세요.")
                 continue
             act = {"g": "grip", "o": "open", "w": "wait", "s": "shake"}.get(key)
+
+            # 티칭 중에도 실제로 그리퍼를 여닫는다. 표시만 남기면 손잡이를 안 쥔 채로
+            # 이후 자세를 가르치게 되고, 그러면 **바구니 무게가 자세에 반영되지 않아**
+            # 재생 때 짐을 들고 그 자세로 가면 처짐만큼 낮게 도달한다.
+            if act == "grip":
+                arm.close_gripper(GRIPPER_SPEED)
+                time.sleep(0.5)
+                v = arm.gripper_value()
+                print(f"    그리퍼 닫음 — 값 {v} "
+                      + ("(손잡이 물림)" if v and v > 6 else "⚠ (빈손일 수 있음)"))
+            elif act == "open":
+                arm.open_gripper(GRIPPER_SPEED)
+                time.sleep(0.5)
+                print("    그리퍼 열음 — 바구니를 받쳐 주세요")
+
             steps.append({"angles": angles, "act": act, "mode": mode})
             tail = f" + {_ACT_LABEL[act]}" if act else ""
             print(f"  [{len(steps):2d}] 기록{tail} ({mode}): "
