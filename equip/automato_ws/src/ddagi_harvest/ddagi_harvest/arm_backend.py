@@ -216,7 +216,15 @@ class NetworkArm(ArmBackend):
             cur = self._call(getter)
             if not cur:
                 continue
-            delta = (sum(abs(cur[i] - prev[i]) for i in range(3)) if prev else 0.0)
+            # 각도는 6축 전부, 좌표는 위치 3개만 본다(rx·ry·rz 는 스케일이 달라
+            # 같은 임계로 섞으면 회전 잡음이 '움직임'으로 읽힌다).
+            # ⚠ 예전엔 각도도 앞 3개(J1~J3)만 봤다. J4~J6 만 움직이는 이동은 '출발'을
+            # 감지하지 못했고, 반대로 진동이 남아 J1~J3 가 떨면 '아직 이동 중'으로
+            # 읽혀 4회 연속 정지를 못 만나 타임아웃 15초를 통째로 썼다
+            # (털기 직후 복귀에서 실측 12~14초).
+            n = len(cur) if kind == "angles" else 3
+            delta = (sum(abs(cur[i] - prev[i]) for i in range(min(n, len(prev))))
+                     if prev else 0.0)
             prev = cur
             if delta > tol:
                 started, stable = True, 0

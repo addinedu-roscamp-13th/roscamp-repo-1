@@ -94,8 +94,13 @@ SHAKE_PATTERN = [
 ]
 SHAKE_JOINT = 5           # 1-indexed (J5). SHAKE_PATTERN 이 비었을 때 쓰인다
 SHAKE_AMPLITUDE = 12.0    # ±도. 크면 그리퍼가 손잡이를 놓칠 수 있으니 올릴 땐 단계적으로
-SHAKE_CYCLES = 4
+# 실측: J5 왕복 진폭은 반주기를 늘려도 14° p-p 에서 더 안 는다(명령 30° 대비 47%).
+# 짐을 든 소형 서보의 물리 한계다. 진폭으로는 못 이기니 **지속 시간**으로 간다 —
+# 0.10s 반주기로 12회 왕복하면 2.4초 동안 끊김 없이 진동한다. 4회(0.8초)는
+# "한 번 까딱"으로 보이고, 12회는 "털고 있다"로 보인다.
+SHAKE_CYCLES = 12
 SHAKE_SPEED = 100         # 최대. 털려면 반전 자체가 빨라야 한다
+SHAKE_RETURN_SETTLE = 0.8  # 복귀 후 고정 대기(s). 정지 감지 대신 쓴다(위 주석 참조)
 # ⚠ 반주기 대기(s). **도달을 기다리지 않고** 이만큼만 두고 반대로 꺾는다. 동기 이동으로
 # 왕복시키면 매번 완전히 서고 정착까지 기다려(정지감지 4회 폴링 + 0.25s) '떠는' 게
 # 아니라 '한 번씩 서면서 끄덕이는' 동작이 된다 — 실제로 그렇게 보였다.
@@ -438,8 +443,11 @@ def do_shake(arm, base_angles, cfg: dict, watch=None, samples=None) -> None:
                 a = arm.get_angles()
                 if isinstance(a, (list, tuple)) and len(a) > watch:
                     samples.append(a[watch])
-    # 마지막만 도달까지 기다린다 — 다음 스텝이 흔들리는 도중에 시작되면 안 된다.
-    arm.move_angles(clamp_angles(base_angles)[0], speed)
+    # 복귀는 명령만 던지고 고정 시간만 기다린다. 정지 감지를 쓰면 방금 흔든 진동이
+    # 남아 '아직 이동 중'으로 읽혀 타임아웃(15s)을 통째로 쓴다 — 실측 12~14초.
+    # 털기 뒤엔 어차피 잔진동이 있으므로 '완전 정지'를 기다리는 것 자체가 무의미하다.
+    arm.move_angles_nowait(clamp_angles(base_angles)[0], speed)
+    time.sleep(float(cfg.get("return_settle", SHAKE_RETURN_SETTLE)))
     print(f"      완료 {time.time() - t0:.1f}s")
 
 
