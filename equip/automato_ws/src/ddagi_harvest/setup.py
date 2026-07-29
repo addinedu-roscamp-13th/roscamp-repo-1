@@ -15,12 +15,12 @@ setup(
     zip_safe=True,
     maintainer='kdh',
     maintainer_email='kdhkjh@gmail.com',
-    description='Ddagi 수확 구현 (김동현) — AI 좌표 → send_coords 파지. 경쟁 구현본.',
+    description='Ddagi 수확 구현 (김동현) — AI 좌표 → send_coords 파지. 시나리오2 채택본.',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            # 노드 추가 시 여기에 등록 (예: harvest_server = ddagi_harvest.harvest_server:main)
+            'harvest_node = ddagi_harvest.harvest_node:main',
         ],
     },
 )

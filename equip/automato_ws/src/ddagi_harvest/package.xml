@@ -3,7 +3,7 @@
 <package format="3">
   <name>ddagi_harvest</name>
   <version>0.1.0</version>
-  <description>Ddagi 수확 구현 (김동현) — AI 좌표 → send_coords 파지. 경쟁 구현본.</description>
+  <description>Ddagi 수확 구현 (김동현) — AI 좌표 → send_coords 파지. 시나리오2 채택본.</description>
   <maintainer email="kdhkjh@gmail.com">kdh</maintainer>
   <license>Apache-2.0</license>
 

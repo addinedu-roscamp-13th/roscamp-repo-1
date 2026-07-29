@@ -34,11 +34,18 @@ MAX_CAPACITY = 7          # 정상품(NORMAL) 바구니 용량 — NORMAL 7개�
                           # 폐기품(DISCARD)은 별도 바구니라 이 용량에 세지 않는다.
 MAX_ATTEMPTS = 30         # 총 시도 상한(무한루프 방지)
 MAX_RETRY = 3             # 한 자리 파지 실패 재시도 횟수(넘으면 제외)
+MAX_ROUNDS = 5            # 촬영-수확 라운드 상한(시나리오2 스펙). 정상 종료는 보통 2~3
+                          # 라운드이므로 그 2배를 상한으로 둔다. 넘으면 비정상 종료로
+                          # 보고 MAX_ROUNDS_EXCEEDED 로 빠져나온다.
 
 # 파지 우선순위 기준.
-#   'base_x'  : base 기준 x(팔 정면 거리)가 작은 것부터 — 팔에 가까운 것 우선(기본)
-#   'depth'   : 카메라 depth(광축 방향 거리)가 작은 것부터 — 화면 앞쪽 우선
-#   'base_z'  : 낮은 것부터 — 아래 열매를 먼저 비워 위 열매를 안 건드림
+#   'base_x'    : base x(팔 정면 거리)가 작은 것부터 — 팔에 가까운 것 우선(현재 기본)
+#   'base_dist' : base 원점에서의 3D 거리 순 — 시나리오2 스펙 문언("가까운 순")
+#   'depth'     : 카메라 depth(광축 방향 거리)가 작은 것부터 — 화면 앞쪽 우선
+#   'base_z'    : 낮은 것부터 — 아래 열매를 먼저 비워 위 열매를 안 건드림
+# ⚠ base_dist 는 z(250~350mm)가 x·y 보다 커서 사실상 '낮은 것 우선'에 가깝게 동작한다.
+#   튜닝·실측이 전부 base_x 로 이뤄졌으므로 기본값은 base_x 를 유지한다. 스펙 문언에
+#   맞추려면 이 한 줄만 'base_dist' 로 바꾸면 된다.
 SORT_KEY = "base_x"
 RETRY_Z_BUMP = 8.0        # 재시도마다 목표 z를 이만큼(mm) 위로 — 같은 실패 반복 방지(너무 아래 잡던 것 보정)
 EXCLUDE_RADIUS = 25.0     # 실패/수확한 자리 반경(mm) 내 재검출은 같은 것으로 보고 건너뜀.
@@ -69,8 +76,18 @@ def _find_fail(fails: list, base, radius: float):
 def harvest(arm: ArmBackend, detector: TomatoDetector,
             max_capacity: int = MAX_CAPACITY, max_attempts: int = MAX_ATTEMPTS,
             exclude_radius: float = EXCLUDE_RADIUS, max_retry: int = MAX_RETRY,
-            dry_run: bool = False) -> dict:
+            dry_run: bool = False, max_rounds: int = MAX_ROUNDS,
+            on_progress=None, should_cancel=None) -> dict:
     """검출→파지 루프 1회 수확 세션. 결과 요약 dict 반환.
+
+    ROS2 액션 서버(harvest_node)에서도 이 함수를 그대로 쓴다. 그래서 ROS 의존을
+    들이지 않고 두 개의 콜백만 받는다:
+      on_progress(round, normal, discard, failed, remaining_in_round) -> None
+          라운드 시작마다·파지 1건마다 호출. 액션 Feedback 발행에 쓴다.
+      should_cancel() -> bool
+          True 면 진행 중인 배치를 중단하고 exit_reason='CANCELED' 로 종료한다.
+          파지 도중이 아니라 '파지 1건이 끝난 경계'에서만 검사한다 — 팔이 열매를
+          문 채로 멈추면 사람이 빼줘야 한다.
 
     **카메라 검증** 방식: 그리퍼 값은 줄기·잎을 물어도 '성공'으로 오판하므로, 성공
     집계를 위치값이 아니라 **재검출로 확인**한다 — 직전 배치에서 시도한 토마토가 다음
@@ -86,6 +103,14 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
     fails: list[dict] = []          # [{base, n}] 실패 자리와 횟수(근접 매칭)
     prev: list[dict] = []           # 직전 배치에서 시도한 {base, grade} (다음 검출로 검증)
     attempts = 0
+    round_no = 0                    # 촬영 라운드 (1부터). 관측+검출 1회 = 1라운드
+    exit_reason = "DEPLETED"        # 종료 사유. 아래 분기에서 덮어쓴다
+
+    def progress(remaining: int = 0) -> None:
+        if on_progress is None:
+            return
+        on_progress(round_no, harvested["NORMAL"], harvested["DISCARD"],
+                    len(excluded), remaining)
 
     def verify(detections: list) -> None:
         """직전 배치의 **실패분**만 재검출과 대조해 재시도/제외를 정한다.
@@ -121,7 +146,15 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
         prev.clear()
 
     full = False
-    while attempts < max_attempts and not full:
+    canceled = False
+    while attempts < max_attempts and not full and not canceled:
+        if round_no >= max_rounds:           # 라운드 상한 — 비정상 종료로 본다
+            print(f"\n라운드 상한 {max_rounds} 도달 — 수확 중단(점검 필요)")
+            exit_reason = "MAX_ROUNDS_EXCEEDED"
+            break
+        round_no += 1
+        print(f"\n===== 라운드 {round_no}/{max_rounds} =====")
+        progress()
         pk.move_observe(arm)                 # 검출은 관측자세에서만(FK 가정)
         time.sleep(SETTLE)
         detections = detector.detect()
@@ -134,11 +167,14 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
                       f"(제외 {len(excluded)}건) — 수확 종료")
             else:
                 print("검출 0개 — 수확 종료")
+            exit_reason = "DEPLETED"
             break
         keyfn = {"base_x": lambda t: t["base"][0],
+                 "base_dist": lambda t: math.sqrt(sum(c * c for c in t["base"])),
                  "base_z": lambda t: t["base"][2],
                  "depth": lambda t: t.get("depth_cm", 1e9)}[SORT_KEY]
         label = {"base_x": "base x 가까운 순(팔 정면 거리)",
+                 "base_dist": "base 원점 거리 가까운 순",
                  "base_z": "낮은 순(base z)",
                  "depth": "카메라 depth 가까운 순"}[SORT_KEY]
         batch.sort(key=keyfn)
@@ -149,11 +185,17 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
                   f"base={[round(c, 1) for c in t['base']]}  x={t['base'][0]:.0f}mm"
                   + (f"  depth {dc:.1f}cm" if dc is not None else ""))
 
-        for t in batch:
+        for idx, t in enumerate(batch):
+            progress(len(batch) - idx)       # 이번 라운드 잔여 개수
             if attempts >= max_attempts:
                 break
-            if harvested[t["grade"]] >= max_capacity:
-                continue                     # 그 등급 바구니가 이미 참
+            if should_cancel is not None and should_cancel():
+                # 파지 1건이 끝난 경계에서만 검사한다 — 파지 도중에 멈추면 팔이 열매를
+                # 문 채로 서고, 사람이 빼줘야 한다.
+                print("\n[중단] 취소 요청 — 이번 라운드를 여기서 종료")
+                exit_reason = "CANCELED"
+                canceled = True
+                break
             b = t["base"]
             if _near_any(b, excluded, exclude_radius):
                 continue
@@ -190,24 +232,41 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
                 # (b) 뒤에 가려 있다가 드러난 열매를 못 따게 된다.
                 print(f"    ✓ 수확 확정 — {t['grade']} "
                       f"(NORMAL {harvested['NORMAL']}/{max_capacity}, "
-                      f"DISCARD {harvested['DISCARD']}/{max_capacity})")
-                if harvested[t["grade"]] >= max_capacity:
-                    print(f"\n만차: {t['grade']} 바구니 {max_capacity}개 — 수확 종료")
+                      f"DISCARD {harvested['DISCARD']})")
+                # 만차는 수확품(NORMAL)만 본다 — 폐기품은 소량이라 기준으로 삼지 않는다
+                # (시나리오2 E4). 폐기품이 넘치는 경우는 설계상 감수한 제약이다.
+                if harvested["NORMAL"] >= max_capacity:
+                    print(f"\n만차: 수확품 바구니 {max_capacity}개 — 수확 종료")
+                    exit_reason = "FULL"
                     full = True
                     break
             else:
                 prev.append({"base": b, "grade": t["grade"]})   # 실패분만 재검출로 확인
 
-    if prev:                                 # 마지막 배치 검증 (관측 1회 더)
+    if attempts >= max_attempts and not full and not canceled:
+        # 라운드 상한과 별개인 내부 안전장치. 스펙에 대응 값이 없어 '점검 필요'로 묶는다.
+        print(f"\n시도 상한 {max_attempts} 도달 — 수확 중단(점검 필요)")
+        exit_reason = "MAX_ROUNDS_EXCEEDED"
+
+    if prev and not canceled:                # 마지막 배치 검증 (관측 1회 더)
         pk.move_observe(arm)
         time.sleep(SETTLE)
         print("\n[마지막 배치 검증]")
         verify(detector.detect())
 
-    total = sum(harvested.values())
     pk.move_observe(arm)
-    summary = {"harvested": harvested, "total": total,
-               "excluded": len(excluded), "attempts": attempts}
+    summary = {
+        "normal_count": harvested["NORMAL"],
+        "discard_count": harvested["DISCARD"],
+        "failed_count": len(excluded),   # 3회 시도 후 포기한 개수(제외 목록)
+        "exit_reason": exit_reason,
+        "rounds": round_no,
+        "attempts": attempts,
+        "total": sum(harvested.values()),
+        "harvested": harvested,          # 하위호환(기존 호출부·로그)
+        "excluded": len(excluded),
+    }
+    progress()
     print(f"\n=== 수확 요약 === {summary}")
     return summary
 
