@@ -5,7 +5,7 @@
 tf_transform 으로 base 좌표를 구한다. 'p' 로 그 좌표에 pick()을 실행해 실제로
 집히는지 본다 — 카메라→TF→pick 전 파이프라인의 실물 검증.
 
-  python3 tf_verify.py                 # 팔 IP 기본 192.168.3.12
+  python3 tf_verify.py                 # 팔 IP 기본 192.168.100.12
 
 키/마우스:
   (마우스 좌클릭)  그 픽셀의 토마토를 목표로 → camera·base 좌표 표시
@@ -53,7 +53,7 @@ def main():
         print("RealSense 장치 없음")
         return 1
 
-    ip = os.environ.get("ARM_IP", "192.168.3.12")
+    ip = os.environ.get("ARM_IP", "192.168.100.12")
     print(f"팔 연결 → {ip}:9010")
     arm = NetworkArm(ip)
     print("관측자세로 이동...")

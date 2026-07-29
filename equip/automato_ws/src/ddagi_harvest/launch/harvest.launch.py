@@ -30,7 +30,7 @@ def generate_launch_description():
                               description="노드를 실행할 파이썬 (ultralytics 가 있는 것)"),
         DeclareLaunchArgument("arm", default_value="network",
                               description="network | fake"),
-        DeclareLaunchArgument("arm_ip", default_value="192.168.3.12",
+        DeclareLaunchArgument("arm_ip", default_value="192.168.100.12",
                               description="Pi 의 arm_server.py 주소 (9010)"),
         DeclareLaunchArgument("detector", default_value="ros",
                               description="ros | yolo | mock | list"),

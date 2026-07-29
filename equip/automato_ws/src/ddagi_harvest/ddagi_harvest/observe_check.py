@@ -11,7 +11,7 @@
 
 실행:
     ~/venv/automato/bin/python ddagi_harvest/observe_check.py
-    ARM_IP=192.168.x.x ...  (기본 192.168.3.12)
+    ARM_IP=192.168.x.x ...  (기본 192.168.100.12)
 """
 import os
 import sys
@@ -25,7 +25,7 @@ REPEATS = 3          # 여러 번 반복해 재현성(매번 같은 오차인지
 
 
 def main() -> int:
-    ip = os.environ.get("ARM_IP", "192.168.3.12")
+    ip = os.environ.get("ARM_IP", "192.168.100.12")
     arm = NetworkArm(ip)
     cmd = pk.OBSERVE_ANGLES
     try:

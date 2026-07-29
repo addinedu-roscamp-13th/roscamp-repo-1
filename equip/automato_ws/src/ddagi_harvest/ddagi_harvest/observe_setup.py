@@ -6,7 +6,7 @@
 캡처한다. 캡처는 OBSERVE_ANGLES(관절각)와 OBSERVE_COORDS(get_coords)를 함께 딴다
 — 각각 pick.py 상수와 tf_transform의 base←joint6 에 들어간다.
 
-  python3 observe_setup.py                        # 팔 IP 기본 192.168.3.12
+  python3 observe_setup.py                        # 팔 IP 기본 192.168.100.12
   ARM_IP=192.168.x.x python3 observe_setup.py
 
 키(카메라 창에 포커스):
@@ -38,7 +38,7 @@ def main():
         print("RealSense 장치 없음")
         return 1
 
-    ip = os.environ.get("ARM_IP", "192.168.3.12")
+    ip = os.environ.get("ARM_IP", "192.168.100.12")
     print(f"팔 서버 연결 → {ip}:9010 ...")
     arm = NetworkArm(ip)
     print("연결 OK")
