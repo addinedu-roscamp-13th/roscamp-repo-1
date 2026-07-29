@@ -10,6 +10,8 @@
   <depend>rclpy</depend>
   <depend>automato_interfaces</depend>
   <depend>visualization_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

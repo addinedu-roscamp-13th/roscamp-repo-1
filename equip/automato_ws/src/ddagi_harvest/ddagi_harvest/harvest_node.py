@@ -29,6 +29,7 @@ Goal 파싱 · Feedback 발행 · 취소 처리 · Result 매핑.
 """
 from __future__ import annotations
 
+import os
 import threading
 
 import rclpy
@@ -149,6 +150,11 @@ class HarvestActionServer(Node):
             weights = self.get_parameter("weights").value
             if not weights:
                 raise RuntimeError("detector=yolo 인데 weights 파라미터가 비었다")
+            # bash 는 'weights:=~/...' 처럼 단어 중간의 ~ 를 확장하지 않아 문자 그대로
+            # 넘어온다. 여기서 풀어준다 — 안 그러면 파일이 있는데도 No such file 이다.
+            weights = os.path.expanduser(str(weights))
+            if not os.path.isfile(weights):
+                raise RuntimeError(f"가중치 파일이 없다: {weights}")
             return YoloDetector(weights, angles_provider=arm.get_angles)
         return MockColorDetector(angles_provider=arm.get_angles)
 

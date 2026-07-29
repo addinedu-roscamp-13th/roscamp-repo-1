@@ -16,7 +16,8 @@
 """
 from __future__ import annotations
 
-FRAME_ID = "ddagi_base"
+FRAME_ID = "ddagi_base"     # 팔 base. URDF 를 붙일 때 이 이름을 base 링크에 맞춘다
+PARENT_FRAME = "world"      # ddagi_base 의 부모. 정적 변환 하나로 트리를 만든다
 TOPIC = "/ddagi/markers"
 
 TOMATO_D = 0.022          # 방울토마토 지름(m) — 마커 크기
@@ -42,6 +43,27 @@ class MarkerPublisher:
         self._pub = node.create_publisher(MarkerArray, TOPIC, 1)
         self._show_zone = show_zone
         self._last_n = 0
+        self._publish_static_tf()
+
+    def _publish_static_tf(self) -> None:
+        """world -> ddagi_base 항등 변환을 한 번 쏜다.
+
+        rviz2 는 **Fixed Frame 이 TF 트리에 실재해야** 렌더링한다. 마커의 frame_id 와
+        Fixed Frame 이 같기만 하면 되는 게 아니다(실측: 마커는 도착하는데
+        "Frame [ddagi_base] does not exist" 로 아무것도 안 그려졌다). 정적 변환 하나로
+        두 프레임을 만들어 두면 별도 터미널에서 static_transform_publisher 를 띄울
+        필요가 없다. 나중에 URDF·robot_state_publisher 를 붙이면 그쪽 base 링크가
+        ddagi_base 를 잇는다.
+        """
+        from geometry_msgs.msg import TransformStamped
+        from tf2_ros import StaticTransformBroadcaster
+        self._tf = StaticTransformBroadcaster(self._node)
+        t = TransformStamped()
+        t.header.stamp = self._node.get_clock().now().to_msg()
+        t.header.frame_id = PARENT_FRAME
+        t.child_frame_id = FRAME_ID
+        t.transform.rotation.w = 1.0        # 나머지 성분은 0 = 항등
+        self._tf.sendTransform(t)
 
     # ---- 내부 ------------------------------------------------------------ #
 
