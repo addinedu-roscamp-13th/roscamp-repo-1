@@ -11,7 +11,13 @@ IK 해가 매번 달라져 경로가 튀는 문제를 피하려면 관절각 재
     검사:  python3 ddagi_harvest/teach_unload.py check
     재생:  python3 ddagi_harvest/teach_unload.py run
 
-티칭 키:
+티칭은 두 모드를 오간다. **드래그로 대충 잡고 조그로 다듬는다.**
+
+  [드래그] 서보를 풀고 손으로 끈다. 큰 자세를 빠르게 잡을 때.
+  [조그]   서보를 켠 채 관절 하나씩 ±도 단위로 민다. 미세 조정용 —
+           6축을 동시에 손으로 잡는 건 사실상 불가능하다.
+
+공통 키:
     SPACE  현재 자세를 웨이포인트로 저장 (그리퍼 동작 없음)
     g      저장 + 여기서 그리퍼 닫기   (= 바구니 손잡이 파지)
     o      저장 + 여기서 그리퍼 열기   (= 손잡이 놓기)
@@ -20,6 +26,16 @@ IK 해가 매번 달라져 경로가 튀는 문제를 피하려면 관절각 재
     u      마지막 기록 취소
     l      지금까지 기록 목록
     q      기록 종료(저장)
+
+모드 전환:
+    f      조그 모드로 (서보 ON — 팔이 그 자리에 선다)
+    d      드래그 모드로 (서보 OFF — ⚠ 팔이 처지니 받치고 누를 것)
+
+조그 모드 키:
+    1~6    조종할 관절 선택
+    ] [    +/- 스텝만큼 움직임   (또는 = -)
+    . ,    스텝 크기 바꾸기 (0.5 / 1 / 2 / 5 / 10°)
+    p      현재 각도 출력
 
 ■ 반드시 바구니를 매단 채로 티칭할 것
 서보를 풀고 손으로 끌어 가르치지만 재생은 서보를 켜고 한다. 이 차이로 팔이 중력에
@@ -48,6 +64,7 @@ PATH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # 재생 속도 — 짐을 들고 움직이므로 파지 속도(30)보다도 낮게 시작한다.
 SPEED = 25
+JOG_SPEED = 30            # 조그 1회 이동 속도. 몇 도씩만 움직이므로 낮게 둔다
 SETTLE = 0.4              # 스텝 후 정착 대기(s)
 GRIPPER_SPEED = 60
 WAIT_SEC = 3.0            # 'w' 스텝 기본 대기 (Unload.action 의 shake_delay_sec)
@@ -155,14 +172,84 @@ def do_teach(arm) -> None:
         raise SystemExit("취소됨")
 
     arm.release_servos()
-    print("\n서보 해제됨 — 손으로 팔을 원하는 자세로 옮기고 키를 누르세요.\n")
+    print("\n[드래그] 서보 해제됨 — 손으로 옮기고 키를 누르세요. "
+          "미세 조정이 필요하면 f 로 조그 모드.\n")
 
     steps: list[dict] = []
+    mode = "drag"
+    joint = 5           # 조그 대상 관절(1-indexed). 손목부터 시작 — 여기가 제일 까다롭다
+    step_deg = 2.0
+    target: list | None = None   # 조그 모드에서 '명령한' 각도
+
+    def show_jog():
+        print(f"    J{joint}={target[joint - 1]:7.2f}°  "
+              f"(스텝 {step_deg}°)  전체 {[round(a, 1) for a in target]}")
+
     try:
         while True:
             key = getch()
             if key in ("q", "\r", "\n", "\x03"):
                 break
+
+            # ---- 모드 전환 ------------------------------------------------ #
+            if key == "f" and mode == "drag":
+                cur = read_stable(arm, tries=2, tol=1.5, gap=0.2)
+                if not cur:
+                    print("  [실패] 각도를 읽지 못해 조그로 못 넘어갑니다.")
+                    continue
+                arm.focus_servos()
+                time.sleep(0.6)
+                mode, target = "jog", list(cur)
+                print(f"\n[조그] 서보 ON — 팔이 그 자리에 섰습니다. "
+                      f"1~6 관절선택, ] [ 이동, . , 스텝")
+                show_jog()
+                continue
+            if key == "d" and mode == "jog":
+                print("\n⚠ 드래그로 전환합니다 — 팔이 처집니다. 받치고 아무 키나 누르세요.")
+                getch()
+                arm.release_servos()
+                mode, target = "drag", None
+                print("[드래그] 서보 해제됨.")
+                continue
+
+            # ---- 조그 조작 ------------------------------------------------ #
+            if mode == "jog":
+                if key in "123456":
+                    joint = int(key)
+                    show_jog()
+                    continue
+                if key in ("]", "="):
+                    delta = +step_deg
+                elif key == "[":
+                    delta = -step_deg
+                elif key == ".":
+                    step_deg = {0.5: 1.0, 1.0: 2.0, 2.0: 5.0,
+                                5.0: 10.0, 10.0: 10.0}[step_deg]
+                    show_jog()
+                    continue
+                elif key == ",":
+                    step_deg = {10.0: 5.0, 5.0: 2.0, 2.0: 1.0,
+                                1.0: 0.5, 0.5: 0.5}[step_deg]
+                    show_jog()
+                    continue
+                elif key == "p":
+                    print(f"    실측 {[round(a, 1) for a in (arm.get_angles() or [])]}")
+                    continue
+                else:
+                    delta = None
+                if delta is not None:
+                    nt = list(target)
+                    nt[joint - 1] += delta
+                    nt, ch = clamp_angles(nt)
+                    if ch:
+                        print(f"    ⚠ J{joint} 명령 한계 — {ch[0][1]:.1f}° 요청, "
+                              f"{ch[0][2]:.1f}° 로 조정")
+                    arm.move_angles(nt, JOG_SPEED)
+                    target = nt
+                    show_jog()
+                    continue
+
+            # ---- 저장 ------------------------------------------------------ #
             if key == "u":
                 if steps:
                     steps.pop()
@@ -174,14 +261,22 @@ def do_teach(arm) -> None:
                 continue
             if key not in (" ", "g", "o", "w", "s"):
                 continue
-            angles = read_stable(arm, tries=2, tol=1.5, gap=0.2)
+
+            if mode == "jog":
+                # 조그는 '명령한 값'을 저장한다. 실측을 저장하면 팔이 명령에 1~1.5°
+                # 미달하는 만큼이 매번 누적돼(명령 X -> 실측 X-1.5 저장 -> 재생 시
+                # X-3 도달) 반복할수록 자세가 밀린다.
+                angles = list(target)
+            else:
+                angles = read_stable(arm, tries=2, tol=1.5, gap=0.2)
             if not angles:
                 print("  [실패] 각도를 읽지 못했습니다. 다시 시도하세요.")
                 continue
             act = {"g": "grip", "o": "open", "w": "wait", "s": "shake"}.get(key)
-            steps.append({"angles": angles, "act": act})
+            steps.append({"angles": angles, "act": act, "mode": mode})
             tail = f" + {_ACT_LABEL[act]}" if act else ""
-            print(f"  [{len(steps):2d}] 기록{tail}: {[round(a, 1) for a in angles]}")
+            print(f"  [{len(steps):2d}] 기록{tail} ({mode}): "
+                  f"{[round(a, 1) for a in angles]}")
     finally:
         print("\n서보를 다시 켭니다 — 팔을 계속 받치고 있으세요.")
         arm.focus_servos()
