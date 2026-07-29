@@ -100,6 +100,15 @@ ARM_IP = os.environ.get("ARM_IP", "192.168.100.12")
 _ACT_LABEL = {"grip": "손잡이 파지", "open": "손잡이 놓기",
               "wait": f"{WAIT_SEC:.0f}초 대기", "shake": "털기"}
 
+# 티칭 중 화면에 띄우는 키 안내. 예전엔 독스트링을 문자열로 잘라 썼는데, 섹션 이름을
+# 바꾸는 순간 IndexError 로 죽었다. 안내문은 상수로 둔다.
+KEYS_HELP = """
+  [저장]  SPACE 자세만 · g 파지 · o 놓기 · w 대기 · s 털기
+  [편집]  u 마지막 취소 · l 목록 · q 종료·저장
+  [모드]  f 조그(서보 ON) · d 드래그(서보 OFF, 팔이 처짐)
+  [조그]  1~6 관절선택 · ] [ 이동 · . , 스텝(0.5/1/2/5/10°) · p 실측출력
+"""
+
 
 def clamp_angles(angles):
     """관절각을 명령 가능 한계 안으로 조인다. (clamped, changes) 반환."""
@@ -178,7 +187,15 @@ def do_teach(arm) -> None:
     if not cur:
         raise SystemExit("각도 읽기 실패 — Pi 의 arm_server.py 가 떠 있는지 확인")
     print("현재 자세:", [round(a, 1) for a in cur])
-    print(__doc__.split("티칭 키:")[1].split("■ 반드시")[0])
+    _, over = clamp_angles(cur)
+    if over:
+        # 지금 자세가 이미 명령 범위 밖이면 여기서 저장한 웨이포인트도 재생이 안 된다.
+        print("  ⚠ 현재 자세가 명령 한계를 벗어나 있습니다: "
+              + ", ".join(f"J{j}={o:.1f}°(한계 {JOINT_LIMITS[j][0]}~{JOINT_LIMITS[j][1]})"
+                          for j, o, _ in over))
+        print("    손으로 끌어 넣은 자세라면 정상입니다. 다만 이 상태 그대로는 저장하지"
+              " 마세요 — 재생 시 조여져 다른 자세가 됩니다.")
+    print(KEYS_HELP)
     print("!! 서보를 풀면 팔이 중력으로 처집니다. 반드시 팔을 손으로 받친 뒤 진행하세요.")
     print("!! 바구니를 매단 채로 가르치세요 — 짐 무게가 자세에 반영돼야 합니다.")
     if input("서보를 풀고 티칭을 시작할까요? (y/N) ").strip().lower() != "y":
