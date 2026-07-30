@@ -112,6 +112,43 @@ def test_centerline_plan_only_at_reliable_distance():
     assert fsm2.cl_phase == 'TURN1'
 
 
+def test_plan_backup_no_rotation():
+    """(B) PLAN 근접(d<0.24) 재획득 후진은 회전 없이 직진(bearing 커도 w=0).
+
+    근접·스큐 검출은 미약해서 후진과 '동시 회전'이 그걸 깨뜨려 마커를 놓쳤다.
+    → 재획득 후진은 v<0, w=0(직진)만."""
+    F.configure(D_STAGE=0.20)
+    fsm = F.DockFsm()
+    fsm.state = 'CENTERLINE'
+    fsm.cl_phase = 'PLAN'
+    v, w = fsm.update(True, 0.20, math.radians(10.0), 0.0, 0.0, 0, 0,
+                      plan=(0.1, 0.05, 0.1), odom_xy=(0.0, 0.0), n=99)
+    assert v < 0.0                          # 후진
+    assert abs(w) < 1e-9                     # 회전 없음(bearing 10°인데도)
+
+
+def test_plan_lost_marker_goes_to_search():
+    """(A) PLAN 중 마커 상실이 LOST_TIMEOUT 넘으면 SEARCH(빠른 재탐색, 8초 대기 회피)."""
+    fsm = F.DockFsm()
+    fsm.state = 'CENTERLINE'
+    fsm.cl_phase = 'PLAN'
+    fsm.cl_plan_since = time.monotonic()
+    fsm.lost_since = time.monotonic() - (F.LOST_TIMEOUT + 0.5)   # 이미 상실 타임아웃 경과
+    fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.0, 0.0))
+    assert fsm.state == 'SEARCH'
+    assert fsm.cl_phase == 'PLAN'           # 재획득하면 다시 계획부터
+
+
+def test_plan_lost_backs_straight_before_timeout():
+    """(A) 상실 직후(타임아웃 전)엔 회전 없이 직진 후진으로 재획득 시도."""
+    fsm = F.DockFsm()
+    fsm.state = 'CENTERLINE'
+    fsm.cl_phase = 'PLAN'
+    v, w = fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.0, 0.0))
+    assert fsm.state == 'CENTERLINE'
+    assert v < 0.0 and abs(w) < 1e-9        # 직진 후진(회전 X)
+
+
 def test_face_timeout_aborts_when_unaligned():
     """CENTERLINE 미완주(cl_done=False)에 yaw 안 맞으면 FACE_TIMEOUT 후 ABORT."""
     F.configure(FACE_TIMEOUT=0.05)

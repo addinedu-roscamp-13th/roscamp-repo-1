@@ -311,7 +311,28 @@ class DockFsm:
                     if odom_xy is not None and self.cl_plan_xy0 is not None:
                         backed = math.hypot(odom_xy[0] - self.cl_plan_xy0[0],
                                             odom_xy[1] - self.cl_plan_xy0[1])
-                    # 후방 장애물이면 더 못 물러남 → 즉시 ALIGN 폴백(충돌 방지, 다음 진행).
+                    # (A) 마커 완전 상실: 회전 없이 잠깐 직진 후진(화각 확대)으로 재획득 시도,
+                    #     LOST_TIMEOUT 넘게 못 잡으면 SEARCH(제자리 회전 탐색)로 — 8초 대기 회피.
+                    if not found:
+                        self.lost_since = self.lost_since or now
+                        if now - self.lost_since > LOST_TIMEOUT:
+                            self._warn('PLAN 마커 상실 %.1fs — SEARCH 재탐색'
+                                       % (now - self.lost_since))
+                            self.state = "SEARCH"
+                            self.search_start = None
+                            self.cl_phase = "PLAN"
+                            self.cl_plan_since = None
+                            self.cl_plan_xy0 = None
+                            self.lost_since = None
+                            return 0.0, 0.0
+                        # 후방 여유 있으면 직진 후진(회전 X)으로 재획득, 막혔으면 정지 대기.
+                        if (not self.obstacle_behind and backed < CL_PLAN_BACKUP_MAX
+                                and odom_xy is not None):
+                            return -V_APPROACH, 0.0
+                        return 0.0, 0.0
+                    # 여기부턴 found=True(근접 d<YAW_RELIABLE_D 또는 부실 프레임).
+                    self.lost_since = None
+                    # 후방 장애물/시간초과/후진한계면 더 못 물러남 → ALIGN 폴백(충돌 방지, 다음 진행).
                     if (self.obstacle_behind or now - self.cl_plan_since > CL_PLAN_TIMEOUT
                             or backed >= CL_PLAN_BACKUP_MAX):
                         why = ('후방 장애물' if self.obstacle_behind
@@ -319,8 +340,9 @@ class DockFsm:
                         self._warn('중심선 계획 불가(%s) — ALIGN 접근 폴백' % why)
                         self.state = "ALIGN"       # 계획 실패 → 접근 폴백(cl_done=False)
                         return 0.0, 0.0
-                    if found and d < D_STAGE + CL_PLAN_BACKUP_MAX and odom_xy is not None:
-                        return -V_APPROACH, _clamp(-K_BEARING * bearing, W_MAX)
+                    # (B) 신뢰거리까지 직진 후진만(회전 제거) — 근접 검출을 동시 회전이 깨뜨리지 않게.
+                    if d < D_STAGE + CL_PLAN_BACKUP_MAX and odom_xy is not None:
+                        return -V_APPROACH, 0.0
                     return 0.0, 0.0
                 if odom_yaw is None:
                     self._abort('odom 없음 — 중심선 기동 불가 (bringup 미실행?)')
