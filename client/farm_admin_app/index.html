@@ -1757,21 +1757,33 @@ function drawFarmHeat(){
   // 화면 기준 오프셋 — CSS 90° 회전 때문에 캔버스 +x 는 화면 아래, +y 는 화면 왼쪽이 된다.
   // 라벨을 '노드 오른쪽 위'에 두려면 캔버스에서 (-, -) 로 밀어야 한다.
   function offUpRight(X,Y,d){ return [X-(d||13), Y-(d||13)]; }
+  // ── 팔레트 ────────────────────────────────────────────────────────────────
+  // 이 그림은 '히트맵' 이다. 색으로 정보를 주는 건 밀집도(빨강→주황→노랑→연두) 하나뿐이고,
+  // 배경 구조물(벽·베드·노드·통로·시설)은 전부 무채색 한 계열로 눌러야 히트가 읽힌다.
+  // 구버전은 색이 19가지였고, 특히 통로·노드가 초록(#1f9d55)이라 히트맵의 저밀도 초록과
+  // 경쟁해 화면이 난잡했다.
+  var C={ line:'#8a949c',   // 외벽·구조물 테두리
+          soft:'#c3cace',   // 통로·격자 같은 옅은 선
+          fill:'#eceff1',   // 구조물 채움
+          floor:'#dfe4e7',  // 밭 바닥
+          node:'#7b858c',   // 경유점
+          nodeOn:'#4c565d', // 순찰 촬영점
+          fac:'#6f8ba6',    // 시설(수확대·충전소·예냉실) — 파랑 한 톤만
+          txt:'#3c454c' };
   g.clearRect(0,0,CW,CH);
-  // 밭 바닥 (은은한 그라디언트 + 옅은 격자)
-  var bg=g.createLinearGradient(0,sy(-F.HZ),0,sy(F.HZ));
-  bg.addColorStop(0,'#ccd3d9'); bg.addColorStop(1,'#bec6cd');
-  g.fillStyle=bg; g.fillRect(sx(-F.HX),sy(-F.HZ),sw(F.HX*2),sh(F.HZ*2));
-  g.strokeStyle='rgba(255,255,255,.16)'; g.lineWidth=1;
-  for(var gx=-6;gx<=6;gx+=2){ g.beginPath(); g.moveTo(sx(gx),sy(-F.HZ)); g.lineTo(sx(gx),sy(F.HZ)); g.stroke(); }
-  for(var gz=-12;gz<=12;gz+=2){ g.beginPath(); g.moveTo(sx(-F.HX),sy(gz)); g.lineTo(sx(F.HX),sy(gz)); g.stroke(); }
+  // 밭 바닥 — 그라디언트/격자 제거. 히트 위에 무늬가 겹치면 밀집도를 못 읽는다.
+  g.fillStyle=C.floor; g.fillRect(sx(-F.HX),sy(-F.HZ),sw(F.HX*2),sh(F.HZ*2));
   // 밀집 히트(재배 베드 주변, 부드러운 열지도 빨강→주황→노랑→연두)
   // 순찰 검출이 아직 없으면(_heatAwaiting) 열지도를 아예 그리지 않는다 — 시드 밀집도를
   // 칠해두면 스캔한 적도 없는 구역이 '완숙 밀집'으로 보인다.
   var dens=window._heatDens;
+  // 열지도는 밭 안쪽으로 잘라낸다 — 구버전은 반경 배수가 커서(3.0) 벽 밖으로 번져
+  // 패널 배경까지 물들었고, 그게 '난잡함' 의 큰 부분이었다.
+  g.save();
+  g.beginPath(); g.rect(sx(-F.HX),sy(-F.HZ),sw(F.HX*2),sh(F.HZ*2)); g.clip();
   F.pillars.forEach(dens?function(p,i){
-    var rx,ry;
-    if(p.face==='x'){ rx=sw(p.w)*3.0; ry=sh(p.d)*0.92; } else { rx=sw(p.d)*0.92; ry=sh(p.w)*3.0; }
+    var lenX=p.face==='x'?p.w:p.d, lenZ=p.face==='x'?p.d:p.w;
+    var rx=sw(lenX)*0.85, ry=sh(lenZ)*0.62;      // 베드를 감싸는 정도의 헤일로
     var cx=sx(p.x), cy=sy(p.z), d=dens[i]||0.6, R=Math.max(rx,ry);
     g.save(); g.translate(cx,cy);
     var grd=g.createRadialGradient(0,0,2,0,0,R);
@@ -1782,70 +1794,83 @@ function drawFarmHeat(){
     grd.addColorStop(1,'rgba(150,205,110,0)');
     g.fillStyle=grd; g.beginPath(); g.ellipse(0,0,rx,ry,0,0,7); g.fill(); g.restore();
   }:function(){});
-  // 로봇팔 위(맵 상단 바깥) 방울토마토 = 그림 대신 밀집 색으로 표시 (히트맵 일관성)
-  F.arms.forEach(function(a){
-    var cx=sx(a.x), cy=sy(a.z)-30, rx=Math.max(34,sw(1.8)), ry=19, d=0.92;
-    g.save(); g.translate(cx,cy);
-    var grd=g.createRadialGradient(0,0,2,0,0,Math.max(rx,ry));
-    grd.addColorStop(0,'rgba(214,28,20,'+(0.9*d)+')');
-    grd.addColorStop(0.35,'rgba(236,96,36,'+(0.62*d)+')');
-    grd.addColorStop(0.68,'rgba(250,190,55,'+(0.4*d)+')');
-    grd.addColorStop(1,'rgba(150,205,110,0)');
-    g.fillStyle=grd; g.beginPath(); g.ellipse(0,0,rx,ry,0,0,7); g.fill(); g.restore();
-  });
+  g.restore();                                   // 클립 해제 — 로봇팔은 맵 바깥이라 잘리면 안 된다
+  // 로봇팔 위(맵 바깥) 방울토마토 덩굴의 밀집.
+  // ⚠ 구버전은 d=0.92 하드코딩이라 검출 데이터가 없어도 빨갛게 칠했다(데모 잔재).
+  //   실제 검출값이 있을 때만, 베드 밀집도의 평균으로 그린다.
+  if(dens&&dens.length){
+    var davg=dens.reduce(function(s,v){return s+(v||0);},0)/dens.length;
+    F.arms.forEach(function(a){
+      var cx=sx(a.x), cy=sy(a.z), rx=Math.max(26,sw(1.6)), ry=15;
+      g.save(); g.translate(cx,cy);
+      var grd=g.createRadialGradient(0,0,2,0,0,Math.max(rx,ry));
+      grd.addColorStop(0,'rgba(214,28,20,'+(0.85*davg)+')');
+      grd.addColorStop(0.4,'rgba(236,96,36,'+(0.55*davg)+')');
+      grd.addColorStop(0.72,'rgba(250,190,55,'+(0.32*davg)+')');
+      grd.addColorStop(1,'rgba(150,205,110,0)');
+      g.fillStyle=grd; g.beginPath(); g.ellipse(0,0,rx,ry,0,0,7); g.fill(); g.restore();
+    });
+  }
   // 외벽 — 위·좌·우는 통짜, 아래쪽은 F.wallBars 로 따로 그린다(가운데가 뚫려 있으므로
   // strokeRect 로 사각형을 닫아버리면 개방부가 벽으로 메워져 보인다).
-  g.strokeStyle='#5b6b7a'; g.lineWidth=5; g.lineCap='butt';
+  g.strokeStyle=C.line; g.lineWidth=3; g.lineCap='butt';
   var L=sx(-F.HX), R=sx(F.HX), TP=sy(-F.HZ), BT=sy(F.HZ);
   g.beginPath();
   g.moveTo(L,TP); g.lineTo(L,BT); g.lineTo(R,BT); g.lineTo(R,TP);   // 좌·아래(화면기준)·우
   g.stroke();
-  // 기둥(흰 베드 + 빨강 테두리=방울토마토 면, face 반영)
+  // 재배 베드 — 히트가 이 위에 얹히므로 테두리는 얇은 무채색. (구버전 빨강 테두리는 히트 빨강과 겹쳐 보였다)
   F.pillars.forEach(function(p){
     var lenX=p.face==='x'?p.w:p.d, lenZ=p.face==='x'?p.d:p.w;
     var x=sx(p.x)-sw(lenX)/2, y=sy(p.z)-sh(lenZ)/2;
-    g.fillStyle='#f0f2f4'; g.fillRect(x,y,sw(lenX),sh(lenZ));
-    g.strokeStyle='#e23b2d'; g.lineWidth=3; g.strokeRect(x,y,sw(lenX),sh(lenZ));
+    g.fillStyle=C.fill; g.fillRect(x,y,sw(lenX),sh(lenZ));
+    g.strokeStyle=C.line; g.lineWidth=1.5; g.strokeRect(x,y,sw(lenX),sh(lenZ));
   });
   // 통로(corridor) = 로봇이 실제로 다니는 길. 순찰점끼리 직선으로 잇지 않는다(없는 길이 생긴다).
-  (F.links||[]).forEach(function(lk){ var a=F.waypoints.find(function(w){return w.id===lk[0];}), b=F.waypoints.find(function(w){return w.id===lk[1];}); if(a&&b){ g.strokeStyle='rgba(31,157,85,.75)'; g.lineWidth=2; g.setLineDash([6,5]); g.beginPath(); g.moveTo(sx(a.x),sy(a.z)); g.lineTo(sx(b.x),sy(b.z)); g.stroke(); g.setLineDash([]); } });
-  // waypoint 마커 (시설 진입=파랑 / 순찰·경유=초록). 순찰 순서는 점 옆에 작게 (n).
+  g.strokeStyle=C.soft; g.lineWidth=1.5; g.setLineDash([4,4]);
+  (F.links||[]).forEach(function(lk){
+    var a=F.waypoints.find(function(w){return w.id===lk[0];}), b=F.waypoints.find(function(w){return w.id===lk[1];});
+    if(a&&b){ g.beginPath(); g.moveTo(sx(a.x),sy(a.z)); g.lineTo(sx(b.x),sy(b.z)); g.stroke(); }
+  });
+  g.setLineDash([]);
+  // waypoint 마커 — 시설 진입은 무채색 파랑 한 톤, 순찰점은 진회색, 경유점은 옅은 회색.
   g.textAlign='center'; g.textBaseline='middle';
   F.waypoints.forEach(function(w){ var X=sx(w.x),Y=sy(w.z);
-    g.fillStyle=w.gate?'#2f7fd6':'#1f9d55'; g.beginPath(); g.arc(X,Y,7.5,0,7); g.fill();
-    g.fillStyle='#fff'; g.font='bold 9px sans-serif'; T(w.id,X,Y);
-    if(w.ord){ var o=offUpRight(X,Y,12); g.fillStyle='#0f6b34'; g.font='bold 9px sans-serif'; T('('+w.ord+')',o[0],o[1]); } });
+    g.fillStyle=w.gate?C.fac:(w.ord?C.nodeOn:C.node);
+    g.beginPath(); g.arc(X,Y,6.5,0,7); g.fill();
+    g.fillStyle='#fff'; g.font='bold 8.5px sans-serif'; T(w.id,X,Y);
+    if(w.ord){ var o=offUpRight(X,Y,11); g.fillStyle=C.txt; g.font='bold 8.5px sans-serif'; T('('+w.ord+')',o[0],o[1]); } });
   // ★ 하단 외벽 — 두 토막. 가운데 42cm 는 뚫려 있다(로봇팔 2대 사이 = 수확물 인수 공간).
-  g.strokeStyle='#5b6b7a'; g.lineWidth=5;
+  g.strokeStyle=C.line; g.lineWidth=3;
   (F.wallBars||[]).forEach(function(wb){ var wy=sy(wb.z);
     g.beginPath(); g.moveTo(sx(wb.x-wb.w/2),wy); g.lineTo(sx(wb.x+wb.w/2),wy); g.stroke(); });
   // 개방 구간에는 점선·라벨을 따로 그리지 않는다 — 아래에서 수확대(주차칸) 2개를 그 자리에
   // 그리므로 '벽 두 토막이 끝나고 그 사이에 주차칸이 있다'는 것만으로 개방이 읽힌다.
   // 겹쳐 그리면 라벨이 뭉쳐 오히려 안 보였다.
   // 수확대 = Pinky 주차칸 2개 (로봇팔과 같은 줄, 벽 개방부 안). 2대 주차가 보이게 칸을 그린다.
+  // 시설 3종(수확대·예냉실·충전소)은 같은 모양 규칙으로 그린다 — 옅은 채움 + 얇은 테두리 + 라벨.
+  // 종류마다 색·굵기·모양이 다르면 눈이 '이게 다른 정보인가' 하고 붙잡힌다.
+  function facBox(cx,cy,w,h,label,fs){
+    g.fillStyle=C.fill; g.fillRect(cx-w/2,cy-h/2,w,h);
+    g.strokeStyle=C.fac; g.lineWidth=1.5; g.strokeRect(cx-w/2,cy-h/2,w,h);
+    g.fillStyle=C.fac; g.font='bold '+(fs||9)+'px sans-serif'; T(label,cx,cy);
+  }
   (F.harvestBays||[]).forEach(function(b){
-    var bx=sx(b.x)-sw(b.w)/2, by=sy(b.z)-sh(b.d)/2, bw=sw(b.w), bh=Math.max(14,sh(b.d));
-    g.fillStyle='rgba(224,120,95,.55)'; g.fillRect(bx,by,bw,bh);
-    g.strokeStyle='#8a3f2f'; g.lineWidth=2; g.strokeRect(bx,by,bw,bh);
-    g.fillStyle='#7a2f20'; g.font='bold 9px sans-serif'; T(b.label,sx(b.x),sy(b.z));
+    facBox(sx(b.x),sy(b.z),sw(b.w),Math.max(14,sh(b.d)),b.label);
   });
-  // 로봇팔 2대 (관절 아이콘) — 그 위 방울토마토는 위에서 밀집 '색'으로 표시함(그림 제거)
+  // 로봇팔 2대 — 무채색 단색 글리프. (구버전은 파랑 4색이라 시설·노드와 색이 경쟁했다)
   g.textAlign='center'; g.textBaseline='middle';
   F.arms.forEach(function(a){ var X=sx(a.x), Y=sy(a.z);
-    // 로봇팔(베이스+링크+관절+그리퍼)
-    g.fillStyle='#39414b'; g.fillRect(X-8,Y+5,16,5);
-    g.strokeStyle='#2f7fd6'; g.lineWidth=4; g.lineCap='round'; g.beginPath(); g.moveTo(X,Y+5); g.lineTo(X-5,Y-4); g.lineTo(X+8,Y-10); g.stroke();
-    g.fillStyle='#1b5fa8'; [[X,Y+5],[X-5,Y-4],[X+8,Y-10]].forEach(function(p){g.beginPath();g.arc(p[0],p[1],2.6,0,7);g.fill();});
-    g.strokeStyle='#39414b'; g.lineWidth=2; g.beginPath(); g.moveTo(X+8,Y-10); g.lineTo(X+12,Y-14); g.moveTo(X+8,Y-10); g.lineTo(X+13,Y-8); g.stroke(); });
-  // 예냉실
-  var c=F.cold, ex=sx(c.x)-sw(c.w)/2, ey=sy(c.z)-sh(c.d)/2;
-  g.fillStyle='rgba(120,180,220,.5)'; g.fillRect(ex,ey,sw(c.w),sh(c.d));
-  g.strokeStyle='#3a7fb8'; g.lineWidth=2; g.strokeRect(ex,ey,sw(c.w),sh(c.d));
-  g.fillStyle='#12456e'; g.font='bold 12px sans-serif'; T('예냉실',sx(c.x),sy(c.z));
-  // DG 충전소 3개 (사각 패드 — 접근 waypoint와 겹치지 않게)
-  F.stations.forEach(function(s,i){ var cx=sx(s.x),cy=sy(s.z),ww=Math.max(24,sw(0.9)),hh=Math.max(17,sh(0.85));
-    g.fillStyle='#2f7fd6'; g.fillRect(cx-ww/2,cy-hh/2,ww,hh);
-    g.fillStyle='#fff'; g.font='bold 11px sans-serif'; T('DG'+(i+1),cx,cy);});
+    g.strokeStyle=C.line; g.fillStyle=C.line;
+    g.fillRect(X-7,Y+5,14,4);                                            // 베이스
+    g.lineWidth=3; g.lineCap='round';
+    g.beginPath(); g.moveTo(X,Y+5); g.lineTo(X-4,Y-3); g.lineTo(X+7,Y-9); g.stroke();   // 링크
+    [[X,Y+5],[X-4,Y-3],[X+7,Y-9]].forEach(function(p){g.beginPath();g.arc(p[0],p[1],2.2,0,7);g.fill();});
+  });
+  // 예냉실 · 충전소 — 수확대와 같은 규칙
+  var c=F.cold; facBox(sx(c.x),sy(c.z),sw(c.w),sh(c.d),'예냉실',10);
+  F.stations.forEach(function(s,i){
+    facBox(sx(s.x),sy(s.z),Math.max(24,sw(0.9)),Math.max(17,sh(0.85)),'DG'+(i+1),9);
+  });
 }
 function sliderRow(lab,val,pct){return `<div class="pr" style="margin-bottom:16px"><div class="top"><span>${lab}</span><b>${val}</b></div>
   <div class="bar2" style="height:7px"><i style="width:${pct}%;background:var(--leaf)"></i></div></div>`;}
