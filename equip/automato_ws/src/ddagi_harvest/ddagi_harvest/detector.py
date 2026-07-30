@@ -365,7 +365,6 @@ class RosDetector(TomatoDetector):
                         "tomato_id": int(tom.tomato_id)})
         return out
 
-
     def close(self) -> None:
         """서비스 클라이언트를 정리한다.
 

@@ -127,7 +127,7 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
         on_progress(round_no, harvested["NORMAL"], harvested["DISCARD"],
                     len(excluded), remaining)
 
-    def verify(detections: list) -> None:
+    def verify(detections: list | None) -> None:
         """직전 배치의 **실패분**만 재검출과 대조해 재시도/제외를 정한다.
 
         성공은 여기서 세지 않는다 — 파지 후 '상승 후 확인'(그리퍼 재확인)을 통과하면
@@ -135,8 +135,13 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
         (실측: 파지값 80·92·67 이 모두 상승 후 0), 거기서 살아남았으면 떼어낸 열매다.
         거기서 바구니까지는 놓치지 않는다. 반면 재검출은 가려져 있던 뒤 열매를 보고
         성공을 실패로 오판한 사례가 있었다.
+
+        detections=None(검출 자체 실패)이면 대조를 건너뛴다. 마지막 배치 검증에서
+        None 이 올 수 있는데, len() 을 바로 불러 Goal 이 통째로 죽었다. 빈 리스트로
+        떨어뜨려도 안 된다 — '재검출에 없다 = 사라졌다'가 되어 카메라가 안 열린 것이
+        낙과로 기록된다. 확인을 못 했을 뿐이므로 실패분(prev)은 그대로 남긴다.
         """
-        if not prev:
+        if not prev or detections is None:
             return
         log(f"\n[검증] 재검출 {len(detections)}개로 실패분 {len(prev)}건 확인 "
               f"— 아직 있으면 재시도, 사라졌으면 낙과")
@@ -180,13 +185,17 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
             # 비었다"로 보고된다. AI 가이드도 CAMERA_NOT_AVAILABLE 은 다음 라운드에
             # 재시도하라고 명시한다(서버가 매 요청마다 재오픈을 시도).
             # 라운드만 소모하고 넘어가며, 반복되면 MAX_ROUNDS 가 상한 역할을 한다.
+            #
+            # exit_reason 은 건드리지 않는다. 실패한 라운드는 attempts·full·canceled 를
+            # 하나도 바꾸지 않으므로 루프가 여기서 끝날 수 없고, 계속 실패하면 위쪽
+            # 라운드 상한에 걸려 MAX_ROUNDS_EXCEEDED 로 나간다. 중간 사유를 넣었다
+            # 지우는 왕복은 결과가 같고, Harvest.action 의 exit_reason 은 애초에
+            # DEPLETED / FULL / MAX_ROUNDS_EXCEEDED 만 정의한다 — 새 값이 새면 ACS 가
+            # 모르는 사유를 받는다.
             warn(f"  검출 실패 — 라운드 {round_no} 건너뜀 (남은 라운드 "
                  f"{max_rounds - round_no}회)")
-            exit_reason = "DETECT_FAILED"
             continue
         verify(detections)                   # 직전 배치 결과를 재검출로 확정
-        if exit_reason == "DETECT_FAILED":
-            exit_reason = "DEPLETED"         # 검출이 회복됐으므로 실패 사유를 지운다
         batch = [t for t in detections
                  if not _near_any(t["base"], excluded, exclude_radius)]
         if not batch:
