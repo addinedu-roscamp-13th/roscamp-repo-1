@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'harvest_node = ddagi_harvest.harvest_node:main',
+            'unload_node = ddagi_harvest.unload_node:main',
         ],
     },
 )

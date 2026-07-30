@@ -89,8 +89,13 @@ Fixed Frame·토픽·시점이 잡혀서 뜬다. **파란 와이어프레임 상
 
 ### 5) 이제 기다린다
 
-수확 노드는 액션 서버다. **ACS → DG → Ddagi 로 Goal 이 내려오면 자동으로 시작한다.**
-따고가 수확 위치에 도킹하면 DG 가 보낸다(DG 는 도킹 성공한 task 의 goal 만 수락).
+수확·하역 노드는 액션 서버다. **ACS → DG → Ddagi 로 Goal 이 내려오면 자동으로 시작한다.**
+DG 는 도킹 성공(`is_docked`)한 task 의 goal 만 수락한다.
+
+| 액션 | 언제 | 하는 일 |
+|---|---|---|
+| `/ddagi/harvest` | 따고가 **수확 위치**에 도킹 | 관측 → 검출 → 파지 → 바구니 (라운드 반복) |
+| `/ddagi/unload` | 따고가 **예냉실**에 도킹 | 손잡이 파지 → 들기 → 쏟기 → 놓기 → 복귀 |
 
 ```
 대기 → Goal 수신 → 라운드 반복 → Result 반환 → 대기 → ...
@@ -231,6 +236,40 @@ AI 가 좌표를 mm 로 보내면 1000배가 되어 전량 작업공간 밖으�
 
 ---
 
+## 예냉실 하역 (E6)
+
+따고가 예냉실에 도킹하면 DG 가 `/ddagi/unload` 로 Goal 을 보낸다. 티칭한 관절각 경로를
+재생해 바구니를 쏟고 완료를 돌려준다.
+
+```bash
+# 티칭 (로봇마다 각자 — 예냉실 배치가 다르다)
+python3 ddagi_harvest/teach_unload.py teach
+python3 ddagi_harvest/teach_unload.py check     # 명령 한계 검사 (필수)
+python3 ddagi_harvest/teach_unload.py run       # 수동 재생
+
+# 수동 Goal
+ros2 action send_goal /ddagi/unload automato_interfaces/action/Unload \
+  "{task_id: 1, shake_delay_sec: 3.0}" --feedback
+```
+
+티칭 값은 **`~/.config/automato/unload_path.json`** 에 저장된다. 패키지 안에 두면
+티칭은 `src` 에 쓰이는데 액션 서버는 `install` 공간에서 읽어 못 찾고, `rm -rf install`
+로 날아간다. `UNLOAD_PATH` 로 경로를 바꿀 수 있다.
+
+| `result_code` | 의미 |
+|---|---|
+| `0` | 성공 |
+| `1` | 손잡이 파지 실패 — 그리퍼를 열고 준비 자세로 복귀한다 |
+| `2` | 중단(취소) 또는 티칭 경로 없음 |
+
+`shake_delay_sec` 은 '들어올린 뒤 대기 시간'이라 쏟아지는 걸 기다리는 구간에 쓴다.
+
+> **털기는 빼기로 했다(2026-07-30).** 경로에서 `shake` 스텝의 `act` 를 해제했으므로
+> Feedback 에 `SHAKE` phase 가 나오지 않는다. 되살리려면 `unload_path.json` 의 그
+> 스텝 `act` 를 `"shake"` 로 되돌린다(코드는 기능을 남겨 두었다).
+
+---
+
 ## 종료 사유 (`exit_reason`)
 
 | 값 | 의미 |
@@ -253,6 +292,7 @@ AI 가 좌표를 mm 로 보내면 1000배가 되어 전량 작업공간 밖으�
 | `detector.py` | 검출 추상화. `RosDetector` / `YoloDetector` / `MockColorDetector` / `ListDetector` |
 | `arm_backend.py` | 팔 추상화. `NetworkArm`(TCP) / `RealArm` / `FakeArm` |
 | `markers.py`·`log.py` | rviz 시각화 · 출력 싱크 주입 |
+| `unload_node.py` | 하역 액션 서버(`/ddagi/unload`). `teach_unload.replay` 를 감싼다 |
 | `teach_unload.py` | 예냉실 하역 모션 티칭·재생 (RP-130) |
 | `fit_observe_tf.py` | 관측자세 변환 피팅 (rigid/affine + LOO 교차검증) |
 | `tf_verify.py` | 클릭 검증·게이지 측정·손목 자세 티칭 |

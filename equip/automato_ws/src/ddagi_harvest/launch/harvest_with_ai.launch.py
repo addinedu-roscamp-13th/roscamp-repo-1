@@ -87,6 +87,19 @@ def generate_launch_description():
         parameters=[{"model_path": LaunchConfiguration("model")}],
     )
 
+    unload = Node(
+        package="ddagi_harvest",
+        executable="unload_node",
+        name="ddagi_unload_node",
+        output="screen",
+        emulate_tty=True,
+        prefix=[py],
+        parameters=[{
+            "arm": LaunchConfiguration("arm"),
+            "arm_ip": LaunchConfiguration("arm_ip"),
+        }],
+    )
+
     harvest = Node(
         package="ddagi_harvest",
         executable="harvest_node",
@@ -103,4 +116,4 @@ def generate_launch_description():
             "conf": ParameterValue(LaunchConfiguration("conf"), value_type=float),
         }],
     )
-    return LaunchDescription(args + [ai, harvest])
+    return LaunchDescription(args + [ai, harvest, unload])
