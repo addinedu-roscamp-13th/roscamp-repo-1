@@ -102,6 +102,12 @@ function renderBackground(layer, layout, T) {
 
 const FACILITY_LABEL = { CHARGE: "충전", HARVEST: "수확대", PRECOOL: "예냉실" };
 
+// 시설 박스 배치 상수 — renderFacilities 와 '로봇 도킹 위치'(renderRobots)가 공유한다.
+// 박스는 waypoint 와 '별개'로 고정된 행에 그린다(위=수확대 줄 y≈-0.69, 아래=충전·예냉실 줄 y≈1.11).
+const FAC = { W: 0.135, H: 0.105, TOP_FAR: -0.69, BOTTOM_FAR: 1.11 };
+// 충전소는 로봇이 도킹해 '들어가는' 곳 → 그 자리 로봇을 이 박스의 세로 중앙(DB y)에 그린다.
+const DOCK_Y = FAC.BOTTOM_FAR - FAC.H / 2;
+
 /**
  * 시설 레이어: task_points(충전소·수확대·예냉실)를 DB 좌표에 그린다.
  *
@@ -110,12 +116,15 @@ const FACILITY_LABEL = { CHARGE: "충전", HARVEST: "수확대", PRECOOL: "예�
  * 겹쳐 그리면 노드 원이 라벨 위에 올라앉아 글자가 안 보인다.
  */
 function renderFacilities(layer, graph, T, room) {
-  const W = 0.135, H = 0.105;         // 시설 박스 크기(m)
+  const { W, H, TOP_FAR, BOTTOM_FAR } = FAC;
   const midY = (room.y0 + room.y1) / 2;
+  // 박스는 waypoint 와 '별개'로 행마다 고정된 y 에 그려 수평으로 맞춘다(위 행=수확대,
+  // 아래 행=충전·예냉실). 노드(로봇 접근/도킹 지점)와 박스(실제 시설)는 20~30cm 떨어져
+  // 있고, 그 빈틈이 곧 그 간격을 나타낸다.
   for (const t of graph.task_points) {
     const outward = t.y > midY ? 1 : -1;     // 아래쪽 시설은 아래로, 위쪽 시설은 위로
-    const yNear = t.y;                       // 노드가 걸리는 모서리
-    const yFar = t.y + outward * H;          // 벽 쪽 모서리
+    const yFar = outward < 0 ? TOP_FAR : BOTTOM_FAR;   // 행마다 고정된 벽 쪽 모서리
+    const yNear = yFar - outward * H;        // 로봇(안) 쪽 모서리
     const left = T.x(t.x + W / 2);
     const w = T.x(t.x - W / 2) - left;
     const top = Math.min(T.y(yNear), T.y(yFar));
@@ -128,13 +137,16 @@ function renderFacilities(layer, graph, T, room) {
     const cx = left + w / 2;
     const cy = top + h / 2;
     const name = FACILITY_LABEL[t.point_type] || t.point_type;
-    // 충전소는 어느 로봇 자리인지가 핵심 정보다(순찰 출발 노드가 여기서 정해진다).
-    const sub = t.robots.length ? t.robots.join(",") : `wp${t.waypoint_id}`;
-    // 글자를 노드 반대쪽(벽 쪽)으로 밀어 노드 원에 가리지 않게 한다.
-    // outward=+1 이면 노드가 박스 위 모서리에 있으므로 글자는 아래로, -1 이면 반대.
-    const shift = outward * 1.4;
-    layer.appendChild(el("text", { x: cx, y: cy - 0.6 + shift, class: "facility-name" }, name));
-    layer.appendChild(el("text", { x: cx, y: cy + 2.9 + shift, class: "facility-sub" }, sub));
+    const sub = t.robots.length ? t.robots.join(",") : "";
+    if (sub) {
+      // 충전소: 로봇이 도킹해 '들어오는' 칸. 이름은 위, 로봇 자리(dg_01…)는 아래에 둬
+      // 가운데에 도킹한 로봇 원과 겹치지 않게 한다.
+      layer.appendChild(el("text", { x: cx, y: cy - 3.0, class: "facility-name" }, name));
+      layer.appendChild(el("text", { x: cx, y: cy + 4.0, class: "facility-sub" }, sub));
+    } else {
+      // 수확대·예냉실: 이름을 로봇팔 라벨처럼 박스 '중앙'에 놓는다.
+      layer.appendChild(el("text", { x: cx, y: cy + 1.1, class: "facility-name" }, name));
+    }
   }
 }
 
@@ -216,22 +228,13 @@ function renderNodes(layer, graph, T, opts) {
 
     layer.appendChild(el("circle", { cx, cy, r, class: cls }));
 
-    // 시설 노드는 시설 박스가 이미 이름을 달고 있어 번호를 또 쓰면 겹친다 → 생략.
-    if (!isFacility) {
-      // 맨 윗줄(y<-0.3)은 위쪽에 로봇팔·수확대가 있어 라벨을 아래로 내린다.
-      const below = w.y < -0.3;
-      layer.appendChild(el("text", {
-        x: cx, y: below ? cy + r + 3.2 : cy - r - 1.3, class: "node-id",
-      }, String(w.waypoint_id)));
-    }
-
-    // 순찰 순번 배지
-    if (w.patrol_order !== null && w.patrol_order !== undefined) {
-      layer.appendChild(el("circle", { cx: cx - 3.0, cy: cy + 3.0, r: 1.9, class: "order-badge" }));
-      layer.appendChild(el("text", {
-        x: cx - 3.0, y: cy + 3.75, class: "order-text",
-      }, String(w.patrol_order)));
-    }
+    // 모든 노드에 waypoint 번호를 단다(시설 노드 포함). 시설 박스는 이제 노드에서
+    // 20~30cm 떨어진 '고정 행'에 있어 번호가 박스와 겹치지 않는다.
+    // 맨 윗줄(y<-0.3)은 위쪽에 로봇팔·수확대가 있어 라벨을 아래로 내린다.
+    const below = w.y < -0.3;
+    layer.appendChild(el("text", {
+      x: cx, y: below ? cy + r + 3.2 : cy - r - 1.3, class: "node-id",
+    }, String(w.waypoint_id)));
 
     // 짝 배지(↻) — 이 지점에서 제자리 회전 촬영이 한 번 더 있다는 표시
     const pair = pairByParent.get(w.waypoint_id);
@@ -309,6 +312,17 @@ function render(graph, layout) {
       document.getElementById(`nring-${n}`)]));
   VIEW.robotColor = new Map(
     Object.keys(graph.patrol_start).sort().map((rid, i) => [rid, (i % 3) + 1]));
+  // 충전소는 로봇이 도킹해 들어가는 곳 — 로봇이 자기 충전 waypoint 에 서 있으면
+  // 그 waypoint 가 아니라 '충전 박스 안'(dockPos)에 그린다. 여기서 로봇별로 미리 계산해 둔다.
+  VIEW.dockPos = new Map();     // robot_id → 충전 박스 중앙(DB 좌표)
+  VIEW.chargeWp = new Map();    // robot_id → 그 로봇의 충전 waypoint id
+  for (const t of graph.task_points) {
+    if (t.point_type !== "CHARGE") continue;
+    for (const rid of t.robots) {
+      VIEW.dockPos.set(rid, { x: t.x, y: DOCK_Y });
+      VIEW.chargeWp.set(rid, t.waypoint_id);
+    }
+  }
   buildControls(graph);
 }
 
@@ -434,9 +448,19 @@ function updateCorridors(msg) {
 function updateNodes(msg) {
   const holders = msg.node_holders || {};
   const avoidNodes = new Set((msg.avoiding_nodes || []).map(String));
+  // 도킹한 로봇은 '충전 박스 안'에 있는 것으로 본다 → 그 로봇의 충전 waypoint(wp22·23·24)는
+  // 비어 있는 것처럼 둔다(자리 점유 링을 안 칠한다). 초기 화면에서 로봇은 충전소에 있고
+  // 그 waypoint 는 '나가는 통로'일 뿐이라 색이 없어야 한다(renderRobots 의 docked 와 같은 규칙).
+  const dockedNodes = new Set();
+  for (const r of msg.robots || []) {
+    if (!r.moving && !r.spinning
+        && String(r.waypoint_id) === String(VIEW.chargeWp.get(r.robot_id))) {
+      dockedNodes.add(String(r.waypoint_id));
+    }
+  }
   for (const [nid, ring] of VIEW.nodeRings) {
     if (!ring) continue;
-    const holder = holders[nid];
+    const holder = dockedNodes.has(nid) ? null : holders[nid];
     let cls = "node-ring";
     if (holder) cls += ` nr-held r${VIEW.robotColor.get(holder) || 1}`;
     else if (avoidNodes.has(nid)) cls += " nr-avoid";
@@ -453,8 +477,15 @@ function renderRobots(msg) {
     // LIVE 에서 한 번도 텔레메트리를 못 받은 로봇은 좌표가 없다. 0,0 으로 채워
     // 그리면 '있지도 않은 로봇'이 맵 구석에 생기므로 아예 안 그린다(목록엔 남는다).
     if (r.x === null || r.y === null || r.x === undefined) continue;
-    const cx = T.x(r.x);
-    const cy = T.y(r.y);
+    // 자기 충전 waypoint 에 '멈춰' 서 있으면(출발 전/복귀 후) 그 노드가 아니라 '충전 박스 안'에
+    // 그린다 — 충전소는 로봇이 도킹해 들어가는 곳이라(박스와 waypoint 는 별개).
+    // 주행/회전 중엔 제외한다 — 충전을 빠져나가는 동안 waypoint_id 가 잠깐 충전 노드로 남아도
+    // 박스 안에 얼어붙지 않고 실제 좌표로 움직이게.
+    const dock = VIEW.dockPos.get(r.robot_id);
+    const docked = !!dock && !r.moving && !r.spinning
+      && r.waypoint_id === VIEW.chargeWp.get(r.robot_id);
+    const cx = docked ? T.x(dock.x) : T.x(r.x);
+    const cy = docked ? T.y(dock.y) : T.y(r.y);
     const n = VIEW.robotColor.get(r.robot_id) || 1;
     const active = r.status === "RUNNING";
     // LIVE 에서 텔레메트리가 끊긴 로봇은 '마지막으로 본 자리'일 뿐 지금 거기 있다는
@@ -463,12 +494,15 @@ function renderRobots(msg) {
     const stale = VIEW.mode === "LIVE" && r.online === false ? " stale" : "";
 
     // 진행 방향 표시. 화면 x 축이 뒤집혀 있으므로 x 성분만 부호를 바꾼다.
+    // 도킹 중엔 방향이 의미 없고 박스 안이 좁아 생략한다.
     const L = 4.2;
-    layer.appendChild(el("line", {
-      x1: cx, y1: cy,
-      x2: cx - Math.cos(r.yaw) * L, y2: cy + Math.sin(r.yaw) * L,
-      class: `robot-heading r${n}`,
-    }));
+    if (!docked) {
+      layer.appendChild(el("line", {
+        x1: cx, y1: cy,
+        x2: cx - Math.cos(r.yaw) * L, y2: cy + Math.sin(r.yaw) * L,
+        class: `robot-heading r${n}`,
+      }));
+    }
     layer.appendChild(el("circle", {
       cx, cy, r: 2.6,
       class: `robot r${n}${active ? "" : " idle"}${stale}`,
@@ -477,9 +511,12 @@ function renderRobots(msg) {
     if (r.spinning) {
       layer.appendChild(el("circle", { cx, cy, r: 4.0, class: `robot-spin r${n}` }));
     }
-    layer.appendChild(el("text", {
-      x: cx, y: cy - 4.6, class: `robot-label r${n}${stale}`,
-    }, r.robot_id));
+    // 도킹 중이면 충전 박스가 이미 이름·자리(dg_01…)를 달고 있어 로봇 라벨은 생략(겹침 방지).
+    if (!docked) {
+      layer.appendChild(el("text", {
+        x: cx, y: cy - 4.6, class: `robot-label r${n}${stale}`,
+      }, r.robot_id));
+    }
   }
 }
 
