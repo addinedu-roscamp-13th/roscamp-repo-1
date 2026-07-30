@@ -1597,8 +1597,16 @@ def _kst_today():
 
 
 def harvest_default():
-    seed = [92, 104, 88, 118, 110, 121, 128.6]                       # 최근 7일 데모 시드
+    """최근 7일 초기값.
+       ACS 연동 시엔 전부 0 — 실제 수확 완료 콜백으로만 채운다. 데모 시드
+       (92/104/88/118/110/121/128.6)를 내보내면 수확을 한 적도 없는데 그래프에
+       막대가 서서, 관리자가 '오늘 118kg 나왔네' 로 읽는다(2026-07-30 발견)."""
     base = _kst_today()
+    if ACS_MODE:
+        days = {(base - _dt.timedelta(days=6 - i)).isoformat(): 0 for i in range(7)}
+        return {"days": days, "sold_kg": 0, "discard_kg": 0, "updated_at": None,
+                "source": "acs"}
+    seed = [92, 104, 88, 118, 110, 121, 128.6]                       # 최근 7일 데모 시드
     days = {(base - _dt.timedelta(days=6 - i)).isoformat(): seed[i] for i in range(7)}
     return {"days": days, "sold_kg": 50.1, "discard_kg": 16.8, "updated_at": None}
 
@@ -1606,9 +1614,13 @@ def harvest_default():
 def load_harvest_stats():
     try:
         with open(HARVEST_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            d = json.load(f)
     except Exception:
         return harvest_default()
+    # 실연동인데 파일에 데모 시드가 남아있으면(이전 단독 구동/테스트 잔재) 쓰지 않는다.
+    if ACS_MODE and d.get("source") != "acs":
+        return harvest_default()
+    return d
 
 
 def save_harvest_stats(d):
@@ -1636,6 +1648,8 @@ def _bump_harvest(kg):
         today = _kst_today().isoformat()
         d["days"][today] = round(d["days"].get(today, 0) + kg, 1)
         d["updated_at"] = time.strftime("%m/%d %H:%M")
+        if ACS_MODE:
+            d["source"] = "acs"       # 실수확 기록이 생겼다 → 다음 로드부터 이 파일을 신뢰
         save_harvest_stats(d)
 
 
