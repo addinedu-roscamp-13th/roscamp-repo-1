@@ -840,7 +840,9 @@ function renderAlertBanner(){
   var pad='border-radius:12px;padding:13px 18px;font-size:15.5px;font-weight:800;display:flex;align-items:center;gap:9px;';
   if(urgent.length) el.innerHTML='<div style="'+pad+'background:#e0483a;color:#fff;box-shadow:0 4px 16px rgba(224,72,58,.4);animation:alertPulse 1.5s ease-in-out infinite">🚨 조치 필요 — '+urgent.join(' · ')+(warn.length?'<span style="font-weight:500;font-size:13px;opacity:.92"> · '+warn.join(' · ')+'</span>':'')+'</div>';
   else if(warn.length) el.innerHTML='<div style="'+pad+'background:#fbe4c0;border-left:6px solid #e8912d;color:#8a4f0a">⚠️ 주의 — '+warn.join(' · ')+'</div>';
-  else el.innerHTML='<div style="'+pad+'background:#eafaef;border:1px solid #a9d8b5;color:#1d6a35;font-weight:700">✓ 이상 없음 — 로봇·작물 모두 정상</div>';
+  // '로봇·작물 모두 정상' 이라고 단정하지 않는다 — 로봇이 안 붙었거나 순찰을 아직 안 한
+  // 상태에서도 이 문구가 떠서, 점검한 적 없는 것을 확인해서 정상이라고 한 것처럼 읽혔다.
+  else el.innerHTML='<div style="'+pad+'background:#eafaef;border:1px solid #a9d8b5;color:#1d6a35;font-weight:700">✓ 이상 없음</div>';
 }
 // 순찰/수확 요청: 자동배정/직접선택 토글 1개 공유(로봇 상태 헤더). 직접선택 시 위 로봇카드를 눌러 선택.
 // 순찰차 1대(dg_03), 수확차 2대(dg_01·dg_02)
