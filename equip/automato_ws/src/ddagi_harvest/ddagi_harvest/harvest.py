@@ -173,7 +173,20 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
         pk.move_observe(arm)                 # 검출은 관측자세에서만(FK 가정)
         time.sleep(SETTLE)
         detections = detector.detect()
+        if detections is None:
+            # 검출 자체가 실패했다(AI 서비스 오류·카메라 미개방·응답 시간초과).
+            # 빈 리스트와 구분해야 한다 — 빈 리스트는 '딸 게 없다'라서 DEPLETED 로
+            # 끝내는 게 맞지만, 실패를 그렇게 처리하면 카메라가 안 열린 것이 "밭이
+            # 비었다"로 보고된다. AI 가이드도 CAMERA_NOT_AVAILABLE 은 다음 라운드에
+            # 재시도하라고 명시한다(서버가 매 요청마다 재오픈을 시도).
+            # 라운드만 소모하고 넘어가며, 반복되면 MAX_ROUNDS 가 상한 역할을 한다.
+            warn(f"  검출 실패 — 라운드 {round_no} 건너뜀 (남은 라운드 "
+                 f"{max_rounds - round_no}회)")
+            exit_reason = "DETECT_FAILED"
+            continue
         verify(detections)                   # 직전 배치 결과를 재검출로 확정
+        if exit_reason == "DETECT_FAILED":
+            exit_reason = "DEPLETED"         # 검출이 회복됐으므로 실패 사유를 지운다
         batch = [t for t in detections
                  if not _near_any(t["base"], excluded, exclude_radius)]
         if not batch:
