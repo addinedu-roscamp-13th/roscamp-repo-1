@@ -394,7 +394,10 @@ class AutomatoControlNode(Node):
             만지지 않는다는 경계(harvest_dispatcher 설계노트 2) 때문이다. 순찰이
             start_wp 를 여기서 조회해 넘기는 것과 같은 관례다.
         """
-        status, reason = "FAILED", None
+        status, reason, last_wp = "FAILED", None, None
+        # 아래 복귀에서 쓰므로 try 밖에서 초기화한다 — _get_engine 이 예외를 내면
+        # 이름 자체가 없어 복귀 분기에서 NameError 가 난다.
+        engine = None
         try:
             engine = self._get_engine()
             harvest_point = self._task_point_for(harvest_location)
@@ -411,7 +414,7 @@ class AutomatoControlNode(Node):
                     "harvest": self._action_client_for(robot_id, Harvest, "harvest"),
                     "unload": self._action_client_for(robot_id, Unload, "unload"),
                 }
-                status, reason = self._harvest_dispatcher.run_harvest(
+                status, reason, last_wp = self._harvest_dispatcher.run_harvest(
                     task_id, robot_id, harvest_point, engine, clients,
                     start_wp=self._start_waypoint_for(robot_id),
                     on_progress=self._harvest_progress_reporter(
@@ -423,7 +426,7 @@ class AutomatoControlNode(Node):
                         task_id, robot_id))
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f"수확 디스패치 예외 task={task_id}: {exc}")
-            status, reason = "FAILED", None
+            status, reason, last_wp = "FAILED", None, None
         if self._db_pool is not None:
             try:
                 automato_db.set_task_status(self._db_pool, task_id, status)
@@ -438,9 +441,17 @@ class AutomatoControlNode(Node):
             self._notify_dock_failed(
                 task_id, robot_id, None, f"수확지 {harvest_location} 도킹 실패",
                 task_type="HARVEST")
-        # TODO(E6): 수확 완료를 Web Service 로 통지 — 보낼 모듈(harvest_notify)은 이미
-        # 있고 배선만 남았다. 완료 페이로드에 수확 실적(normal/discard/failed)이 들어가는데
-        # 그 값이 E3~4 Harvest 액션 결과에서 나오므로, 그 단계가 붙어야 채울 수 있다.
+
+        # 충전소 복귀 — 수확이 정상 종료됐을 때만. 순찰(E4)과 같은 함수를 쓴다.
+        # 시점: tasks 는 위에서 이미 COMPLETED 로 마감됐다(문서 E6 은 예냉실 도착 시점에
+        # 완료를 확정한다). 복귀는 그 뒤의 뒷정리이고, 도중에 실패해도 **task 상태는
+        # 건드리지 않는다** — 토마토는 예냉실에 무사히 들어갔고 못 돌아온 건 로봇 사정이라,
+        # _immobilize 가 로봇만 IMMOBILIZED 로 세우고 사람을 부른다.
+        # undock_from: 로봇은 예냉실에 H 마커로 도킹돼 있다 → 복귀 주행 전에 빼내야 한다
+        # (순찰 복귀는 도킹 안 된 순찰 지점에서 출발하므로 이 인자가 없다).
+        if status == "COMPLETED" and engine is not None and last_wp is not None:
+            self._return_and_dock(task_id, robot_id, engine, last_wp,
+                                  undock_from=last_wp, task_type="HARVEST")
 
     def _precool_point(self):
         """예냉실 진입노드 dict. 없으면 None. (RP-123 E5)
@@ -588,16 +599,23 @@ class AutomatoControlNode(Node):
             self._web_url, payload, log=self.get_logger())
 
     # ---------------------------- E4 복귀·도킹 오케스트레이션 ---------------------------- #
-    def _return_and_dock(self, task_id, robot_id, engine, last_wp) -> None:
-        """E4: 순찰을 마친 로봇을 전용 충전소로 복귀시키고 도킹한다(같은 task_id 유지).
+    def _return_and_dock(self, task_id, robot_id, engine, last_wp,
+                         undock_from=None, task_type="PATROL") -> None:
+        """작업을 마친 로봇을 전용 충전소로 복귀시키고 도킹한다(같은 task_id 유지).
 
-        순찰이 '쥔 채' 넘긴 마지막 자리(last_wp)를 복귀 주행이 이어받아 충전소 진입 노드
-        까지 가고, 도킹 성공 시점에 그 자리까지 한 번에 해제한다(문서 E4 8번). 복귀는 새
-        task 를 만들지 않는다 — 끝난 순찰의 task_id 를 그대로 쓴다(그 task 의 뒷정리).
+        순찰(E4)·수확(E6 이후)이 함께 쓴다. 앞 단계가 '쥔 채' 넘긴 마지막 자리(last_wp)를
+        복귀 주행이 이어받아 충전소 진입 노드까지 가고, 도킹 성공 시점에 그 자리까지 한
+        번에 해제한다(문서 E4 8번). 복귀는 새 task 를 만들지 않는다 — 끝난 작업의 task_id
+        를 그대로 쓴다(그 task 의 뒷정리).
 
-        실패 세 갈래(충전소 미등록/복귀 막힘/도킹 실패)는 지금은 자리·로그만 정리한다.
-        task_failed(DOCK_FAILED)·22-2 현장 정지(operational_status=IMMOBILIZED)는
-        6·7단계에서 이 자리에 채운다.
+        undock_from: 복귀를 **도킹된 상태에서** 시작할 때 그 진입 노드. 수확은 예냉실에
+            H 마커로 붙어 있으므로 빼내고 출발해야 한다(안 그러면 후면~벽 3cm 에서
+            방향을 틀어 코너가 벽에 닿는다). 순찰 복귀는 도킹되지 않은 순찰 지점에서
+            출발하므로 None 이다.
+        task_type: 도킹 실패 알림에 실을 작업 종류(PATROL/HARVEST).
+            ⚠️ 이 함수는 **tasks 상태를 건드리지 않는다.** 호출부가 이미 마감한 뒤
+            부르며, 복귀가 실패해도 그 마감은 유지된다 — 순찰은 이미 돌았고 수확물은
+            이미 예냉실에 있다. 못 돌아온 것은 로봇의 문제라 _immobilize 가 로봇만 세운다.
         """
         # 1) 전용 충전소 조회. 충전소는 반사테이프(reflective) 도킹이라 마커 조회가 없다
         #    (마커리스). 좌표도 진입 노드 waypoint_id 만 있으면 wp_meta 에서 얻는다.
@@ -620,7 +638,18 @@ class AutomatoControlNode(Node):
         nav_client = self._client_for(robot_id)
         dock_client = self._dock_client(robot_id, method)
 
-        # 2) 복귀 주행 — 순찰 마지막 자리를 이어받아 충전소 진입 노드까지(촬영 없음).
+        # 2-0) 언도킹 — 도킹된 자리에서 복귀를 시작하는 경우(수확: 예냉실)에만.
+        # 못 빠져나왔는데 복귀 주행을 하달하면 그 자리에서 회전한다(벽까지 3cm).
+        if undock_from is not None:
+            if not self._dispatcher.runner.undock_step(
+                    nav_client, task_id, undock_from):
+                self.get_logger().warn(
+                    f"복귀 언도킹 실패 task={task_id} {robot_id} 노드 {undock_from} "
+                    f"→ 현장 정지(22-2)")
+                self._immobilize(task_id, robot_id, engine, undock_from)
+                return
+
+        # 2) 복귀 주행 — 앞 단계의 마지막 자리를 이어받아 충전소 진입 노드까지(촬영 없음).
         outcome, pos = self._dispatcher.drive_to_point(
             task_id, robot_id, last_wp, target, engine, nav_client)
         if outcome != "arrived":
@@ -651,7 +680,8 @@ class AutomatoControlNode(Node):
             self.get_logger().warn(
                 f"도킹 실패(code={code}) task={task_id} {robot_id}: {msg} "
                 f"→ 진입 노드 정지, DOCK_FAILED 알림")
-            self._notify_dock_failed(task_id, robot_id, code, msg)
+            self._notify_dock_failed(task_id, robot_id, code, msg,
+                                     task_type=task_type)
 
     def _notify_dock_failed(self, task_id, robot_id, code, msg,
                             task_type="PATROL") -> None:
@@ -663,8 +693,10 @@ class AutomatoControlNode(Node):
         task_type 으로 순찰·수확이 갈린다 — 알림 규격은 같지만 tasks 마감이 다르다:
           · PATROL: 상태는 이미 순찰 종료값(COMPLETED/PARTIAL)으로 마감돼 있고 여기서
             바꾸지 않는다. 순찰은 끝났고 뒷정리(충전소 도킹)만 실패한 것이다.
-          · HARVEST: 도킹을 못 하면 수확 자체를 못 하므로 task 는 FAILED 다
-            (_harvest_job 이 이미 그렇게 마감한 뒤 이 알림을 보낸다).
+          · HARVEST: 두 갈래다. 수확지·예냉실 도킹 실패는 수확 자체를 못 한 것이라
+            task 가 FAILED 이고(_harvest_job 이 그렇게 마감한 뒤 이 알림을 보낸다),
+            **복귀 도킹 실패는 task 가 COMPLETED 인 채로** 이 알림만 나간다 — 수확물은
+            이미 예냉실에 들어갔고 충전소에 못 붙은 것은 그 뒤의 뒷정리 실패다.
         """
         now = datetime.now(timezone.utc)
         payload = patrol_notify.build_task_failed_payload(

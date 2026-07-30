@@ -142,6 +142,54 @@ class RouteRunner:
         corridors, nodes = self._split_blocked(engine, self._blacklist_active())
         return {"corridors": sorted(corridors), "nodes": sorted(nodes)}
 
+    # ---------------------------- 언도킹(도킹 탈출) ---------------------------- #
+    def undock_step(self, client, task_id, wp) -> bool:
+        """도킹된 로봇을 진입 노드 '그 자리'로 한 칸 하달해 정면으로 빼낸다.
+
+        순찰(충전소 출발)·수확(충전소·수확지·예냉실 출발)이 함께 쓴다. 로봇은 도킹으로
+        충전기/벽 안쪽에 물리적으로 붙어 있는데 ACS 는 '진입 노드에 서 있다'고 보므로,
+        그대로 다음 목표를 하달하면 Nav2 가 그 좁은 자리에서 회전부터 시작할 수 있다
+        (충전 단자를 긁거나, H 마커 도킹은 후면~벽 3cm 에서 코너가 벽에 닿는다).
+        먼저 진입 노드로 한 스텝만 보내 정면으로 빠져나오게 한 뒤 평범한 주행을 시작한다.
+
+        **하달 방향(yaw)을 반드시 명시한다.** 그냥 두면 _dispatch_segment 가 '다음 노드
+        쪽'을 보게 하려다, 노드가 하나뿐이라 계산에 실패해 0.0(정동쪽)으로 폴백한다.
+        그 값에는 의미가 없는데, 로봇은 이동거리가 min_travel_m(기본 10cm) 미만이면
+        ACS 가 준 yaw 를 그대로 쓰므로(navigate_server) 도킹 자리에서 엉뚱한 방향으로
+        크게 도는 사고가 된다. 충전소는 탈출거리가 20cm 라 그 폴백이 덮여 우연히
+        무사했을 뿐이고, 마커리스인 수확지·예냉실은 탈출거리를 보장할 수 없다.
+
+        줄 값은 '도킹을 마친 로봇이 지금 보고 있는 방향' = **진입 노드 yaw + π** 다.
+        진입 노드의 yaw 는 '충전소/마커 쪽으로 들어가는 방향'이고 도킹은 후진이라,
+        도킹을 마친 로봇은 정확히 그 반대를 본다(CHARGE_01 실측 대조: 진입 노드
+        1.45 → 반대 -1.69 vs 실제 도킹 자세 -1.75, 차이 3.4°). 이러면 탈출거리가
+        10cm 를 넘든 안 넘든 회전량이 0 에 가깝다.
+
+        반환: True 성공(도착 보고 0) / False 실패 — 호출부가 중단 여부를 정한다.
+        """
+        meta = self.wp_meta.get(wp) or {}
+        entry_yaw = meta.get("yaw")
+        if entry_yaw is None:
+            # yaw 가 없는 진입 노드(DB yaw_coord NULL). 방향을 지어내면 더 위험하므로
+            # 기존 폴백(_dispatch_segment 의 진행방향 계산)에 맡기고 경고만 남긴다.
+            yaw = None
+            self._log.warn(
+                f"언도킹 노드 {wp} 에 yaw 가 없다 task={task_id} — 방향 지정 없이 "
+                f"하달한다(도킹 자리에서 회전할 수 있음, waypoints.yaw_coord 확인)")
+        else:
+            # +π 한 값을 -π~π 로 되돌린다(로그 가독성·다른 각도 비교와 단위를 맞춘다).
+            raw = float(entry_yaw) + math.pi
+            yaw = math.atan2(math.sin(raw), math.cos(raw))
+        # 촬영 없는 노드 1개짜리 하달. DriveHooks 기본값이 정확히 '경로 그대로,
+        # 아무것도 안 찍음'이라 순찰의 _build_segment_goal(seg_start=None) 과 결과가 같다.
+        hadal, cap_ids, _ = DriveHooks().build_goal([wp], None)
+        self._log.info(
+            f"언도킹 하달 task={task_id} 노드 {wp} "
+            f"yaw={'미지정' if yaw is None else f'{yaw:.2f}'}")
+        code, _last = self._dispatch_segment(
+            client, task_id, hadal, cap_ids, yaw_override=yaw)
+        return code == 0
+
     # ---------------------------- 주행 본체 ---------------------------- #
     def drive(self, engine, client, task_id, robot_id, current, target,
               hooks=None):
@@ -545,7 +593,7 @@ class RouteRunner:
 
     def _dispatch_segment(self, client, task_id, waypoint_ids,
                           capture_ids, heartbeat=None, on_tick=None,
-                          on_feedback=None):
+                          on_feedback=None, yaw_override=None):
         """확보된 세그먼트(연속 waypoint 목록)를 Navigate Goal(Waypoint[] 배열)로 한 번에 하달.
 
         waypoint_ids: [세그먼트 첫 노드 ... 끝 노드] — 예약을 확보한 통로들을 지나는 경로에
@@ -558,6 +606,11 @@ class RouteRunner:
         on_feedback: Navigate Feedback 의 current_waypoint_id 를 받는 콜백(조기 반납용).
                      ⚠️ ROS executor 스레드에서 실행되므로 '값 전달'만 하고, 예약 반납 같은
                      공유 상태 변경은 디스패치 스레드(on_tick)에서 해야 한다.
+        yaw_override: 배열 전체의 도착 방향을 이 값(rad)으로 고정한다. None 이면 아래
+                     기본 규칙(촬영=DB yaw / 통과=진행 방향)대로 노드마다 계산한다.
+                     언도킹처럼 **노드가 하나뿐이라 진행 방향을 계산할 수 없는** 하달에서
+                     쓴다 — 그 경우 기본 규칙은 0.0(정동쪽)으로 폴백하는데, 그 값에는
+                     의미가 없어 도킹 자리에서 엉뚱하게 도는 원인이 된다(undock_step 참고).
         반환: (result_code, last_waypoint_id). result_code 0 성공/1 실패·막힘/2 중단.
         """
         # 좌표를 먼저 모은다 — 통과 노드 yaw 를 '진행 방향(다음 노드 쪽)'으로 잡으려면
@@ -571,7 +624,11 @@ class RouteRunner:
         for i, wid in enumerate(waypoint_ids):
             m = self.wp_meta.get(wid, {})
             is_capture = bool(wid in capture_ids)
-            if is_capture:
+            if yaw_override is not None:
+                # 호출부가 방향을 지정했다(언도킹). 촬영 판정보다 우선한다 — 이 하달은
+                # 애초에 촬영이 없고, 목적이 '고개를 돌리지 않고 빠져나오기' 이다.
+                yaw = float(yaw_override)
+            elif is_capture:
                 # 촬영 지점: 베드를 봐야 사진이 나온다 → DB 에 지정된 방향 그대로.
                 yaw = float(m.get("yaw") or 0.0)
             else:

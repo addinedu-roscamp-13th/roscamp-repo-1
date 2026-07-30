@@ -26,6 +26,7 @@
 실행:
   PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest test/test_harvest_drive.py -v
 """
+import math
 import os
 import sys
 import threading
@@ -116,10 +117,16 @@ class FakeNav:
     도구가 바뀔 때 같이 깨진다(test_slot_handoff 와 같은 방침).
     """
 
-    def __init__(self, server_up=True, code=0):
+    def __init__(self, server_up=True, code=0, codes=None):
         self.server_up = server_up
         self.code = code          # 0 도착 / 1 막힘 / 2 중단
+        # 하달마다 결과를 달리 줄 때(마지막 값으로 클램프). FakeDock 과 같은 관례로,
+        # '언도킹만 실패' 처럼 첫 하달을 골라 실패시킬 때 쓴다.
+        self.codes = list(codes) if codes else None
         self.dispatched = []
+        # 하달 배열의 yaw 까지 남긴다 — 언도킹은 '어느 노드로' 만큼 '어느 방향으로'가
+        # 중요하다(방향을 안 실으면 0=정동쪽 폴백이 나가 도킹 자리에서 크게 돈다).
+        self.yaws = []
 
     def wait_for_server(self, timeout_sec=None):
         return self.server_up
@@ -127,13 +134,17 @@ class FakeNav:
     def send_goal_async(self, goal, feedback_callback=None):
         wps = [w.waypoint_id for w in goal.waypoints]
         self.dispatched.append(wps)
+        self.yaws.append([w.yaw for w in goal.waypoints])
+        code = self.code
+        if self.codes:
+            code = self.codes[min(len(self.dispatched) - 1, len(self.codes) - 1)]
         result_future = Future()
 
         def drive():
             for wp in wps:
                 if feedback_callback is not None:
                     feedback_callback(_Feedback(wp))
-            result_future.set_result(_Result(self.code, wps[-1]))
+            result_future.set_result(_Result(code, wps[-1]))
 
         threading.Thread(target=drive, daemon=True).start()
         goal_future = Future()
@@ -326,12 +337,74 @@ def _no_reservations(engine):
     return snap["corridors"] == {} and snap["nodes"] == {}
 
 
+def _only_standing_node(engine, node_id, robot_id="dg_01"):
+    """성공 종료 뒤 남아야 할 예약 = '로봇이 서 있는 자리' 하나뿐인가.
+
+    수확이 성공하면 마지막 자리를 일부러 남긴다 — 충전소 복귀(_return_and_dock)가
+    같은 로봇 자격으로 이어받아 도킹 성공 시점에 해제하기 때문이다. 여기서 놓아
+    버리면 그 찰나에 남이 예냉실 자리로 들어와 복귀 출발선이 막힌다.
+    (실패로 끝났을 때는 뒷단계가 없으므로 _no_reservations 가 맞다.)
+    """
+    snap = engine.reservation_snapshot()
+    return snap["corridors"] == {} and snap["nodes"] == {node_id: robot_id}
+
+
+# ------------------------------- 언도킹(도킹 탈출) ------------------------------- #
+def test_충전소에서_언도킹부터_하달한다(fast_timing):
+    """로봇은 충전기에 '물리적으로 붙어' 있다 — 첫 하달은 진입 노드 한 개짜리여야 한다.
+
+    이게 없으면 Nav2 가 좁은 충전 공간에서 회전부터 시작해 충전 단자를 긁는다.
+    순찰(_lead_in ①)이 같은 이유로 하는 일을 수확도 해야 한다.
+    """
+    engine, disp, _log, nav, dock, harv = _make()
+
+    disp.run_harvest(1, "dg_01", HARVEST_POINT, engine,
+                     _clients(nav, dock, harv), start_wp=15)
+
+    assert nav.dispatched[0] == [15], \
+        f"첫 하달이 언도킹([15] 단독)이 아니다: {nav.dispatched}"
+
+
+def test_언도킹은_도킹을_마친_방향으로_하달한다(fast_timing):
+    """언도킹 하달에는 '지금 보고 있는 방향'을 실어야 한다.
+
+    방향을 안 실으면 route_runner 가 '다음 노드 쪽'을 계산하려다 노드가 하나뿐이라
+    0.0(정동쪽)으로 폴백한다. 로봇은 이동거리가 10cm 미만이면 그 값을 그대로 쓰므로
+    (navigate_server 의 min_travel_m), 벽에 붙은 자리에서 엉뚱한 방향으로 크게 돈다.
+    실을 값은 진입 노드 yaw + π — 후진 도킹이라 로봇은 진입 방향의 반대를 본다.
+    """
+    engine, disp, _log, nav, dock, harv = _make()
+
+    disp.run_harvest(1, "dg_01", HARVEST_POINT, engine,
+                     _clients(nav, dock, harv), start_wp=15)
+
+    # 테스트 그래프의 진입 노드 yaw 는 0.0 → 도킹을 마친 방향은 ±π 다.
+    undock_yaw = nav.yaws[0][0]
+    assert abs(abs(undock_yaw) - math.pi) < 1e-6, \
+        f"언도킹 방향이 도킹 자세(±π)가 아니다: {undock_yaw} (0.0 이면 폴백이 나간 것)"
+
+
+def test_언도킹이_실패하면_주행하지_않고_FAILED(fast_timing):
+    """충전기에서 못 빠져나왔는데 다음 목표를 하달하면 그 자리에서 회전한다."""
+    engine, disp, log, _nav, dock, harv = _make()
+    nav = FakeNav(codes=[1])          # 첫 하달(언도킹)만 실패시킨다
+
+    status, _reason, _last = disp.run_harvest(
+        1, "dg_01", HARVEST_POINT, engine, _clients(nav, dock, harv), start_wp=15)
+
+    assert status == STATUS_FAILED
+    assert nav.dispatched == [[15]], \
+        f"언도킹이 실패했는데 주행을 계속했다: {nav.dispatched}"
+    assert log.has("E2 언도킹 실패"), f"실패 로그가 없다: {log.lines}"
+    assert _no_reservations(engine), "언도킹 실패 후 예약이 남았다"
+
+
 # --------------------------------------------------------------------------- #
 def test_수확지까지_주행하고_자리를_반납한다(fast_timing):
     """1·2 — 수확지에 도달하고, 끝나면 예약이 하나도 안 남는다."""
     engine, disp, log, nav, dock, harv = _make()
 
-    status, _reason = disp.run_harvest(
+    status, _reason, _last = disp.run_harvest(
         1, "dg_01", HARVEST_POINT, engine, _clients(nav, dock, harv), start_wp=15)
 
     # 15 → 4 까지 실제로 하달됐는가(마지막 하달의 끝이 수확지여야 한다)
@@ -362,7 +435,7 @@ def test_경로가_없으면_FAILED_이고_예약도_안_남는다(fast_timing):
     # 유일한 통로(15-12)의 도착 자리를 남이 쥐고 있으면 이 일직선 그래프에선 우회로가 없다.
     assert engine.try_reserve(engine.node_slot(12), "dg_09") is True
 
-    status, _reason = disp.run_harvest(
+    status, _reason, _last = disp.run_harvest(
         1, "dg_01", HARVEST_POINT, engine, _clients(nav, dock, harv), start_wp=15)
 
     assert status == STATUS_FAILED
@@ -376,7 +449,7 @@ def test_로봇이_중단을_보고하면_FAILED(fast_timing):
     """3 — 로봇이 스스로 멈췄다(result_code=2)면 재시도 없이 끊는다."""
     engine, disp, _log, nav, dock, harv = _make(FakeNav(code=2))
 
-    status, _reason = disp.run_harvest(
+    status, _reason, _last = disp.run_harvest(
         1, "dg_01", HARVEST_POINT, engine, _clients(nav, dock, harv), start_wp=15)
 
     assert status == STATUS_FAILED
@@ -387,7 +460,7 @@ def test_출발점을_모르면_나서지도_않는다(fast_timing):
     """4 — 순찰과 달리 폴백하지 않는다. 한 발짝도 움직이면 안 된다."""
     engine, disp, log, nav, dock, harv = _make()
 
-    status, _reason = disp.run_harvest(
+    status, _reason, _last = disp.run_harvest(
         1, "dg_01", HARVEST_POINT, engine, _clients(nav, dock, harv), start_wp=None)
 
     assert status == STATUS_FAILED
@@ -401,7 +474,7 @@ def test_그래프에_없는_수확지는_거절한다(fast_timing):
     engine, disp, _log, nav, dock, harv = _make()
     ghost = dict(HARVEST_POINT, waypoint_id=999)
 
-    status, _reason = disp.run_harvest(
+    status, _reason, _last = disp.run_harvest(
         1, "dg_01", ghost, engine, _clients(nav, dock, harv), start_wp=15)
 
     assert status == STATUS_FAILED
@@ -412,7 +485,7 @@ def test_액션서버가_없으면_즉시_끊는다(fast_timing):
     """안 걸러내면 Goal 마다 수락 타임아웃을 다 기다린 뒤에야 실패한다."""
     engine, disp, _log, nav, dock, harv = _make(FakeNav(server_up=False))
 
-    status, _reason = disp.run_harvest(
+    status, _reason, _last = disp.run_harvest(
         1, "dg_01", HARVEST_POINT, engine, _clients(nav, dock, harv), start_wp=15)
 
     assert status == STATUS_FAILED
@@ -461,7 +534,7 @@ def test_도킹이_계속_실패하면_N회_재시도_후_DOCK_FAILED(fast_timin
     """N_dock 소진 → FAILED + DOCK_FAILED 사유(노드가 이걸 보고 관리자에게 알린다)."""
     engine, disp, log, nav, dock, harv = _make(dock=FakeDock(code=1))
 
-    status, reason = disp.run_harvest(
+    status, reason, _last = disp.run_harvest(
         1, "dg_01", HARVEST_POINT, engine, _clients(nav, dock, harv), start_wp=15)
 
     assert dock.calls == docking.DOCK_RETRY_MAX, \
@@ -477,7 +550,7 @@ def test_주행_실패는_도킹까지_가지_않는다(fast_timing):
     engine, disp, _log, nav, dock, harv = _make()
     assert engine.try_reserve(engine.node_slot(12), "dg_09") is True
 
-    status, reason = disp.run_harvest(
+    status, reason, _last = disp.run_harvest(
         1, "dg_01", HARVEST_POINT, engine, _clients(nav, dock, harv), start_wp=15)
 
     assert dock.calls == 0, "도착도 못 했는데 도킹을 시도했다"
@@ -510,7 +583,7 @@ def test_중단된_수확을_성공으로_오인하지_않는다(fast_timing):
         harvest=FakeHarvest(status=GoalStatus.STATUS_ABORTED,
                             normal=0, discard=0, failed=0, exit_reason=""))
 
-    status, reason = disp.run_harvest(
+    status, reason, _last = disp.run_harvest(
         1, "dg_01", HARVEST_POINT, engine,
         _clients(nav, dock, harv), start_wp=15)
 
@@ -562,7 +635,7 @@ def test_수확_서버가_없거나_거부하면_FAILED(fast_timing):
     engine, disp, _log, nav, dock, harv = _make(
         harvest=FakeHarvest(accepted=False))
 
-    status, _reason = disp.run_harvest(
+    status, _reason, _last = disp.run_harvest(
         1, "dg_01", HARVEST_POINT, engine,
         _clients(nav, dock, harv), start_wp=15)
 
@@ -574,7 +647,7 @@ def test_도킹_실패하면_수확까지_가지_않는다(fast_timing):
     """도킹이 안 됐는데 팔을 뻗으면 엉뚱한 곳을 집는다."""
     engine, disp, _log, nav, dock, harv = _make(dock=FakeDock(code=1))
 
-    status, reason = disp.run_harvest(
+    status, reason, _last = disp.run_harvest(
         1, "dg_01", HARVEST_POINT, engine,
         _clients(nav, dock, harv), start_wp=15)
 
@@ -617,6 +690,28 @@ def test_실적을_이송_전에_적는다(fast_timing):
     assert log.has("batch_id=77"), f"batch_id 가 로그에 안 남았다: {log.lines}"
 
 
+def test_예냉실로_출발하기_전에도_언도킹한다(fast_timing):
+    """수확지도 도킹 상태다 — H 마커 도킹은 후면이 벽에서 3cm(floor_fsm 의
+    WALL_GAP_TARGET). 바로 예냉실 쪽으로 방향을 틀면 후면 코너가 벽을 긁는다.
+    충전소 출발과 같은 이유로 여기서도 한 스텝 빼낸 뒤 이송을 시작해야 한다.
+    """
+    engine, disp, _log, nav, dock, harv = _make()
+
+    _e5(disp, engine, _clients(nav, dock, harv), save_batch=lambda h: 1)
+
+    # 수확지(4) 한 개짜리 하달 = 언도킹. 주행 세그먼트는 여러 노드를 묶어 나간다.
+    assert [4] in nav.dispatched, \
+        f"수확지 언도킹([4] 단독) 하달이 없다: {nav.dispatched}"
+    undock_at = nav.dispatched.index([4])
+    # 순서: 언도킹이 '예냉실로 떠나는 하달'보다 앞에 있어야 의미가 있다.
+    assert nav.dispatched[-1][-1] == 12, f"예냉실(12)까지 못 갔다: {nav.dispatched}"
+    assert undock_at < len(nav.dispatched) - 1, \
+        f"언도킹이 이송 하달보다 뒤에 있다: {nav.dispatched}"
+    # 충전소와 같은 규칙 — 도킹을 마친 방향(진입 노드 yaw + π)을 실어야 한다.
+    assert abs(abs(nav.yaws[undock_at][0]) - math.pi) < 1e-6, \
+        f"언도킹 방향이 도킹 자세가 아니다: {nav.yaws[undock_at]}"
+
+
 def test_예냉실까지_이송하고_도킹한다(fast_timing):
     """수확지 → 예냉실 이동 후 도킹. 도킹은 수확지·예냉실 두 번 일어난다."""
     engine, disp, log, nav, dock, harv = _make()
@@ -628,7 +723,9 @@ def test_예냉실까지_이송하고_도킹한다(fast_timing):
     assert dock.calls == 2, f"도킹이 두 번(수확지·예냉실) 일어나야 한다: {dock.calls}"
     assert dock.goal.task_point_id == "PRECOOL_01", "마지막 도킹이 예냉실이 아니다"
     assert log.has("E5 예냉실 도킹 완료"), f"완료 로그가 없다: {log.lines}"
-    assert _no_reservations(engine), "이송이 끝났는데 예약이 남았다"
+    # 예냉실 자리 하나만 남는다 — 충전소 복귀가 이어받아 도킹 후 해제한다.
+    assert _only_standing_node(engine, 12), \
+        f"예냉실 자리만 남아야 한다(복귀에 인계): {engine.reservation_snapshot()}"
 
 
 def test_실적_저장이_실패해도_이송은_계속한다(fast_timing):
@@ -651,9 +748,9 @@ def test_예냉실이_그래프에_없으면_이송_실패(fast_timing):
     saved = []
     ghost = dict(PRECOOL_POINT, waypoint_id=999)
 
-    status, _reason = _e5(disp, engine, _clients(nav, dock, harv),
-                          save_batch=lambda h: saved.append(h) or 5,
-                          precool=ghost)
+    status, _reason, _last = _e5(disp, engine, _clients(nav, dock, harv),
+                                 save_batch=lambda h: saved.append(h) or 5,
+                                 precool=ghost)
 
     assert status == STATUS_FAILED
     assert saved, "이송이 불가능해도 수확 실적은 남아야 한다"
@@ -665,8 +762,8 @@ def test_예냉실_도킹_실패는_DOCK_FAILED(fast_timing):
     # codes=[0, 1]: 1번째(수확지) 성공, 2번째부터(예냉실 + 재시도) 실패.
     engine, disp, _log, nav, dock, harv = _make(dock=FakeDock(codes=[0, 1]))
 
-    status, reason = _e5(disp, engine, _clients(nav, dock, harv),
-                         save_batch=lambda h: 3)
+    status, reason, _last = _e5(disp, engine, _clients(nav, dock, harv),
+                                save_batch=lambda h: 3)
 
     assert dock.calls >= 2, "수확지(성공)·예냉실(실패) 도킹이 모두 일어나야 한다"
     assert status == STATUS_FAILED
@@ -700,21 +797,53 @@ def _e6(disp, engine, nav, dock, harv, unload, **kw):
         on_completed=kw.get("on_completed"))
 
 
+def test_성공하면_복귀_출발점을_돌려준다(fast_timing):
+    """3-tuple 의 세 번째 값 — 노드가 이걸 받아 충전소 복귀(_return_and_dock)를 잇는다.
+
+    None 이 오면 복귀가 통째로 생략돼 로봇이 예냉실에 도킹된 채 남는다. 그러면 다음
+    task 는 '이 로봇은 자기 충전소에 있다'(_start_waypoint_for)고 가정하므로, 실제
+    위치와 어긋난 출발점으로 경로를 예약한다.
+    """
+    engine, disp, _log, nav, dock, harv = _make()
+
+    status, _reason, last_wp = _e6(disp, engine, nav, dock, harv, FakeUnload())
+
+    assert status == STATUS_COMPLETED
+    assert last_wp == 12, f"복귀 출발점(예냉실 12)을 안 돌려줬다: {last_wp}"
+
+
+def test_실패하면_복귀_출발점을_돌려주지_않는다(fast_timing):
+    """실패는 복귀하지 않는다 — 자리도 디스패처가 그 자리에서 반납한다."""
+    engine, disp, _log, _nav, dock, harv = _make()
+    nav = FakeNav(codes=[1])          # 언도킹부터 실패시킨다
+
+    status, _reason, last_wp = disp.run_harvest(
+        1, "dg_01", HARVEST_POINT, engine, _clients(nav, dock, harv),
+        start_wp=15, precool_point=PRECOOL_POINT)
+
+    assert status == STATUS_FAILED
+    assert last_wp is None, f"실패인데 복귀 출발점을 넘겼다: {last_wp}"
+    assert _no_reservations(engine), "실패로 끝났는데 자리가 남았다"
+
+
 def test_하역하고_입고를_기록하고_성공으로_마감한다(fast_timing):
     """정상 흐름의 끝 — 여기서 처음으로 COMPLETED 가 나온다."""
     engine, disp, log, nav, dock, harv = _make()
     unload = FakeUnload(code=0)
     logged = []
 
-    status, reason = _e6(disp, engine, nav, dock, harv, unload,
-                         save_unload=lambda h: logged.append(h) or 9)
+    status, reason, _last = _e6(disp, engine, nav, dock, harv, unload,
+                                save_unload=lambda h: logged.append(h) or 9)
 
     assert (status, reason) == (STATUS_COMPLETED, None)
     assert unload.calls == 1, f"하역 하달 횟수가 이상하다: {unload.calls}"
     assert unload.goal.shake_delay_sec == hd.UNLOAD_SHAKE_DELAY_SEC
     assert logged and logged[0]["normal_count"] == 5, "입고 기록이 안 남았다"
     assert log.has("E6 하역 완료"), f"하역 완료 로그가 없다: {log.lines}"
-    assert _no_reservations(engine), "작업이 끝났는데 예약이 남았다"
+    # 수확 task 는 여기서 끝나지만 예약은 하나 남는다 — 로봇이 예냉실에 서 있고,
+    # 충전소 복귀(노드가 잇는다)가 그 자리를 이어받기 때문이다.
+    assert _only_standing_node(engine, 12), \
+        f"예냉실 자리만 남아야 한다(복귀에 인계): {engine.reservation_snapshot()}"
 
 
 def test_하역이_실패해도_작업은_성공이다(fast_timing):
@@ -728,8 +857,8 @@ def test_하역이_실패해도_작업은_성공이다(fast_timing):
     unload = FakeUnload(code=1)          # 손잡이 파지 실패
     logged = []
 
-    status, reason = _e6(disp, engine, nav, dock, harv, unload,
-                         save_unload=lambda h: logged.append(h) or 9)
+    status, reason, _last = _e6(disp, engine, nav, dock, harv, unload,
+                                save_unload=lambda h: logged.append(h) or 9)
 
     assert status == STATUS_COMPLETED, "하역 실패로 수확 task 까지 실패로 뒤집혔다"
     assert reason is None
@@ -758,8 +887,8 @@ def test_통지가_실패해도_작업_마감은_막지_않는다(fast_timing):
     def broken(_summary):
         raise RuntimeError("웹 서비스 다운")
 
-    status, _reason = _e6(disp, engine, nav, dock, harv, FakeUnload(),
-                          on_completed=broken)
+    status, _reason, _last = _e6(disp, engine, nav, dock, harv, FakeUnload(),
+                                 on_completed=broken)
 
     assert status == STATUS_COMPLETED
 
@@ -769,9 +898,9 @@ def test_하역_서버가_없어도_작업은_성공이다(fast_timing):
     engine, disp, _log, nav, dock, harv = _make()
     logged = []
 
-    status, _reason = _e6(disp, engine, nav, dock, harv,
-                          FakeUnload(server_up=False),
-                          save_unload=lambda h: logged.append(h) or 9)
+    status, _reason, _last = _e6(disp, engine, nav, dock, harv,
+                                 FakeUnload(server_up=False),
+                                 save_unload=lambda h: logged.append(h) or 9)
 
     assert status == STATUS_COMPLETED
     assert logged == [], "하역을 못 했는데 입고를 기록했다"
@@ -784,8 +913,8 @@ def test_입고_기록이_실패해도_작업은_성공이다(fast_timing):
     def broken(_h):
         raise RuntimeError("DB 연결 끊김")
 
-    status, _reason = _e6(disp, engine, nav, dock, harv, FakeUnload(),
-                          save_unload=broken)
+    status, _reason, _last = _e6(disp, engine, nav, dock, harv, FakeUnload(),
+                                 save_unload=broken)
 
     assert status == STATUS_COMPLETED
     assert log.has("입고 기록 실패"), f"실패가 로그에 안 남았다: {log.lines}"
@@ -799,7 +928,7 @@ def test_예냉실에_못_가면_하역도_완료통지도_없다(fast_timing):
     clients = {"nav": nav, "harvest": harv, "unload": unload,
                "dock_for": lambda method: dock}
 
-    status, _reason = disp.run_harvest(
+    status, _reason, _last = disp.run_harvest(
         1, "dg_01", HARVEST_POINT, engine, clients, start_wp=15,
         precool_point=dict(PRECOOL_POINT, waypoint_id=999),
         save_batch=lambda h: 1, on_completed=got.append)

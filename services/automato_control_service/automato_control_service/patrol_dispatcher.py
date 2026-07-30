@@ -248,18 +248,17 @@ class PatrolDispatcher:
         ① 언도킹 — 로봇은 충전기 '안'에 도킹돼 있고 ACS 는 current(전용 충전소의 진입
            노드)에 서 있다고 가정한다. 그대로 첫 목표로 출발하면 로봇이 15cm 충전 공간
            안에서 크게 돌 수 있다(도킹 방향과 첫 이동 방향이 벌어질 때). 먼저 진입 노드
-           '그 자리'로 한 스텝만 하달해 정면으로 빠져나오게 한다. 도킹 방향 정면에 진입
-           노드가 있으면 회전 없이 직진이다. current 자리는 위에서 이미 예약했다.
+           '그 자리'로 한 스텝만 하달해 정면으로 빠져나오게 한다. current 자리는 위에서
+           이미 예약했다. 실제 하달은 RouteRunner.undock_step 이 한다 — 수확(충전소·
+           수확지·예냉실 출발)도 같은 함수를 쓴다. 언도킹 코드가 두 벌이 되면 한쪽만
+           고쳐 순찰은 되는데 수확은 안 되는 종류의 버그가 생긴다.
         ② 진입 노드 — 첫 촬영 목표로 갈 때 '최단 경로'가 반대 방향에서 접근해 촬영이
            방향 게이트에 막히는 것을 피하려, 지정 진입 노드를 먼저 거친다. 여기서는
            촬영하지 않는다(훅 없는 평범한 주행). 지정이 없거나 이미 그 노드면 생략한다.
         """
-        # ① 언도킹: [current] 한 노드만 하달(촬영 없음). 좌표는 wp_meta[current] 를 쓴다.
-        hadal, cap_ids, _ = self._build_segment_goal([current], set(), None)
-        code, _last = self.runner._dispatch_segment(client, task_id, hadal, cap_ids)
-        if code != 0:
-            self._log.warn(
-                f"언도킹 하달 실패 task={task_id} 노드 {current} code={code}")
+        # ① 언도킹: [current] 한 노드만 하달(촬영 없음). 좌표·yaw 는 undock_step 이 정한다.
+        if not self.runner.undock_step(client, task_id, current):
+            self._log.warn(f"언도킹 하달 실패 task={task_id} 노드 {current}")
             return "aborted", current
         self._log.info(f"언도킹 완료 task={task_id} → 노드 {current}")
 
