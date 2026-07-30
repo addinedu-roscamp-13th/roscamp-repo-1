@@ -221,6 +221,18 @@ class HarvestActionServer(Node):
             )
         except Exception as exc:                       # 팔·검출 예외 → abort
             self.get_logger().error(f"수확 실패: {exc}")
+            # 팔 연결을 버려 다음 Goal 이 새로 붙게 한다. NetworkArm 은 TCP 소켓을
+            # 캐시하는데, 노드를 켜둔 채 오래 기다리면 그 소켓이 조용히 끊긴다
+            # (공유기 NAT 타임아웃·Pi 재부팅·팔 전원 재인가). 죽은 소켓을 계속 들고
+            # 있으면 **이후 모든 Goal 이 같은 오류로 실패**하고 노드를 재시작할 때까지
+            # 회복되지 않는다. 통합 테스트처럼 몇 시간 띄워두는 상황에서 치명적이다.
+            if self._arm is not None:
+                try:
+                    self._arm.close()
+                except Exception:
+                    pass
+                self._arm = None
+                self.get_logger().warning("팔 연결을 버렸습니다 — 다음 Goal 에서 재접속")
             goal_handle.abort()
             result.exit_reason = "ERROR"
             result.message = str(exc)
