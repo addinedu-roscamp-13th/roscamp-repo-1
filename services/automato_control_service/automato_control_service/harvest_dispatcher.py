@@ -9,12 +9,18 @@ automato_node(ROS 표면)에서 '수확 동작 결정' 로직을 떼어낸 클�
 수확 로봇이 같은 통로를 놓고 경합하므로, 예약표가 하나여야 교통관제가 성립한다.
 
 수확 task 하나의 전 생애:
-  E2   수확지까지 주행 + 바닥 H 마커(floor) 도킹
+  E2   충전소 언도킹 + 수확지까지 주행 + 바닥 H 마커(floor) 도킹
   E3~4 Harvest 액션(Ddagi 주관) — 진행 피드백 중계, 최종 집계 수신
-  E5   수확 실적 저장 + 예냉실까지 주행 + 도킹
+  E5   수확 실적 저장 + 수확지 언도킹 + 예냉실까지 주행 + 도킹
   E6   완료 처리 + (보너스) 바구니 하역
+  이후 충전소 복귀는 **노드**가 잇는다(_return_and_dock) — 순찰과 같은 관례로,
+       이 함수는 마지막 자리를 쥔 채 last_wp 를 돌려주고 끝난다.
 
-⚠️ 지금은 E2 앞부분(수확지까지 주행)까지만 구현됐다. 도킹부터는 아직 없다.
+■ 언도킹을 세 번 하는 이유
+  도킹은 로봇을 충전 단자·벽에 물리적으로 붙여 놓는다(반사테이프는 충전 접점, H 마커는
+  후면~벽 3cm). 그 자리에서 다음 목적지로 바로 방향을 틀면 단자를 긁거나 후면 코너가
+  벽에 닿는다. 그래서 출발할 때마다 진입 노드로 한 스텝 빼내고(RouteRunner.undock_step)
+  평범한 주행을 시작한다. 순찰의 _lead_in ①과 같은 장치이고 코드도 같은 것을 쓴다.
 
 ■ 확정된 설계 노트
   (1) ✅ 주행 재사용 — RouteRunner 로 추출 완료(C-1). E2/E5 주행은 self.runner.drive 를
@@ -101,17 +107,14 @@ class HarvestDispatcher:
         on_completed  : 수확 task 완료를 알리는 콜백. 집계 + batch_id 를 받는다.
                         노드가 Web Service 로 보낸다.
 
-        반환: (status, reason)
+        반환: (status, reason, last_wp) — 순찰 run_patrol 과 같은 3-tuple 계약이다.
           status: STATUS_COMPLETED | STATUS_FAILED — 노드가 tasks 에 마감한다.
           reason: 실패 사유(REASON_*) 또는 None. 노드가 이걸 보고 task_failed 알림을
                   보낼지 정한다 — 디스패처는 '무슨 일이 있었는지'만 보고하고 HTTP 는
-                  모른 채로 남는다(순찰 run_patrol 과 같은 관례).
-
-        ⚠️ 지금은 E2(주행+도킹)까지 구현됐다. 도킹까지 성공해도 수확을 안 했으므로
-        FAILED 로 마감한다. 남은 순서:
-          outcome = E3~4 Harvest 액션(Ddagi 주관)+피드백 중계  (clients['harvest'])
-          ...     E5  수확 실적 저장(콜백) + 예냉실 주행·도킹  (clients['nav'], clients['dock_for'])
-          ...     E6  완료 처리 + (보너스) Unload 하역          (clients['unload'])
+                  모른 채로 남는다.
+          last_wp: 성공 시 로봇이 서 있는 노드(예냉실 진입 노드)와 **그 자리의 예약**을
+                  함께 넘긴다. 노드가 이걸 받아 충전소 복귀(_return_and_dock)를 잇는다.
+                  실패 시엔 None 이다 — 복귀하지 않고, 자리는 아래 finally 가 반납한다.
         """
         target = (harvest_point or {}).get("waypoint_id")
         label = (harvest_point or {}).get("task_point_id", "?")
@@ -121,12 +124,12 @@ class HarvestDispatcher:
             # 안 걸러내면 Goal 마다 수락 타임아웃(30초)을 다 기다린 뒤에야 실패한다.
             self._log.warning(
                 f"[HARVEST] {robot_id} Navigate 액션 서버 미기동 → task {task_id} FAILED")
-            return STATUS_FAILED, None
+            return STATUS_FAILED, None, None
         if target is None or target not in self.wp_meta:
             self._log.error(
                 f"[HARVEST] 수확지 {label}(노드 {target})가 라우팅 그래프에 없다 "
                 f"→ task {task_id} FAILED")
-            return STATUS_FAILED, None
+            return STATUS_FAILED, None, None
         # 순찰과 달리 출발점 폴백을 두지 않는다. 순찰은 지점이 여러 개라 하나쯤 예약 없이
         # 가도 나머지가 이어지지만, 수확은 목적지가 하나뿐이라 출발점을 모르면 경로 예약
         # 자체가 성립하지 않고, 도착 직후 바닥 H 마커 도킹이 붙어 위치가 어긋나면 그대로
@@ -135,13 +138,36 @@ class HarvestDispatcher:
             self._log.error(
                 f"[HARVEST] {robot_id} 출발 노드({start_wp}) 미상 → task {task_id} FAILED "
                 f"(robots.charge_point_id 확인 필요)")
-            return STATUS_FAILED, None
+            return STATUS_FAILED, None, None
 
         current = start_wp
+        # 맨 아래 finally 가 '마지막 자리를 반납할지, 복귀에 넘길지'를 이 값으로 가른다.
+        completed = False
         self._log.info(
             f"[HARVEST] E2 주행 시작 task={task_id} robot={robot_id} "
             f"{current} → {target}({label})")
         try:
+            # --- 출발선: 자리 확보 → 언도킹 → 주행 (순찰 run_patrol 과 같은 순서) ---
+            # 자리를 먼저 잡는 이유: 이 예약은 원래 drive 가 출발선에서 잡아 주는데,
+            # 언도킹이 그보다 앞선다. 그 사이 이 로봇이 예약표에 안 보이면 '비어 있는
+            # 지점'으로 보여 남이 들어온다. 아래 drive 가 같은 로봇 자격으로 이어받고
+            # (멱등이라 재예약 성공), 맨 끝 finally 가 반납한다.
+            start_slot = engine.node_slot(current)
+            if not engine.try_reserve(start_slot, robot_id):
+                self._log.warning(
+                    f"[HARVEST] 출발 지점 {current} 자리를 남(로봇 "
+                    f"{engine.holder_of(start_slot)})이 쥐고 있다 task={task_id} "
+                    f"— 예약표와 실제 위치가 어긋남")
+
+            # 로봇은 지금 충전기에 '물리적으로 붙어' 있다(반사테이프 도킹). 그대로 다음
+            # 목표를 하달하면 좁은 충전 공간에서 회전부터 시작해 충전 단자를 긁는다.
+            # 먼저 진입 노드로 한 스텝 빼내 정면으로 나오게 한다(순찰 _lead_in ①과 동일).
+            if not self.runner.undock_step(clients["nav"], task_id, current):
+                self._log.warning(
+                    f"[HARVEST] E2 언도킹 실패 task={task_id} {robot_id} "
+                    f"노드 {current} → FAILED (충전기에서 빠져나오지 못했다)")
+                return STATUS_FAILED, None, None
+
             # 훅을 안 넘긴다 = DriveHooks 기본값(촬영·짝·방문 마킹 없는 평범한 주행).
             # 순찰과 같은 예약 규칙으로 움직이므로 두 로봇이 통로를 놓고 경합해도 안전하다.
             outcome, current = self.runner.drive(
@@ -151,7 +177,7 @@ class HarvestDispatcher:
                 self._log.warning(
                     f"[HARVEST] E2 주행 실패({outcome}) task={task_id} "
                     f"로봇 위치 {current} 목표 {target}({label}) → FAILED")
-                return STATUS_FAILED, None
+                return STATUS_FAILED, None, None
 
             self._log.info(
                 f"[HARVEST] E2 수확지 도착 task={task_id} robot={robot_id} "
@@ -171,7 +197,7 @@ class HarvestDispatcher:
                 self._log.warning(
                     f"[HARVEST] E2 도킹 실패(code={code}) task={task_id} "
                     f"{robot_id} @ {label}: {msg} → FAILED")
-                return STATUS_FAILED, REASON_DOCK_FAILED
+                return STATUS_FAILED, REASON_DOCK_FAILED, None
 
             # 순찰(복귀)은 도킹 성공 시 예약을 전부 해제하지만 수확은 놓지 않는다 —
             # 로봇이 여기 붙어서 팔 작업을 이어가므로, 자리를 놓으면 남이 들어온다.
@@ -189,7 +215,7 @@ class HarvestDispatcher:
             if harvested is None:
                 self._log.warning(
                     f"[HARVEST] E3~4 수확 실패/중단 task={task_id} {robot_id} → FAILED")
-                return STATUS_FAILED, None
+                return STATUS_FAILED, None, None
 
             self._log.info(
                 f"[HARVEST] E3~4 수확 종료 task={task_id} {robot_id} "
@@ -210,11 +236,22 @@ class HarvestDispatcher:
                     f"[HARVEST] 예냉실({precool_label}/노드 {precool_wp})이 라우팅 "
                     f"그래프에 없다 → task {task_id} 이송 불가 FAILED "
                     f"(수확 실적 batch_id={batch_id} 은 저장됨)")
-                return STATUS_FAILED, None
+                return STATUS_FAILED, None, None
 
             self._log.info(
                 f"[HARVEST] E5 예냉실 이송 시작 task={task_id} {robot_id} "
                 f"{current} → {precool_wp}({precool_label})")
+            # 수확지 언도킹 — 로봇은 H 마커 도킹으로 후면이 벽에서 3cm 다(floor_fsm 의
+            # WALL_GAP_TARGET). 여기서 바로 예냉실 쪽으로 돌면 후면 코너가 벽을 긁는다.
+            # 자리(entry_slot)는 수확 내내 쥐고 있었으므로 새로 예약하지 않는다.
+            # 실적(batch_id)은 이미 저장했다 — 여기서 실패해도 딴 개수는 남는다.
+            if not self.runner.undock_step(clients["nav"], task_id, current):
+                self._log.warning(
+                    f"[HARVEST] E5 언도킹 실패 task={task_id} {robot_id} "
+                    f"노드 {current} → FAILED (수확지에서 빠져나오지 못했다. "
+                    f"수확 실적 batch_id={batch_id} 은 저장됨)")
+                return STATUS_FAILED, None, None
+
             # 수확지 → 예냉실. 여기도 훅 없이 부른다(촬영·짝 없는 평범한 주행).
             # 수확지 자리는 drive 가 출발하며 이어받아 반납한다.
             outcome, current = self.runner.drive(
@@ -223,7 +260,7 @@ class HarvestDispatcher:
                 self._log.warning(
                     f"[HARVEST] E5 예냉실 이송 실패({outcome}) task={task_id} "
                     f"로봇 위치 {current} → FAILED")
-                return STATUS_FAILED, None
+                return STATUS_FAILED, None, None
 
             precool_slot = engine.node_slot(current)
             precool_method = docking.method_for(precool_label)   # PRECOOL_* → floor
@@ -235,7 +272,7 @@ class HarvestDispatcher:
                 self._log.warning(
                     f"[HARVEST] E5 예냉실 도킹 실패(code={code}) task={task_id} "
                     f"{robot_id} @ {precool_label}: {msg} → FAILED")
-                return STATUS_FAILED, REASON_DOCK_FAILED
+                return STATUS_FAILED, REASON_DOCK_FAILED, None
 
             self._log.info(
                 f"[HARVEST] E5 예냉실 도킹 완료 task={task_id} {robot_id} "
@@ -262,14 +299,24 @@ class HarvestDispatcher:
                 except Exception as exc:  # noqa: BLE001
                     self._log.warning(
                         f"[HARVEST] 완료 통지 실패(무시) task={task_id}: {exc}")
-            return STATUS_COMPLETED, None
+            completed = True
+            return STATUS_COMPLETED, None, current
         finally:
             # drive 는 '지금 서 있는 자리'를 일부러 남기고 나온다 — 다음 구간이 이어받아
-            # 예약이 끊기는 순간을 없애기 위해서다. 수확은 아직 뒷단계가 없으므로 여기서
-            # 반납하지 않으면 그 자리가 영영 점유된 채로 남아 남의 길을 막는다.
-            engine.release(engine.node_slot(current), robot_id)
-            self._log.info(
-                f"[HARVEST] task={task_id} 지점 {current} 자리 반납")
+            # 예약이 끊기는 순간을 없애기 위해서다. 그 마지막 한 장을 누가 놓느냐가
+            # 성공/실패로 갈린다(순찰 run_patrol 과 같은 계약):
+            #   · 성공 → 놓지 않는다. 충전소 복귀(_return_and_dock)가 같은 로봇 자격으로
+            #     이어받아 도킹 성공 시점에 한 번에 해제한다. 여기서 놓으면 그 찰나에
+            #     남이 예냉실 자리로 들어와 복귀 출발선이 막힌다.
+            #   · 실패 → 뒷단계가 없으므로 즉시 반납한다. 안 놓으면 그 자리가 영영
+            #     점유된 채 남아 남의 길을 막는다.
+            if completed:
+                self._log.info(
+                    f"[HARVEST] task={task_id} 지점 {current} 자리 유지 → 복귀에 인계")
+            else:
+                engine.release(engine.node_slot(current), robot_id)
+                self._log.info(
+                    f"[HARVEST] task={task_id} 지점 {current} 자리 반납")
 
     def _save_batch(self, save_batch, task_id, harvested):
         """수확 실적을 콜백으로 저장하고 batch_id 를 돌려준다. 실패해도 None 만 낸다.
