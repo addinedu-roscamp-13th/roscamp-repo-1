@@ -328,9 +328,11 @@ def _post(path, body):
 @app.post("/reset")
 def reset():
     with _LOCK:
-        _ROBOTS["dg_01"]["status"] = "IDLE"
-        _ROBOTS["dg_03"]["status"] = "IDLE"   # 순찰 로봇 대기 = 순찰 가능
-    log("상태 초기화")
+        # 전체를 되돌린다. dg_02 가 빠져 있어서 수확 테스트를 두 번 돌리면 두 번째가
+        # HARVEST_IN_PROGRESS 로 막혔고, 원인을 찾기 어려웠다(2026-07-30).
+        for r in _ROBOTS.values():
+            r["status"] = "IDLE"
+    log("상태 초기화(전체 IDLE)")
     return jsonify({"ok": True})
 
 

@@ -1754,17 +1754,26 @@ def _apply_detection_to_heat(d):
             pcts[name] = float(v)
     if not pcts:
         return
+    wp = d.get("waypoint_id")
     with LOCK:
         h = load_heat()
         crop = dict(h.get("crop", HEAT_DEFAULT["crop"]))
         for name, v in pcts.items():
             crop[name] = int(round(v * 10))          # % → 1000 스케일 개수
         h["crop"] = crop
+        # 웨이포인트별 익음 비율도 남긴다. 밀집 히트맵은 '어디가 많은가' 를 보여줘야 하므로
+        # 전체 비율 하나로는 못 그린다. 화면(FARM 지오메트리를 아는 쪽)이 이 값을 베드별로
+        # 묶어 밀집도를 만든다. pillars 를 보내주는 서비스가 따로 없어서 이 경로가 유일하다.
+        if wp is not None and isinstance(d.get("ripe_percent"), (int, float)):
+            byw = dict(h.get("by_waypoint") or {})
+            byw[str(wp)] = {"ripe": float(d["ripe_percent"]),
+                            "at": time.strftime("%m/%d %H:%M:%S")}
+            h["by_waypoint"] = byw
         h["patrol_count"] = h.get("patrol_count", 0) + 1
         h["updated_at"] = time.strftime("%m/%d %H:%M")
         h["source"] = "acs"
         save_heat(h)
-    wlog("  ↳ 작물 상태 갱신(ACS 검출): %s" % ", ".join("%s %.1f%%" % (k, v) for k, v in pcts.items()))
+    wlog("  ↳ 작물 상태 갱신(ACS 검출 WP%s): %s" % (wp, ", ".join("%s %.1f%%" % (k, v) for k, v in pcts.items())))
 
 
 def _evolve_heat():
@@ -1800,7 +1809,7 @@ def get_heatmap():
     d = load_heat()
     if ACS_MODE and d.get("source") != "acs":
         return jsonify({"pillars": None, "crop": None, "patrol_count": 0,
-                        "updated_at": None, "awaiting_patrol": True,
+                        "updated_at": None, "awaiting_patrol": True, "by_waypoint": {},
                         "note": "아직 순찰 검출 결과가 없습니다. 순찰이 완료되면 채워집니다."})
     return jsonify(d)
 

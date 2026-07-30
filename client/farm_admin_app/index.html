@@ -1052,6 +1052,30 @@ async function requestHarvest(){
 async function harvestReset(){await fetch('/api/v1/patrol/reset',{method:'POST'});loadHarvest();}
 /* 순찰 카메라(D435+4분류)가 감지한 밀집 히트맵 + 방울토마토 상태 — 순찰마다 서버(/api/heatmap)에서 갱신 */
 window._heatDens=window._heatDens||null; window._heatCrop=window._heatCrop||null; window._heatMeta=window._heatMeta||null;
+/* 웨이포인트별 익음 비율 → 베드별 밀집도(0~1).
+   AI 는 순찰 지점(웨이포인트) 단위로만 검출 비율을 낸다. 히트맵은 '어느 베드가 많은가' 를
+   보여줘야 하므로, 각 순찰점을 가장 가까운 베드에 묶고 그 평균을 그 베드의 밀집도로 쓴다.
+   촬영한 지점이 하나도 없는 베드는 null 로 남겨 그 베드만 안 칠한다(없는 데이터를 0 으로
+   칠하면 '검사했고 익은 게 없다' 로 읽힌다). */
+function bedDensityFromWaypoints(byWp){
+  if(!byWp) return null;
+  var ids=Object.keys(byWp); if(!ids.length) return null;
+  var beds=FARM.pillars.map(function(){return {sum:0,n:0};});
+  ids.forEach(function(id){
+    var w=FARM.waypoints.find(function(v){return String(v.id)===String(id);});
+    var r=byWp[id]&&byWp[id].ripe;
+    if(!w||typeof r!=='number') return;
+    var best=-1,bd=Infinity;
+    FARM.pillars.forEach(function(p,i){                 // 베드 사각형까지의 최단거리
+      var lenX=p.face==='x'?p.w:p.d, lenZ=p.face==='x'?p.d:p.w;
+      var dx=Math.max(Math.abs(w.x-p.x)-lenX/2,0), dz=Math.max(Math.abs(w.z-p.z)-lenZ/2,0);
+      var dist=Math.hypot(dx,dz); if(dist<bd){bd=dist;best=i;}
+    });
+    if(best>=0){ beds[best].sum+=r; beds[best].n++; }
+  });
+  if(!beds.some(function(b){return b.n;})) return null;
+  return beds.map(function(b){ return b.n?Math.max(0,Math.min(1,(b.sum/b.n)/100)):null; });
+}
 async function loadHeat(){
   try{
     const d=await(await fetch('/api/heatmap?t='+Date.now())).json();
@@ -1059,7 +1083,13 @@ async function loadHeat(){
     window._heatAwaiting=!!d.awaiting_patrol;
     if(d.awaiting_patrol){ window._heatDens=null; window._heatCrop=null; }
     else{
-      if(Array.isArray(d.pillars)) window._heatDens=d.pillars;
+      // 밀집도는 ACS 검출 콜백의 '웨이포인트별 익음 비율' 로 만든다.
+      // pillars 를 직접 보내주는 서비스가 없어서(AI 는 웨이포인트 단위로만 낸다),
+      // 각 웨이포인트를 가장 가까운 베드에 묶고 그 평균을 그 베드의 밀집도로 쓴다.
+      // → 익음이 많은 베드는 진하게, 적은 베드는 옅게 자동으로 칠해진다.
+      var dens=bedDensityFromWaypoints(d.by_waypoint);
+      if(dens) window._heatDens=dens;
+      else if(Array.isArray(d.pillars)) window._heatDens=d.pillars;   // 누가 pillars 를 보내주면 그걸 우선
       if(d.crop) window._heatCrop=d.crop;
     }
     window._heatMeta={count:d.patrol_count,at:d.updated_at};
@@ -1782,9 +1812,11 @@ function drawFarmHeat(){
   g.save();
   g.beginPath(); g.rect(sx(-F.HX),sy(-F.HZ),sw(F.HX*2),sh(F.HZ*2)); g.clip();
   F.pillars.forEach(dens?function(p,i){
+    var d=dens[i];
+    if(typeof d!=='number') return;             // 그 베드는 아직 촬영 안 됨 → 안 칠한다
     var lenX=p.face==='x'?p.w:p.d, lenZ=p.face==='x'?p.d:p.w;
     var rx=sw(lenX)*0.85, ry=sh(lenZ)*0.62;      // 베드를 감싸는 정도의 헤일로
-    var cx=sx(p.x), cy=sy(p.z), d=dens[i]||0.6, R=Math.max(rx,ry);
+    var cx=sx(p.x), cy=sy(p.z), R=Math.max(rx,ry);
     g.save(); g.translate(cx,cy);
     var grd=g.createRadialGradient(0,0,2,0,0,R);
     grd.addColorStop(0,'rgba(214,28,20,'+(0.9*d)+')');
@@ -1798,8 +1830,9 @@ function drawFarmHeat(){
   // 로봇팔 위(맵 바깥) 방울토마토 덩굴의 밀집.
   // ⚠ 구버전은 d=0.92 하드코딩이라 검출 데이터가 없어도 빨갛게 칠했다(데모 잔재).
   //   실제 검출값이 있을 때만, 베드 밀집도의 평균으로 그린다.
-  if(dens&&dens.length){
-    var davg=dens.reduce(function(s,v){return s+(v||0);},0)/dens.length;
+  var known=(dens||[]).filter(function(v){return typeof v==='number';});
+  if(known.length){
+    var davg=known.reduce(function(s,v){return s+v;},0)/known.length;   // 촬영된 베드만 평균
     F.arms.forEach(function(a){
       var cx=sx(a.x), cy=sy(a.z), rx=Math.max(26,sw(1.6)), ry=15;
       g.save(); g.translate(cx,cy);

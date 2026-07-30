@@ -71,20 +71,29 @@ def main():
             except Exception: pass
             time.sleep(0.3)
         ctrl_reset()
+        # 순찰은 역할상 dg_03 전용이다(mock 의 role 고정 + Web 의 PATROL_ROBOT_IDS).
+        # 예전 이 블록은 dg_01·dg_02 가 순찰 목록에 나온다고 가정했는데, mock 에 역할이
+        # 들어간 뒤(PR #25)로는 성립하지 않아 계속 실패하고 있었다. 역할 기준으로 고쳤다.
         avr = requests.get(WEB + "/api/v1/robots/patrol/available", timeout=5).json().get("robots", [])
         def rb(rid): return next((x for x in avr if x.get("robot_id") == rid), {})
-        check("E1 available 3상태: dg_01 가능 / dg_02 배터리부족 / dg_03 순찰중",
-              rb("dg_01").get("available") is True and rb("dg_02").get("unavailable_reason") == "BATTERY_TOO_LOW"
-              and rb("dg_03").get("unavailable_reason") == "ROBOT_BUSY")
+        ids0 = [x.get("robot_id") for x in avr]
+        check("E1 available: 순찰 후보는 dg_03 만 · 대기중이면 가능",
+              ids0 == ["dg_03"] and rb("dg_03").get("available") is True, "ids=%s" % ids0)
         ctrl_reset()
-        rs = requests.post(WEB + "/api/v1/patrol/requests", json={"robot_selection": "specific", "robot_id": "dg_01"}, timeout=5).json()
-        check("E1 직접선택(specific dg_01) → ACCEPTED", rs.get("status") == "ACCEPTED" and rs.get("assigned_robot_id") == "dg_01",
+        rs = requests.post(WEB + "/api/v1/patrol/requests", json={"robot_selection": "specific", "robot_id": "dg_03"}, timeout=5).json()
+        check("E1 직접선택(specific dg_03) → ACCEPTED", rs.get("status") == "ACCEPTED" and rs.get("assigned_robot_id") == "dg_03",
               "robot=%s" % rs.get("assigned_robot_id"))
+        # 순찰 중인 로봇을 다시 지정 → ACS 판단(ROBOT_BUSY)이 그대로 내려와야 한다
+        busy = requests.get(WEB + "/api/v1/robots/patrol/available", timeout=5).json().get("robots", [])
+        bz = next((x for x in busy if x.get("robot_id") == "dg_03"), {})
+        check("ACS 판단(순찰중=ROBOT_BUSY) 그대로 전달",
+              bz.get("available") is False and bz.get("unavailable_reason") == "ROBOT_BUSY",
+              "dg_03.reason=%s" % bz.get("unavailable_reason"))
         ctrl_reset()
-        rna = requests.post(WEB + "/api/v1/patrol/requests", json={"robot_selection": "specific", "robot_id": "dg_02"}, timeout=5)
+        rna = requests.post(WEB + "/api/v1/patrol/requests", json={"robot_selection": "specific", "robot_id": "dg_01"}, timeout=5)
         jna = rna.json()
-        check("E1 거절: 배터리부족 로봇 지정 → 409 ROBOT_NOT_AVAILABLE",
-              rna.status_code == 409 and jna.get("reason") == "ROBOT_NOT_AVAILABLE", "%s %s" % (rna.status_code, jna.get("reason")))
+        check("E1 거절: 순찰 자격 없는 로봇(dg_01=수확전용) 지정 → 409",
+              rna.status_code == 409, "%s %s" % (rna.status_code, jna.get("reason")))
         ctrl_reset()
         requests.post(WEB + "/api/v1/patrol/requests", json={"robot_selection": "auto"}, timeout=5)      # dg_01 busy
         rno = requests.post(WEB + "/api/v1/patrol/requests", json={"robot_selection": "auto"}, timeout=5)  # 즉시 재요청 → 거절
@@ -100,12 +109,15 @@ def main():
         # Web 의 available 응답이 Control 것과 동일해야(중계 성공): dg_01 + current_position 은 Control만의 형식
         rw = requests.get(WEB + "/api/v1/robots/patrol/available", timeout=5).json()
         ids = [x.get("robot_id") for x in rw.get("robots", [])]
-        has_ctrl_shape = any(x.get("robot_id") == "dg_01" and "current_position" in x for x in rw.get("robots", []))
-        check("Web available 가 Control 응답을 중계함", has_ctrl_shape, "robot_ids=%s" % ids)
-        # dg_02 는 배터리 62<70 → BATTERY_TOO_LOW 로 내려와야
-        dg02 = next((x for x in rw.get("robots", []) if x.get("robot_id") == "dg_02"), {})
-        check("Control 판단(배터리부족) 그대로 전달", dg02.get("unavailable_reason") == "BATTERY_TOO_LOW",
-              "dg_02.reason=%s" % dg02.get("unavailable_reason"))
+        # current_position 은 Control 응답에만 있는 형식 → 이게 보이면 중계된 것이다
+        has_ctrl_shape = any(x.get("robot_id") == "dg_03" and "current_position" in x for x in rw.get("robots", []))
+        check("Web available 가 Control 응답을 중계함(형식 보존)", has_ctrl_shape, "robot_ids=%s" % ids)
+        # 수확 목록도 ACS 텔레메트리에서 나와야 한다(자체 데모 함대가 아니라)
+        rh = requests.get(WEB + "/api/v1/robots/harvest/available", timeout=5).json()
+        hids = sorted(x.get("robot_id") for x in rh.get("robots", []))
+        check("수확 목록이 ACS 텔레메트리 기반(데모 폴백 아님)",
+              rh.get("source", "").startswith("telemetry") and hids == ["dg_01", "dg_02"],
+              "source=%s ids=%s" % (rh.get("source"), hids))
 
         # ---------- 링크 3: 전체 체인 (App→Web→Control→콜백→App) ----------
         print("\n[링크 3] App ↔ Web ↔ Control 전체 체인 (순찰 시나리오 E1→E2→E3)", flush=True)
@@ -188,6 +200,63 @@ def main():
         r2 = requests.post(WEB + "/api/v1/notify/telegram",
                            json={"event": "patrol_completed", "seq": 999001}, timeout=5).json()
         check("같은 seq 재요청은 중복차단(다중 클라이언트 안전)", r2.get("reason") == "dup", str(r2))
+
+        # ---------- [역할 분담] 순찰=dg_03 / 수확=dg_01(H01)·dg_02(H02) ----------
+        # 위 링크1·2 는 중계 검사를 위해 PATROL_ROBOT_IDS 를 전체로 열어 뒀다.
+        # 여기서는 운영 기본값(dg_03)으로 별도 프로세스를 띄워 역할이 실제로 강제되는지 본다.
+        print("\n[역할 분담] 순찰=dg_03 · 수확=dg_01(HARVEST_01)/dg_02(HARVEST_02)", flush=True)
+        env_role = dict(os.environ, PORT="7010", CONTROL_SERVICE_URL=CTRL,
+                        INGEST_TOKEN="automato-live-2026")     # PATROL_ROBOT_IDS 기본값(dg_03) 사용
+        role = subprocess.Popen([sys.executable, "app.py"], cwd=HERE, env=env_role,
+                                stdout=logs, stderr=logs)
+        W2 = "http://127.0.0.1:7010"
+        try:
+            assert wait_up(W2 + "/api/v1/_config"), "역할검증용 Web 안 뜸"
+            cfg = requests.get(W2 + "/api/v1/_config", timeout=5).json()
+            check("설정에 역할이 실려 있음",
+                  cfg.get("patrol_robot_ids") == ["dg_03"]
+                  and cfg.get("harvest_robot_ids") == ["dg_01", "dg_02"]
+                  and cfg.get("harvest_bay_map") == {"dg_01": "HARVEST_01", "dg_02": "HARVEST_02"},
+                  "patrol=%s harvest=%s" % (cfg.get("patrol_robot_ids"), cfg.get("harvest_robot_ids")))
+            try: requests.post(CTRL + "/reset", timeout=3)
+            except Exception: pass
+            pv = requests.get(W2 + "/api/v1/robots/patrol/available", timeout=5).json()
+            pids = [x.get("robot_id") for x in pv.get("robots", [])]
+            check("순찰 목록은 dg_03 만", pids == ["dg_03"], "ids=%s" % pids)
+            hv = requests.get(W2 + "/api/v1/robots/harvest/available", timeout=5).json()
+            hids = sorted(x.get("robot_id") for x in hv.get("robots", []))
+            check("수확 목록은 dg_01·dg_02 만", hids == ["dg_01", "dg_02"], "ids=%s" % hids)
+
+            def hreq(body):
+                r = requests.post(W2 + "/api/v1/harvest/requests", json=body, timeout=8)
+                return r.status_code, r.json()
+            for bay, want in (("HARVEST_01", "dg_01"), ("HARVEST_02", "dg_02")):
+                try: requests.post(CTRL + "/reset", timeout=3)
+                except Exception: pass
+                sc, js = hreq({"robot_selection": "auto", "harvest_location": bay})
+                check("%s 고르면 %s 자동 배정" % (bay, want),
+                      js.get("status") == "ACCEPTED" and js.get("assigned_robot_id") == want
+                      and js.get("harvest_location") == bay,
+                      "%s robot=%s loc=%s" % (sc, js.get("assigned_robot_id"), js.get("harvest_location")))
+            try: requests.post(CTRL + "/reset", timeout=3)
+            except Exception: pass
+            sc, js = hreq({"robot_selection": "manual", "robot_id": "dg_02"})
+            check("dg_02 만 지정하면 HARVEST_02 자동", js.get("harvest_location") == "HARVEST_02",
+                  "loc=%s" % js.get("harvest_location"))
+            try: requests.post(CTRL + "/reset", timeout=3)
+            except Exception: pass
+            sc, js = hreq({"robot_selection": "manual", "robot_id": "dg_03"})
+            check("dg_03 으로 수확 요청은 거절(로봇팔 없음)",
+                  sc == 409 and js.get("status") == "REJECTED", "%s %s" % (sc, js.get("reason")))
+            sc, js = hreq({"harvest_location": "HARVEST_09"})
+            check("없는 수확대는 거절", sc == 400 and js.get("status") == "REJECTED",
+                  "%s %s" % (sc, js.get("reason")))
+        finally:
+            try:
+                role.send_signal(signal.SIGTERM); role.wait(timeout=5)
+            except Exception:
+                try: role.kill()
+                except Exception: pass
 
     finally:
         try:
