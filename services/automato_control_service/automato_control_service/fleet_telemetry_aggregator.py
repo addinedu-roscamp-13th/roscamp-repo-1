@@ -43,6 +43,10 @@ from automato_control_service.fleet_collector import (
 # 이 시간(초) 넘게 텔레메트리가 안 오면 경고 로그. QT 오프라인 표시 기준과 같은 값이다.
 STALE_SEC = 3.0
 
+# 반복 상태 로그(취합 발행 중 / 아직 수신 없음)의 최소 간격(초).
+# 발행 자체는 1Hz 그대로이고 '찍는 주기'만 늦춘다 — 순찰·수확 로그를 덮지 않기 위해서다.
+STATUS_LOG_SEC = 30.0
+
 
 class FleetTelemetryAggregator(Node):
     def __init__(self, **kwargs):
@@ -135,7 +139,7 @@ class FleetTelemetryAggregator(Node):
             self.get_logger().warn(
                 '아직 받은 로봇 텔레메트리가 없음 — 빈 배열 발행 중 '
                 '(DG 발행과 robot_ids 파라미터 확인 필요)',
-                throttle_duration_sec=5.0)
+                throttle_duration_sec=STATUS_LOG_SEC)
             return
 
         # 오래된 로봇을 함께 알린다. 배열에서 빼지는 않는다(QT 가 stamp 로 판정).
@@ -146,7 +150,7 @@ class FleetTelemetryAggregator(Node):
             '취합 발행: 로봇 %d대%s'
             % (len(msg.robots),
                ' (미수신 %.0fs+: %s)' % (STALE_SEC, ', '.join(stale)) if stale else ''),
-            throttle_duration_sec=5.0)
+            throttle_duration_sec=STATUS_LOG_SEC)
 
 
 def main(args=None):

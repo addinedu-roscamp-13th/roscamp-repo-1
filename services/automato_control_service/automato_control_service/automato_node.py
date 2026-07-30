@@ -761,7 +761,13 @@ def main(args=None) -> None:
         f"Automato Control Service (순찰) HTTP API → http://0.0.0.0:{port}")
 
     try:
-        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+        # access_log=False: 요청 한 건마다 찍히는 접수 기록('… "GET /…" 200 OK')을 끈다.
+        # verify_web LIVE 모드가 /internal/v1/debug/traffic 을 2Hz(0.5초)로 폴링해
+        # 분당 120줄이 쌓여 순찰·수확 로그를 덮어버린다. 끄는 건 '기록'이지 '기능'이
+        # 아니라 API 응답은 그대로이고, 접수 사실은 각 핸들러가 자기 로그로 남긴다
+        # (예: start_patrol). 기동 배너와 오류 트레이스백도 다른 로거라 그대로 나온다.
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
+                    access_log=False)
     except KeyboardInterrupt:
         pass
     finally:
