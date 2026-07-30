@@ -32,10 +32,21 @@ from dg_ai_service.yolo_detector import ModelNotReadyError, TomatoDetector
 DEFAULT_HOST = '0.0.0.0'
 DEFAULT_PORT = 9100
 DEFAULT_CONF = 0.4
-DEFAULT_MODEL_PATH = os.environ.get('DG_AI_MODEL_PATH', None)
 DEFAULT_LOG_FILE = os.path.join('logs', 'dg_ai_service.log')
 
 SUPPORTED_ENCODINGS = {'jpeg', 'jpg', 'png'}
+
+
+def models_dir() -> str:
+    """이 패키지의 models/ 디렉토리 절대경로 (dg_ai_service/models/)."""
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'models')
+
+
+# DG Control Service(시나리오1 analyze_frame)가 쓰는 모델. Ddagi(DetectTomatoes,
+# 시나리오2)는 별도 버전을 쓴다 -> detect_tomatoes_server.DEFAULT_MODEL_PATH(v8).
+# 두 서비스는 별도 프로세스로 뜨므로 DG_AI_MODEL_PATH로 오버라이드해도 서로
+# 영향을 주지 않는다.
+DEFAULT_MODEL_PATH = os.environ.get('DG_AI_MODEL_PATH') or os.path.join(models_dir(), 'tomato_4cls_v6.pt')
 
 LOG = logging.getLogger('dg_ai_service')
 

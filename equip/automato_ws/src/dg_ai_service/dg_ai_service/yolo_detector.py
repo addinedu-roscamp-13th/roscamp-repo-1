@@ -16,6 +16,15 @@ CLASSES = ['ripe', 'unripe', 'rotten', 'disease']
 # 이 클래스가 하나라도 감지되면 응답에 레이블링된 이미지를 함께 반환한다.
 LABEL_TRIGGER_CLASSES = ('rotten', 'disease')
 
+# RP-127  DetectTomatoes(시나리오2) 등급 매핑. ripe -> 수확품(NORMAL),
+# rotten/disease -> 폐기품(DISCARD). unripe는 매핑에 없음 -> 검출 결과에서
+# 제외한다(안익은 열매는 따지 않는다).
+GRADE_BY_LABEL = {
+    'ripe': 'NORMAL',
+    'rotten': 'DISCARD',
+    'disease': 'DISCARD',
+}
+
 # 레이블링 이미지(encode_labeled_image)에 그려지는 박스 텍스트만 한글로 표시.
 # 모델 매칭(CLASSES)과 JSON 응답 필드명(ripe_percent 등)은 영문을 그대로 쓴다.
 KOREAN_LABELS = {
@@ -90,6 +99,42 @@ class TomatoDetector:
             if label in CLASSES:
                 counts[label] += 1
         return counts, result
+
+    def detect_instances(self, img: Any, padding_px: float = 6.0) -> list:
+        """개별 검출 결과를 픽셀 원 마스크 정보로 반환 (RP-110, Ddagi/D435용).
+
+        analyze()는 프레임 전체의 클래스별 개수/비율(시나리오1 순찰 분석)을
+        반환하지만, 이건 검출된 각 토마토를 그리퍼 URDF가 이미 실제 충돌검사를
+        하므로 padding은 bbox 경계/검출 오차 정도의 작은 여유만 둔다.
+
+        반환 원소(dict): label, confidence, center_u, center_v(픽셀 중심),
+        radius_px(= bbox의 min(width,height)/2 + padding_px). 3D 좌표는 여기서
+        계산하지 않음 — depth 조회는 호출측(카메라 토픽을 든 노드) 책임.
+        """
+        result = self.model.predict(img, conf=self.conf, verbose=False)[0]
+        detections = []
+        boxes = getattr(result, 'boxes', None)
+        if boxes is None:
+            return detections
+        for box in boxes:
+            try:
+                cls_index = int(box.cls[0])
+                confidence = float(box.conf[0])
+                x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
+            except Exception:
+                continue
+            label = self.model.names.get(cls_index, str(cls_index))
+            if label not in CLASSES:
+                continue
+            radius_px = min(x2 - x1, y2 - y1) / 2.0 + padding_px
+            detections.append({
+                'label': label,
+                'confidence': confidence,
+                'center_u': int(round((x1 + x2) / 2.0)),
+                'center_v': int(round((y1 + y2) / 2.0)),
+                'radius_px': int(round(radius_px)),
+            })
+        return detections
 
     @staticmethod
     def percentages(counts: Counter) -> Dict[str, int]:

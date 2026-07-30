@@ -22,6 +22,8 @@ setup(
         'console_scripts': [
             'analysis_server = dg_ai_service.analysis_server:main',
             'camera_viewer = dg_ai_service.camera_viewer:main',
+            'detect_tomatoes_server = dg_ai_service.detect_tomatoes_server:main',
+            'detect_tomatoes_test_client = dg_ai_service.detect_tomatoes_test_client:main',
         ],
     },
 )

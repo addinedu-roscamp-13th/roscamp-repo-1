@@ -7,6 +7,10 @@
   <maintainer email="finekim67@gmail.com">hskim</maintainer>
   <license>Apache-2.0</license>
 
+  <!-- detect_tomatoes_server(RP-127) — /ai/detect_tomatoes ROS2 서비스 -->
+  <depend>rclpy</depend>
+  <depend>automato_interfaces</depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
