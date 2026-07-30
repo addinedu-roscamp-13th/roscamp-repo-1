@@ -31,6 +31,11 @@ from automato_control_service.fleet_collector import (
     subscribe_per_robot,
 )
 
+# '텔레메트리가 흐르고 있다'를 알리는 요약 로그의 주기(초).
+# 1Hz 수신을 그대로 찍으면 순찰·수확 로그가 파묻히므로, 이 주기마다 '그동안 수신된
+# 로봇 목록'을 한 줄로만 낸다. 짧게 잡을수록 로그가 시끄러워진다.
+RX_REPORT_SEC = 30.0
+
 
 # --------------------------------------------------------------------------- #
 # 텔레메트리 캐시 — 로봇별 '그 로봇의 최신 상태' 1건을 메모리에 보관(수신마다 덮어씀).
@@ -115,16 +120,22 @@ class TelemetryNode(Node):
     def __init__(self, **kwargs):
         super().__init__("telemetry_ws_node", **kwargs)
         self.cache = FleetCache()
-        # 로봇별 첫 수신을 1회만 INFO 로 알리기 위한 표시(이후엔 throttle 로만 로그).
+        # 로봇별 첫 수신을 1회만 INFO 로 알리기 위한 표시(이후엔 주기 요약으로만 로그).
         self._first_rx_logged = set()
+        # 최근 보고 주기 동안 텔레메트리가 들어온 로봇들(_report_rx 가 비운다).
+        self._rx_since_report = set()
 
         self.declare_parameter("robot_ids", DEFAULT_ROBOT_IDS)
         self.declare_parameter("legacy_input", True)
         robot_ids = list(self.get_parameter("robot_ids").value)
         legacy_input = bool(self.get_parameter("legacy_input").value)
+        # 주기 요약에서 '와야 하는데 안 온 로봇'을 가려내려면 기대 목록이 필요하다.
+        self._robot_ids = robot_ids
 
         # 1Hz 상시 구독. DG 발행자와 맞춰 기본 QoS(RELIABLE, depth 10).
         subscribe_per_robot(self, robot_ids, self._on_robot_telemetry)
+        # 수신 요약 타이머 — 콜백마다 찍는 대신 이 타이머가 한 줄로 묶어 낸다.
+        self.create_timer(RX_REPORT_SEC, self._report_rx)
         # [삭제 예정] 팀원의 DG 이전 전까지 옛 경로도 함께 받는다.
         if legacy_input:
             self.create_subscription(
@@ -145,12 +156,31 @@ class TelemetryNode(Node):
         if robot_id not in self._first_rx_logged:   # 첫 수신은 로봇마다 1회 확실히 알림
             self._first_rx_logged.add(robot_id)
             log.info("%s 첫 수신: ddago %d → 캐시 갱신" % (robot_id, len(msg.ddagos)))
-        else:                                       # 이후엔 5초에 한 번만(1Hz 도배 방지)
-            log.info("텔레메트리 수신 중: %s" % robot_id, throttle_duration_sec=5.0)
+        # 이후엔 여기서 찍지 않고 표시만 남긴다 → _report_rx 가 주기마다 한 줄로 요약.
+        # (콜백에서 throttle 로 찍으면 rclpy throttle 상태가 '호출 라인' 단위라 로봇을
+        #  구분하지 못한다. 3대가 같은 줄을 공유해 매번 한 대 이름만 번갈아 나온다.)
+        self._rx_since_report.add(robot_id)
         # 값이 실제로 바뀌는지 검증용 상세는 DEBUG — 평소 숨김, --log-level debug 로만.
         for d in msg.ddagos:
             log.debug("  %s nav=%s batt=%.0f pos=(%.2f,%.2f)"
                       % (robot_id, d.nav_status, d.battery_percent, d.x, d.y))
+
+    def _report_rx(self) -> None:
+        """RX_REPORT_SEC 마다 '그동안 텔레메트리가 들어온 로봇'을 한 줄로 요약한다.
+
+        set 을 비우지 않고 '통째로 갈아끼우는' 이유: 이 타이머와 구독 콜백이 서로 다른
+        스레드에서 돌 수 있어(MultiThreadedExecutor), 읽는 도중 콜백이 add 하면
+        순회가 깨진다. 참조 교체는 원자적이라 락 없이 안전하다.
+        """
+        received, self._rx_since_report = self._rx_since_report, set()
+        if not received:
+            return          # 아직 아무것도 안 들어옴(기동 직후) — 조용히 넘어간다.
+        missing = [r for r in self._robot_ids if r not in received]
+        self.get_logger().info(
+            "텔레메트리 수신 중: %s%s"
+            % (", ".join(sorted(received)),
+               " (미수신 %.0fs: %s)" % (RX_REPORT_SEC, ", ".join(missing))
+               if missing else ""))
 
     def _on_fleet(self, msg: FleetTelemetry) -> None:
         """[삭제 예정] 옛 /automato/telemetry/fleet 경로."""
@@ -196,8 +226,12 @@ def main(args=None) -> None:
 
     try:
         # ws_ping_interval/timeout: 서버가 주기적으로 ping 을 보내 죽은 연결을 감지(keepalive).
+        # access_log=False: 요청별 접수 기록을 끈다(automato_node 와 같은 이유).
+        # 여기선 WS 접속/해제가 그 대상인데, 그 둘은 이미 한글 ROS 로그로 따로 남는다
+        # ("텔레메트리 WS 접속 (현재 N명)").
         uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
-                    ws_ping_interval=20.0, ws_ping_timeout=20.0)
+                    ws_ping_interval=20.0, ws_ping_timeout=20.0,
+                    access_log=False)
     except KeyboardInterrupt:
         pass
     finally:

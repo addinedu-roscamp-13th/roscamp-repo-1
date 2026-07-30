@@ -44,6 +44,10 @@ DEFAULT_BATTERY_THRESHOLD = 30.0
 # 방송 주기(초). 1.0 = 1Hz.
 BROADCAST_INTERVAL_SEC = 1.0
 
+# 방송이 살아 있음을 알리는 요약 로그의 간격(틱 수). 1Hz 방송이므로 30 = 30초에 한 줄.
+# 순찰·수확 로그가 배경 잡음에 묻히지 않게 넉넉히 잡는다.
+BROADCAST_LOG_EVERY = 30
+
 
 def judge_robot_availability(entry: dict, now: float, active_task_type,
                              operational_status: str, battery_threshold: float,
@@ -259,10 +263,11 @@ async def broadcast_loop(manager: ConnectionManager, cache, read_db_state,
         # dict → JSON text frame. ensure_ascii=False 로 한글 등도 그대로 싣는다.
         await manager.broadcast(json.dumps(msg, ensure_ascii=False))
 
-        # 흐름 가시화 로그(캐시 읽기 → WS 발행). 첫 방송 + 5틱(≈5초)마다만 찍어 1Hz 도배 방지.
+        # 흐름 가시화 로그(캐시 읽기 → WS 발행). 첫 방송 + BROADCAST_LOG_EVERY 틱마다만
+        # 찍어 1Hz 도배 방지.
         # rclpy 전용 throttle 대신 seq 수동 스로틀 — 이 루프는 std logging 도 허용하기 때문.
         # '로봇 N대(캐시)'가 캐시 읽은 결과, '클라이언트 M명'이 실제 발행 대상.
-        if logger is not None and (seq == 1 or seq % 5 == 0):
+        if logger is not None and (seq == 1 or seq % BROADCAST_LOG_EVERY == 0):
             logger.info("방송 seq=%d: 로봇 %d대(캐시) → 클라이언트 %d명"
                         % (seq, len(robots_cache), manager.count()))
 
