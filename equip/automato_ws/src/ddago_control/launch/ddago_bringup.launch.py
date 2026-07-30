@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """RP-EX  DdaGo 로봇측 스택 일괄 기동 launch (bringup).
 
-로봇측 노드(주행+촬영+텔레메트리)를 한 번에 올린다. 지금까지는 두 개로 갈려 있었다:
-  ddago_navigate.launch.py   → camera_node + navigate_server (주행·촬영)
-  ddago_telemetry.launch.py  → telemetry_publisher          (상태 발행)
-이 bringup 은 그 둘을 그대로 **불러와(include)** 합치기만 한다 — 노드 정의·인자·주석은
-각 원본 launch 에 그대로 두고 여기선 중복하지 않는다. 그래서 필요하면 원본을 따로도
-(주행만, 텔레메트리만) 쓸 수 있고, 평소엔 이 파일 하나로 전부 띄운다.
+로봇측 노드(주행+촬영+텔레메트리+도킹)를 한 번에 올린다. 원본 launch 넷을 그대로
+**불러와(include)** 합치기만 한다 — 노드 정의·인자·주석은 각 원본 launch 에 그대로 두고
+여기선 중복하지 않는다:
+  ddago_navigate.launch.py        → camera_node + navigate_server           (주행·촬영)
+  ddago_telemetry.launch.py       → telemetry_publisher                     (상태 발행)
+  ddago_reflective_dock.launch.py → reflective_detector + reflective_dock_server (충전소 반사테이프 도킹)
+  ddago_floor_dock.launch.py      → floor_dock_server                       (수확·예냉실 H마커 도킹)
+그래서 필요하면 원본을 따로도 쓸 수 있고, 평소엔 이 파일 하나로 전부 띄운다.
+
+도킹 안전: 두 도킹 서버는 goal 이 올 때만 /cmd_vel 을 낸다(평소엔 idle). 그래도 첫 투입
+사고를 막으려고 **dry_run 기본값을 true** 로 둔다 — 검출·계획만 하고 바퀴는 안 굴린다.
+실제로 붙일 때만 dry_run:=false. 세 센서(측면 웹캠·전면 CSI·라이다)를 각기 써 서로 간섭 없다.
 
   ('bringup' 은 "한 컴포넌트의 스택 전체를 올린다"는 ROS2 관례 이름이다. nav2_bringup,
    turtlebot3_bringup 처럼.)
@@ -31,6 +37,8 @@
   # 웹캠 없이(정지 이미지로 촬영 사슬 확인)
   ros2 launch ddago_control ddago_bringup.launch.py \\
       source:=file image_path:=/home/ane/dummy_tomato.jpg
+  # 도킹을 실제로 붙일 때(기본은 안전모드 dry_run=true)
+  ros2 launch ddago_control ddago_bringup.launch.py dry_run:=false
 """
 import os
 
@@ -38,7 +46,8 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
@@ -61,6 +70,22 @@ def generate_launch_description():
             'image_path', default_value='',
             description='file 모드에서 반환할 JPEG 경로'),
 
+        # ── 도킹 인자(반사·floor 공용 dry_run + 로봇별 캘리브 파일) ──
+        DeclareLaunchArgument(
+            'dry_run', default_value='true',
+            description='도킹 안전(반사·floor 공용). true=cmd_vel 미발행(검출·계획만). '
+                        '실제로 붙일 때만 dry_run:=false 로 준다'),
+        DeclareLaunchArgument(
+            'config_file',
+            default_value=PathJoinSubstitution([
+                FindPackageShare('ddago_control'),
+                'config', 'reflective_dock', 'ddago01.yaml']),
+            description='반사도킹 로봇별 물리값 yaml(rear_offset 등). 로봇 바꾸면 ddago02.yaml'),
+        DeclareLaunchArgument(
+            'floor_calib_file',
+            default_value='/home/pinky/floor_dock_ws/floor_calib.npz',
+            description='floor 도킹 로봇별 바닥 캘리브(npz). 로봇마다 다름'),
+
         # ── 주행 + 촬영 스택 (camera_node + navigate_server) ──
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
@@ -79,4 +104,28 @@ def generate_launch_description():
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(launch_dir, 'ddago_telemetry.launch.py'))),
+
+        # ── 반사테이프 후진 도킹 (reflective_detector + reflective_dock_server) ──
+        # 라이다 /scan 으로 충전소 반사테이프를 보고 후진 접붙임(/ddago/reflective_dock).
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(launch_dir, 'ddago_reflective_dock.launch.py')),
+            launch_arguments={
+                'robot_id': LaunchConfiguration('robot_id'),
+                'config_file': LaunchConfiguration('config_file'),
+                'dry_run': LaunchConfiguration('dry_run'),
+            }.items(),
+        ),
+
+        # ── 바닥 H마커 후진 도킹 (floor_dock_server) ──
+        # 전면 CSI 카메라로 바닥 H테이프를 보고 후진 접붙임(/ddago/floor_dock).
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(launch_dir, 'ddago_floor_dock.launch.py')),
+            launch_arguments={
+                'robot_id': LaunchConfiguration('robot_id'),
+                'floor_calib_file': LaunchConfiguration('floor_calib_file'),
+                'dry_run': LaunchConfiguration('dry_run'),
+            }.items(),
+        ),
     ])
