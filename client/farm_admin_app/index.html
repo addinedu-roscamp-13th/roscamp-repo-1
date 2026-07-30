@@ -1352,19 +1352,25 @@ function initFarm3D(){
    ============================================================================ */
 var FARM={
   HX:6.5, HZ:13, wallH:1.6, PH:1.6,   // 씬 반크기. 실측 1.17 x 1.92m 를 이 박스에 매핑
-  pillars:[  // 재배 베드 3개 {x,z,w,d,face} — map_layout.STRUCTURES 를 씬으로 변환
-    {x:-0.36, z:-7.62, w:3.65, d:7.45, face:'z'},  // 가로 베드 (1·2행과 5·6·8행 사이를 막는 통짜)
-    {x:-1.53, z: 0.57, w:2.45, d:7.32, face:'x'},  // 세로 베드 (노드열 사이)
-    {x: 2.47, z: 0.57, w:2.22, d:7.32, face:'x'}   // 세로 베드
+  // 재배 베드 3개 {x,z,w,d,face} — map_layout.STRUCTURES 를 씬으로 변환한 뒤 14% 축소.
+  //   왜 줄였나: 실측 그대로면 가운데 통로 실폭이 1.33(베드 밖으로 나온 토마토 구슬 0.165 포함)
+  //   이라 Pinky(폭 0.95)가 지날 때 좌우 여유가 0.20 뿐이라 로봇이 가린다. 1.67 로 넓혀 0.36 확보.
+  //   map_layout.py 도 "구조물은 배치·비율만 참고, 노드·통로만 진짜"라 명시 → 가독성 조정 허용.
+  pillars:[
+    {x:-0.36, z:-7.62, w:3.15, d:7.45, face:'z'},  // 가로 베드 (1·2행과 5·6·8행 사이를 막는 통짜)
+    {x:-1.53, z: 0.57, w:2.10, d:7.32, face:'x'},  // 세로 베드 (노드열 사이)
+    {x: 2.47, z: 0.57, w:1.90, d:7.32, face:'x'}   // 세로 베드
   ],
-  // ★ 하단 벽 — 가운데가 뚫려 있다(PGM rows 61~63: 열 0~11 벽 / 12~25 개방 / 26~38 벽).
+  // ★ 하단 벽 = 맵 아래쪽 '외벽'. 가운데가 뚫려 있다
+  //   (PGM rows 61~63: 열 0~11 벽 / 열 12~25 개방 42cm / 열 26~38 벽).
   //   왜 뚫렸나: 로봇팔 2대 사이에 Pinky Pro 가 주차해 수확물을 받는 공간이 생겼다.
-  //   그래서 통짜 벽 하나가 아니라 '개방 42cm' 를 둔 두 토막이다. 수확대(20·21)가 그 사이에 있다.
+  //   ⚠ z 를 -HZ(맵 경계)에 둔다. 안쪽에 따로 두면 외벽과 이중으로 보이고, 외벽은 통짜라서
+  //     정작 '뚫린 것'이 화면에 안 나타난다 → 외벽의 아래쪽을 이 두 토막으로 대체한다.
   wallBars:[
-    {x: 4.59, z:-12.39, w:3.83, h:1.9, d:0.3},   // 화면 오른쪽 토막
-    {x:-4.09, z:-12.39, w:4.17, h:1.9, d:0.3}    // 화면 왼쪽 토막
+    {x: 4.59, z:-13, w:3.83, h:1.9, d:0.34},   // 화면 오른쪽 토막
+    {x:-4.09, z:-13, w:4.17, h:1.9, d:0.34}    // 화면 왼쪽 토막
   ],
-  wallGap:{x0:-2.00, x1:2.67, z:-12.39},          // 개방 구간(수확물 인수 공간) — 표시용
+  wallGap:{x0:-2.00, x1:2.67, z:-13},          // 개방 구간(수확물 인수 공간)
   arms:[{x:-3.53,z:-13.07},{x:4.02,z:-13.07}],    // 로봇팔 2대 = 하단 벽의 양쪽 끝
   vines:[{x:-3.53,z:-14.7},{x:4.02,z:-14.7}],     // 로봇팔 위·맵 바깥 방울토마토 덩굴
   cold:{x:4.30, z:9.9, w:2.4, d:1.8, h:2.0},      // 예냉실 (진입 노드 25)
@@ -1441,7 +1447,8 @@ function buildFarmScene(){
   // 바닥 + 외벽
   box(F.HX*2,0.3,F.HZ*2,0,-0.15,0,new THREE.MeshLambertMaterial({color:0x9aa4ad}));
   var t=0.28, wh=F.wallH;
-  box(F.HX*2+t,wh,t,0,wh/2,-F.HZ,wallMat); box(F.HX*2+t,wh,t,0,wh/2,F.HZ,wallMat);
+  // 위·좌·우 외벽만 통짜. 아래쪽 외벽은 F.wallBars 로 그린다(가운데 42cm 개방).
+  box(F.HX*2+t,wh,t,0,wh/2,F.HZ,wallMat);
   box(t,wh,F.HZ*2,-F.HX,wh/2,0,wallMat); box(t,wh,F.HZ*2,F.HX,wh/2,0,wallMat);
   // ===== 방울토마토 클러스터 면 (매달린 토마토처럼 실제 3D 구슬) =====
   var tomRed=new THREE.MeshLambertMaterial({color:0xe12e22}), tomHi=new THREE.MeshLambertMaterial({color:0xf2705f}), leafMat=new THREE.MeshLambertMaterial({color:0x3f9a4e});
@@ -1461,9 +1468,8 @@ function buildFarmScene(){
     if(p.face==='x'){ tomatoFace(p.x-lenX/2-0.02,p.z,'x',-1,p.d); tomatoFace(p.x+lenX/2+0.02,p.z,'x',1,p.d); }
     else { tomatoFace(p.x,p.z-lenZ/2-0.02,'z',-1,p.d); tomatoFace(p.x,p.z+lenZ/2+0.02,'z',1,p.d); }
   });
-  // 하단 벽 — 두 토막(가운데 42cm 개방). 개방부는 Pinky 가 수확물을 받는 자리라 비워 둔다.
-  var wbMat=new THREE.MeshLambertMaterial({color:0xdfe4ea});
-  (F.wallBars||[]).forEach(function(wb){ box(wb.w,wb.h,wb.d,wb.x,wb.h/2,wb.z,wbMat); });
+  // 하단 외벽 — 두 토막(가운데 42cm 개방). 개방부는 Pinky 가 수확물을 받는 자리라 비워 둔다.
+  (F.wallBars||[]).forEach(function(wb){ box(wb.w,wb.h,wb.d,wb.x,wb.h/2,wb.z,wallMat); });
   // 로봇팔 2대
   function robotArm(x,z){
     var g=new THREE.Group(), aM=new THREE.MeshLambertMaterial({color:0xf3f5f7}), jM=new THREE.MeshLambertMaterial({color:0x2f7fd6}), dM=new THREE.MeshLambertMaterial({color:0x39414b});
@@ -1714,10 +1720,16 @@ function drawFarmHeat(){
   var cv=document.getElementById('farmHeat'); if(!cv)return;
   var F=FARM, g=cv.getContext('2d'), CW=cv.width, CH=cv.height, pad=22;
   function T(t,x,y){ g.save(); g.translate(x,y); g.rotate(-Math.PI/2); g.fillText(t,0,0); g.restore(); }   // CSS 90° 회전 상쇄 → 라벨 똑바로
-  function sx(x){return pad+(x+F.HX)/(F.HX*2)*(CW-2*pad);}
-  function sy(z){return pad+(z+F.HZ)/(F.HZ*2)*(CH-2*pad);}
-  function sw(w){return w/(F.HX*2)*(CW-2*pad);}
-  function sh(d){return d/(F.HZ*2)*(CH-2*pad);}
+  // 보이는 범위는 맵(±HX/±HZ)보다 조금 넓게 잡는다 — 로봇팔·덩굴·하단 벽이 맵 경계 바깥에
+  // 있어서, 맵 범위로 그리면 캔버스 밖으로 잘려 반쪽만 보인다.
+  var VX=F.HX+0.7, VZ=F.HZ+2.4;
+  function sx(x){return pad+(x+VX)/(VX*2)*(CW-2*pad);}
+  function sy(z){return pad+(z+VZ)/(VZ*2)*(CH-2*pad);}
+  function sw(w){return w/(VX*2)*(CW-2*pad);}
+  function sh(d){return d/(VZ*2)*(CH-2*pad);}
+  // 화면 기준 오프셋 — CSS 90° 회전 때문에 캔버스 +x 는 화면 아래, +y 는 화면 왼쪽이 된다.
+  // 라벨을 '노드 오른쪽 위'에 두려면 캔버스에서 (-, -) 로 밀어야 한다.
+  function offUpRight(X,Y,d){ return [X-(d||13), Y-(d||13)]; }
   g.clearRect(0,0,CW,CH);
   // 밭 바닥 (은은한 그라디언트 + 옅은 격자)
   var bg=g.createLinearGradient(0,sy(-F.HZ),0,sy(F.HZ));
@@ -1754,8 +1766,13 @@ function drawFarmHeat(){
     grd.addColorStop(1,'rgba(150,205,110,0)');
     g.fillStyle=grd; g.beginPath(); g.ellipse(0,0,rx,ry,0,0,7); g.fill(); g.restore();
   });
-  // 외벽
-  g.strokeStyle='#5b6b7a'; g.lineWidth=5; g.strokeRect(sx(-F.HX),sy(-F.HZ),sw(F.HX*2),sh(F.HZ*2));
+  // 외벽 — 위·좌·우는 통짜, 아래쪽은 F.wallBars 로 따로 그린다(가운데가 뚫려 있으므로
+  // strokeRect 로 사각형을 닫아버리면 개방부가 벽으로 메워져 보인다).
+  g.strokeStyle='#5b6b7a'; g.lineWidth=5; g.lineCap='butt';
+  var L=sx(-F.HX), R=sx(F.HX), TP=sy(-F.HZ), BT=sy(F.HZ);
+  g.beginPath();
+  g.moveTo(L,TP); g.lineTo(L,BT); g.lineTo(R,BT); g.lineTo(R,TP);   // 좌·아래(화면기준)·우
+  g.stroke();
   // 기둥(흰 베드 + 빨강 테두리=방울토마토 면, face 반영)
   F.pillars.forEach(function(p){
     var lenX=p.face==='x'?p.w:p.d, lenZ=p.face==='x'?p.d:p.w;
@@ -1770,18 +1787,17 @@ function drawFarmHeat(){
   F.waypoints.forEach(function(w){ var X=sx(w.x),Y=sy(w.z);
     g.fillStyle=w.gate?'#2f7fd6':'#1f9d55'; g.beginPath(); g.arc(X,Y,7.5,0,7); g.fill();
     g.fillStyle='#fff'; g.font='bold 9px sans-serif'; T(w.id,X,Y);
-    if(w.ord){ g.fillStyle='#0f6b34'; g.font='bold 9px sans-serif'; T('('+w.ord+')',X+15,Y-9); } });
-  // ★ 하단 벽 — 두 토막. 가운데 42cm 는 뚫려 있다(로봇팔 2대 사이 = 수확물 인수 공간).
-  g.fillStyle='#cbd3db';
-  (F.wallBars||[]).forEach(function(wb){
-    g.fillRect(sx(wb.x)-sw(wb.w)/2, sy(wb.z)-sh(wb.d)/2, sw(wb.w), Math.max(4,sh(wb.d)));
-  });
-  // 개방 구간 표시 — '벽이 없다'는 걸 눈에 보이게 (점선 + 라벨)
+    if(w.ord){ var o=offUpRight(X,Y,12); g.fillStyle='#0f6b34'; g.font='bold 9px sans-serif'; T('('+w.ord+')',o[0],o[1]); } });
+  // ★ 하단 외벽 — 두 토막. 가운데 42cm 는 뚫려 있다(로봇팔 2대 사이 = 수확물 인수 공간).
+  g.strokeStyle='#5b6b7a'; g.lineWidth=5;
+  (F.wallBars||[]).forEach(function(wb){ var wy=sy(wb.z);
+    g.beginPath(); g.moveTo(sx(wb.x-wb.w/2),wy); g.lineTo(sx(wb.x+wb.w/2),wy); g.stroke(); });
+  // 개방 구간 — '벽이 없다'를 눈에 보이게 (파란 점선 + 라벨)
   if(F.wallGap){ var gp=F.wallGap, gy=sy(gp.z);
-    g.strokeStyle='#2f7fd6'; g.lineWidth=2; g.setLineDash([4,4]);
+    g.strokeStyle='#2f7fd6'; g.lineWidth=3; g.setLineDash([5,4]);
     g.beginPath(); g.moveTo(sx(gp.x0),gy); g.lineTo(sx(gp.x1),gy); g.stroke(); g.setLineDash([]);
     g.fillStyle='#1b5fa8'; g.font='bold 9px sans-serif';
-    T('개방(수확물 인수)', (sx(gp.x0)+sx(gp.x1))/2, gy-9); }
+    T('개방 · 수확물 인수', (sx(gp.x0)+sx(gp.x1))/2, gy-11); }
   // 로봇팔 2대 (관절 아이콘) — 그 위 방울토마토는 위에서 밀집 '색'으로 표시함(그림 제거)
   g.textAlign='center'; g.textBaseline='middle';
   F.arms.forEach(function(a){ var X=sx(a.x), Y=sy(a.z);
