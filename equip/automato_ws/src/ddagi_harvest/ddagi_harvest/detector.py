@@ -353,6 +353,19 @@ class RosDetector(TomatoDetector):
         return out
 
 
+    def close(self) -> None:
+        """서비스 클라이언트를 정리한다.
+
+        검출기는 **Goal 마다 새로 만들어진다**(task_id·라운드 카운터가 Goal 에 매이므로).
+        정리하지 않으면 같은 노드에 클라이언트가 계속 쌓인다 — 데모에서 몇 번 돌릴 때는
+        티가 안 나지만, 수확 명령이 반복되는 운영에서는 누적된다.
+        """
+        try:
+            self._node.destroy_client(self._cli)
+        except Exception:
+            pass
+
+
 class ListDetector(TomatoDetector):
     """고정 리스트 반환(테스트/데모용). detect()마다 같은 목록을 준다."""
 
