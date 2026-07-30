@@ -1,6 +1,8 @@
+from glob import glob
+
 from setuptools import find_packages, setup
 
-package_name = 'ddagi_control'
+package_name = 'ddagi_harvest'
 
 setup(
     name=package_name,
@@ -10,17 +12,18 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='hskim',
-    maintainer_email='finekim67@gmail.com',
-    description='Ddagi Control Service — 로봇팔 제어 노드',
+    maintainer='kdh',
+    maintainer_email='kdhkjh@gmail.com',
+    description='Ddagi 수확 구현 (김동현) — AI 좌표 → send_coords 파지. 시나리오2 채택본.',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'telemetry_publisher = ddagi_control.telemetry_publisher:main',
+            'harvest_node = ddagi_harvest.harvest_node:main',
         ],
     },
 )

@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>로봇팔 캘리브레이션 — 완전 정리</title>
+<style>
+  :root{--color-text-primary:#1f2937;--color-text-secondary:#475569;--color-border-secondary:#e5e7eb;--color-background-primary:#fff;--font-sans:'Noto Sans KR',system-ui,sans-serif;--font-mono:ui-monospace,Menlo,Consolas,monospace}
+  body{margin:0;background:#f1f5f9;padding:28px 18px;font-family:var(--font-sans)}
+  .cg{max-width:900px;margin:0 auto;background:#fff;border-radius:18px;padding:30px 34px;box-shadow:0 8px 40px rgba(0,0,0,.08);color:var(--color-text-primary);line-height:1.62}
+  .cg *{box-sizing:border-box}
+  .cg h1{font-size:27px;font-weight:800;letter-spacing:-.02em;margin:0}
+  .cg .lead{font-size:15.5px;color:var(--color-text-secondary);margin:6px 0 18px}
+  .cg h2.sec{font-size:20px;font-weight:800;margin:32px 0 4px;padding-top:16px;border-top:2px solid #eef1f5}
+  .cg .schem{background:#fff;border:1px solid var(--color-border-secondary);border-radius:16px;padding:14px;margin:10px 0 8px}
+  .cg .card{background:#fff;border:1px solid var(--color-border-secondary);border-left:6px solid var(--ac);border-radius:14px;padding:16px 20px;margin:14px 0}
+  .cg .n{display:inline-flex;align-items:center;justify-content:center;width:29px;height:29px;border-radius:50%;background:var(--ac);color:#fff;font-weight:800;font-size:15px;margin-right:9px;flex:0 0 auto}
+  .cg .hd{display:flex;align-items:center;gap:3px;flex-wrap:wrap}
+  .cg .hd h3{font-size:18.5px;font-weight:800;margin:0}
+  .cg .full{font-family:var(--font-mono);font-size:12.5px;color:#64748b;margin-left:8px}
+  .cg .badge{margin-left:auto;font-size:12px;font-weight:700;color:#fff;background:var(--ac);padding:3px 11px;border-radius:999px}
+  .cg .exact{background:color-mix(in srgb,var(--ac) 9%,transparent);border-radius:10px;padding:10px 13px;margin:10px 0;font-size:15px}
+  .cg .exact .lab{font-weight:800;color:var(--ac);margin-right:6px}
+  .cg .row{display:flex;gap:8px;margin:9px 0;font-size:14.5px}
+  .cg .row b{flex:0 0 88px;color:#111827}
+  .cg .row span{color:var(--color-text-secondary)}
+  .cg .why{background:#f8fafc;border-radius:10px;padding:10px 13px;margin:11px 0;font-size:14px;color:var(--color-text-secondary)}
+  .cg .why b{color:var(--ac)}
+  .cg pre{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px 14px;overflow:auto;font-family:var(--font-mono);font-size:12.5px;line-height:1.55;margin:10px 0}
+  .cg pre .c{color:#7dd3fc}.cg pre .g{color:#86efac}.cg pre .y{color:#fcd34d}
+  .cg .now{border:1.5px dashed var(--ac);border-radius:10px;padding:10px 13px;margin:11px 0;font-size:14px;background:color-mix(in srgb,var(--ac) 7%,transparent)}
+  .cg .now b{color:var(--ac)}
+  .cg .box{border:1px solid var(--color-border-secondary);border-radius:12px;padding:16px 18px;margin:12px 0}
+  .cg .box p{font-size:14.5px;color:var(--color-text-secondary);margin:7px 0}
+  .cg .warn{background:#fffbeb;border:1px solid #fde68a}
+  .cg .tag1{display:inline-block;background:#2f6fed;color:#fff;font-weight:800;font-size:13px;padding:3px 12px;border-radius:999px;margin-bottom:4px}
+  .cg .life{margin:6px 0}
+  .cg .st{position:relative;padding:2px 0 14px 40px;border-left:2px solid #e5e7eb;margin-left:14px}
+  .cg .st:last-child{border-left:0}
+  .cg .st::before{content:attr(data-n);position:absolute;left:-15px;top:0;width:30px;height:30px;border-radius:50%;background:#2f6fed;color:#fff;font-weight:800;display:flex;align-items:center;justify-content:center;font-size:14px}
+  .cg .st h4{margin:2px 0;font-size:15.5px;font-weight:800}
+  .cg .st small{color:#64748b;font-weight:700}
+  .cg table{width:100%;border-collapse:collapse;margin:10px 0;font-size:14px}
+  .cg th,.cg td{border:1px solid #e5e7eb;padding:8px 11px;text-align:left;vertical-align:top}
+  .cg th{background:#f8fafc;font-weight:800}
+  .cg .flow{display:flex;flex-wrap:wrap;align-items:center;gap:7px;font-size:14px;margin:8px 0}
+  .cg .step{background:#eef2ff;border-radius:8px;padding:5px 10px;font-weight:600}
+  .cg .ar{color:#94a3b8;font-weight:700}
+  .cg .ans{background:#ecfdf5;border:1px solid #a7f3d0;border-radius:10px;padding:11px 14px;font-size:14.5px;margin:10px 0}
+</style>
+</head>
+<body>
+<div class="cg">
+<h1>🤖 로봇팔 캘리브레이션 — 완전 정리</h1>
+<p class="lead">"카메라가 본 토마토"를 "로봇 손끝이 정확히 잡는" 좌표로 바꾸려면 <b>세 개의 변환</b>이 모두 정확해야 합니다. 각 캘리브는 <b>정확히 "어디 ↔ 어디"</b>를 맞추는 작업이에요.</p>
+
+<div class="schem">
+<svg viewBox="0 0 660 300" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto" role="img" aria-label="로봇팔 좌표 체인과 3가지 캘리브 위치">
+  <line x1="20" y1="262" x2="640" y2="262" stroke="#cbd5e1" stroke-width="2"/>
+  <rect x="46" y="222" width="74" height="40" rx="8" fill="#334155"/>
+  <text x="83" y="247" font-size="12" fill="#fff" text-anchor="middle" font-weight="700">베이스</text>
+  <text x="83" y="284" font-size="11.5" fill="#64748b" text-anchor="middle">로봇 원점(좌표계)</text>
+  <g stroke="#94a3b8" stroke-width="13" stroke-linecap="round" fill="none"><path d="M92 224 L150 150"/><path d="M150 150 L246 126"/></g>
+  <circle cx="150" cy="150" r="7" fill="#64748b"/>
+  <rect x="238" y="104" width="12" height="44" rx="3" fill="#475569" transform="rotate(14 244 126)"/>
+  <text x="238" y="96" font-size="12.5" fill="#1f2937" text-anchor="middle" font-weight="800">플랜지</text>
+  <g stroke="#475569" stroke-width="6" stroke-linecap="round" fill="none"><path d="M252 132 L296 168"/><path d="M266 120 L306 156"/></g>
+  <circle cx="301" cy="162" r="8" fill="#16a34a"/>
+  <text x="331" y="178" font-size="12.5" fill="#16a34a" font-weight="800">TCP · 도구 끝</text>
+  <rect x="214" y="70" width="46" height="30" rx="6" fill="#0f172a"/><circle cx="237" cy="85" r="7" fill="#38bdf8"/>
+  <text x="237" y="60" font-size="12.5" fill="#1f2937" text-anchor="middle" font-weight="800">카메라</text>
+  <path d="M237 100 L470 246 L360 250 Z" fill="#38bdf8" opacity="0.12"/>
+  <line x1="237" y1="100" x2="470" y2="246" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <line x1="237" y1="100" x2="360" y2="250" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <g transform="translate(398,224)"><rect x="0" y="0" width="52" height="36" fill="#fff" stroke="#94a3b8"/><g fill="#334155"><rect x="0" y="0" width="13" height="12"/><rect x="26" y="0" width="13" height="12"/><rect x="13" y="12" width="13" height="12"/><rect x="39" y="12" width="13" height="12"/><rect x="0" y="24" width="13" height="12"/><rect x="26" y="24" width="13" height="12"/></g></g>
+  <text x="424" y="278" font-size="11.5" fill="#64748b" text-anchor="middle">체커판 / 마커</text>
+  <!-- number badges at locations -->
+  <g font-weight="800" font-size="14">
+    <circle cx="196" cy="85" r="13" fill="#2f6fed"/><text x="196" y="90" fill="#fff" text-anchor="middle">1</text>
+    <circle cx="286" cy="146" r="13" fill="#16a34a"/><text x="286" y="151" fill="#fff" text-anchor="middle">2</text>
+    <circle cx="175" cy="196" r="13" fill="#ea580c"/><text x="175" y="201" fill="#fff" text-anchor="middle">3</text>
+  </g>
+  <line x1="205" y1="88" x2="222" y2="85" stroke="#2f6fed" stroke-width="1.4"/>
+  <line x1="188" y1="188" x2="150" y2="160" stroke="#ea580c" stroke-width="1.2" stroke-dasharray="3 3"/>
+  <!-- legend -->
+  <g font-size="12.5" font-weight="800">
+    <rect x="474" y="66" width="164" height="26" rx="13" fill="#2f6fed"/><text x="556" y="84" fill="#fff" text-anchor="middle">1  픽셀 ↔ 카메라 3D</text>
+    <rect x="474" y="100" width="164" height="26" rx="13" fill="#16a34a"/><text x="556" y="118" fill="#fff" text-anchor="middle">2  플랜지 ↔ 도구 끝</text>
+    <rect x="474" y="134" width="164" height="26" rx="13" fill="#ea580c"/><text x="556" y="152" fill="#fff" text-anchor="middle">3  카메라 ↔ 로봇</text>
+  </g>
+</svg>
+</div>
+
+<h2 class="sec">1부. 세 가지 캘리브레이션 — 정확히 무엇을 맞추나</h2>
+
+<div class="card" style="--ac:#2f6fed">
+  <div class="hd"><span class="n">1</span><h3>카메라 내부 캘리브</h3><span class="full">Camera Intrinsic</span><span class="badge">가장 먼저 · 필수</span></div>
+  <div class="exact"><span class="lab">정확히</span><b>이미지 픽셀(2D) ↔ 카메라 3D 방향</b> — 렌즈가 픽셀과 실제 3D 광선을 잇는 <b>카메라 내부</b> 관계를 맞춤</div>
+  <div class="row"><b>구하는 값</b><span><b>fx,fy</b>(초점거리) · <b>cx,cy</b>(이미지 중심) · <b>왜곡계수</b></span></div>
+  <div class="row"><b>방법</b><span>체커보드 20~30장 촬영 → <code>cv2.calibrateCamera</code> → K·distCoeffs 산출</span></div>
+  <div class="why"><b>왜 맨 먼저?</b> 픽셀→3D 역투영의 출발점이라, 틀리면 ③·②까지 오차가 <b>그대로 누적</b>됩니다.</div>
+  <div class="now"><b>현재</b> — 직접 안 하고 <b>D435 공장값</b> 사용. 값은 카메라 안에 있고 <code>get_intrinsics()</code>가 실행마다 받아옴(파일 저장 X).</div>
+</div>
+
+<div class="card" style="--ac:#16a34a">
+  <div class="hd"><span class="n">2</span><h3>TCP 캘리브</h3><span class="full">Tool Center Point · 공구 중심점</span><span class="badge">순서 자유</span></div>
+  <div class="exact"><span class="lab">정확히</span><b>플랜지(팔 끝 장착면) ↔ 도구 끝(TCP)</b> — 이 둘 사이의 <b>위치 오프셋</b>을 맞춤</div>
+  <div class="row"><b>구하는 값</b><span>플랜지 → 도구 끝 오프셋 (x,y,z·방향)</span></div>
+  <div class="row"><b>방법</b><span>도구 끝을 <b>고정된 한 점</b>에 <b>다른 자세로 4번↑</b> 대기 → "항상 같은 점" 제약으로 오프셋 역산 (수동)</span></div>
+  <div class="why"><b>플랜지</b> = 팔 맨 끝 공구 장착 면. 로봇은 <b>여기까지만</b> 정확히 앎 → 그 앞 도구 끝은 ②로 알려줘야 함. (강사님 "플랜지" 이야기)</div>
+  <div class="now"><b>현재</b> — 집기 코드에 <code>goff</code>(손목↔손끝 보정) 오프셋으로 반영.</div>
+</div>
+
+<div class="card" style="--ac:#ea580c">
+  <div class="hd"><span class="n">3</span><h3>핸드아이 캘리브</h3><span class="full">Hand-Eye · 카메라↔로봇</span><span class="badge">① 뒤에</span></div>
+  <div class="exact"><span class="lab">정확히</span><b>카메라 ↔ 로봇 베이스(좌표계)</b> — 카메라가 본 좌표를 로봇 좌표로 바꾸는 <b>변환 X</b>를 맞춤</div>
+  <div class="row"><b>구하는 값</b><span>카메라 → 로봇 변환 X (eye-in-hand: 카메라↔플랜지)</span></div>
+  <div class="row"><b>방법</b><span>체커판 고정 → 여러 자세로 (로봇 자세, 카메라가 본 체커판) 짝 수집 → <code>cv2.calibrateHandEye</code>(A·X=X·B)</span></div>
+  <div class="why"><b>자가검증</b> 체커판은 고정 → 모든 자세에서 계산한 board 위치의 <b>퍼짐(mm)이 작을수록</b> 잘 된 것 = 품질 지표.</div>
+  <div class="now"><b>현재</b> — <code>calibrate_handeye_full.py</code> 있음(18자세 자동 수집).</div>
+</div>
+
+<h2 class="sec">2부. <span style="color:#2f6fed">①번(카메라 내부)</span> 결과값을 코드에서 어떻게 쓰나</h2>
+<p class="lead" style="margin:6px 0 10px"><span class="tag1">이 코드는 ①번(카메라 내부)에 대한 것</span><br>캘리브는 <b>딱 한 번</b>. 결과(K·왜곡)를 <b>파일에 저장</b>해두고 이후엔 <b>불러다 쓰기만</b> 합니다. (매번 재캘리브 X)</p>
+<div class="life">
+  <div class="st" data-n="1"><h4>① 캘리브 실행 <small>· 딱 한 번</small></h4>
+    <pre><span class="c"># calibrate_camera.py — 한 번만 실행</span>
+ret, K, dist, _, _ = cv2.calibrateCamera(objpoints, imgpoints, size, None, None)
+np.savez(<span class="y">"cam_calib.npz"</span>, K=K, dist=dist)   <span class="g"># 결과를 파일로 저장</span></pre></div>
+  <div class="st" data-n="2"><h4>② 불러오기 <small>· 프로그램 켤 때 한 번</small></h4>
+    <pre><span class="c"># auto_scan_pick.py 시작 부분</span>
+d = np.load(<span class="y">"cam_calib.npz"</span>); K, dist = d["K"], d["dist"]   <span class="g"># 저장값 꺼냄(재계산 아님)</span></pre></div>
+  <div class="st" data-n="3"><h4>③ 매 프레임 사용 <small>· 찍을 때마다 (재캘리브 X)</small></h4>
+    <pre>while True:                      <span class="g"># 토마토 찍을 때마다</span>
+    X = (u - K[0,2]) / K[0,0] * z   <span class="g"># K로 픽셀→3D "계산"만 (K를 다시 구하는 게 아님)</span>
+    ...  cv2.solvePnP(obj, corners, K, dist)</pre></div>
+</div>
+<div class="box"><p style="margin:0"><b>비유</b> — 캘리브 = <b>자를 한 번 정밀하게 만드는 일</b>, 매 프레임 = 그 <b>자로 재는 일</b>. 잴 때마다 자를 새로 만들지 않죠. 똑같습니다.</p></div>
+<div class="now" style="--ac:#2f6fed"><b>지금 우리 코드</b>는 파일 대신 카메라에서 꺼낼 뿐 패턴은 동일: <code>get_intrinsics()</code>로 시작 시 한 번 로드 → 매 프레임 사용. <b>내 값으로 바꾸려면 "불러오는 두 줄"만 교체</b>, 나머지(solvePnP·픽셀→3D)는 그대로.</div>
+
+<h2 class="sec">3부. 순서는 2가지 — 서로 완전히 무관</h2>
+<p class="lead" style="margin:6px 0 10px"><b>캘리브를 어떤 순서로 하든, 실제 집기 순서에는 아무 영향이 없습니다.</b></p>
+<table>
+<tr><th></th><th>① 캘리브 순서 (준비)</th><th>② 실제 집기 순서 (사용)</th></tr>
+<tr><td><b>언제</b></td><td>딱 한 번 (설정할 때)</td><td>매번 (토마토 잡을 때마다)</td></tr>
+<tr><td><b>무엇</b></td><td>값 3개를 <b>만드는</b> 순서</td><td>저장된 값 3개를 <b>쓰는</b> 순서</td></tr>
+<tr><td><b>바뀌나</b></td><td>2·3은 자유 (아무렇게나)</td><td><b>항상 고정</b> (안 바뀜)</td></tr>
+</table>
+<div class="box"><p style="margin:2px 0"><b>실제 집기 순서 (항상 이대로, 코드가 자동으로):</b></p>
+<div class="flow"><span class="step">카메라가 봄</span><span class="ar">→1</span><span class="step">3D 점</span><span class="ar">→3</span><span class="step">로봇 좌표</span><span class="ar">→2</span><span class="step">도구 끝 명령</span></div>
+<p style="margin:8px 0 0"><b>왜 고정이냐?</b> ①로 픽셀→3D를 먼저 해야 ③이 로봇 좌표로 바꾸고, 그래야 ②로 도구 끝을 보낼 수 있어요. <b>앞 결과가 있어야 뒤가 되는 데이터 흐름</b>이라 순서를 못 바꿉니다 — 캘리브를 어떻게 했든 무관하게.</p></div>
+<div class="ans">✅ <b>직접 답:</b> TCP(②)를 ③보다 먼저 하든 뒤에 하든 → 실제 집기 순서엔 <b>0의 영향.</b> 집기는 항상 1→3→2 로 코드가 자동으로 합니다. 캘리브는 "값 3개 만들어 저장"일 뿐, 다 만들면 <b>만든 순서는 잊어도 됩니다.</b></div>
+
+<div class="box warn" style="margin-top:20px"><p style="margin:0"><b>🎓 강사님이 "①도 직접 하라"면</b> — 지금은 공장값 사용 중이라 체커보드로 <b>내 카메라 전용 값을 산출·파일 저장</b>하는 코드는 없습니다. 만들면 위 2부의 "파일 저장→불러오기"로 바로 연결되고, <b>RP-91(재캘리브)</b>과 딱 맞습니다.</p></div>
+</div>
+</body>
+</html>
