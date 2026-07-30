@@ -12,6 +12,8 @@
   <depend>visualization_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>tf2_ros</depend>
+  <!-- harvest_with_ai.launch.py 가 AI 서비스 노드를 함께 띄운다 (같은 PC 구성) -->
+  <exec_depend>dg_ai_service</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

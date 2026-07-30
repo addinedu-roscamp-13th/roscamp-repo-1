@@ -17,7 +17,7 @@ Goal 파싱 · Feedback 발행 · 취소 처리 · Result 매핑.
 
 파라미터:
     arm         network | fake      (기본 network. fake = 팔 없이 명령 로깅만)
-    arm_ip      로봇팔 브리지 IP (기본 raspi.local, arm_server.py 가 9010 대기)
+    arm_ip      로봇팔 브리지 IP (기본 192.168.3.12, arm_server.py 가 9010 대기)
     detector    ros | yolo | mock | list  (기본 ros = /ai/detect_tomatoes 호출)
     weights     detector=yolo 일 때 .pt 경로
     max_rounds  촬영-수확 라운드 상한 (기본 5)
@@ -66,7 +66,7 @@ class HarvestActionServer(Node):
     def __init__(self):
         super().__init__("ddagi_harvest_node")
         self.declare_parameter("arm", "network")
-        self.declare_parameter("arm_ip", "raspi.local")
+        self.declare_parameter("arm_ip", "192.168.3.12")
         self.declare_parameter("detector", "ros")
         self.declare_parameter("weights", "")
         self.declare_parameter("max_rounds", hv.MAX_ROUNDS)

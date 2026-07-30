@@ -45,7 +45,7 @@ class V(Node):
         try: self.pr=cv2.aruco.DetectorParameters_create()
         except: self.pr=cv2.aruco.DetectorParameters()
         self.ssh=paramiko.SSHClient(); self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self.ssh.connect("raspi.local",username="jetcobot",password="1",timeout=15,banner_timeout=20)
+        self.ssh.connect("192.168.3.12",username="jetcobot",password="1",timeout=15,banner_timeout=20)
         self.pre="source /opt/ros/jazzy/setup.bash; export ROS_DOMAIN_ID=20; "
     def move(self,a):
         self.ssh.exec_command(self.pre+f"ros2 topic pub --once /automato/manual_cmd std_msgs/msg/String \"data: 'angles:{a}'\" 2>/dev/null")[1].read()

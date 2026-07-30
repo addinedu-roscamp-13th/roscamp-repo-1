@@ -62,9 +62,18 @@ import tty
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ddagi_harvest.arm_backend import NetworkArm      # noqa: E402
+# replay()·do_shake() 는 액션 서버에서도 불린다. 거기서는 print 가 버퍼링돼 보이지 않으니
+# 싱크 주입(log.set_sink)을 타야 한다. 나머지 CLI 함수(do_teach/do_check/...)는 터미널
+# 전용이라 print 로 둔다.
+from ddagi_harvest.log import log, warn                # noqa: E402
 
-PATH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "unload_path.json")
+# ⚠ 패키지 안(__file__ 기준)에 두면 안 된다. 그러면 티칭은 src 에 쓰이는데 액션 서버는
+# **install 공간**에서 읽어(colcon 이 모듈을 복사하므로) 파일을 못 찾는다 — 실측:
+#   .../install/ddagi_harvest/lib/python3.12/site-packages/ddagi_harvest/unload_path.json
+# 게다가 rm -rf install 로 날아간다. 티칭 값은 코드가 아니라 **그 로봇의 런타임 설정**
+# 이므로 사용자 설정 디렉터리에 둔다. UNLOAD_PATH 로 덮어쓸 수 있다.
+PATH_FILE = os.environ.get("UNLOAD_PATH") or os.path.join(
+    os.path.expanduser("~"), ".config", "automato", "unload_path.json")
 
 # 재생 속도 — 짐을 들고 움직이므로 파지 속도(30)보다도 낮게 시작한다.
 SPEED = 25
@@ -140,7 +149,7 @@ JOINT_LIMITS = {1: (-168, 168), 2: (-140, 140), 3: (-150, 150),
                 4: (-150, 150), 5: (-155, 160), 6: (-180, 180)}
 CLAMP_MARGIN = 0.5
 
-ARM_IP = os.environ.get("ARM_IP", "raspi.local")
+ARM_IP = os.environ.get("ARM_IP", "192.168.3.12")
 
 _ACT_LABEL = {"grip": "손잡이 파지", "open": "손잡이 놓기",
               "wait": f"{WAIT_SEC:.0f}초 대기", "shake": "털기"}
@@ -259,6 +268,7 @@ def _teach_save(steps: list) -> None:
         print("  재생은 현재 자세가 어디든 1번으로 직행하고, 그 경로는 팔이 정합니다.")
         print("  → 팔을 편 안전한 **준비 자세**를 앞에 하나 추가하는 것을 권합니다"
               " (u 로 되돌린 뒤 SPACE 로 준비 자세부터 기록).")
+    os.makedirs(os.path.dirname(PATH_FILE), exist_ok=True)
     with open(PATH_FILE, "w", encoding="utf-8") as fp:
         json.dump({"speed": SPEED, "shake": {"joint": SHAKE_JOINT,
                                              "amplitude": SHAKE_AMPLITUDE,
@@ -500,11 +510,11 @@ def do_shake(arm, base_angles, cfg: dict, watch=None, samples=None) -> None:
     desc = " + ".join(f"J{j}{'→' if oneway else '±'}{d:.0f}°" for j, d in travel)
     cut = [f"J{j}" for (j, d), p in zip(travel, pattern)
            if d < (1 if oneway else 2) * float(p["amp"]) - 0.6]
-    print(f"    털기: {desc} × {cycles}회 "
+    log(f"    털기: {desc} × {cycles}회 "
           f"({'한방향' if oneway else '대칭'}, 속도 {speed}, 반주기 {dwell}s"
           + (f", {burst}회마다 {burst_pause}s 쉼" if burst else "") + ")")
     if cut:
-        print(f"      ⚠ 관절 한계로 진폭이 잘린 축: {', '.join(cut)}"
+        log(f"      ⚠ 관절 한계로 진폭이 잘린 축: {', '.join(cut)}"
               f" — 기준 자세를 한계에서 떼거나 여유 있는 축으로 진폭을 옮기세요")
 
     # 도달을 기다리지 않고 반대로 꺾는다. 그래야 왕복이 이어져 '진동'이 된다.
@@ -531,7 +541,7 @@ def do_shake(arm, base_angles, cfg: dict, watch=None, samples=None) -> None:
     # 털기 뒤엔 어차피 잔진동이 있으므로 '완전 정지'를 기다리는 것 자체가 무의미하다.
     arm.move_angles_nowait(home, speed)
     time.sleep(float(cfg.get("return_settle", SHAKE_RETURN_SETTLE)))
-    print(f"      완료 {time.time() - t0:.1f}s")
+    log(f"      완료 {time.time() - t0:.1f}s")
 
 
 def do_shakeroom() -> None:
@@ -611,9 +621,85 @@ def do_shaketest(arm) -> None:
     arm.move_angles(base, SPEED)
 
 
+def replay(arm, steps, *, speed: int = SPEED, shake_cfg: dict | None = None,
+           wait_sec: float = WAIT_SEC, on_phase=None, should_cancel=None,
+           grip_threshold: int = 6) -> dict:
+    """티칭 경로를 재생한다. **프롬프트·입력이 없어** 액션 서버에서도 그대로 쓴다.
+
+    harvest.harvest() 와 같은 방식으로 ROS 의존을 들이지 않고 콜백만 받는다:
+      on_phase(phase, step_no, total) -> None   Unload.action 의 Feedback 발행에 쓴다
+      should_cancel() -> bool                   스텝 경계에서만 검사한다
+
+    반환 {"result_code", "message", "phase"} — Unload.action 의 result_code 규약대로
+    0 성공 / 1 손잡이 파지 실패 / 2 중단.
+    """
+    shake_cfg = shake_cfg or {}
+    total = len(steps)
+    phase = "GRIP_HANDLE"
+    holding = False
+
+    def emit(ph, i):
+        nonlocal phase
+        phase = ph
+        if on_phase is not None:
+            on_phase(ph, i, total)
+
+    def bail(code, msg):
+        return {"result_code": code, "message": msg, "phase": phase}
+
+    for i, st in enumerate(steps, start=1):
+        if should_cancel is not None and should_cancel():
+            # 스텝 경계에서만 멈춘다. 이동 도중에 끊으면 팔이 바구니를 든 채 어중간한
+            # 자세로 서고, 그러면 사람이 받쳐서 빼줘야 한다.
+            warn(f"  [중단] 취소 요청 — step {i} 진입 전 정지"
+                 + (" (바구니를 들고 있음 — 받쳐서 빼주세요)" if holding else ""))
+            return bail(2, "취소됨" + (" (바구니 파지 상태)" if holding else ""))
+
+        angles, changes = clamp_angles(st["angles"])
+        if changes:
+            note = ", ".join(f"J{j}:{o:.1f}→{c:.1f}" for j, o, c in changes)
+            warn(f"    [clamp] step {i} 한계초과 조정: {note}")
+        act = st.get("act")
+        emit(phase_of(st, i - 1, steps), i)
+        # 첫 이동만 감속 — 출발 자세가 정해져 있지 않아 경로가 예측 불가능한 유일한 구간.
+        spd = FIRST_MOVE_SPEED if i == 1 else speed
+        log(f"  step {i}/{total} [{phase}]"
+            + (f" — {_ACT_LABEL[act]}" if act else "")
+            + (f"  (첫 이동, 속도 {spd})" if i == 1 else ""))
+        arm.move_angles(angles, spd)
+        time.sleep(SETTLE)
+
+        if act == "grip":
+            arm.close_gripper(GRIPPER_SPEED)
+            time.sleep(0.4)
+            v = arm.gripper_value()
+            if not v or v <= grip_threshold:
+                # 손잡이를 못 물었다. 그대로 진행하면 빈 그리퍼로 예냉실 위에서
+                # 쏟는 동작을 하게 되고, 무엇도 확인할 수 없다. 그리퍼를 열고
+                # 준비 자세로 되돌려 사람이 개입할 수 있는 상태로 만든다.
+                warn(f"    그리퍼값 {v} (임계 {grip_threshold}) — 손잡이 미파지")
+                arm.open_gripper(GRIPPER_SPEED)
+                back, _ = clamp_angles(steps[0]["angles"])
+                arm.move_angles(back, FIRST_MOVE_SPEED)
+                return bail(1, f"손잡이 파지 실패 (그리퍼값 {v})")
+            holding = True
+            log(f"    그리퍼값 {v} — 손잡이 물림")
+        elif act == "open":
+            arm.open_gripper(GRIPPER_SPEED)
+            holding = False
+            log("    그리퍼 열음 — 바구니 놓음")
+        elif act == "wait":
+            log(f"    {wait_sec:.1f}초 대기(쏟아지는 중)")
+            time.sleep(wait_sec)
+        elif act == "shake":
+            do_shake(arm, angles, shake_cfg)
+
+    return bail(0, f"하역 완료 ({total}스텝)")
+
+
 def do_run(arm) -> None:
     data = load()
-    steps, shake_cfg = data["steps"], data.get("shake", {})
+    steps = data["steps"]
     speed = data.get("speed", SPEED)
     print(f"기록된 자세 {len(steps)}개를 재생합니다 (속도 {speed}).")
     describe(steps)
@@ -639,35 +725,11 @@ def do_run(arm) -> None:
 
     t0 = time.time()
     try:
-        for i, s in enumerate(steps, start=1):
-            angles, changes = clamp_angles(s["angles"])
-            if changes:
-                note = ", ".join(f"J{j}:{o:.1f}→{c:.1f}" for j, o, c in changes)
-                print(f"    [clamp] step {i} 한계초과 조정: {note}")
-            ph = phase_of(s, i - 1, steps)
-            act = s.get("act")
-            spd = FIRST_MOVE_SPEED if i == 1 else speed
-            print(f"  step {i}/{len(steps)} [{ph}]"
-                  + (f" — {_ACT_LABEL[act]}" if act else "")
-                  + (f"  (첫 이동, 속도 {spd})" if i == 1 else ""))
-            arm.move_angles(angles, spd)
-            time.sleep(SETTLE)
-
-            if act == "grip":
-                arm.close_gripper(GRIPPER_SPEED)
-                v = arm.gripper_value()
-                print(f"    그리퍼값 {v} — "
-                      + ("손잡이 물림" if v and v > 6 else "⚠ 빈손일 수 있음"))
-            elif act == "open":
-                arm.open_gripper(GRIPPER_SPEED)
-            elif act == "wait":
-                print(f"    {WAIT_SEC:.0f}초 대기(쏟아지는 중)")
-                time.sleep(WAIT_SEC)
-            elif act == "shake":
-                do_shake(arm, angles, shake_cfg)
+        r = replay(arm, steps, speed=speed, shake_cfg=data.get("shake", {}))
+        print(f"\n결과: code={r['result_code']}  {r['message']}")
     except KeyboardInterrupt:
         print("\n[중단] 사용자 중지 — 팔을 그 자리에 세웁니다.")
-    print(f"\n완료 ({time.time() - t0:.1f}s)")
+    print(f"완료 ({time.time() - t0:.1f}s)")
 
 
 def main() -> int:

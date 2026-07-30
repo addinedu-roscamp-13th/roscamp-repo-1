@@ -175,7 +175,7 @@ class RealArm(ArmBackend):
 class NetworkArm(ArmBackend):
     """노트북에서 Pi의 arm_server로 팔을 원격 조종 (개발 편의용).
 
-    주소는 IP 대신 **호스트명(raspi.local)** 을 기본으로 쓴다. Pi 가 DHCP 라 공유기를
+    주소는 IP 대신 **호스트명(192.168.3.12)** 을 기본으로 쓴다. Pi 가 DHCP 라 공유기를
     재부팅하면 IP 가 바뀌는데(실측: 192.168.100.12 -> .5), 그러면 Goal 이
     'No route to host' 로 실패하고 원인이 팔·AI·도메인 중 어디인지 헷갈린다.
     mDNS 는 IP 변경을 자동으로 따라간다.
