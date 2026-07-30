@@ -259,8 +259,8 @@ class VerifySim:
 
         def run():
             try:
-                # run_patrol 은 (status, 미방문목록) 을 돌려준다. 검증 화면은 status 만 쓴다.
-                result, _unvisited = dispatcher.run_patrol(
+                # run_patrol 은 (status, 미방문목록, 마지막노드) 를 돌려준다. 검증 화면은 status 만 쓴다.
+                result, _unvisited, _last_wp = dispatcher.run_patrol(
                     task_id, robot_id, targets, engine, client, start_wp=start_wp)
             except Exception as exc:  # noqa: BLE001
                 self.events.warn(f"{robot_id} 작업 예외: {exc}")
@@ -314,10 +314,12 @@ class VerifySim:
 
     # ---------------------- 시나리오 ---------------------- #
     # 데드락(대기 사이클)을 만드는 사슬. 통로 3개짜리 일직선이다.
-    #   15 -[12-15]- 12 -[9-12]- 9 -[4-9]- 4
-    DEADLOCK_CHAIN = (15, 12, 9, 4)
+    #   15 -[12-15]- 12 -[9-12]- 9 -[5-9]- 5
+    # (예전 코너 wp4 는 지도 개편으로 삭제됐다. 화면 왼쪽 세로줄에서 wp4 를 대신하는
+    #  같은 성격의 노드가 wp5 다 — 15→5 최단경로가 정확히 이 사슬이라 조건이 동일하다.)
+    DEADLOCK_CHAIN = (15, 12, 9, 5)
     DEADLOCK_A = "dg_01"        # 15 쪽에서 출발
-    DEADLOCK_B = "dg_03"        # 4 쪽에서 출발
+    DEADLOCK_B = "dg_03"        # 5 쪽에서 출발
 
     def scenario_deadlock(self) -> dict:
         """두 로봇이 서로의 통로를 기다리는 '대기 사이클'을 확실하게 만든다.
