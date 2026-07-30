@@ -19,7 +19,7 @@ from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.parameter import Parameter
 
-from automato_interfaces.action import Dock
+from automato_interfaces.action import Dock, FloorDock, ReflectiveDock
 from dg_control.dcs_node import DcsNode
 from dg_sim import dg_ai_sim
 from dg_sim.acs_sim import AcsSim
@@ -216,8 +216,11 @@ def test_harvest_move_and_dock(system):
     """S2 E2: 수확 위치까지 이동(전 구간 capture=false) → 도착 후 도킹 → 성공.
 
     - 이동 중 촬영·분석이 전혀 없어야 한다(capture=false → AnalyzeFrame 미호출).
-    - Dock feedback(phase)·result(오차 축별 값)가 DCS 를 거쳐 그대로 ACS 로 올라온다.
+    - 도킹 feedback(phase)·result(오차 축별 값)가 DCS 를 거쳐 그대로 ACS 로 올라온다.
     - 도킹 성공 시에만 DCS 의 E3 진입 게이트(is_docked)가 열린다.
+
+    수확지(HARVEST_*)는 **바닥 H 마커(FloorDock)** 로 붙는다 — acs_sim 기본
+    dock_method='auto' 가 실제 ACS(docking.method_for)와 같은 규칙으로 고른다.
     """
     acs, dcs = system['acs'], system['dcs']
     task_id = acs.send_harvest_move(num_waypoints=HARVEST_WP, seg_size=HARVEST_SEG)
@@ -233,11 +236,14 @@ def test_harvest_move_and_dock(system):
     # 수확 이동은 촬영이 없다 → 분석·저장이 한 건도 없어야 한다
     assert acs.saved == [], '수확 이동 중 분석/저장이 발생함: %s' % acs.saved
 
-    # Dock feedback(phase)이 중계됐다 — 탐색~후진까지의 단계가 올라온다
-    assert acs.dock_feedback_phases, 'Dock feedback 미중계'
-    assert 'SEARCHING' in acs.dock_feedback_phases
+    # 도킹 feedback(phase)이 중계됐다 — H마커 기동의 탐색~후진 단계가 올라온다
+    assert acs.dock_feedback_phases, '도킹 feedback 미중계'
+    assert 'SEARCH' in acs.dock_feedback_phases, (
+        '수확지가 H마커로 가지 않았다: %s' % acs.dock_feedback_phases)
+    assert 'REVERSE' in acs.dock_feedback_phases
 
     # 오차 축별 값이 손실 없이 중계됐다(ddago_sim 성공값과 일치)
+    assert abs(acs.last_dock_result.final_wall_gap_m - 0.025) < 1e-4
     assert abs(acs.last_dock_result.final_lateral_m - (-0.012)) < 1e-4
     assert abs(acs.last_dock_result.final_yaw_error - 0.021) < 1e-4
 
@@ -326,6 +332,154 @@ def test_dock_timeout(system_short_dock_timeout):
     assert acs.last_dock_result.result_code == 3, acs.last_dock_result.message
     assert not dcs.is_docked(task_id)
     acs.cancel_dock()   # 매달린 sim goal 을 풀어 teardown 을 빠르게
+
+
+# ================= RP-131 도킹 방식 3종 중계 (H마커·반사테이프) =================
+# 방식마다 액션 타입·phase 이름·앞뒤 오차 필드가 다르다. DCS 는 그 차이를 해석하지 않고
+# 받은 것을 그대로 올려야 한다 — 아래 테스트는 '그대로'가 지켜지는지만 본다.
+@pytest.mark.parametrize('method, point, phases_seen, gap_field, gap_value', [
+    ('floor', 'HARVEST_01', ('SEARCH', 'CENTERLINE', 'TURN', 'REVERSE'),
+     'final_wall_gap_m', 0.025),
+    ('reflective', 'CHARGE_01', ('SNAP', 'TURN1', 'APPROACH', 'CREEP'),
+     'final_gap_m', 0.020),
+    # charuco 는 어느 지점도 쓰지 않지만(휴면) 중계 경로가 살아 있으므로 함께 검증한다 —
+    # 방식을 명시하지 않으면 auto 라우팅에 걸려 다시 살아날 일이 없는 경로다.
+    ('charuco', 'HARVEST_01', ('SEARCHING', 'CENTERING', 'ROTATING', 'REVERSING'),
+     'final_error_m', 0.012),
+])
+def test_dock_relay_by_method(system, method, point, phases_seen, gap_field, gap_value):
+    """H마커(FloorDock)·반사테이프(ReflectiveDock) 도킹이 ACS→DCS→DdaGo 로 왕복한다."""
+    acs, dcs = system['acs'], system['dcs']
+    acs.dock_method = method
+    task_id = acs.send_harvest_move(num_waypoints=HARVEST_WP, seg_size=HARVEST_SEG,
+                                    dock_point=point)
+    assert task_id is not None
+    assert _wait(lambda: acs.dock_done), '%s 도킹 결과 미수신' % method
+
+    r = acs.last_dock_result
+    assert r.result_code == 0, r.message
+    # phase 이름 집합이 방식마다 다르다 — 가공 없이 그대로 올라와야 한다
+    for ph in phases_seen:
+        assert ph in acs.dock_feedback_phases, (
+            '%s phase 미중계: %s (받은 것=%s)' % (method, ph, acs.dock_feedback_phases))
+    # 앞뒤 오차는 방식마다 필드 이름이 다르다(중계에서 빠뜨리기 가장 쉬운 자리)
+    assert abs(getattr(r, gap_field) - gap_value) < 1e-4, '%s 미중계' % gap_field
+    # 좌우(중심선/법선 이탈)·스큐는 세 방식 공통 — ACS 의 도킹 품질 판정 근거
+    assert abs(r.final_lateral_m - (-0.012)) < 1e-4
+    assert abs(r.final_yaw_error - 0.021) < 1e-4
+    # 도킹 성공 게이트는 방식을 가리지 않는다
+    assert dcs.is_docked(task_id), '도킹 성공했는데 E3 게이트가 닫힘'
+
+
+@pytest.mark.parametrize('method, point', [
+    ('floor', 'HARVEST_01'),
+    ('reflective', 'CHARGE_01'),
+])
+def test_dock_cancel_by_method(system, method, point):
+    """ACS 취소(E2 22-1)가 방식과 무관하게 DdaGo 까지 전파된다(code 3).
+
+    ⚠️ bringup 에 cmd_vel 워치독이 없어, 취소가 중계 도중 새면 로봇이 마지막 명령으로
+    계속 굴러간다. 방식이 늘어난 만큼 경로마다 확인해 둔다."""
+    acs, ddago, dcs = system['acs'], system['ddago'], system['dcs']
+    acs.dock_method = method
+    ddago.move_delay = 1.2   # 취소를 걸 시간을 벌기 위해 도킹을 느리게
+    task_id = acs.send_harvest_move(num_waypoints=HARVEST_WP, seg_size=HARVEST_SEG,
+                                    dock_point=point)
+
+    assert _wait(lambda: len(acs.dock_feedback_phases) >= 1, timeout=15.0), '도킹 시작 안 됨'
+    acs.cancel_dock()
+
+    assert _wait(lambda: acs.dock_done), '취소 결과 미수신'
+    assert acs.last_dock_result.result_code == 3, acs.last_dock_result.message
+    assert not dcs.is_docked(task_id), '취소됐는데 E3 게이트가 열림'
+
+
+def test_return_to_charger_two_stages(system):
+    """E4 순찰 종료 후 복귀 및 충전 — 복귀 주행 → 충전소 도킹 2단계가 이어서 돈다.
+
+    - 복귀 주행은 전 구간 capture=false → 이동 중 촬영·분석이 한 건도 없어야 한다.
+    - 충전소(CHARGE_*)이므로 도킹은 **반사테이프**로 간다(지점 id 로 방식이 정해진다).
+    - 실제 E4 는 끝난 순찰의 task_id 를 재사용하지만(새 task 를 만들지 않는다) 시뮬은
+      단독 실행을 전제로 새 task_id 를 쓴다 — 중계 검증에는 영향이 없다.
+    """
+    acs, dcs = system['acs'], system['dcs']
+    task_id = acs.send_return_to_charger(num_waypoints=HARVEST_WP, seg_size=HARVEST_SEG)
+    assert task_id is not None
+
+    # 1단계: 복귀 주행 완주
+    assert _wait(lambda: acs.harvest_move_done), '복귀 주행 미완료'
+    assert acs.last_result is not None and acs.last_result.result_code == 0
+    assert acs.last_waypoint_id == HARVEST_WP - 1
+    assert acs.saved == [], '복귀 주행 중 촬영/저장이 발생함: %s' % acs.saved
+
+    # 2단계: 충전소 도킹 — 반사테이프 phase 와 갭이 올라온다
+    assert _wait(lambda: acs.dock_done), '도킹 결과 미수신'
+    r = acs.last_dock_result
+    assert r.result_code == 0, r.message
+    assert 'SNAP' in acs.dock_feedback_phases, (
+        '충전소가 반사테이프로 가지 않았다: %s' % acs.dock_feedback_phases)
+    assert 'CREEP' in acs.dock_feedback_phases
+    assert abs(r.final_gap_m - 0.020) < 1e-4
+    assert dcs.is_docked(task_id), '도킹 성공했는데 게이트가 닫힘'
+
+
+def test_dock_method_auto_routing(system):
+    """dock_method='auto' 면 지점 id 로 방식을 고른다(실제 ACS docking.method_for 규칙).
+
+    충전소(CHARGE_*)는 반사테이프다 — 반사테이프 phase(SNAP)가 올라오면 라우팅이 맞다."""
+    acs = system['acs']
+    acs.dock_method = 'auto'
+    task_id = acs.send_harvest_move(num_waypoints=HARVEST_WP, seg_size=HARVEST_SEG,
+                                    dock_point='CHARGE_01')
+    assert task_id is not None
+    assert _wait(lambda: acs.dock_done), '도킹 결과 미수신'
+    assert acs.last_dock_result.result_code == 0, acs.last_dock_result.message
+    assert 'SNAP' in acs.dock_feedback_phases, (
+        'CHARGE_01 인데 반사테이프로 가지 않았다: %s' % acs.dock_feedback_phases)
+
+
+def test_dock_methods_are_serialized(system):
+    """방식이 다른 도킹 goal 두 개가 겹쳐 들어와도 로봇에는 하나씩만 나간다.
+
+    도킹 3종이 각자 락을 가지면 서로를 막지 못해, 로봇이 H마커 기동과 반사테이프 기동을
+    동시에 받는다(cmd_vel 이 두 노드에서 나온다). DCS 가 _ddago_lock 하나로 묶는지를
+    ddago_sim 이 기록한 동시 실행 최대치로 확인한다."""
+    dcs, ddago = system['dcs'], system['ddago']
+    ddago.move_delay = 0.9        # 겹칠 시간을 충분히 준다(직렬화가 없으면 반드시 겹친다)
+    ddago.dock_concurrent_max = 0
+
+    node = rclpy.create_node('dock_serialize_probe')
+    results = []
+    try:
+        clients = [
+            ActionClient(node, FloorDock, '/%s/floor_dock' % dcs.robot_id),
+            ActionClient(node, ReflectiveDock, '/%s/reflective_dock' % dcs.robot_id),
+        ]
+        goals = [FloorDock.Goal(task_id=7001, task_point_id='HARVEST_01'),
+                 ReflectiveDock.Goal(task_id=7002, task_point_id='CHARGE_01')]
+        ex = MultiThreadedExecutor(num_threads=2)
+        ex.add_node(node)
+        threading.Thread(target=ex.spin, daemon=True).start()
+        for c in clients:
+            assert c.wait_for_server(timeout_sec=5.0), 'DCS 도킹 서버 없음'
+
+        # 두 방식을 거의 동시에 하달한다
+        send_futs = [c.send_goal_async(g) for c, g in zip(clients, goals)]
+        for f in send_futs:
+            assert _wait(f.done, timeout=10.0), '도킹 goal 응답 없음'
+            gh = f.result()
+            assert gh.accepted, '도킹 goal 거부'
+            results.append(gh.get_result_async())
+        for rf in results:
+            assert _wait(rf.done, timeout=30.0), '도킹 결과 미수신'
+            assert rf.result().result.result_code == 0
+        ex.shutdown()
+    finally:
+        node.destroy_node()
+
+    assert ddago.dock_concurrent_max == 1, (
+        '도킹이 겹쳐 실행됐다(동시 최대 %d) — 방식별 락이 따로 놀고 있다'
+        % ddago.dock_concurrent_max)
 
 
 # ============================ S2 E3 Harvest 중계 ============================

@@ -336,6 +336,22 @@ const MSGS = [
   { key: 'dg_ai', dir: 'from_dcs', iface: 'analyze_request',    type: 'TCP',     name: '4B len + JSON',              scen: 'E2' },
   { key: 'dg_ai', dir: 'to_dcs',   iface: 'analyze_response',   type: 'TCP',     name: '4B len + JSON',              scen: 'E2·E3' },
 ];
+// 정밀 도킹 3종(RP-131) — 액션 타입·이름만 다르고 goal/feedback/result 구조는 같아서
+// 표를 돌려 6줄씩 만든다. charuco 는 현재 휴면이지만 중계 경로가 살아 있어 남겨 둔다.
+for (const d of [
+  { iface: 'Dock',           act: 'dock',            scen: '휴면' },
+  { iface: 'FloorDock',      act: 'floor_dock',      scen: 'S2 E2·E5' },
+  { iface: 'ReflectiveDock', act: 'reflective_dock', scen: 'E4·22-1' },
+]) {
+  MSGS.push(
+    { key: 'acs',   dir: 'to_dcs',   iface: d.iface,                        type: 'action', name: `/{rid}/${d.act}`,             scen: d.scen },
+    { key: 'acs',   dir: 'from_dcs', iface: `${d.iface}/feedback`,          type: 'action', name: `/{rid}/${d.act} (feedback)`,  scen: d.scen },
+    { key: 'acs',   dir: 'from_dcs', iface: `${d.iface}/result`,            type: 'action', name: `/{rid}/${d.act} (result)`,    scen: d.scen },
+    { key: 'ddago', dir: 'from_dcs', iface: `${d.iface}(→DdaGo)`,           type: 'action', name: `/ddago/${d.act}`,             scen: d.scen },
+    { key: 'ddago', dir: 'to_dcs',   iface: `${d.iface}(→DdaGo)/feedback`,  type: 'action', name: `/ddago/${d.act} (feedback)`,  scen: d.scen },
+    { key: 'ddago', dir: 'to_dcs',   iface: `${d.iface}(→DdaGo)/result`,    type: 'action', name: `/ddago/${d.act} (result)`,    scen: d.scen },
+  );
+}
 // iface -> {key, type, short, name}. 방향(dir)은 각 wire 레코드의 값을 사용.
 // name 의 {rid} 는 서버가 알려준 ROBOT_ID 로 치환한다(토픽/액션 실제 이름).
 const IFACE = {};
@@ -503,8 +519,9 @@ const TESTS = [
   { key: 'e0', name: 'E0 상시 모니터링', desc: '실행 시 시뮬 텔레메트리 상시 발행 → DCS 취합 → ACS RobotTelemetry 수신 (중지 버튼으로 정지)' },
   { key: 'e1', name: 'E1 순찰 시작',     desc: 'ACS→DCS 경로(Waypoint[]) 접수 → DCS→DdaGo 구간 하달' },
   { key: 'e2', name: 'E2 체크·저장',     desc: 'capture 노드 분석 → SaveDetection 저장(병해충 시 이미지 동봉) → 순찰 완료' },
-  { key: 'e4', name: 'E4 복귀·도킹',     desc: 'ACS→DCS Dock goal 접수 → DCS→DdaGo 중계 → 결과(중심선 이탈·스큐) 반환. DCS는 중계자' },
-  { key: 's2e2', name: 'S2 E2 수확 이동·도킹', desc: 'ACS→DCS 수확지점 경로(전 구간 capture=false, 촬영 없음) → 도착 후 Dock 하달·중계 → 도킹 성공 시 E3 진입 게이트 오픈' },
+  { key: 'e4', name: 'E4 순찰 종료 후 복귀 및 충전', desc: '2단계 — ① 충전소까지 복귀 주행(전 구간 capture=false, 촬영 없음) 하달·중계 → ② 도착 후 ReflectiveDock 하달·중계 → phase(SNAP~CREEP)·결과(뒤끝~마커 갭·법선이탈·스큐) 반환. 충전소는 반사테이프 도킹. DCS는 중계자' },
+  { key: 'e4floor', name: 'H마커 도킹 중계',  desc: 'ACS→DCS FloorDock goal 접수 → DCS→DdaGo 중계 → phase(SEARCH~REVERSE)·결과(후면~벽 갭·이탈·스큐) 반환. 수확지·예냉실용' },
+  { key: 's2e2', name: 'S2 E2 수확 이동·도킹', desc: 'ACS→DCS 수확지점 경로(전 구간 capture=false, 촬영 없음) → 도착 후 FloorDock(H마커) 하달·중계 → 도킹 성공 시 E3 진입 게이트 오픈' },
   { key: 's2e3', name: 'S2 E3 수확 대상 인식', desc: 'E2(이동+도킹)로 게이트 오픈 → 수확 시작(Harvest) → ACS→DCS→Ddagi 중계 → 라운드 Feedback·종료 사유(exit_reason) 반환. DG는 중계자' },
   { key: 's2e6', name: 'S2 E6 예냉실 하역', desc: 'E2(이동+도킹)로 게이트 오픈 → 하역 시작(Unload) → ACS→DCS→Ddagi 중계 → phase Feedback·result_code 반환. DG는 중계자' },
 ];
