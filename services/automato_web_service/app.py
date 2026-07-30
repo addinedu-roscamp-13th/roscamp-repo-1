@@ -180,14 +180,19 @@ _MAP_OX, _MAP_OY, _MAP_W, _MAP_H = _load_map_extent()
 
 def _map_to_norm(x, y):
     """ROS 맵 좌표(m) → 3D 지도 정규화 좌표(-1~1). 맵 밖이면 가장자리로 자른다.
-       좌표를 못 읽으면 None → 호출부가 '위치 미확인' 으로 처리한다."""
+       좌표를 못 읽으면 None → 호출부가 '위치 미확인' 으로 처리한다.
+
+       ⚠ x 는 부호를 뒤집는다. 보연님 관제화면(verify_web)과 같은 방향으로 보이게 하려면
+         'DB x 가 클수록 화면 왼쪽' 이어야 한다(map_layout.py 주석과 동일 규약).
+         Farm Admin App 의 지도(FARM.waypoints)도 같은 변환으로 좌표를 박아 놨으므로,
+         여기서 뒤집지 않으면 로봇만 좌우 반대로 움직인다."""
     try:
         fx, fy = float(x), float(y)
     except (TypeError, ValueError):
         return None
     if not (_MAP_W > 0 and _MAP_H > 0):
         return None
-    nx = (fx - (_MAP_OX + _MAP_W / 2.0)) / (_MAP_W / 2.0)
+    nx = -(fx - (_MAP_OX + _MAP_W / 2.0)) / (_MAP_W / 2.0)
     nz = (fy - (_MAP_OY + _MAP_H / 2.0)) / (_MAP_H / 2.0)
     return round(max(-1.0, min(1.0, nx)), 4), round(max(-1.0, min(1.0, nz)), 4)
 

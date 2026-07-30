@@ -1332,34 +1332,78 @@ function initFarm3D(){
   document.head.appendChild(s);
   setTimeout(function(){ if(!window.THREE){ var l=document.getElementById('farm3dLoad'); if(l) l.innerHTML='🗺️ 3D 지도는 온라인(라이브) 환경에서 표시됩니다'; } }, 6000);  // CDN 지연/차단 시 멈춤 방지
 }
-/* 실제 농장 배치 좌표 (세로로 긴 밭, X=가로 ±6, Z=길이 ±13, -Z=로봇팔쪽 상단) */
+/* ============================================================================
+   실제 농장 배치 — 데모 좌표가 아니라 실측값이다.
+
+   출처 (2026-07-30 확정):
+     · 맵      equip/automato_ws/map/automato_map.pgm  (39x64px @ 0.030m/px = 1.17 x 1.92m,
+               origin [-0.193,-0.632]) — 보연님 PR #48 "opened bottom passage"
+     · 노드    waypoints.csv (DB 덤프) = alembic 0009 재측정본. 21개.
+               ⚠ 4·7 은 DB 에서 삭제됨(0009), 18·19(짝 지점)는 표시 제외 — 부모 10·13 자리와
+                 같아서 겹쳐 보이기만 한다.
+     · 통로    alembic 0003 + 0009. (4,5)(4,9)(6,7)(7,8)(7,10) 삭제 →
+               (5,9)(6,8)(6,10) 로 이웃 직결. 23쌍.
+     · 구조물  verify_web/map_layout.py (방 외곽·베드·로봇팔)
+
+   좌표계: DB 미터좌표 → 씬(x,z). DB x 가 클수록 화면 왼쪽(-x), DB y 가 클수록 화면 아래(+z)
+           — 보연님 관제화면(verify_web)과 같은 방향이다. 변환식은 farmScene() 주석 참조.
+           nx=-(x-0.392)/0.585, nz=(y-0.328)/0.96 → 씬 x=nx*HX, z=nz*HZ
+           (서버 app.py 의 _map_to_norm 과 동일 — 로봇 위치와 지도가 어긋나지 않게)
+   ============================================================================ */
 var FARM={
-  HX:6.5, HZ:13, wallH:1.6, PH:1.6,   // 실측 100×200cm · scale 0.13
-  pillars:[  // 기둥3개 {x,z,w,d,face} — 실측 도면 반영
-    {x:-2.4, z:2.5, w:1.17, d:6.24, face:'x'},  // 중앙 좌 (9×48cm) ㅣ
-    {x: 2.4, z:2.5, w:1.17, d:6.24, face:'x'},  // 중앙 우 (9×48cm) ㅣ — 나란히
-    {x:-2.6, z:-5.5, w:1.04, d:7.8, face:'z'}   // 로봇팔 근처 가로 (8×60cm, 좌벽정렬)
+  HX:6.5, HZ:13, wallH:1.6, PH:1.6,   // 씬 반크기. 실측 1.17 x 1.92m 를 이 박스에 매핑
+  pillars:[  // 재배 베드 3개 {x,z,w,d,face} — map_layout.STRUCTURES 를 씬으로 변환
+    {x:-0.36, z:-7.62, w:3.65, d:7.45, face:'z'},  // 가로 베드 (1·2행과 5·6·8행 사이를 막는 통짜)
+    {x:-1.53, z: 0.57, w:2.45, d:7.32, face:'x'},  // 세로 베드 (노드열 사이)
+    {x: 2.47, z: 0.57, w:2.22, d:7.32, face:'x'}   // 세로 베드
   ],
-  wallBar:{x:0, z:-10.3, w:10.5, h:1.9, d:0.3}, // 로봇팔 영역 하단 경계(z=21cm)
-  arms:[{x:-3.6,z:-11.6},{x:3.6,z:-11.6}],       // 로봇팔 2대 (26cm칸, 중심 x±3.6)
-  vines:[{x:-3.6,z:-13.4},{x:3.6,z:-13.4}],      // 로봇팔 위·맵 바깥 방울토마토 덩굴
-  cold:{x:5.2, z:12.2, w:2.6, d:1.56, h:2.0},    // 예냉실 20×12cm (우+아래 벽 딱붙임)
-  stations:[{x:-5.6,z:12.0},{x:-3.8,z:12.0},{x:-1.95,z:12.0}],  // 충전1~3 각 14×15cm (좌하단 벽붙임)
-  waypoints:[  // z-3.5·z-1 2열을 z-2.25 한 줄로 합침 · 중앙통로 순찰 제외 · 16=예냉실입구·21=충전소입구(둘 다 파란 gate이자 waypoint)
-    {id:1,x:-4.7,z:7},{id:2,x:-4.7,z:3.5},{id:3,x:-4.7,z:0},{id:4,x:-4.7,z:-2.25},  // 좌통로(z-2.25 가운데)
-    {id:5,x:-2,z:-2.25},{id:6,x:1.3,z:-2.25},{id:7,x:4,z:-2.25},                    // P3 아래 라인(2열 가운데로 올림)
-    {id:8,x:4,z:-8},{id:9,x:-4,z:-8},{id:10,x:0,z:-8},{id:11,x:3.4,z:-8},           // 가벽~P3 통로
-    {id:12,x:4.7,z:-2.25},{id:13,x:4.7,z:0},{id:14,x:4.7,z:3.5},{id:15,x:4.7,z:7},  // 우통로(z-2.25 가운데)
-    {id:16,x:5.2,z:10.2,gate:'예냉실'},                                             // 예냉실 입구(파랑·waypoint 겸용)
-    {id:17,x:2,z:11},                                                              // 하단 중앙
-    {id:18,x:0,z:7,type:'mid'},{id:19,x:0,z:3.5,type:'mid'},{id:20,x:0,z:0,type:'mid'},  // 중앙통로(연결선 도로)
-    {id:21,x:-3.8,z:10.5,gate:'충전소'}                                            // 충전소 입구(파랑·waypoint 겸용) — 순찰 순환은 …17→21→1 로 닫힘
+  // ★ 하단 벽 — 가운데가 뚫려 있다(PGM rows 61~63: 열 0~11 벽 / 12~25 개방 / 26~38 벽).
+  //   왜 뚫렸나: 로봇팔 2대 사이에 Pinky Pro 가 주차해 수확물을 받는 공간이 생겼다.
+  //   그래서 통짜 벽 하나가 아니라 '개방 42cm' 를 둔 두 토막이다. 수확대(20·21)가 그 사이에 있다.
+  wallBars:[
+    {x: 4.59, z:-12.39, w:3.83, h:1.9, d:0.3},   // 화면 오른쪽 토막
+    {x:-4.09, z:-12.39, w:4.17, h:1.9, d:0.3}    // 화면 왼쪽 토막
   ],
-  // 순찰 순환(mid 제외): 1…15→16→17→21→1 (긴 1↔17 대각선 없앰). 아래는 추가 도로(모두 점선).
-  links:[[18,19],[19,20],[18,1],[18,15],[21,18],[15,17],[20,5],[20,6],[18,17]],  // 중앙세로 + z7좌우 + 충전소↔중앙 + 15↔17 + 중앙도로20→좁은라인(5·6 깔때기) + 18↔17
-  // 게이트(예냉실/충전소) 진입 좌표·연계 코드 준비 — 나중에 로봇을 시설 안으로 보낼 때 사용
-  gates:{ '예냉실':{wp:16, dock:{x:5.2,z:12.2}, purpose:'수확물 하역·예냉'},
-          '충전소':{wp:21, dock:{x:-3.8,z:12.0}, purpose:'자동 충전 도킹'} }
+  wallGap:{x0:-2.00, x1:2.67, z:-12.39},          // 개방 구간(수확물 인수 공간) — 표시용
+  arms:[{x:-3.53,z:-13.07},{x:4.02,z:-13.07}],    // 로봇팔 2대 = 하단 벽의 양쪽 끝
+  vines:[{x:-3.53,z:-14.7},{x:4.02,z:-14.7}],     // 로봇팔 위·맵 바깥 방울토마토 덩굴
+  cold:{x:4.30, z:9.9, w:2.4, d:1.8, h:2.0},      // 예냉실 (진입 노드 25)
+  stations:[{x:-4.29,z:9.9},{x:-1.69,z:9.9},{x:0.21,z:9.9}],  // 충전 1~3 (진입 노드 22·23·24)
+  // 실측 노드 21개. ord = 순찰 촬영 순서(없으면 경유점/시설 진입). gate 는 시설 라벨.
+  waypoints:[
+    {id:1, x:-3.42,z: -9.99, ord:8 },
+    {id:2, x:-0.68,z: -9.99, ord:7 },
+    {id:3, x: 4.09,z: -9.82           },
+    {id:5, x:-2.98,z: -4.69, ord:1 },
+    {id:6, x: 0.03,z: -4.55, ord:2 },
+    {id:8, x: 3.94,z: -4.51           },
+    {id:9, x:-3.78,z: -0.47, ord:9 },
+    {id:10,x: 0.53,z: -1.52, ord:12},
+    {id:11,x: 4.48,z: -1.06, ord:6 },
+    {id:12,x:-3.63,z:  2.53, ord:10},
+    {id:13,x: 0.27,z:  1.69, ord:11},
+    {id:14,x: 4.50,z:  1.80, ord:5 },
+    {id:15,x:-3.20,z:  7.20           },
+    {id:16,x: 0.41,z:  5.78           },
+    {id:17,x: 4.17,z:  6.36           },
+    {id:20,x:-1.02,z:-10.20, gate:'수확대1'},
+    {id:21,x: 1.53,z: -9.89, gate:'수확대2'},
+    {id:22,x:-4.29,z:  6.80, gate:'충전소1'},
+    {id:23,x:-1.69,z:  7.56, gate:'충전소2'},
+    {id:24,x: 0.21,z:  7.45, gate:'충전소3'},
+    {id:25,x: 4.50,z:  5.28, gate:'예냉실'}
+  ],
+  // 실제 통로(corridor) 23쌍 = 로봇이 다닐 수 있는 간선. 이게 곧 지도의 '길'이다.
+  links:[[1,2],[1,20],[2,3],[3,21],[3,8],[5,6],[5,9],[6,8],[6,10],[8,11],
+         [9,12],[10,13],[11,14],[12,15],[13,16],[14,17],[15,16],[15,22],
+         [15,23],[15,24],[16,17],[16,24],[17,25]],
+  // 게이트 진입 좌표 — 나중에 로봇을 시설 안으로 보낼 때 사용
+  gates:{ '예냉실':{wp:25, dock:{x:4.30,z:9.9},  purpose:'수확물 하역·예냉'},
+          '충전소1':{wp:22, dock:{x:-4.29,z:9.9}, purpose:'자동 충전 도킹(dg_01)'},
+          '충전소2':{wp:23, dock:{x:-1.69,z:9.9}, purpose:'자동 충전 도킹(dg_02)'},
+          '충전소3':{wp:24, dock:{x:0.21,z:9.9},  purpose:'자동 충전 도킹(dg_03)'},
+          '수확대1':{wp:20, dock:{x:-1.02,z:-11.6}, purpose:'수확물 인수(로봇팔→Pinky)'},
+          '수확대2':{wp:21, dock:{x:1.53,z:-11.6},  purpose:'수확물 인수(로봇팔→Pinky)'} }
 };
 /* 게이트 진입 스텁: 순찰/수확 waypoint(16·21)에서 시설(예냉실 하역 / 충전소 도킹) 안으로 보낼 때 호출.
    현재는 프런트 데모 → 나중에 Automato Control Service의 '시설 이동' API로 연결. */
@@ -1417,8 +1461,9 @@ function buildFarmScene(){
     if(p.face==='x'){ tomatoFace(p.x-lenX/2-0.02,p.z,'x',-1,p.d); tomatoFace(p.x+lenX/2+0.02,p.z,'x',1,p.d); }
     else { tomatoFace(p.x,p.z-lenZ/2-0.02,'z',-1,p.d); tomatoFace(p.x,p.z+lenZ/2+0.02,'z',1,p.d); }
   });
-  // 로봇팔 아래 가벽
-  var wb=F.wallBar; box(wb.w,wb.h,wb.d,wb.x,wb.h/2,wb.z,new THREE.MeshLambertMaterial({color:0xdfe4ea}));
+  // 하단 벽 — 두 토막(가운데 42cm 개방). 개방부는 Pinky 가 수확물을 받는 자리라 비워 둔다.
+  var wbMat=new THREE.MeshLambertMaterial({color:0xdfe4ea});
+  (F.wallBars||[]).forEach(function(wb){ box(wb.w,wb.h,wb.d,wb.x,wb.h/2,wb.z,wbMat); });
   // 로봇팔 2대
   function robotArm(x,z){
     var g=new THREE.Group(), aM=new THREE.MeshLambertMaterial({color:0xf3f5f7}), jM=new THREE.MeshLambertMaterial({color:0x2f7fd6}), dM=new THREE.MeshLambertMaterial({color:0x39414b});
@@ -1468,18 +1513,18 @@ function buildFarmScene(){
     var lb=farmLabelSprite(THREE,'⚡ DG'+(i+1),'rgba(20,60,110,.94)'); lb.scale.set(1.5,0.5,1); lb.position.set(s.x,1.0,s.z); scene.add(lb);
   });
   // (D435 카메라는 각 Pinky 우측에 부착 — makePinky)
-  // ===== 순찰 waypoint 마커 + 경로 (시나리오 waypoint) =====
-  var patrolWps=F.waypoints.filter(function(w){return !w.type;}), wpPts=[];
+  // ===== 실측 waypoint 마커 + 통로(corridor) =====
+  // 순찰점끼리 직선으로 잇지 않는다 — 실제 로봇은 통로(links)를 따라가므로, 촬영 순서대로
+  // 직선을 그으면 베드를 관통하는 없는 길이 생긴다. 순서는 라벨의 (n) 으로만 표시한다.
+  var patrolWps=F.waypoints.filter(function(w){return w.ord;})
+                           .sort(function(a,b){return a.ord-b.ord;});
   F.waypoints.forEach(function(w){
     var dock=!!w.gate, col=dock?0x2f7fd6:0x1f9d55, dotc=dock?0x5aa9f0:0x14c46a;
     var ring=new THREE.Mesh(new THREE.TorusGeometry(0.34,0.06,8,22),new THREE.MeshLambertMaterial({color:col})); ring.rotation.x=Math.PI/2; ring.position.set(w.x,0.06,w.z); scene.add(ring);
     var dot=new THREE.Mesh(new THREE.CylinderGeometry(0.12,0.12,0.05,12),new THREE.MeshLambertMaterial({color:dotc})); dot.position.set(w.x,0.06,w.z); scene.add(dot);
-    var lb=farmLabelSprite(THREE,'WP'+w.id+(dock?' · '+w.gate:''),dock?'rgba(30,90,180,.94)':'rgba(20,120,70,.92)'); lb.scale.set(dock?1.7:1.2,0.46,1); lb.position.set(w.x,0.98,w.z); scene.add(lb);
+    var txt='WP'+w.id+(w.ord?' ('+w.ord+')':'')+(dock?' · '+w.gate:'');
+    var lb=farmLabelSprite(THREE,txt,dock?'rgba(30,90,180,.94)':'rgba(20,120,70,.92)'); lb.scale.set(dock?1.9:1.35,0.46,1); lb.position.set(w.x,0.98,w.z); scene.add(lb);
   });
-  patrolWps.forEach(function(w){ wpPts.push(new THREE.Vector3(w.x,0.12,w.z)); });
-  wpPts.push(wpPts[0].clone());
-  var pathLine=new THREE.Line(new THREE.BufferGeometry().setFromPoints(wpPts),new THREE.LineDashedMaterial({color:0x1f9d55,dashSize:0.4,gapSize:0.28}));
-  pathLine.computeLineDistances(); scene.add(pathLine);
   (F.links||[]).forEach(function(lk){ var a=F.waypoints.find(function(w){return w.id===lk[0];}), b=F.waypoints.find(function(w){return w.id===lk[1];}); if(a&&b){ var ln=new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(a.x,0.12,a.z),new THREE.Vector3(b.x,0.12,b.z)]),new THREE.LineDashedMaterial({color:0x1f9d55,dashSize:0.4,gapSize:0.28})); ln.computeLineDistances(); scene.add(ln); } });
   // ===== Pinky 3대 (dg_01/02/03) =====
   function makePinky(col){
@@ -1718,17 +1763,25 @@ function drawFarmHeat(){
     g.fillStyle='#f0f2f4'; g.fillRect(x,y,sw(lenX),sh(lenZ));
     g.strokeStyle='#e23b2d'; g.lineWidth=3; g.strokeRect(x,y,sw(lenX),sh(lenZ));
   });
-  // 순찰 경로(초록·patrol만) + waypoint 마커(충전소/예냉실=파랑)
-  var pw=F.waypoints.filter(function(w){return !w.type;});
-  g.strokeStyle='rgba(31,157,85,.75)'; g.lineWidth=2; g.setLineDash([6,5]); g.beginPath();
-  pw.forEach(function(w,i){ var X=sx(w.x),Y=sy(w.z); if(i===0)g.moveTo(X,Y); else g.lineTo(X,Y); });
-  g.lineTo(sx(pw[0].x),sy(pw[0].z)); g.stroke(); g.setLineDash([]);
+  // 통로(corridor) = 로봇이 실제로 다니는 길. 순찰점끼리 직선으로 잇지 않는다(없는 길이 생긴다).
   (F.links||[]).forEach(function(lk){ var a=F.waypoints.find(function(w){return w.id===lk[0];}), b=F.waypoints.find(function(w){return w.id===lk[1];}); if(a&&b){ g.strokeStyle='rgba(31,157,85,.75)'; g.lineWidth=2; g.setLineDash([6,5]); g.beginPath(); g.moveTo(sx(a.x),sy(a.z)); g.lineTo(sx(b.x),sy(b.z)); g.stroke(); g.setLineDash([]); } });
+  // waypoint 마커 (시설 진입=파랑 / 순찰·경유=초록). 순찰 순서는 점 옆에 작게 (n).
   g.textAlign='center'; g.textBaseline='middle';
-  F.waypoints.forEach(function(w){ g.fillStyle=w.gate?'#2f7fd6':'#1f9d55'; g.beginPath(); g.arc(sx(w.x),sy(w.z),7.5,0,7); g.fill();
-    g.fillStyle='#fff'; g.font='bold 9px sans-serif'; T(w.id,sx(w.x),sy(w.z)); });
-  // 로봇팔 아래 가벽
-  var wb=F.wallBar; g.fillStyle='#cbd3db'; g.fillRect(sx(wb.x)-sw(wb.w)/2,sy(wb.z)-sh(wb.d)/2,sw(wb.w),Math.max(4,sh(wb.d)));
+  F.waypoints.forEach(function(w){ var X=sx(w.x),Y=sy(w.z);
+    g.fillStyle=w.gate?'#2f7fd6':'#1f9d55'; g.beginPath(); g.arc(X,Y,7.5,0,7); g.fill();
+    g.fillStyle='#fff'; g.font='bold 9px sans-serif'; T(w.id,X,Y);
+    if(w.ord){ g.fillStyle='#0f6b34'; g.font='bold 9px sans-serif'; T('('+w.ord+')',X+15,Y-9); } });
+  // ★ 하단 벽 — 두 토막. 가운데 42cm 는 뚫려 있다(로봇팔 2대 사이 = 수확물 인수 공간).
+  g.fillStyle='#cbd3db';
+  (F.wallBars||[]).forEach(function(wb){
+    g.fillRect(sx(wb.x)-sw(wb.w)/2, sy(wb.z)-sh(wb.d)/2, sw(wb.w), Math.max(4,sh(wb.d)));
+  });
+  // 개방 구간 표시 — '벽이 없다'는 걸 눈에 보이게 (점선 + 라벨)
+  if(F.wallGap){ var gp=F.wallGap, gy=sy(gp.z);
+    g.strokeStyle='#2f7fd6'; g.lineWidth=2; g.setLineDash([4,4]);
+    g.beginPath(); g.moveTo(sx(gp.x0),gy); g.lineTo(sx(gp.x1),gy); g.stroke(); g.setLineDash([]);
+    g.fillStyle='#1b5fa8'; g.font='bold 9px sans-serif';
+    T('개방(수확물 인수)', (sx(gp.x0)+sx(gp.x1))/2, gy-9); }
   // 로봇팔 2대 (관절 아이콘) — 그 위 방울토마토는 위에서 밀집 '색'으로 표시함(그림 제거)
   g.textAlign='center'; g.textBaseline='middle';
   F.arms.forEach(function(a){ var X=sx(a.x), Y=sy(a.z);
