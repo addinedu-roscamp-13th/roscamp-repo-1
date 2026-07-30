@@ -16,7 +16,7 @@ pick.py 는 그리퍼를 닫은 뒤 값이 임계값보다 크면 '파지 성공
 실행 (노트북, 팔 연결):
     ~/venv/automato/bin/python ddagi_harvest/gripper_check.py            # 측정만
     CALIBRATE=1 ~/venv/automato/bin/python ddagi_harvest/gripper_check.py # 캘리 후 측정
-    ARM_IP=192.168.x.x ... (기본 raspi.local)
+    ARM_IP=192.168.x.x ... (기본 192.168.3.12)
 """
 import os
 import sys
@@ -53,7 +53,7 @@ def calibrate(arm) -> None:
 
 
 def main() -> int:
-    ip = os.environ.get("ARM_IP", "raspi.local")
+    ip = os.environ.get("ARM_IP", "192.168.3.12")
     do_cal = os.environ.get("CALIBRATE", "") not in ("", "0", "false")
     arm = NetworkArm(ip)
     try:
