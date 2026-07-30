@@ -25,11 +25,11 @@ DT = 0.05
 
 
 def test_geometry_centered():
-    """정면 마커(0, 0.4) heading 0 → bearing~0, gx=0.4-D_STAGE, 횡오프셋 5mm 반영."""
-    F.configure(D_STAGE=0.20, LATERAL_OFFSET=0.005)
+    """정면 마커(0, 0.4) heading 0 → bearing~0, gx=0.4-CL_TARGET_D, 횡오프셋 5mm 반영."""
+    F.configure(D_STAGE=0.20, LATERAL_OFFSET=0.005, CL_TARGET_D=0.26)
     d, b, y, plan, gx, gy = F.square_geometry((0.0, 0.40), 0.0)
     assert abs(d - 0.40) < 0.02
-    assert abs(gx - 0.20) < 0.01            # 스테이징점 = 중심 앞 D_STAGE
+    assert abs(gx - 0.14) < 0.01            # 중심선 기동 목표 = 중심 앞 CL_TARGET_D(0.26)
     assert abs(gy - 0.005) < 0.002          # 왼쪽 5mm
 
 
@@ -105,10 +105,10 @@ def test_centerline_plan_only_at_reliable_distance():
     fsm.state = 'CENTERLINE'
     v, w = fsm.update(True, 0.20, 0.0, 0.0, 0.0, 0, 0, plan=plan, odom_xy=(0, 0), n=99)
     assert fsm.cl_phase == 'PLAN'           # 아직 계획 안 잡힘
-    # 신뢰거리: d=0.35 → 계획 잡힘
+    # 신뢰거리 + 미정렬(yaw 10°): d=0.35 → 계획 잡힘 → TURN1
     fsm2 = F.DockFsm()
     fsm2.state = 'CENTERLINE'
-    fsm2.update(True, 0.35, 0.0, 0.0, 0.0, 0, 0, plan=plan, odom_xy=(0, 0), n=99)
+    fsm2.update(True, 0.35, 0.0, math.radians(10.0), 0.0, 0, 0, plan=plan, odom_xy=(0, 0), n=99)
     assert fsm2.cl_phase == 'TURN1'
 
 
@@ -159,16 +159,50 @@ def test_verify_replans_when_skewed():
     assert fsm.state == 'CENTERLINE'
 
 
-def test_verify_search_when_cannot_reacquire():
-    """VERIFY: 놓친 채 후진해도 재획득 못 하면 SEARCH(무한대기 방지)."""
-    F.configure(VERIFY_BACKUP_MAX=0.0)     # 조금만 물러나도 재획득 실패로 판정
+def test_verify_trusts_plan_when_not_found():
+    """VERIFY: 미검출이면 ★후진 없이★ 계획 신뢰 → ALIGN(cl_done). (불필요한 후진 제거)"""
     fsm = F.DockFsm()
     fsm.state = 'CENTERLINE'
     fsm.cl_phase = 'VERIFY'
     v, w = fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.0, 0.0))
-    assert fsm.state == 'CENTERLINE' and v < 0.0    # 아직 후진 재획득 시도
-    fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.5, 0.0))   # 후진량 초과 → SEARCH
-    assert fsm.state == 'SEARCH'
+    assert fsm.state == 'ALIGN'
+    assert fsm.cl_done is True
+    assert v == 0.0 and w == 0.0            # 후진 안 함
+
+
+def test_centerline_skip_when_aligned():
+    """PLAN서 이미 정렬(신뢰거리 bearing/yaw 작음)이면 turn-drive-turn 스킵 → ALIGN(cl_done)."""
+    F.configure(D_STAGE=0.20)
+    fsm = F.DockFsm()
+    fsm.state = 'CENTERLINE'
+    fsm.cl_phase = 'PLAN'
+    fsm.update(True, 0.30, 0.0, 0.0, 0.0, 0, 0, plan=(0.1, 0.05, 0.1), odom_xy=(0, 0), n=99)
+    assert fsm.state == 'ALIGN'
+    assert fsm.cl_done is True
+
+
+def test_plan_align_fallback_when_obstacle_behind():
+    """PLAN 후진 중 후방 장애물(obstacle_behind)이면 후진 중지 → ALIGN 폴백(충돌 방지)."""
+    fsm = F.DockFsm()
+    fsm.state = 'CENTERLINE'
+    fsm.cl_phase = 'PLAN'
+    fsm.obstacle_behind = True
+    # 근접(d<신뢰거리)이라 계획 못 잡는 상황 + 후방 장애물 → ALIGN 폴백
+    fsm.update(True, 0.20, 0.0, 0.0, 0.0, 0, 0, plan=(0.1, 0.05, 0.1), odom_xy=(0, 0), n=99)
+    assert fsm.state == 'ALIGN'
+
+
+def test_advance_obstacle_early_stop():
+    """ADVANCE 중 obstacle_ahead=True 면 목표 전에 정지·완료(DONE), ABORT 아님."""
+    F.configure(STAGE_SETTLE_SEC=0.0, POST_DOCK_HOLD_SEC=0.0)
+    fsm = F.DockFsm()
+    fsm.post_advance_m = 0.30
+    fsm.state = 'ADVANCE'
+    fsm.adv_xy0 = (0.0, 0.0)
+    fsm.obstacle_ahead = True
+    fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.10, 0.0))   # 0.10<0.30 이지만 장애물 → DONE
+    assert fsm.state == 'DONE'
+    assert fsm.result_code == 0
 
 
 def test_post_advance_after_reverse():

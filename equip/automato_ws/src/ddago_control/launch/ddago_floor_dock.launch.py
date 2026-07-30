@@ -41,7 +41,10 @@ def generate_launch_description():
              'rotate_180', 'dry_run', 'wall_gap_target', 'lateral_offset',
              'd_stage', 'reverse_k', 'crossbar_to_wall', 'dynamic_reverse',
              'stage_settle_sec', 'cl_verify_d', 'cl_max_replans', 'post_advance_m',
-             'post_dock_hold_sec', 'debug', 'stream', 'stream_port')
+             'post_dock_hold_sec', 'obstacle_avoid', 'scan_topic', 'obstacle_stop_m',
+             'obstacle_timeout', 'lidar_front_deg', 'lidar_sector_deg', 'obstacle_min_m',
+             'obstacle_side_min_m', 'advance_obstacle_m', 'plan_obstacle_m',
+             'debug', 'stream', 'stream_port')
 
     return LaunchDescription([
         DeclareLaunchArgument('robot_id', default_value='dg_01'),
@@ -75,6 +78,19 @@ def generate_launch_description():
         DeclareLaunchArgument('post_advance_m', default_value='0.0'),
         # 반복 시 도킹 완료 후 정지 유지[s] (post_advance_m>0 경로에서만 적용).
         DeclareLaunchArgument('post_dock_hold_sec', default_value='2.5'),
+        # 라이다 충돌 방지(opt-in). 후진-투-벽(TURN/REVERSE/HOLD) 제외. ⚠️lidar_front_deg·임계값 현장 튜닝.
+        DeclareLaunchArgument('obstacle_avoid', default_value='false'),
+        DeclareLaunchArgument('scan_topic', default_value='scan'),
+        DeclareLaunchArgument('obstacle_stop_m', default_value='0.10'),  # 100mm 이내만
+        DeclareLaunchArgument('obstacle_timeout', default_value='5.0'),
+        DeclareLaunchArgument('lidar_front_deg', default_value='180.0'),  # 180° 뒤집힌 장착
+        DeclareLaunchArgument('lidar_sector_deg', default_value='30.0'),  # 코너 기둥(±45°) 회피
+        # 이보다 가까운 반사 무시 하한[m]. 기둥이 경계서 0.08로 튀어 0.10.
+        DeclareLaunchArgument('obstacle_min_m', default_value='0.10'),
+        DeclareLaunchArgument('obstacle_side_min_m', default_value='0.10'),
+        # ADVANCE 전방 조기정지 170mm / PLAN 후진 후방 조기정지 110mm.
+        DeclareLaunchArgument('advance_obstacle_m', default_value='0.17'),
+        DeclareLaunchArgument('plan_obstacle_m', default_value='0.13'),
         DeclareLaunchArgument('debug', default_value='false'),
         # 웹 스트리밍(뷰 전용 MJPEG). http://<로봇ip>:<stream_port>/
         DeclareLaunchArgument('stream', default_value='false'),

@@ -20,6 +20,7 @@ ChArUco 도킹(dock_server.py)과 별개 방식이다. 바닥에 그린 **청색
 ⚠️ 첫 현장 투입은 dry_run:=true 로 명령만 확인 후 실주행(bringup 에 cmd_vel 워치독 없음).
 """
 import fcntl
+import json
 import math
 import os
 import threading
@@ -33,9 +34,11 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.logging import LoggingSeverity
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import (DurabilityPolicy, QoSProfile, ReliabilityPolicy,
+                       qos_profile_sensor_data)
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Int64
 
 from automato_interfaces.action import FloorDock
@@ -51,11 +54,17 @@ RC_MARKER_NOT_FOUND = 1
 RC_TOLERANCE = 2
 RC_CANCELLED = 3
 RC_ALIGN_FAILED = 4
+RC_OBSTACLE = 5                 # 라이다 장애물 지속 감지로 중단
 
 # 카메라 프리즈 대응(dock_server 와 동일): 감지만 하고 재오픈 금지.
 CAPTURE_TIMEOUT = 3.0
 STALL_STOP_SEC = 0.5
 STREAM_FPS = 15
+OBSTACLE_DEBOUNCE = 3          # 라이다 장애물: 연속 이 프레임 감지돼야 인정(경계 스파이크 무시)
+# 웹 원격 조그(도킹 미진행 시에만 유효). 데드맨: 버튼 뗀 뒤 JOG_EXPIRE 지나면 자동 정지.
+JOG_V = 0.06                    # 조그 전/후진 [m/s]
+JOG_W = 0.5                     # 조그 회전 [rad/s]
+JOG_EXPIRE = 0.6               # 데드맨 [s]
 
 
 def acquire_single_instance(path=LOCK_PATH):
@@ -83,9 +92,46 @@ def _put(img, text, org, color):
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DdaGo Floor Dock</title>
-<style>body{margin:0;background:#111;color:#eee;font-family:sans-serif;text-align:center}
-img{max-width:100%;height:auto;background:#000}</style></head>
-<body><h3>DdaGo Floor Dock (view only)</h3><img src="/stream" alt="stream"></body></html>"""
+<style>
+ body{margin:0;background:#111;color:#eee;font-family:sans-serif;text-align:center}
+ img{max-width:100%;height:auto;background:#000}
+ #st{padding:8px;font-size:15px;min-height:22px}
+ #pad{display:inline-grid;grid-template-columns:repeat(3,66px);gap:8px;margin:10px auto 20px}
+ #pad button{height:58px;font-size:22px;border:0;border-radius:10px;background:#2b4c7e;
+   color:#fff;touch-action:none;user-select:none;cursor:pointer}
+ #pad button:active{background:#3d6db3}
+ #pad button:disabled{background:#333;color:#666;cursor:not-allowed}
+ .lock{color:#e08a2f}
+</style></head><body>
+<h3>DdaGo Floor Dock</h3>
+<img src="/stream" alt="stream">
+<div id="st">상태 확인 중…</div>
+<div id="pad">
+ <span></span><button data-d="forward">&#9650;</button><span></span>
+ <button data-d="left">&#9664;</button><button data-d="stop">&#9632;</button><button data-d="right">&#9654;</button>
+ <span></span><button data-d="back">&#9660;</button><span></span>
+</div>
+<script>
+let locked=true;
+const jog=d=>fetch('/jog/'+d,{method:'POST'}).catch(()=>{});
+async function poll(){
+ try{const s=await(await fetch('/status')).json();locked=s.busy;
+  document.getElementById('st').innerHTML=s.busy
+   ?'<span class="lock">&#128274; 도킹 진행 중 — 원격제어 잠금</span>'
+   :'&#127919; 원격제어 가능 ('+(s.dry_run?'DRY-RUN':'LIVE')+')';
+  document.querySelectorAll('#pad button').forEach(b=>b.disabled=s.busy);
+ }catch(e){}}
+setInterval(poll,500);poll();
+document.querySelectorAll('#pad button').forEach(b=>{const d=b.dataset.d;
+ const go=e=>{e.preventDefault();if(locked)return;jog(d);clearInterval(b._t);b._t=setInterval(()=>jog(d),200);};
+ const end=e=>{e.preventDefault();clearInterval(b._t);jog('stop');};
+ b.addEventListener('mousedown',go);b.addEventListener('mouseup',end);b.addEventListener('mouseleave',end);
+ b.addEventListener('touchstart',go);b.addEventListener('touchend',end);});
+const K={ArrowUp:'forward',ArrowDown:'back',ArrowLeft:'left',ArrowRight:'right'},ki={};
+addEventListener('keydown',e=>{const d=K[e.key];if(!d||locked||ki[e.key])return;e.preventDefault();
+ jog(d);ki[e.key]=setInterval(()=>jog(d),200);});
+addEventListener('keyup',e=>{if(ki[e.key]){clearInterval(ki[e.key]);delete ki[e.key];e.preventDefault();jog('stop');}});
+</script></body></html>"""
 
 
 class FloorDockServer(Node):
@@ -121,6 +167,26 @@ class FloorDockServer(Node):
         self.declare_parameter('post_advance_m', 0.0)
         # 반복 시 도킹 완료 후 정지 유지 [s] (post_advance_m>0 경로에서만).
         self.declare_parameter('post_dock_hold_sec', float(fsm_mod.POST_DOCK_HOLD_SEC))
+        # 라이다 충돌 방지(opt-in). 진행방향 섹터에 물체 근접 시 정지, 지속되면 ABORT(rc=5).
+        #  후진-투-벽(TURN/REVERSE/HOLD)은 제외. ⚠️lidar_front_deg(장착 전방각)·임계값 현장 튜닝 필요.
+        self.declare_parameter('obstacle_avoid', False)
+        self.declare_parameter('scan_topic', 'scan')
+        self.declare_parameter('obstacle_stop_m', 0.10)     # 정지 임계 거리 [m] (100mm 이내만)
+        self.declare_parameter('obstacle_timeout', 5.0)     # 이 시간 지속 정지 시 ABORT [s]
+        # 스캔 프레임서 로봇 전방 각 [deg]. 이 로봇은 180° 뒤집힌 장착(카메라 rotate_180)이라
+        #  라이다 0°가 뒤를 향함 → 전방=180°. (실측: 정면 물체 → rear 섹터 반응으로 확인)
+        self.declare_parameter('lidar_front_deg', 180.0)
+        # 섹터 반각 [deg]. 기둥이 4코너(±45°)라 30° 로 좁혀 코너를 피한다(정면/측면 사이 열림).
+        self.declare_parameter('lidar_sector_deg', 30.0)
+        # 이보다 가까운 반사는 무시(로봇 자체 기둥/구조물). 기둥이 경계에서 0.08로 튀어 0.10.
+        self.declare_parameter('obstacle_min_m', 0.10)
+        # 측면 전용 하한 [m] (회전 시만 측면 사용).
+        self.declare_parameter('obstacle_side_min_m', 0.10)
+        # ADVANCE(반복 후퇴 전진) 중 전방 장애물 정지 거리 [m]. 안쪽이면 조기 정지·완료(다음 진행).
+        self.declare_parameter('advance_obstacle_m', 0.17)
+        # PLAN 후진 중 후방 장애물 정지 거리 [m]. 안쪽이면 후진 중지 → ALIGN 폴백.
+        #  하한(0.10)보다 충분히 커야 무시영역 진입 전에 멈춘다(1cm 밴드면 통과·충돌 → 0.13).
+        self.declare_parameter('plan_obstacle_m', 0.13)
 
         self._robot_id = self.get_parameter('robot_id').value
         self._rotate_180 = bool(self.get_parameter('rotate_180').value)
@@ -165,6 +231,24 @@ class FloorDockServer(Node):
         odom = self.get_parameter('odom_topic').value
         self.create_subscription(Odometry, odom, self._on_odom, 10,
                                  callback_group=self._cb)
+
+        # 라이다 충돌 방지(opt-in)
+        self._obstacle_avoid = bool(self.get_parameter('obstacle_avoid').value)
+        self._obstacle_stop_m = float(self.get_parameter('obstacle_stop_m').value)
+        self._obstacle_timeout = float(self.get_parameter('obstacle_timeout').value)
+        self._lidar_front = math.radians(float(self.get_parameter('lidar_front_deg').value))
+        self._lidar_half = math.radians(float(self.get_parameter('lidar_sector_deg').value))
+        self._obstacle_min_m = float(self.get_parameter('obstacle_min_m').value)
+        self._obstacle_side_min_m = float(self.get_parameter('obstacle_side_min_m').value)
+        self._advance_obstacle_m = float(self.get_parameter('advance_obstacle_m').value)
+        self._plan_obstacle_m = float(self.get_parameter('plan_obstacle_m').value)
+        self._scan = None
+        self._scan_lock = threading.Lock()
+        if self._obstacle_avoid:
+            # 센서 QoS(BEST_EFFORT) — /scan·/scan_filtered 어느 쪽이든 수신되게.
+            self.create_subscription(LaserScan, self.get_parameter('scan_topic').value,
+                                     self._on_scan, qos_profile_sensor_data,
+                                     callback_group=self._cb)
         self._cmd_pub = self.create_publisher(
             Twist, self.get_parameter('cmd_vel_topic').value, 10)
         # 현재 task 알림(telemetry_publisher 가 싣는다). dock_server 와 동일 QoS.
@@ -179,9 +263,17 @@ class FloorDockServer(Node):
             cancel_callback=lambda _gh: CancelResponse.ACCEPT,
             callback_group=self._cb)
 
+        self._manual = (0.0, 0.0, 0.0)     # (v, w, expiry_monotonic) 웹 원격 조그(데드맨)
+        self._manual_lock = threading.Lock()
+
         threading.Thread(target=self._camera_loop, daemon=True).start()
         if self._stream:
             self._start_stream_server()
+            # 카메라는 웹 /stream 접속 시 on-demand 로 가동(참조카운트) — 접속하면 바로 스트리밍,
+            # 뷰어 없으면 꺼서 CPU/WiFi 부담↓.
+        if self._stream or self._obstacle_avoid:
+            # 렌더·원격조그·라이다 idle 로그 루프(stream 또는 obstacle_avoid 시).
+            threading.Thread(target=self._idle_loop, daemon=True).start()
 
         self.get_logger().info(
             'FloorDock 서버 준비됨: robot_id=%s → /ddago/floor_dock, 정면 picamera %dx%d%s, '
@@ -318,6 +410,69 @@ class FloorDockServer(Node):
         with self._odom_lock:
             return self._odom_yaw, self._odom_xy
 
+    # --- 라이다 충돌 방지 ---------------------------------------------- #
+    def _on_scan(self, msg):
+        with self._scan_lock:
+            self._scan = (list(msg.ranges), msg.angle_min, msg.angle_increment,
+                          max(float(msg.range_min), 0.05))
+
+    def _scan_sectors(self):
+        """전·후·좌·우 섹터의 최소 유효거리 [m] dict. 스캔 없으면 None.
+        로봇 자체 기둥(obstacle_min_m 이내 근접 반사)은 무시한다."""
+        with self._scan_lock:
+            s = self._scan
+        if s is None:
+            return None
+        ranges, amin, ainc, rmin = s
+        fc = self._lidar_front
+        fmin = max(rmin, self._obstacle_min_m)        # 전/후 하한
+        smin = max(rmin, self._obstacle_side_min_m)   # 측면 하한(기둥 더 가까움)
+        sectors = {'front': (fc, fmin), 'rear': (fc + math.pi, fmin),
+                   'left': (fc + math.pi / 2, smin), 'right': (fc - math.pi / 2, smin)}
+        out = {k: float('inf') for k in sectors}
+        for i, r in enumerate(ranges):
+            if not math.isfinite(r):
+                continue
+            a = amin + i * ainc
+            for k, (c, fl) in sectors.items():
+                if abs(fsm_mod._ang_norm(a - c)) <= self._lidar_half:
+                    if fl < r < out[k]:
+                        out[k] = r
+                    break
+        return out
+
+    @staticmethod
+    def _fmt_sectors(sec):
+        if sec is None:
+            return '[no scan]'
+        def g(k):
+            v = sec.get(k, float('inf'))
+            return '%.2f' % v if math.isfinite(v) else '--'
+        return 'front=%s rear=%s left=%s right=%s' % (
+            g('front'), g('rear'), g('left'), g('right'))
+
+    def _obstacle_gate(self, state, v, w, sec):
+        """진행방향(+회전 시 측면) 섹터에 물체 근접이면 (방향, 거리) 반환, 아니면 None.
+        후진-투-벽(TURN/REVERSE/HOLD)·ADVANCE(자체 조기완료 처리)는 제외한다."""
+        if state in ('TURN', 'REVERSE', 'HOLD', 'ADVANCE'):
+            return None
+        if sec is None:
+            return None
+        thr = self._obstacle_stop_m
+        checks = []
+        if v > 0.005:
+            checks.append(('front', sec['front']))
+        elif v < -0.005:
+            checks.append(('rear', sec['rear']))
+        if abs(w) > 0.05:                 # 회전(중심선 turn 등) → 측면 스침 확인
+            checks += [('left', sec['left']), ('right', sec['right'])]
+            if abs(v) <= 0.005:           # 제자리 회전이면 앞뒤도
+                checks += [('front', sec['front']), ('rear', sec['rear'])]
+        for name, dist in checks:
+            if dist < thr:
+                return (name, dist)
+        return None
+
     def _publish(self, v, w):
         if self._dry_run:
             return
@@ -341,6 +496,8 @@ class FloorDockServer(Node):
             result.result_code = RC_ALIGN_FAILED
             result.message = '다른 도킹이 진행 중이다'
             return result
+        with self._manual_lock:
+            self._manual = (0.0, 0.0, 0.0)   # 도킹 시작 → 원격 조그 무효화
         try:
             return self._run(goal_handle, goal_handle.request, result)
         finally:
@@ -381,6 +538,9 @@ class FloorDockServer(Node):
         self._cam_acquire()
         fb = FloorDock.Feedback()
         last_fb = last_dbg = 0.0
+        prev_phase = None
+        obstacle_since = None
+        gate_cnt = adv_cnt = plan_cnt = 0    # 라이다 디바운스(연속 프레임 카운터)
         fresh_t = time.monotonic()
         try:
             while rclpy.ok():
@@ -420,24 +580,74 @@ class FloorDockServer(Node):
                     plan, found = (th1, dist_pl, th2), True
 
                 odom_yaw, odom_xy = self._odom_snapshot()
+                # 라이다 섹터 1회 계산(게이트·ADVANCE·디버그 공용). ADVANCE 중 전방 장애물이면
+                #  FSM 이 조기 완료(150mm 정지·다음 진행)하도록 obstacle_ahead 세팅.
+                sec = self._scan_sectors() if self._obstacle_avoid else None
+                # ADVANCE 전방 조기정지(디바운스: 연속 OBSTACLE_DEBOUNCE 프레임이라야 인정)
+                adv_raw = bool(
+                    self._obstacle_avoid and fsm.state == 'ADVANCE' and sec is not None
+                    and math.isfinite(sec['front']) and sec['front'] < self._advance_obstacle_m)
+                adv_cnt = adv_cnt + 1 if adv_raw else 0
+                fsm.obstacle_ahead = adv_cnt >= OBSTACLE_DEBOUNCE
+                # PLAN 후진 중 후방 장애물(110mm 내)이면 후진 중지 → ALIGN 폴백(충돌 방지).
+                plan_raw = bool(
+                    self._obstacle_avoid and fsm.state == 'CENTERLINE'
+                    and fsm.cl_phase == 'PLAN' and sec is not None
+                    and math.isfinite(sec['rear']) and sec['rear'] < self._plan_obstacle_m)
+                plan_cnt = plan_cnt + 1 if plan_raw else 0
+                fsm.obstacle_behind = plan_cnt >= OBSTACLE_DEBOUNCE
+
                 v, w = fsm.update(found, d, bearing, yaw, odom_yaw, 0.0, 0.0,
                                   proceed=True, n=99 if found else 0,
                                   plan=plan, odom_xy=odom_xy)
+
+                # 라이다 장애물 게이트: 진행방향 근접 시 정지, 지속되면 ABORT
+                #  (TURN/REVERSE/HOLD/ADVANCE 제외). 디바운스: 연속 프레임이라야 정지(스파이크 무시).
+                if self._obstacle_avoid:
+                    obs = self._obstacle_gate(fsm.state, v, w, sec)
+                    gate_cnt = gate_cnt + 1 if obs is not None else 0
+                    if obs is not None and gate_cnt >= OBSTACLE_DEBOUNCE:
+                        v, w = 0.0, 0.0
+                        if obstacle_since is None:
+                            obstacle_since = now
+                            log.warn('[floor_dock] 장애물 %s %.2fm — 정지(진행방향)' % obs)
+                        elif now - obstacle_since > self._obstacle_timeout:
+                            self._stop()
+                            goal_handle.abort()
+                            result.result_code = RC_OBSTACLE
+                            result.message = ('장애물(%s %.2fm) %.0f초 지속 — 도킹 중단'
+                                              % (obs[0], obs[1], self._obstacle_timeout))
+                            log.error('[floor_dock] %s' % result.message)
+                            return result
+                    elif obstacle_since is not None:
+                        obstacle_since = None
+                        log.info('[floor_dock] 장애물 해제 — 재개')
                 self._publish(v, w)
 
-                if self._stream:
-                    self._render_stream(frame, det, fsm, d, bearing, yaw, v, w)
+                phase = self._phase(fsm)
+                oy = ('%+.1f' % math.degrees(odom_yaw)) if odom_yaw is not None else '--'
+                dw = (d + self._crossbar_to_wall) * 100
+                det_s = ('dw=%5.1fcm b=%+5.1f y=%+5.1f n=99'
+                         % (dw, math.degrees(bearing), math.degrees(yaw))
+                         if found else 'H not found')
+                nt = ('  | ' + fsm.note) if fsm.note else ''
 
+                if self._stream:
+                    self._render_stream(frame, det, fsm, d, bearing, yaw, v, w, odom_yaw)
+
+                # 상태 전이는 INFO(희소·중요 — floor_pose 의 dock_state.log 대응).
+                #  전이 순간의 관측·odom·v/w·note(동적후진/VERIFY/ABORT 사유) 를 남긴다.
+                if phase != prev_phase:
+                    log.info('[floor_dock] %-9s -> %-9s | %s odom=%s v=%+.3f w=%+.3f%s'
+                             % (prev_phase or 'START', phase, det_s, oy, v, w, nt))
+                    prev_phase = phase
+                # 매 프레임 상태는 DEBUG(debug:=true, 0.5s 주기 — floor_pose 터미널 대응).
                 if self._debug and now - last_dbg >= 0.5:
-                    oy = ('%+.1f' % math.degrees(odom_yaw)) if odom_yaw is not None else '--'
-                    dw = (d + self._crossbar_to_wall) * 100
-                    log.debug('[%s] dw=%5.1fcm b=%+5.1f y=%+5.1f odom=%s v=%+.3f w=%+.3f'
-                              % (self._phase(fsm), dw if found else 0.0,
-                                 math.degrees(bearing) if found else 0.0,
-                                 math.degrees(yaw) if found else 0.0, oy, v, w)
-                              if found else
-                              '[%s] not found odom=%s v=%+.3f w=%+.3f'
-                              % (self._phase(fsm), oy, v, w))
+                    ls = ''
+                    if self._obstacle_avoid:   # 라이다 4방향 최소거리(위에서 계산한 sec 재사용)
+                        ls = '  lidar ' + self._fmt_sectors(sec)
+                    log.debug('[%s] %s odom=%s v=%+.3f w=%+.3f%s%s'
+                              % (phase, det_s, oy, v, w, nt, ls))
                     last_dbg = now
 
                 if now - last_fb >= 0.2:
@@ -490,19 +700,81 @@ class FloorDockServer(Node):
         result.final_yaw_error = float(y)
 
     # --- 웹 스트림(view only, 디버그) ---------------------------------- #
-    def _render_stream(self, frame, det, fsm, d, bearing, yaw, v, w):
+    def _render_stream(self, frame, det, fsm, d, bearing, yaw, v, w, odom_yaw=None):
+        # floor_pose.py 오버레이 대응: 3줄(검출·상태·note). ⚠️cv2.putText 는 한글 불가라
+        #  note 는 ASCII 만 남긴다(동적후진/거리 수치는 영문이라 유지, 한글 경고는 제거).
         vis = frame.copy()           # BGR
         c = (0, 255, 0) if det is not None else (0, 0, 255)
         if det is not None:
             center, heading, size, contour = det
             cv2.polylines(vis, [contour.astype(int)], True, (0, 255, 0), 2)
             dw = d + self._crossbar_to_wall
-            _put(vis, 'dw=%.3fm(wall) b=%+.1f y=%+.1f' % (
-                dw, math.degrees(bearing), math.degrees(yaw)), (10, 26), c)
+            _put(vis, '[h%.0f] dw=%.3fm(wall) b=%+.1f y=%+.1f n=99'
+                 % (size * 100, dw, math.degrees(bearing), math.degrees(yaw)), (10, 26), c)
         else:
-            _put(vis, 'no H', (10, 26), c)
-        _put(vis, '[%s] v=%+.3f w=%+.3f%s' % (self._phase(fsm), v, w,
-             '  DRY-RUN' if self._dry_run else '  LIVE'), (10, 52), (255, 255, 0))
+            _put(vis, 'H not found', (10, 26), c)
+        oy = ('%+.1f' % math.degrees(odom_yaw)) if odom_yaw is not None else '--'
+        _put(vis, '[%s] v=%+.3f w=%+.3f odom=%s%s'
+             % (self._phase(fsm), v, w, oy, '  DRY-RUN' if self._dry_run else '  LIVE'),
+             (10, 52), (0, 200, 255) if not self._dry_run else (255, 255, 255))
+        if fsm.note:
+            _put(vis, fsm.note.encode('ascii', 'ignore').decode()[:70], (10, 78),
+                 (0, 220, 255))
+        ok, buf = cv2.imencode('.jpg', vis, self._stream_enc)
+        if ok:
+            with self._jpeg_lock:
+                self._latest_jpeg = buf.tobytes()
+
+    def _idle_loop(self):
+        """도킹 미진행 시: 스트림 렌더(4Hz) + 원격 조그 발행(12Hz 데드맨).
+        도킹 goal 이 도는 동안엔 goal 루프가 cmd_vel·스트림을 담당하므로 양보한다."""
+        was_jog = False
+        last_render = 0.0
+        last_lidar = 0.0
+        while rclpy.ok():
+            time.sleep(0.08)
+            if self._busy.locked():          # 도킹 중 → goal 루프에 양보
+                was_jog = False
+                continue
+            now = time.monotonic()
+            # 라이다 전/후방 거리(방향각 튜닝용) — idle 에서도 1초마다(obstacle_avoid+debug)
+            if self._obstacle_avoid and self._debug and now - last_lidar >= 1.0:
+                self.get_logger().info('[idle] lidar %s'
+                                       % self._fmt_sectors(self._scan_sectors()))
+                last_lidar = now
+            # 원격 조그(데드맨). 활성일 때만 발행하고, 만료 직후 1회 정지 → 이후 침묵
+            #  (안 움직일 땐 cmd_vel 을 안 쏴서 다른 노드(Nav 등)와 안 다툰다).
+            with self._manual_lock:
+                v, w, exp = self._manual
+            if now < exp:
+                self._publish(v, w)
+                was_jog = True
+            elif was_jog:
+                self._stop()
+                was_jog = False
+            if now - last_render >= 0.25:     # 스트림/검출 4Hz. 최근 프레임(뷰어 접속)일 때만
+                frame, ft = self._frame_snapshot()
+                if frame is not None and now - ft < 1.0:
+                    self._render_idle(frame, now < exp)
+                last_render = now
+
+    def _render_idle(self, frame, jogging):
+        """IDLE 오버레이(원격제어 안내 + 검출은 표시만). 도킹 진행 X."""
+        vis = frame.copy()
+        det = (None if (self._camera_wedged or self._mapper is None)
+               else detector.find_dock(frame, self._mapper))
+        if det is not None:
+            center, heading, size, contour = det
+            cv2.polylines(vis, [contour.astype(int)], True, (0, 180, 0), 2)
+            d, bearing, yaw = fsm_mod.docking_values(center, heading)
+            _put(vis, '[h%.0f] dw=%.3fm(wall) b=%+.1f y=%+.1f'
+                 % (size * 100, d + self._crossbar_to_wall,
+                    math.degrees(bearing), math.degrees(yaw)), (10, 26), (0, 220, 0))
+        else:
+            _put(vis, 'H not found', (10, 26), (0, 0, 255))
+        _put(vis, 'IDLE  teleop:%s%s' % ('MOVING' if jogging else 'ready',
+             '  DRY-RUN' if self._dry_run else '  LIVE'), (10, 52),
+             (0, 200, 255) if not self._dry_run else (255, 255, 255))
         ok, buf = cv2.imencode('.jpg', vis, self._stream_enc)
         if ok:
             with self._jpeg_lock:
@@ -524,6 +796,7 @@ class FloorDockServer(Node):
                     self.end_headers()
                     self.wfile.write(body)
                 elif self.path == '/stream':
+                    server._cam_acquire()        # 웹 접속 → 카메라 가동(즉시 스트리밍)
                     self.send_response(200)
                     self.send_header('Content-Type',
                                      'multipart/x-mixed-replace; boundary=frame')
@@ -542,8 +815,40 @@ class FloorDockServer(Node):
                             time.sleep(1.0 / STREAM_FPS)
                     except (BrokenPipeError, ConnectionResetError):
                         pass
+                    finally:
+                        server._cam_release()    # 뷰어 종료 → 마지막이면 카메라 off
+                elif self.path == '/status':
+                    self._json({'busy': server._busy.locked(),
+                                'dry_run': server._dry_run})
                 else:
                     self.send_error(404)
+
+            def do_POST(self):
+                if not self.path.startswith('/jog/'):
+                    self.send_error(404)
+                    return
+                key = self.path.rsplit('/', 1)[1]
+                vmap = {'forward': (JOG_V, 0.0), 'back': (-JOG_V, 0.0),
+                        'left': (0.0, JOG_W), 'right': (0.0, -JOG_W), 'stop': (0.0, 0.0)}
+                if key not in vmap:
+                    self.send_error(404)
+                    return
+                # 도킹 중엔 이동 조그 무시(stop 은 허용). 데드맨 만료시각까지만 유효.
+                accepted = not (server._busy.locked() and key != 'stop')
+                if accepted:
+                    vv, ww = vmap[key]
+                    exp = 0.0 if key == 'stop' else time.monotonic() + JOG_EXPIRE
+                    with server._manual_lock:
+                        server._manual = (vv, ww, exp)
+                self._json({'ok': accepted, 'busy': server._busy.locked()})
+
+            def _json(self, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
         self._httpd = ThreadingHTTPServer(('0.0.0.0', self._stream_port), Handler)
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
