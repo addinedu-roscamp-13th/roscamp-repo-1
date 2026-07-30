@@ -238,6 +238,10 @@ services/automato_web_service/heat.json
 services/automato_web_service/harvest.json
 services/automato_web_service/robots.json
 services/automato_web_service/detections/
+# 텔레그램 봇 토큰 — 커밋 금지 (TELEGRAM_CONFIG 또는 ~/.config/automato/telegram.json 사용)
+services/automato_web_service/telegram.json
+# 작업 중 남는 타임스탬프 백업본 (app.py.bak_20260729_1810 등)
+*.bak_*
 # YOLO 학습 가중치 — git push 금지, DG_AI_MODEL_PATH 로 로컬 경로만 참조
 *.pt
 *.onnx
