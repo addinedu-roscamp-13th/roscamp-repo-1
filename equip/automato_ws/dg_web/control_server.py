@@ -263,22 +263,19 @@ def eval_e2():
     return ok, dcs[-4:] + acs[-4:]
 
 
-def _trigger_dock():
-    """ACS 역할로 Dock goal 하달(dashboard.sh dock). 완주까지 기다린다."""
-    subprocess.run(['bash', DASH, 'dock'], capture_output=True, text=True, timeout=90)
+def _eval_dock(cmd):
+    """정밀 도킹 중계 판정 — ACS→DCS 접수 → DCS→DdaGo 하달 → 결과 반환까지.
 
-
-def eval_e4():
-    """E4-6 복귀 후 정밀 도킹: ACS→DCS 로 Dock goal 접수 → DCS→DdaGo 중계 →
-    결과가 ACS 로 되돌아오는지까지.
-
-    DCS 는 중계자다. 실제 도킹 기동(마커 탐색→중심선 정렬→접근→회전→후진)은 DdaGo 가
-    하고, 여기서 보는 것은 **중계가 값을 잃지 않는가**다. 특히 final_lateral_m(중심선
+    DCS 는 중계자다. 실제 도킹 기동(마커 탐색→정렬→접근→회전→후진)은 DdaGo 가 하고,
+    여기서 보는 것은 **중계가 값을 잃지 않는가**다. 특히 final_lateral_m(중심선/법선
     이탈)·final_yaw_error(스큐)는 ACS 가 도킹 품질을 판정하는 근거라 빠지면 안 된다.
+
+    방식(charuco/floor/reflective)이 셋이지만 DCS 로그 문구는 같아서(방식=… 만 다름)
+    판정 절차를 공유한다. cmd 는 dashboard.sh 서브커맨드(dock/floor-dock/…).
     """
     clear_wire()   # 실행 시 메시지 초기화
     t0 = time.time()   # 이번 실행 기준 시각 — 낡은 로그를 판정에서 배제(_tail_since)
-    _trigger_dock()
+    subprocess.run(['bash', DASH, cmd], capture_output=True, text=True, timeout=90)
 
     keys = ['도킹 지시 수신', '도킹 하달', '도킹 종료', '도킹 결과 전달']
 
@@ -297,6 +294,43 @@ def eval_e4():
     return ok, dcs or ['(DCS 로그 없음 — dcs/ddago UP 확인)']
 
 
+def eval_e4():
+    """E4 순찰 종료 후 복귀 및 충전 — **복귀 주행 → 충전소 도킹 2단계**.
+
+    1) ACS 가 충전소까지 경로를 전 구간 capture=false 로 하달 → DCS→DdaGo 중계 (촬영 없음)
+    2) 도착 후 ReflectiveDock 하달 → DCS→DdaGo 중계 → 결과(뒤끝~마커 갭·법선이탈·스큐) 반환
+
+    도킹만 단발로 찔러 보던 것을 시나리오 전체로 바꿨다. 충전소 마커는 반사테이프이고
+    ACS 라우팅(docking.method_for: CHARGE_*→reflective)도 그렇게 정해져 있어, 지점 id 만
+    충전소로 주면 방식은 자동으로 정해진다. charuco 는 어느 지점도 쓰지 않는 휴면 방식이라
+    버튼에서 뺐다(`dashboard.sh dock` 으로 손수 하달할 수 있고, 중계 자체는 test_e2e 가
+    3방식 모두 검증한다).
+
+    판정: 복귀 주행 경로 접수 → 도킹 지시 접수 → 도킹 결과 code=0 이 DCS 로그에 모두 남는지.
+    이동 중 촬영이 없어야 하지만(capture=false) 그건 s2e2 와 같은 경로라 여기서 또 보지 않는다.
+    """
+    clear_wire()   # 실행 시 메시지 초기화
+    t0 = time.time()   # 이번 실행 기준 시각 — 낡은 로그를 판정에서 배제(_tail_since)
+    subprocess.run(['bash', DASH, 'return-dock'], capture_output=True, text=True, timeout=40)
+
+    keys = ['경로 수신', '도킹 지시 수신', '도킹 종료', '도킹 결과 전달']
+
+    def done():
+        dcs = _tail_since('/tmp/dash_dcs.log', keys, t0, n=20)
+        return (any('경로 수신' in l for l in dcs)                 # 1) 복귀 주행 접수
+                and any('도킹 지시 수신' in l for l in dcs)         # 2) 도킹 접수
+                and any('도킹 결과 전달' in l and 'code=0' in l for l in dcs))
+
+    ok = _wait_until(done, 40)
+    dcs = _tail_since('/tmp/dash_dcs.log', keys, t0, n=10)
+    return ok, dcs or ['(DCS 로그 없음 — dcs·acs·ddago UP 확인)']
+
+
+def eval_e4_floor():
+    """바닥 H 마커 도킹 중계 — 수확지·예냉실(S2 E2·E5)에서 쓰는 방식."""
+    return _eval_dock('floor-dock')
+
+
 def _trigger_harvest_move():
     """ACS 역할로 수확 이동+도킹 하달(dashboard.sh harvest-move). 서비스 호출은 즉시 반환하고
     시나리오는 백그라운드로 돈다(완주는 아래 eval 이 로그로 폴링)."""
@@ -305,7 +339,7 @@ def _trigger_harvest_move():
 
 def eval_s2e2():
     """S2 E2 수확 위치 이동+도킹: ACS→DCS 로 수확지점까지 경로(전 구간 capture=false) 접수 →
-    DCS→DdaGo 중계 → 도착 후 Dock 하달·중계 → 도킹 성공 시 E3 진입 게이트 오픈까지.
+    DCS→DdaGo 중계 → 도착 후 FloorDock(H마커) 하달·중계 → 도킹 성공 시 E3 진입 게이트 오픈까지.
 
     순찰(E1·E2)과 달리 이동 중 촬영·분석이 없다(capture=false → 분석 경로 미진입). 판정은
     '경로 수신 → 도킹 지시 수신 → 도킹 결과 전달(code=0) → E3 진입 가능(도킹 성공)' 4단계가
@@ -429,9 +463,11 @@ def eval_s2e6():
 
 
 EVALS = {'e0': eval_e0, 'e1': eval_e1, 'e2': eval_e2, 'e4': eval_e4,
+         'e4floor': eval_e4_floor,
          's2e2': eval_s2e2, 's2e3': eval_s2e3, 's2e6': eval_s2e6}
 EVAL_NAMES = {'e0': 'E0 상시 모니터링', 'e1': 'E1 순찰 시작', 'e2': 'E2 체크·저장',
-              'e4': 'E4 복귀·도킹', 's2e2': 'S2 E2 수확 이동·도킹',
+              'e4': 'E4 순찰 종료 후 복귀 및 충전', 'e4floor': 'H마커 도킹 중계',
+              's2e2': 'S2 E2 수확 이동·도킹',
               's2e3': 'S2 E3 수확 대상 인식', 's2e6': 'S2 E6 예냉실 하역'}
 
 

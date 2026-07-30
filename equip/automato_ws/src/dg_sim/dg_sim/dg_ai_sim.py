@@ -15,7 +15,7 @@ DCS 가 붙는 쪽이다(실서버 대역).
 환경변수:
   DG_AI_SIM_HOST (기본 0.0.0.0)
   DG_AI_SIM_PORT (기본 9100)
-  DG_AI_SIM_SAVE_DIR (기본 automato_ws/dg_ai_recv) — 수신 이미지 저장 폴더
+  DG_AI_SIM_SAVE_DIR (기본 ~/dg_sim_data/dg_ai_recv) — 수신 이미지 저장 폴더
 
 실행: ros2 run dg_sim dg_ai_sim   (ROS 의존 없음, 순수 TCP)
 """
@@ -32,10 +32,13 @@ import time
 RESP_DELAY = 3.0
 # E3 병해충 알림 발동 기준(이 값 이상일 때만 라벨 이미지를 실어 보낸다)
 DISEASE_ALERT_PCT = 5
-# 수신 이미지 저장 폴더
+# 수신 이미지 저장 폴더. 기본값은 홈의 ~/dg_sim_data/dg_ai_recv.
+# 예전 기본값은 사라진 클론 경로(roscamp-rp108-navigate/...)를 가리켜, 저장할 때마다
+# os.makedirs 가 그 빈 트리를 워크스페이스 옆에 되살렸다. 시뮬 산출물은 저장소나
+# 워크스페이스가 아니라 홈 한 곳에 모은다(레포에 섞이지 않고, 클론을 옮겨도 안 깨진다).
 SAVE_DIR = os.environ.get(
     'DG_AI_SIM_SAVE_DIR',
-    '/home/ane/dev_ws/roscamp-rp108-navigate/equip/automato_ws/dg_ai_recv')
+    os.path.join(os.path.expanduser('~'), 'dg_sim_data', 'dg_ai_recv'))
 
 
 def save_received_image(req):

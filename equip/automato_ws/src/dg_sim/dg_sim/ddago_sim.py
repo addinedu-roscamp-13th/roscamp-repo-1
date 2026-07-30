@@ -13,13 +13,18 @@
         - **capture==true 노드에서만** RGB 촬영 흉내 → DCS 로 AnalyzeFrame 분석요청 (E2 3단계)
         - 취소(cancel) 요청 시 그 자리에서 중단 → result_code=2, 도달한 마지막 노드 반환
   E2    AnalyzeFrame 서비스 클라이언트 (→ DCS)    /dg/analyze_frame
-  E4-6  Dock 액션 서버 (DCS ← )                  /ddago/dock
-        - 실제 도킹 기동(마커 탐색→중심선 정렬→접근→180도 회전→후진)은 하지 않는다.
-          phase 를 순서대로 흘려보내 **DCS 의 중계**(feedback·result·cancel)를 검증한다.
+  E4-6  정밀 도킹 액션 서버 3종 (DCS ← )         /ddago/{dock,floor_dock,reflective_dock}
+        - 실제 도킹 기동(마커 탐색→정렬→접근→회전→후진)은 하지 않는다. 방식별 phase 를
+          순서대로 흘려보내 **DCS 의 중계**(feedback·result·cancel)를 검증한다.
         - 취소 요청 시 그 자리에서 CANCELED + result_code=3
         - dock_mode 로 실패를 주입한다: success(0) / no_marker(1) / error_exceeded(2) /
           hang(무응답 → DCS timeout). 테스트가 self.dock_mode 를 바꿔 4종을 검증한다.
+          모드는 3종이 공유한다(같은 로봇의 같은 도킹 실패 양상이라 방식별로 나눌 게 없다).
+        - 동시에 실행된 도킹 goal 수를 dock_concurrent_max 에 기록한다 — DCS 가 방식이
+          다른 도킹까지 하나의 락으로 직렬화하는지 테스트가 이 값으로 확인한다.
 """
+import collections
+import functools
 import os
 import threading
 import time
@@ -33,7 +38,7 @@ from rclpy.node import Node
 
 from std_srvs.srv import Trigger
 
-from automato_interfaces.action import Dock, Navigate
+from automato_interfaces.action import Dock, FloorDock, Navigate, ReflectiveDock
 from automato_interfaces.msg import DdagoTelemetry
 from automato_interfaces.srv import AnalyzeFrame
 from sensor_msgs.msg import Image
@@ -98,18 +103,26 @@ class DdagoSim(Node):
             cancel_callback=lambda _gh: CancelResponse.ACCEPT,
             callback_group=self._cb)
 
-        # E4 Dock 서버. 실기동 대신 phase 를 순서대로 흘려 DCS 중계를 검증한다.
-        self._dock_srv = ActionServer(
-            self, Dock, '/ddago/dock',   # 연동에 robot_id 미사용
-            execute_callback=self._dock_execute,
-            cancel_callback=lambda _gh: CancelResponse.ACCEPT,
-            callback_group=self._cb)
+        # E4 도킹 서버 3종. 실기동 대신 방식별 phase 를 순서대로 흘려 DCS 중계를 검증한다.
+        self._dock_srv = {}
+        for spec in self.DOCK_KINDS:
+            self._dock_srv[spec.name] = ActionServer(
+                self, spec.action, '/ddago/%s' % spec.name,   # 연동에 robot_id 미사용
+                execute_callback=functools.partial(self._dock_execute, spec),
+                cancel_callback=lambda _gh: CancelResponse.ACCEPT,
+                callback_group=self._cb)
+        # 동시에 실행 중인 도킹 goal 수(직렬화 확인용). DCS 가 방식이 다른 도킹까지
+        # _ddago_lock 하나로 묶으므로 정상이면 최대 1 이다.
+        self._dock_active = 0
+        self._dock_active_lock = threading.Lock()
+        self.dock_concurrent_max = 0
 
         self._analyze_cli = self.create_client(
             AnalyzeFrame, '/dg/analyze_frame', callback_group=self._cb)
 
-        self.get_logger().info('DdaGo 시뮬 시작: /ddago/{telemetry,navigate,dock} (dock_mode=%s)'
-                               % self.dock_mode)
+        self.get_logger().info(
+            'DdaGo 시뮬 시작: /ddago/{telemetry,navigate,%s} (dock_mode=%s)'
+            % (','.join(s.name for s in self.DOCK_KINDS), self.dock_mode))
 
     VALID_DOCK_MODES = ('success', 'no_marker', 'error_exceeded', 'hang')
 
@@ -215,10 +228,14 @@ class DdagoSim(Node):
             self._nav_status = 'IDLE'
 
     # ---- E2 분석 요청 (→ DCS) ----
-    # ---- E4-6 Dock (DCS ← ) : 실기동 대신 phase 만 흘려 중계를 검증 ----
-    # 실제 도킹은 ddago_control/dock_server 가 카메라·odom 으로 수행한다. 여기서는
-    # DCS 가 goal 을 그대로 넘기는지, feedback/result 를 손실 없이 되돌리는지,
-    # 취소가 끝까지 전파되는지만 본다.
+    # ---- E4-6 정밀 도킹 3종 (DCS ← ) : 실기동 대신 phase 만 흘려 중계를 검증 ----
+    # 실제 도킹은 ddago_control 의 dock_server/floor_dock_server/reflective_dock_server 가
+    # 카메라·라이다·odom 으로 수행한다. 여기서는 DCS 가 goal 을 그대로 넘기는지,
+    # feedback/result 를 손실 없이 되돌리는지, 취소가 끝까지 전파되는지만 본다.
+    #
+    # phase 표: (phase 이름, 거리 [m], 마커가 보이는가). 값 자체에 의미는 없고 실물이
+    # 흘리는 순서를 흉내 낸다. 방식마다 이름 집합이 다르다는 것이 중계 검증의 핵심이다
+    # (DCS 가 phase 를 해석하지 않고 문자열 그대로 올려야 한다).
     DOCK_PHASES = [
         ('SEARCHING', 0.50, True),
         ('CENTERING', 0.40, True),
@@ -227,19 +244,68 @@ class DdagoSim(Node):
         ('ROTATING', 0.24, True),
         ('REVERSING', 0.00, False),   # 180도 돈 뒤라 카메라가 보드를 못 본다
     ]
+    FLOOR_DOCK_PHASES = [
+        ('SEARCH', 0.60, True),
+        ('CENTERLINE', 0.50, True),
+        ('ALIGN', 0.40, True),
+        ('FACE', 0.35, True),
+        ('STAGED', 0.30, True),
+        ('TURN', 0.30, False),        # 180도 회전 중 — 바닥 H 가 화면에서 벗어난다
+        ('REVERSE', 0.00, False),     # 후진 접붙임(뒤는 카메라가 못 본다)
+        ('DONE', 0.00, False),
+    ]
+    REFLECTIVE_DOCK_PHASES = [
+        ('SNAP', 0.90, True),         # 멈춘 채 마커 법선 스냅
+        ('TURN1', 0.90, True),
+        ('DRIVE', 0.60, True),
+        ('TURN2', 0.45, True),
+        ('APPROACH', 0.20, True),     # 라이다라 가까워져도 계속 보인다
+        ('CREEP', 0.05, False),       # 마지막 블라인드 후진
+    ]
 
-    def _dock_execute(self, goal_handle):
+    # 도킹 방식 3종의 시뮬 사양. 액션 타입·이름·phase 표에 더해, 방식마다 이름과 뜻이
+    # 다른 앞뒤 오차 필드(gap_field/gap_ok)와 feedback 거리 필드(dist_field)를 적어 둔다.
+    #   charuco    final_error_m     목표 대비 최종 위치 오차
+    #   floor      final_wall_gap_m  후면~벽 간격(실측 20~30mm)
+    #   reflective final_gap_m       뒤끝~마커 간격
+    DockKind = collections.namedtuple(
+        'DockKind', 'action name phases gap_field gap_ok dist_field')
+    DOCK_KINDS = (
+        DockKind(Dock, 'dock', DOCK_PHASES,
+                 'final_error_m', 0.012, 'distance_to_marker_m'),
+        DockKind(FloorDock, 'floor_dock', FLOOR_DOCK_PHASES,
+                 'final_wall_gap_m', 0.025, 'distance_to_wall_m'),
+        DockKind(ReflectiveDock, 'reflective_dock', REFLECTIVE_DOCK_PHASES,
+                 'final_gap_m', 0.020, 'distance_to_marker_m'),
+    )
+
+    def _dock_execute(self, spec, goal_handle):
         req = goal_handle.request
         mode = self.dock_mode      # 실행 시점의 모드(테스트가 케이스마다 바꾼다)
+        with self._dock_active_lock:
+            self._dock_active += 1
+            self.dock_concurrent_max = max(self.dock_concurrent_max, self._dock_active)
+        try:
+            return self._dock_run(spec, goal_handle, req, mode)
+        finally:
+            with self._dock_active_lock:
+                self._dock_active -= 1
+
+    def _dock_run(self, spec, goal_handle, req, mode):
         # 실물 dock_server 도 도킹 goal 을 받으면 /ddago/current_task 로 task_id 를 알린다
         # → 텔레메트리의 task_id 를 같이 맞춘다. 반면 nav_status 는 건드리지 않는다:
         # 도킹 기동은 Nav2 goal 이 아니라 dock_server 가 cmd_vel 을 직접 내는 것이라
         # 실물도 도킹 중 nav_status 는 IDLE 이다(가용 판정은 DB 의 활성 task 가 막는다).
         self._task_id = req.task_id
+        # goal 필드는 방식마다 다르다(charuco 만 마커 규격을 싣고, floor/reflective 는
+        # 마커리스라 목표 정차값뿐이다). 공통분(task/point) 밖은 있는 것만 그대로 찍는다.
+        extra = ' '.join(
+            '%s=%s' % (f, getattr(req, f))
+            for f in req.get_fields_and_field_types()
+            if f not in ('task_id', 'task_point_id'))
         self.get_logger().info(
-            '도킹 goal 수신: task=%d point=%s marker=%s %dx%d sq=%.3f mk=%.3f mode=%s'
-            % (req.task_id, req.task_point_id, req.marker_id,
-               req.squares_x, req.squares_y, req.square_size_m, req.marker_size_m, mode))
+            '도킹 goal 수신: 방식=%s task=%d point=%s %s mode=%s'
+            % (spec.name, req.task_id, req.task_point_id, extra, mode))
 
         # hang: 결과를 돌려주지 않는다 → DCS 의 dock_result_timeout 검증용.
         # 취소/종료 시 빠져나오도록 유계 루프로 대기(테스트 teardown 안전).
@@ -249,7 +315,7 @@ class DdagoSim(Node):
             while rclpy.ok() and not goal_handle.is_cancel_requested and waited < 4.0:
                 time.sleep(0.1)
                 waited += 0.1
-            r = Dock.Result()
+            r = spec.action.Result()
             r.result_code = 3
             r.message = 'hang 종료'
             # 종료(shutdown) 중이면 서버가 이미 내려가 상태 전이가 예외를 던진다 → 건드리지 않는다.
@@ -265,27 +331,27 @@ class DdagoSim(Node):
                 pass
             return r
 
-        per = self.move_delay / len(self.DOCK_PHASES) if self.move_delay > 0 else 0.0
-        for phase, dist, seen in self.DOCK_PHASES:
+        per = self.move_delay / len(spec.phases) if self.move_delay > 0 else 0.0
+        for phase, dist, seen in spec.phases:
             if goal_handle.is_cancel_requested:
                 self.get_logger().warn('취소 요청 → 도킹 중단 (phase=%s)' % phase)
                 goal_handle.canceled()
-                r = Dock.Result()
+                r = spec.action.Result()
                 r.result_code = 3            # 3: 중단
                 r.message = '취소로 중단 (phase=%s)' % phase
                 return r
-            fb = Dock.Feedback()
+            fb = spec.action.Feedback()
             fb.phase = phase
             fb.marker_detected = seen
-            fb.distance_to_marker_m = float(dist)
+            setattr(fb, spec.dist_field, float(dist))   # 거리 필드 이름이 방식마다 다르다
             goal_handle.publish_feedback(fb)
             if per > 0:
                 time.sleep(per)
-            # no_marker: 탐색 단계에서 마커를 못 찾고 실패(code 1)
-            if mode == 'no_marker' and phase == 'SEARCHING':
+            # no_marker: 첫 단계(탐색/스냅)에서 마커를 못 찾고 실패(code 1)
+            if mode == 'no_marker' and phase == spec.phases[0][0]:
                 self.get_logger().warn('마커 미검출 시뮬 → code=1')
                 goal_handle.abort()
-                r = Dock.Result()
+                r = spec.action.Result()
                 r.result_code = 1
                 r.message = '마커 미검출(시뮬)'
                 return r
@@ -294,24 +360,24 @@ class DdagoSim(Node):
         if mode == 'error_exceeded':
             self.get_logger().warn('정차 오차 초과 시뮬 → code=2')
             goal_handle.abort()
-            r = Dock.Result()
+            r = spec.action.Result()
             r.result_code = 2
             r.final_lateral_m = 0.085     # 목표(예: 2cm) 크게 초과
             r.final_yaw_error = 0.20
-            r.final_error_m = abs(r.final_lateral_m)
+            setattr(r, spec.gap_field, spec.gap_ok)
             r.message = '정차 오차 초과(시뮬)'
             return r
 
-        r = Dock.Result()
+        r = spec.action.Result()
         r.result_code = 0
         # 실장비 실측(ddago03)과 같은 자릿수의 값을 돌려 ACS 쪽 표시를 확인할 수 있게 한다.
-        r.final_lateral_m = -0.012        # 중심선 이탈(좌우)
+        r.final_lateral_m = -0.012        # 중심선/법선 이탈(좌우)
         r.final_yaw_error = 0.021         # 스큐
-        r.final_error_m = abs(r.final_lateral_m)
+        setattr(r, spec.gap_field, spec.gap_ok)
         r.message = '도킹 완료(시뮬)'
         goal_handle.succeed()
-        self.get_logger().info('도킹 완료(시뮬): task=%d lateral=%.3fm yaw=%.3frad'
-                               % (req.task_id, r.final_lateral_m, r.final_yaw_error))
+        self.get_logger().info('도킹 완료(시뮬): 방식=%s task=%d lateral=%.3fm yaw=%.3frad'
+                               % (spec.name, req.task_id, r.final_lateral_m, r.final_yaw_error))
         return r
 
     def _request_analyze(self, task_id, waypoint_id):

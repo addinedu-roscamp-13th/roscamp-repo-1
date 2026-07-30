@@ -12,7 +12,10 @@
 #   ./dashboard.sh harvest-move  # S2 E2 수확 이동+도킹 1회 (ACS: /acs_sim/start_harvest_move)
 #   ./dashboard.sh harvest       # S2 E3 수확 시작 1회 (도킹 성공 task 로 Harvest 하달)
 #   ./dashboard.sh unload        # S2 E6 하역 시작 1회 (도킹 성공 task 로 Unload 하달)
-#   ./dashboard.sh dock          # E4 도킹 goal 단발 하달 (ACS 역할: /{ROBOT_ID}/dock)
+#   ./dashboard.sh dock          # charuco 도킹 단발 하달 (휴면 방식, 수동 확인용)
+#   ./dashboard.sh floor-dock      # H마커 도킹 단발 하달 (/{ROBOT_ID}/floor_dock)
+#   ./dashboard.sh reflective-dock # 반사테이프 도킹 단발 하달 (/{ROBOT_ID}/reflective_dock, E4 충전소)
+#   ./dashboard.sh return-dock   # E4 복귀 주행+충전소 도킹 2단계 (ACS: /acs_sim/start_return)
 #   ./dashboard.sh stop  <노드>  # 특정 노드만 내림  (dcs|acs|ddago|ddagi|dg_ai|rosbridge|web)
 #   ./dashboard.sh start <노드>  # 특정 노드만 올림
 #
@@ -135,12 +138,20 @@ run_test() {
 }
 
 # S2 E2 수확 위치 이동+도킹 1회 실행 (acs_sim 의 start_harvest_move 서비스 호출).
-#   ACS: 수확 위치까지 전 구간 capture=false 로 주행 → 도착 후 Dock 하달
+#   ACS: 수확 위치까지 전 구간 capture=false 로 주행 → 도착 후 FloorDock(H마커) 하달
 #        → DCS 가 /{ROBOT_ID}/{navigate,dock} 중계 → DdaGo 시뮬이 응답.
 # 도킹 실패를 보려면 먼저 DdaGo 시뮬 모드를 바꾼다(성공 복귀는 dock_mode:=success):
 #   ros2 param set /ddago_sim dock_mode no_marker   # 또는 error_exceeded / hang
 run_harvest_move() {
   bash -c "$SRC; ros2 service call /acs_sim/start_harvest_move std_srvs/srv/Trigger" 2>&1
+}
+
+# E4 순찰 종료 후 복귀 및 충전 — 2단계(복귀 주행 → 충전소 도킹) 1회 실행.
+#   ACS: 충전소까지 전 구간 capture=false 로 주행 → 도착 후 ReflectiveDock 하달
+#   (충전소 마커가 반사테이프. 지점 id CHARGE_* 에서 방식이 자동으로 정해진다.)
+#   서비스 호출은 즉시 반환하고 시나리오는 백그라운드로 돈다(완주는 대시보드 eval 이 로그로 폴링).
+run_return_dock() {
+  bash -c "$SRC; ros2 service call /acs_sim/start_return std_srvs/srv/Trigger" 2>&1
 }
 
 # S2 E3 수확 시작 1회 실행 (acs_sim 의 start_harvest 서비스 호출).
@@ -172,8 +183,9 @@ run_telemetry_stop() {
   bash -c "$SRC; ros2 service call /ddago_sim/stop_telemetry std_srvs/srv/Trigger; ros2 service call /ddagi_sim/stop_telemetry std_srvs/srv/Trigger" 2>&1
 }
 
-# E4-6 정밀 도킹: ACS 역할로 Dock goal 을 DCS 에 하달한다.
+# charuco 정밀 도킹: ACS 역할로 Dock goal 을 DCS 에 하달한다.
 #   ACS → DCS(/{ROBOT_ID}/dock) → DdaGo(/ddago/dock) 중계 사슬을 한 번에 태운다.
+# 현재 어느 지점도 charuco 를 쓰지 않는다(E4 충전소 복귀는 reflective-dock). 휴면 경로 확인용.
 # 마커 정보는 실제로는 ACS 가 DB(작업 지점의 ChArUco 보드)에서 조회해 채운다.
 # 아래 값은 현장 보드(mid24 스테이션 A): 6x5칸, 칸 24mm / 마커 18mm, 시작 ID 500.
 run_dock() {
@@ -181,6 +193,20 @@ run_dock() {
     '{task_id: 1024, task_point_id: CHARGE_01, marker_id: \"500\",
       dictionary: DICT_5X5_1000, squares_x: 6, squares_y: 5,
       square_size_m: 0.024, marker_size_m: 0.018}' --feedback" 2>&1
+}
+
+# 도킹 방식 나머지 둘(RP-131) — 바닥 H 마커(수확지·예냉실) / 반사테이프(충전소).
+# charuco 와 달리 **마커리스**라 goal 에 마커 규격이 없다. 목표 정차값을 0 으로 두면
+# 로봇 노드(반사테이프는 로봇별 config yaml)의 기본값을 쓴다 — 실제 ACS 도 그렇게 보낸다.
+run_floor_dock() {
+  bash -c "$SRC; ros2 action send_goal /$ROBOT_ID/floor_dock automato_interfaces/action/FloorDock \
+    '{task_id: 1024, task_point_id: HARVEST_01, wall_gap_m: 0.0, lateral_offset_m: 0.0}' \
+    --feedback" 2>&1
+}
+run_reflective_dock() {
+  bash -c "$SRC; ros2 action send_goal /$ROBOT_ID/reflective_dock \
+    automato_interfaces/action/ReflectiveDock \
+    '{task_id: 1024, task_point_id: CHARGE_01, stop_gap_m: 0.0}' --feedback" 2>&1
 }
 
 # 최근 흐름 로그(분석→저장→순찰결과)만 추려 출력.
@@ -205,6 +231,9 @@ case "${1:-}" in
   telemetry)      run_telemetry ;;
   telemetry-stop) run_telemetry_stop ;;
   dock)           run_dock ;;
+  floor-dock)      run_floor_dock ;;
+  reflective-dock) run_reflective_dock ;;
+  return-dock)     run_return_dock ;;
   logs)           logs ;;
-  *) echo "usage: $0 {up [--no-sim]|down|status|restart [--no-sim]|test|harvest-move|harvest|unload|dock|telemetry|telemetry-stop|logs|stop <node>|start <node>}  # node: dcs|acs|ddago|ddagi|dg_ai|rosbridge|web"; exit 1 ;;
+  *) echo "usage: $0 {up [--no-sim]|down|status|restart [--no-sim]|test|harvest-move|harvest|unload|dock|floor-dock|reflective-dock|return-dock|telemetry|telemetry-stop|logs|stop <node>|start <node>}  # node: dcs|acs|ddago|ddagi|dg_ai|rosbridge|web"; exit 1 ;;
 esac
