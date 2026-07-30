@@ -817,14 +817,18 @@ function busyLabel(r){ return (r.unavailable_reason==='ROBOT_BUSY')?(WORK_LABEL[
 const TASK_LABEL={PATROL:'순찰',HARVEST:'수확',TRANSFER:'이송'};
 // 로봇 역할: dg_03=순찰·운반 전용, dg_01·dg_02=수확 전용
 const ROLE={dg_01:'수확',dg_02:'수확',dg_03:'순찰·운반'};
+// 배터리 표시용 반올림. ACS 는 float32 라 89.30999755859375 처럼 내려온다 —
+// 화면에서만 소수 1자리로 줄인다(ACS 응답 원문은 건드리지 않는다). 값이 없으면 '—'.
+function bat(v){ return (v===null||v===undefined||isNaN(v))?'—':(Math.round(v*10)/10); }
 // 최상단 "이상 없나?" 경고 배너 — 긴급/주의/이상없음. 로봇 문제 + 작물(병해충·썩음) 임계 판정.
 function renderAlertBanner(){
   var el=document.getElementById('alertBanner'); if(!el)return;
   var robots=window._lastRobots||[], crop=window._heatCrop||null;
   var urgent=[], warn=[];
+  // 오프라인은 경보로 올리지 않는다 — 로봇 전원을 아직 안 켠 상태에서도 계속 울려
+  //   정작 봐야 할 병해충·갇힘 경보가 묻힌다. 오프라인 여부는 로봇 카드에서 이미 보인다.
   robots.forEach(function(r){ var u=r.unavailable_reason;
     if(u==='IMMOBILIZED') urgent.push(r.robot_id+' 갇힘(개입 필요)');
-    else if(u==='ROBOT_OFFLINE') urgent.push(r.robot_id+' 오프라인');
     else if(u==='BATTERY_TOO_LOW') warn.push(r.robot_id+' 배터리 부족');
   });
   if(crop){ var tot=(crop.ripe||0)+(crop.unripe||0)+(crop.pest||0)+(crop.rot||0)||1;
@@ -836,7 +840,9 @@ function renderAlertBanner(){
   var pad='border-radius:12px;padding:13px 18px;font-size:15.5px;font-weight:800;display:flex;align-items:center;gap:9px;';
   if(urgent.length) el.innerHTML='<div style="'+pad+'background:#e0483a;color:#fff;box-shadow:0 4px 16px rgba(224,72,58,.4);animation:alertPulse 1.5s ease-in-out infinite">🚨 조치 필요 — '+urgent.join(' · ')+(warn.length?'<span style="font-weight:500;font-size:13px;opacity:.92"> · '+warn.join(' · ')+'</span>':'')+'</div>';
   else if(warn.length) el.innerHTML='<div style="'+pad+'background:#fbe4c0;border-left:6px solid #e8912d;color:#8a4f0a">⚠️ 주의 — '+warn.join(' · ')+'</div>';
-  else el.innerHTML='<div style="'+pad+'background:#eafaef;border:1px solid #a9d8b5;color:#1d6a35;font-weight:700">✓ 이상 없음 — 로봇·작물 모두 정상</div>';
+  // '로봇·작물 모두 정상' 이라고 단정하지 않는다 — 로봇이 안 붙었거나 순찰을 아직 안 한
+  // 상태에서도 이 문구가 떠서, 점검한 적 없는 것을 확인해서 정상이라고 한 것처럼 읽혔다.
+  else el.innerHTML='<div style="'+pad+'background:#eafaef;border:1px solid #a9d8b5;color:#1d6a35;font-weight:700">✓ 이상 없음</div>';
 }
 // 순찰/수확 요청: 자동배정/직접선택 토글 1개 공유(로봇 상태 헤더). 직접선택 시 위 로봇카드를 눌러 선택.
 // 순찰차 1대(dg_03), 수확차 2대(dg_01·dg_02)
@@ -906,7 +912,7 @@ function renderFleet(){
       +'<div style="display:flex;justify-content:space-between;align-items:center;gap:6px"><span style="font-weight:700;font-size:15px">'+r.robot_id+'<span style="font-weight:400;font-size:11px;color:var(--muted);margin-left:5px">'+(ROLE[r.robot_id]||'')+'</span></span>'
       +'<span style="font-size:12px;font-weight:700;padding:3px 9px;border-radius:20px;background:'+s.bg+';color:'+s.fg+'">'+s.t+'</span></div>'
       +'<div style="font-size:13px;color:var(--muted);margin-top:6px">현재 작업: <b style="color:var(--ink)">'+(r.task_type?(TASK_LABEL[r.task_type]||r.task_type):'없음')+'</b>'+(sel?' <span style="color:var(--leaf-d);font-weight:700">· 선택됨</span>':'')+'</div>'
-      +'<div style="font-size:13px;margin-top:3px;display:flex;align-items:center;gap:6px">배터리 '+r.battery_percent+'%'
+      +'<div style="font-size:13px;margin-top:3px;display:flex;align-items:center;gap:6px">배터리 '+bat(r.battery_percent)+'%'
         +'<span style="flex:1;max-width:80px;height:6px;background:#eef2f0;border-radius:4px"><span style="display:block;width:'+Math.max(0,Math.min(100,r.battery_percent))+'%;height:100%;border-radius:4px;background:'+bc+'"></span></span></div></div>';
   }
   var harvestR=robots.filter(function(r){return ROLE[r.robot_id]!=='순찰·운반';});   // 수확 = 왼쪽 절반
@@ -942,7 +948,7 @@ async function loadPatrol(){
     let html='<div style="padding:16px;max-width:780px;margin:0 auto">';
     html+='<h3 style="margin:0 0 8px">1. 배정 방식</h3>';
     html+='<div style="display:flex;border:2px solid var(--leaf);border-radius:12px;overflow:hidden;max-width:380px;margin-bottom:8px">'+segBtn('setPatrolPick','auto','⚡ 자동 배정',patrolPick==='auto')+segBtn('setPatrolPick','manual','👆 직접 선택',patrolPick==='manual')+'</div>';
-    html+='<div style="font-size:13px;color:var(--muted);margin-bottom:18px">'+(patrolPick==='auto'?('<b>대기중</b>이면서 배터리가 가장 높은 로봇을 자동 배정'+(autoPick?' → <b>'+autoPick.robot_id+'</b> (🔋'+autoPick.battery_percent+'%)':'')):'아래 <b>순찰 가능 로봇</b>에서 보낼 로봇 <b>1대</b>를 눌러 선택하세요')+'</div>';
+    html+='<div style="font-size:13px;color:var(--muted);margin-bottom:18px">'+(patrolPick==='auto'?('<b>대기중</b>이면서 배터리가 가장 높은 로봇을 자동 배정'+(autoPick?' → <b>'+autoPick.robot_id+'</b> (🔋'+bat(autoPick.battery_percent)+'%)':'')):'아래 <b>순찰 가능 로봇</b>에서 보낼 로봇 <b>1대</b>를 눌러 선택하세요')+'</div>';
     html+='<h3 style="margin:0 0 8px">2. 순찰 가능 로봇</h3>';
     html+='<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">';
     d.robots.forEach(r=>{
@@ -951,7 +957,7 @@ async function loadPatrol(){
       const bd=selected?'#1d8a3e':(ok?'#a9d8b5':'var(--line)'), bg=selected?'#eafaef':(ok?'#f7fbf8':'#f6f7f6');
       html+='<div '+(clickable?'onclick="selectPatrolRobot(\''+r.robot_id+'\')" ':'')+'style="flex:1;min-width:190px;border:2px solid '+bd+';border-radius:12px;padding:14px 16px;background:'+bg+';'+(clickable?'cursor:pointer;':(ok?'':'opacity:.7;'))+'transition:.12s">'
         +'<div style="display:flex;align-items:center;justify-content:space-between"><span style="font-weight:700;font-size:16px">'+(ok?'🟢 ':'⚪ ')+r.robot_id+'</span>'+(selected?'<span style="color:#1d8a3e;font-weight:800;font-size:14px">✓ 선택됨</span>':(clickable?'<span style="font-size:14px;color:#1d8a3e">눌러 선택</span>':''))+'</div>'
-        +'<div style="font-size:14px;color:var(--muted);margin-top:6px">🔋 '+r.battery_percent+'%</div>'
+        +'<div style="font-size:14px;color:var(--muted);margin-top:6px">🔋 '+bat(r.battery_percent)+'%</div>'
         +'<div style="font-size:14px;margin-top:6px;color:'+(ok?'#1d8a3e':'#b0392b')+'">'+(ok?'배정 가능':(busyLabel(r)||PATROL_REASON[r.unavailable_reason]||r.status))+'</div></div>';
     });
     html+='</div>';
@@ -998,7 +1004,7 @@ async function loadHarvest(){
     let html='<div>';
     html+='<h3 style="margin:0 0 8px">1. 배정 방식</h3>';
     html+='<div style="display:flex;border:2px solid var(--leaf);border-radius:12px;overflow:hidden;max-width:380px;margin-bottom:8px">'+segBtn('setHarvestPick','auto','⚡ 자동 배정',harvestPick==='auto')+segBtn('setHarvestPick','manual','👆 직접 선택',harvestPick==='manual')+'</div>';
-    html+='<div style="font-size:13px;color:var(--muted);margin-bottom:18px">'+(harvestPick==='auto'?('<b>로봇팔 탑재·대기중</b>이면서 배터리가 가장 높은 로봇을 자동 배정'+(autoPick?' → <b>'+autoPick.robot_id+'</b> (🔋'+autoPick.battery_percent+'%)':'')):'아래 <b>수확 가능 로봇</b>에서 보낼 로봇 <b>1대</b>를 눌러 선택하세요')+'</div>';
+    html+='<div style="font-size:13px;color:var(--muted);margin-bottom:18px">'+(harvestPick==='auto'?('<b>로봇팔 탑재·대기중</b>이면서 배터리가 가장 높은 로봇을 자동 배정'+(autoPick?' → <b>'+autoPick.robot_id+'</b> (🔋'+bat(autoPick.battery_percent)+'%)':'')):'아래 <b>수확 가능 로봇</b>에서 보낼 로봇 <b>1대</b>를 눌러 선택하세요')+'</div>';
     html+='<h3 style="margin:0 0 8px">2. 수확 가능 로봇</h3>';
     html+='<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">';
     d.robots.forEach(r=>{
@@ -1007,7 +1013,7 @@ async function loadHarvest(){
       const bd=selected?'#1d8a3e':(ok?'#a9d8b5':'var(--line)'), bg=selected?'#eafaef':(ok?'#f7fbf8':'#f6f7f6');
       html+='<div '+(clickable?'onclick="selectHarvestRobot(\''+r.robot_id+'\')" ':'')+'style="flex:1;min-width:190px;border:2px solid '+bd+';border-radius:12px;padding:14px 16px;background:'+bg+';'+(clickable?'cursor:pointer;':(ok?'':'opacity:.7;'))+'transition:.12s">'
         +'<div style="display:flex;align-items:center;justify-content:space-between"><span style="font-weight:700;font-size:16px">'+(ok?'🟢 ':'⚪ ')+r.robot_id+'</span>'+(selected?'<span style="color:#1d8a3e;font-weight:800;font-size:14px">✓ 선택됨</span>':(clickable?'<span style="font-size:14px;color:#1d8a3e">눌러 선택</span>':''))+'</div>'
-        +'<div style="font-size:14px;color:var(--muted);margin-top:6px">🔋 '+r.battery_percent+'%</div>'
+        +'<div style="font-size:14px;color:var(--muted);margin-top:6px">🔋 '+bat(r.battery_percent)+'%</div>'
         +'<div style="font-size:14px;margin-top:6px;color:'+(ok?'#1d8a3e':'#b0392b')+'">'+(ok?'배정 가능':(busyLabel(r)||HARVEST_REASON[r.unavailable_reason]||r.status))+'</div></div>';
     });
     html+='</div>';
@@ -1094,7 +1100,7 @@ async function loadHarvestWork(){
     const box=document.getElementById('harvestWork'); if(!box){if(harvestTimer){clearInterval(harvestTimer);harvestTimer=null;}return;}
     const LAB={IDLE:['🟢 대기 중','#1d8a3e'],PATROLLING:['🚓 순찰 중','#e8912d'],HARVESTING:['🍅 수확 중','#e0483a'],RESERVED:['📅 예약','#2f7fd6']};
     box.innerHTML=(d.robots||[]).map(function(r){ var l=LAB[r.status]||[r.status,'#888'];
-      return '<div style="flex:1;min-width:150px;border:1px solid var(--line);border-radius:10px;padding:12px;background:#fff"><div style="font-weight:700">'+r.robot_id+'</div><div style="font-size:14px;color:'+l[1]+';font-weight:700;margin-top:4px">'+l[0]+'</div><div style="font-size:14px;color:var(--muted);margin-top:3px">🔋 '+r.battery_percent+'%</div></div>';
+      return '<div style="flex:1;min-width:150px;border:1px solid var(--line);border-radius:10px;padding:12px;background:#fff"><div style="font-weight:700">'+r.robot_id+'</div><div style="font-size:14px;color:'+l[1]+';font-weight:700;margin-top:4px">'+l[0]+'</div><div style="font-size:14px;color:var(--muted);margin-top:3px">🔋 '+bat(r.battery_percent)+'%</div></div>';
     }).join('');
   }catch(e){}
 }
@@ -1170,7 +1176,7 @@ async function loadSensors(){
         +'<div style="display:flex;justify-content:space-between;align-items:center"><b style="font-size:16px">'+r.robot_id+'</b>'
         +'<span style="font-size:13px;padding:2px 10px;border-radius:20px;background:'+(ok?'#eef7ec':'#fbeaea')+';color:'+(ok?'#1d6a35':'#b0392b')+';font-weight:700">'+(ok?'🟢 정상':(off?'⚫ 오프라인':'🔧 점검 필요'))+'</span></div>'
         +'<div style="height:6px"></div>'
-        +'<div style="font-size:14px;margin-bottom:2px">🔋 배터리 '+(has(bp)?'<b style="color:'+bc+'">'+bp+'%</b>':na())
+        +'<div style="font-size:14px;margin-bottom:2px">🔋 배터리 '+(has(bp)?'<b style="color:'+bc+'">'+bat(bp)+'%</b>':na())
         +(has(p.battery_v)?' <span style="color:var(--muted)">('+p.battery_v+'V)</span>':'')+'</div>'
         +'<div style="height:7px;background:#eef2f0;border-radius:4px;margin-bottom:10px"><div style="width:'+(has(bp)?bp:0)+'%;height:100%;background:'+bc+';border-radius:4px"></div></div>'
         +'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(70px,1fr));gap:6px">'
@@ -1557,7 +1563,7 @@ async function loadBatt(){
       const stt=none?(off?'오프라인':'값 미수신'):(pct>50?'양호':(pct>=20?'충전 권장':'⚠️ 곧 충전 필요'));
       html+='<div class="card" style="flex:1;min-width:230px;padding:18px'+(off?';opacity:.55':'')+'">'
         +'<div style="font-size:17px;font-weight:800;margin-bottom:12px">'+r.robot_id+'</div>'
-        +'<div style="font-size:36px;font-weight:800;color:'+(none?'var(--muted)':bc)+';line-height:1">'+(none?'—':pct+'<small style="font-size:17px">%</small>')+'</div>'
+        +'<div style="font-size:36px;font-weight:800;color:'+(none?'var(--muted)':bc)+';line-height:1">'+(none?'—':bat(pct)+'<small style="font-size:17px">%</small>')+'</div>'
         +'<div style="font-size:14px;color:var(--muted);margin:6px 0 12px">'+(p.battery_v?p.battery_v+'V · ':'')+stt+'</div>'
         +'<div style="height:13px;background:#eef2f0;border-radius:7px;overflow:hidden"><div style="width:'+(none?0:pct)+'%;height:100%;background:'+bc+';border-radius:7px;transition:width .3s"></div></div>'
         +'</div>';
