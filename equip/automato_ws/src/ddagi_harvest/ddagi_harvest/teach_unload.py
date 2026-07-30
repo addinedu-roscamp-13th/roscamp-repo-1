@@ -69,6 +69,9 @@ PATH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # 재생 속도 — 짐을 들고 움직이므로 파지 속도(30)보다도 낮게 시작한다.
 SPEED = 25
 JOG_SPEED = 30            # 조그 1회 이동 속도. 몇 도씩만 움직이므로 낮게 둔다
+# 조그 스텝 사다리(°). '.' 로 한 칸 크게, ',' 로 한 칸 작게. 양 끝에서는 머문다.
+# 예전엔 . 과 , 가 각자 전이표(dict)를 들고 있어 한 칸을 고치면 반대 방향이 어긋났다.
+JOG_STEPS = [0.5, 1.0, 2.0, 5.0, 10.0]
 
 # ---- 첫 이동 보호 ---------------------------------------------------------- #
 # 재생을 시작하는 자세가 정해져 있지 않다. 현재 어디에 있든 1번 웨이포인트로 한 번에
@@ -141,6 +144,8 @@ ARM_IP = os.environ.get("ARM_IP", "raspi.local")
 
 _ACT_LABEL = {"grip": "손잡이 파지", "open": "손잡이 놓기",
               "wait": f"{WAIT_SEC:.0f}초 대기", "shake": "털기"}
+# 저장 키 → act. SPACE 는 act 없는 '자세만' 저장이라 여기 없다.
+_KEY_ACT = {"g": "grip", "o": "open", "w": "wait", "s": "shake"}
 
 # 티칭 중 화면에 띄우는 키 안내. 예전엔 독스트링을 문자열로 잘라 썼는데, 섹션 이름을
 # 바꾸는 순간 IndexError 로 죽었다. 안내문은 상수로 둔다.
@@ -224,7 +229,8 @@ def describe(steps: list) -> None:
 
 # ---- 티칭 ------------------------------------------------------------------ #
 
-def do_teach(arm) -> None:
+def _teach_preflight(arm) -> None:
+    """티칭 시작 전 현재 자세 점검 · 키 안내 · 확인. 서보는 아직 살아 있다."""
     cur = read_stable(arm)
     if not cur:
         raise SystemExit("각도 읽기 실패 — Pi 의 arm_server.py 가 떠 있는지 확인")
@@ -243,6 +249,29 @@ def do_teach(arm) -> None:
     if input("서보를 풀고 티칭을 시작할까요? (y/N) ").strip().lower() != "y":
         raise SystemExit("취소됨")
 
+
+def _teach_save(steps: list) -> None:
+    """기록을 파일로 남기고 다음 명령을 안내한다."""
+    # 1번이 곧 '준비 자세'다. 파지 지점이 1번이면 재생 시작 자세가 어디든 거기로
+    # 직행하므로 팔이 예냉실·바구니를 훑는다(파지에서 staging 을 둔 것과 같은 이유).
+    if steps[0].get("act") == "grip":
+        print("\n⚠ 1번 웨이포인트가 곧바로 '손잡이 파지'입니다.")
+        print("  재생은 현재 자세가 어디든 1번으로 직행하고, 그 경로는 팔이 정합니다.")
+        print("  → 팔을 편 안전한 **준비 자세**를 앞에 하나 추가하는 것을 권합니다"
+              " (u 로 되돌린 뒤 SPACE 로 준비 자세부터 기록).")
+    with open(PATH_FILE, "w", encoding="utf-8") as fp:
+        json.dump({"speed": SPEED, "shake": {"joint": SHAKE_JOINT,
+                                             "amplitude": SHAKE_AMPLITUDE,
+                                             "cycles": SHAKE_CYCLES},
+                   "steps": steps}, fp, ensure_ascii=False, indent=2)
+    print(f"\n총 {len(steps)}개 자세를 저장했습니다 → {PATH_FILE}")
+    describe(steps)
+    print(f"\n검사:  python3 {os.path.basename(__file__)} check")
+    print(f"재생:  python3 {os.path.basename(__file__)} run")
+
+
+def do_teach(arm) -> None:
+    _teach_preflight(arm)
     arm.release_servos()
     print("\n[드래그] 서보 해제됨 — 손으로 옮기고 키를 누르세요. "
           "미세 조정이 필요하면 f 로 조그 모드.\n")
@@ -307,14 +336,9 @@ def do_teach(arm) -> None:
                     delta = +step_deg
                 elif key == "[":
                     delta = -step_deg
-                elif key == ".":
-                    step_deg = {0.5: 1.0, 1.0: 2.0, 2.0: 5.0,
-                                5.0: 10.0, 10.0: 10.0}[step_deg]
-                    show_jog()
-                    continue
-                elif key == ",":
-                    step_deg = {10.0: 5.0, 5.0: 2.0, 2.0: 1.0,
-                                1.0: 0.5, 0.5: 0.5}[step_deg]
+                elif key in (".", ","):
+                    i = JOG_STEPS.index(step_deg) + (1 if key == "." else -1)
+                    step_deg = JOG_STEPS[min(max(i, 0), len(JOG_STEPS) - 1)]
                     show_jog()
                     continue
                 elif key == "p":
@@ -344,7 +368,7 @@ def do_teach(arm) -> None:
                 print("  --- 기록 목록 ---")
                 describe(steps)
                 continue
-            if key not in (" ", "g", "o", "w", "s"):
+            if key != " " and key not in _KEY_ACT:
                 continue
 
             if mode == "jog":
@@ -357,7 +381,7 @@ def do_teach(arm) -> None:
             if not angles:
                 print("  [실패] 각도를 읽지 못했습니다. 다시 시도하세요.")
                 continue
-            act = {"g": "grip", "o": "open", "w": "wait", "s": "shake"}.get(key)
+            act = _KEY_ACT.get(key)
 
             # 티칭 중에도 실제로 그리퍼를 여닫는다. 표시만 남기면 손잡이를 안 쥔 채로
             # 이후 자세를 가르치게 되고, 그러면 **바구니 무게가 자세에 반영되지 않아**
@@ -386,23 +410,7 @@ def do_teach(arm) -> None:
 
     if not steps:
         raise SystemExit("기록된 자세가 없습니다.")
-
-    # 1번이 곧 '준비 자세'다. 파지 지점이 1번이면 재생 시작 자세가 어디든 거기로
-    # 직행하므로 팔이 예냉실·바구니를 훑는다(파지에서 staging 을 둔 것과 같은 이유).
-    if steps[0].get("act") == "grip":
-        print("\n⚠ 1번 웨이포인트가 곧바로 '손잡이 파지'입니다.")
-        print("  재생은 현재 자세가 어디든 1번으로 직행하고, 그 경로는 팔이 정합니다.")
-        print("  → 팔을 편 안전한 **준비 자세**를 앞에 하나 추가하는 것을 권합니다"
-              " (u 로 되돌린 뒤 SPACE 로 준비 자세부터 기록).")
-    with open(PATH_FILE, "w", encoding="utf-8") as fp:
-        json.dump({"speed": SPEED, "shake": {"joint": SHAKE_JOINT,
-                                             "amplitude": SHAKE_AMPLITUDE,
-                                             "cycles": SHAKE_CYCLES},
-                   "steps": steps}, fp, ensure_ascii=False, indent=2)
-    print(f"\n총 {len(steps)}개 자세를 저장했습니다 → {PATH_FILE}")
-    describe(steps)
-    print(f"\n검사:  python3 {os.path.basename(__file__)} check")
-    print(f"재생:  python3 {os.path.basename(__file__)} run")
+    _teach_save(steps)
 
 
 # ---- 재생 ------------------------------------------------------------------ #
@@ -429,22 +437,35 @@ def do_check() -> None:
                "동작이 의도와 달라질 수 있으니 재티칭을 권합니다.")
 
 
-def do_shake(arm, base_angles, cfg: dict, watch=None, samples=None) -> None:
-    """손목 관절을 ±진폭으로 왕복시켜 남은 열매를 털어낸다.
+def load_shake_base():
+    """티칭 파일에서 털기 기준 자세를 찾아 (스텝 index, 조인 각도, 조여진 축) 반환.
 
-    그리퍼는 건드리지 않는다 — 흔드는 중에 손잡이를 놓으면 바구니가 떨어진다.
-    진폭을 키우기 전에 반드시 낮은 값으로 확인할 것.
+    shakeroom 과 shaketest 가 **같은 자세**를 봐야 한다. 한쪽만 다른 스텝을 고르면
+    '여유는 충분한데 진폭이 안 나온다'는 엉뚱한 진단이 나온다.
     """
-    pattern = cfg.get("pattern") or SHAKE_PATTERN or [
+    steps = load()["steps"]
+    idx = next((i for i, s in enumerate(steps) if s.get("act") == "shake"), None)
+    if idx is None:
+        raise SystemExit("'털기' 스텝이 없습니다. 먼저 teach 로 s 를 기록하세요.")
+    base, over = clamp_angles(steps[idx]["angles"])
+    return idx, base, over
+
+
+def shake_pattern(cfg: dict) -> list[dict]:
+    """cfg → 실제로 쓸 털기 패턴. 비어 있으면 SHAKE_JOINT 하나로 되돌린다."""
+    return cfg.get("pattern") or SHAKE_PATTERN or [
         {"joint": int(cfg.get("joint", SHAKE_JOINT)),
          "amp": float(cfg.get("amplitude", SHAKE_AMPLITUDE)), "sign": +1}]
-    cycles = int(cfg.get("cycles", SHAKE_CYCLES))
-    speed = int(cfg.get("speed", SHAKE_SPEED))
-    dwell = float(cfg.get("dwell", SHAKE_DWELL))
-    oneway = bool(cfg.get("oneway", SHAKE_ONEWAY))
-    burst = int(cfg.get("burst", SHAKE_BURST))
-    burst_pause = float(cfg.get("burst_pause", SHAKE_BURST_PAUSE))
 
+
+def shake_poses(base_angles, pattern: list[dict], oneway: bool):
+    """기준 자세 + 패턴 → (기준, 왕복할 두 자세, 축별 실효 왕복폭).
+
+    왕복폭은 **관절 한계로 조여진 뒤** 두 자세의 실제 차이다 — 명령 진폭이 아니다.
+    이 구분을 놓쳐 잘린 진폭을 서보의 물리 한계로 오진한 적이 있다(SHAKE_CYCLES
+    위 주석). 그래서 던지는 쪽(do_shake)과 재는 쪽(do_shaketest)이 같은 계산을
+    쓰게 한 곳에 모았다. 각자 계산하면 '명령 진폭'과 '실제로 던진 명령'이 갈린다.
+    """
     def pose(sign):
         a = list(base_angles)
         for p in pattern:
@@ -454,12 +475,30 @@ def do_shake(arm, base_angles, cfg: dict, watch=None, samples=None) -> None:
     home = clamp_angles(base_angles)[0]
     # 한 방향이면 기준↔기준+진폭, 대칭이면 기준-진폭↔기준+진폭.
     a_pose, b_pose = (pose(+1), home) if oneway else (pose(+1), pose(-1))
+    travel = [(int(p["joint"]),
+               abs(a_pose[int(p["joint"]) - 1] - b_pose[int(p["joint"]) - 1]))
+              for p in pattern]
+    return home, a_pose, b_pose, travel
+
+
+def do_shake(arm, base_angles, cfg: dict, watch=None, samples=None) -> None:
+    """손목 관절을 ±진폭으로 왕복시켜 남은 열매를 털어낸다.
+
+    그리퍼는 건드리지 않는다 — 흔드는 중에 손잡이를 놓으면 바구니가 떨어진다.
+    진폭을 키우기 전에 반드시 낮은 값으로 확인할 것.
+    """
+    pattern = shake_pattern(cfg)
+    cycles = int(cfg.get("cycles", SHAKE_CYCLES))
+    speed = int(cfg.get("speed", SHAKE_SPEED))
+    dwell = float(cfg.get("dwell", SHAKE_DWELL))
+    oneway = bool(cfg.get("oneway", SHAKE_ONEWAY))
+    burst = int(cfg.get("burst", SHAKE_BURST))
+    burst_pause = float(cfg.get("burst_pause", SHAKE_BURST_PAUSE))
+    home, a_pose, b_pose, travel = shake_poses(base_angles, pattern, oneway)
 
     # 실효 진폭을 미리 알려준다 — 한계에 걸려 잘리면 여기서 드러난다.
-    eff = [(int(p["joint"]), abs(a_pose[int(p["joint"]) - 1] - b_pose[int(p["joint"]) - 1]))
-           for p in pattern]
-    desc = " + ".join(f"J{j}{'→' if oneway else '±'}{d:.0f}°" for j, d in eff)
-    cut = [f"J{j}" for (j, d), p in zip(eff, pattern)
+    desc = " + ".join(f"J{j}{'→' if oneway else '±'}{d:.0f}°" for j, d in travel)
+    cut = [f"J{j}" for (j, d), p in zip(travel, pattern)
            if d < (1 if oneway else 2) * float(p["amp"]) - 0.6]
     print(f"    털기: {desc} × {cycles}회 "
           f"({'한방향' if oneway else '대칭'}, 속도 {speed}, 반주기 {dwell}s"
@@ -490,7 +529,7 @@ def do_shake(arm, base_angles, cfg: dict, watch=None, samples=None) -> None:
     # 복귀는 명령만 던지고 고정 시간만 기다린다. 정지 감지를 쓰면 방금 흔든 진동이
     # 남아 '아직 이동 중'으로 읽혀 타임아웃(15s)을 통째로 쓴다 — 실측 12~14초.
     # 털기 뒤엔 어차피 잔진동이 있으므로 '완전 정지'를 기다리는 것 자체가 무의미하다.
-    arm.move_angles_nowait(clamp_angles(base_angles)[0], speed)
+    arm.move_angles_nowait(home, speed)
     time.sleep(float(cfg.get("return_settle", SHAKE_RETURN_SETTLE)))
     print(f"      완료 {time.time() - t0:.1f}s")
 
@@ -502,11 +541,7 @@ def do_shakeroom() -> None:
     없는 일이 흔하고, 그러면 명령한 진폭의 절반이 통째로 잘린다(실측: 실효 50%).
     어느 축에 진폭을 실을 수 있는지 먼저 보고 SHAKE_PATTERN 을 정하는 것이 순서다.
     """
-    steps = load()["steps"]
-    idx = next((i for i, s in enumerate(steps) if s.get("act") == "shake"), None)
-    if idx is None:
-        raise SystemExit("'털기' 스텝이 없습니다. 먼저 teach 로 s 를 기록하세요.")
-    base, over = clamp_angles(steps[idx]["angles"])
+    idx, base, over = load_shake_base()
     print(f"털기 기준 자세 (스텝 {idx + 1}): {[round(a, 1) for a in base]}")
     if over:
         print("  ⚠ 티칭값이 한계를 넘어 조여진 축: "
@@ -531,11 +566,7 @@ def do_shaketest(arm) -> None:
     잔진동으로 보이는 원인). 진폭과 주파수는 서로를 깎아먹으므로 곱(=흔든 총량)이
     가장 큰 조합을 실측으로 찾는다.
     """
-    steps = load()["steps"]
-    idx = next((i for i, s in enumerate(steps) if s.get("act") == "shake"), None)
-    if idx is None:
-        raise SystemExit("'털기' 스텝이 없습니다. 먼저 teach 로 s 를 기록하세요.")
-    base, _ = clamp_angles(steps[idx]["angles"])
+    idx, base, _ = load_shake_base()
     print(f"털기 스텝 {idx + 1} 자세에서 측정합니다: {[round(a, 1) for a in base]}")
     print("!! 바구니를 걸고 팔 반경을 비우세요. 팔이 그 자세로 이동한 뒤 흔듭니다.")
     if input("시작할까요? (y/N) ").strip().lower() != "y":
@@ -543,12 +574,18 @@ def do_shaketest(arm) -> None:
 
     arm.move_angles(base, SPEED)
     time.sleep(0.6)
-    watch = int((SHAKE_PATTERN or [{"joint": SHAKE_JOINT}])[0]["joint"]) - 1
+    # do_shake 가 실제로 쓸 패턴·자세를 그대로 받아 첫 축을 관찰한다.
+    pattern = shake_pattern({})
+    watch = int(pattern[0]["joint"]) - 1
+    _, _, _, travel = shake_poses(base, pattern, SHAKE_ONEWAY)
+    # 도달률의 분모는 '명령 진폭'이 아니라 **그 축이 실제로 오갈 폭**이다. 관절 한계로
+    # 조여지고 한방향/대칭에 따라 달라진 값이라야 도달률이 서보 성능을 뜻한다. 예전엔
+    # 무조건 2×진폭으로 나눠, 한방향에서 잘 따라가는 서보가 50% 로 찍혔다 — 그게
+    # "14° p-p 가 물리 한계"라는 오진의 출처다(SHAKE_CYCLES 위 주석).
+    cmd_pp = sum(d for j, d in travel if j - 1 == watch)
 
-    print(f"\n{'반주기':>6} {'명령진폭':>8} {'실측 p-p':>9} {'도달률':>7} {'흔든총량':>9} {'소요':>6}")
+    print(f"\n{'반주기':>6} {'실효진폭':>8} {'실측 p-p':>9} {'도달률':>7} {'흔든총량':>9} {'소요':>6}")
     best = None
-    cmd_pp = 2 * sum(float(p["amp"]) for p in SHAKE_PATTERN
-                     if int(p["joint"]) - 1 == watch) or 2 * SHAKE_AMPLITUDE
     for dwell in (0.35, 0.28, 0.22, 0.18, 0.14, 0.10):
         seen: list = []
         t0 = time.time()
