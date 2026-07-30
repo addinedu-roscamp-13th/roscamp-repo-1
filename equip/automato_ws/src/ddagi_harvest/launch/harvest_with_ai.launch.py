@@ -30,6 +30,8 @@ AI 서비스가 카메라를 쓰므로 수확 노드는 반드시 detector:=ros 
     conf        YOLO 신뢰도 임계
     with_ai     false 면 AI 는 띄우지 않는다(이미 딴 데서 돌고 있을 때)
 """
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
@@ -37,8 +39,17 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
-DEFAULT_VENV_PYTHON = "/home/cornerstone/venv/automato/bin/python3"
-DEFAULT_MODEL = "/home/cornerstone/Downloads/tomato_4cls_v8.pt"
+# 로봇팔 PC 마다 사용자명·팔 IP 가 다르므로 기본값을 절대경로로 박지 않는다.
+# 홈 기준 경로 + 환경변수로 두면 다른 PC 에서 코드를 고치지 않고 쓸 수 있다.
+#   AUTOMATO_PYTHON     ultralytics·pyrealsense2 가 있는 파이썬
+#   DG_AI_MODEL_PATH    YOLO 가중치 (.pt) — AI 서비스가 쓰는 것과 같은 변수명
+#   ARM_IP              그 로봇의 Pi 주소 (로봇마다 다르다)
+_HOME = os.path.expanduser("~")
+DEFAULT_VENV_PYTHON = os.environ.get(
+    "AUTOMATO_PYTHON", os.path.join(_HOME, "venv/automato/bin/python3"))
+DEFAULT_MODEL = os.environ.get(
+    "DG_AI_MODEL_PATH", os.path.join(_HOME, "Downloads/tomato_4cls_v8.pt"))
+DEFAULT_ARM_IP = os.environ.get("ARM_IP", "192.168.3.12")
 
 
 def generate_launch_description():
@@ -48,7 +59,7 @@ def generate_launch_description():
                               description="ultralytics·pyrealsense2 가 있는 파이썬"),
         DeclareLaunchArgument("model", default_value=DEFAULT_MODEL,
                               description="YOLO 가중치 .pt (저장소에 없으므로 경로 필요)"),
-        DeclareLaunchArgument("arm_ip", default_value="192.168.3.12",
+        DeclareLaunchArgument("arm_ip", default_value=DEFAULT_ARM_IP,
                               description="Pi 의 arm_server.py 주소 (9010)"),
         DeclareLaunchArgument("dry_run", default_value="false",
                               description="파지 없이 검출·마커만"),
