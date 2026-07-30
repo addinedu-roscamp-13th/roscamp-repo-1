@@ -627,8 +627,8 @@ class FloorDockServer(Node):
                 phase = self._phase(fsm)
                 oy = ('%+.1f' % math.degrees(odom_yaw)) if odom_yaw is not None else '--'
                 dw = (d + self._crossbar_to_wall) * 100
-                det_s = ('dw=%5.1fcm b=%+5.1f y=%+5.1f n=99'
-                         % (dw, math.degrees(bearing), math.degrees(yaw))
+                det_s = ('d=%5.1fcm dw=%5.1fcm b=%+5.1f y=%+5.1f n=99'
+                         % (d * 100, dw, math.degrees(bearing), math.degrees(yaw))
                          if found else 'H not found')
                 nt = ('  | ' + fsm.note) if fsm.note else ''
 
@@ -709,16 +709,21 @@ class FloorDockServer(Node):
             center, heading, size, contour = det
             cv2.polylines(vis, [contour.astype(int)], True, (0, 255, 0), 2)
             dw = d + self._crossbar_to_wall
-            _put(vis, '[h%.0f] dw=%.3fm(wall) b=%+.1f y=%+.1f n=99'
-                 % (size * 100, dw, math.degrees(bearing), math.degrees(yaw)), (10, 26), c)
+            _put(vis, '[h%.0f] d=%.3f dw=%.3f(wall) b=%+.1f y=%+.1f n=99'
+                 % (size * 100, d, dw, math.degrees(bearing), math.degrees(yaw)), (10, 26), c)
         else:
             _put(vis, 'H not found', (10, 26), c)
         oy = ('%+.1f' % math.degrees(odom_yaw)) if odom_yaw is not None else '--'
         _put(vis, '[%s] v=%+.3f w=%+.3f odom=%s%s'
              % (self._phase(fsm), v, w, oy, '  DRY-RUN' if self._dry_run else '  LIVE'),
              (10, 52), (0, 200, 255) if not self._dry_run else (255, 255, 255))
+        ny = 78
         if fsm.note:
-            _put(vis, fsm.note.encode('ascii', 'ignore').decode()[:70], (10, 78),
+            _put(vis, fsm.note.encode('ascii', 'ignore').decode()[:70], (10, ny),
+                 (0, 220, 255))
+            ny += 26
+        if self._obstacle_avoid:      # 라이다 on 이면 4방위 최소거리 표시
+            _put(vis, 'lidar ' + self._fmt_sectors(self._scan_sectors()), (10, ny),
                  (0, 220, 255))
         ok, buf = cv2.imencode('.jpg', vis, self._stream_enc)
         if ok:
@@ -767,14 +772,17 @@ class FloorDockServer(Node):
             center, heading, size, contour = det
             cv2.polylines(vis, [contour.astype(int)], True, (0, 180, 0), 2)
             d, bearing, yaw = fsm_mod.docking_values(center, heading)
-            _put(vis, '[h%.0f] dw=%.3fm(wall) b=%+.1f y=%+.1f'
-                 % (size * 100, d + self._crossbar_to_wall,
+            _put(vis, '[h%.0f] d=%.3f dw=%.3f(wall) b=%+.1f y=%+.1f'
+                 % (size * 100, d, d + self._crossbar_to_wall,
                     math.degrees(bearing), math.degrees(yaw)), (10, 26), (0, 220, 0))
         else:
             _put(vis, 'H not found', (10, 26), (0, 0, 255))
         _put(vis, 'IDLE  teleop:%s%s' % ('MOVING' if jogging else 'ready',
              '  DRY-RUN' if self._dry_run else '  LIVE'), (10, 52),
              (0, 200, 255) if not self._dry_run else (255, 255, 255))
+        if self._obstacle_avoid:      # 라이다 on 이면 4방위 최소거리 표시
+            _put(vis, 'lidar ' + self._fmt_sectors(self._scan_sectors()), (10, 78),
+                 (0, 220, 255))
         ok, buf = cv2.imencode('.jpg', vis, self._stream_enc)
         if ok:
             with self._jpeg_lock:
