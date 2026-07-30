@@ -125,6 +125,79 @@ _TELEMETRY = {"robots": [], "recv_at": 0.0, "seq": None, "connected": False}
 _TELEMETRY_STARTED = [False]
 
 # ============================================================================
+#  실연동 모드 — ACS 가 설정돼 있으면 데모(가짜) 데이터를 일절 만들지 않는다.
+#  2026-07-30 통합시험에서, ACS 가 잠깐 끊긴 사이 화면이 데모 함대로 폴백해
+#  '존재하지 않는 로봇 dg_01 85.2% / dg_02 62.0%' 가 관리자 화면에 떴다.
+#  가짜값이 실값처럼 보이는 게 값이 안 보이는 것보다 위험하므로, 실연동 모드에선
+#  데이터가 없으면 '없음/미제공' 으로 비운다.
+# ============================================================================
+ACS_MODE = bool(CONTROL_SERVICE_URL or TELEMETRY_WS_URL)
+
+# ============================================================================
+#  농장 맵 좌표 변환 — ACS 텔레메트리(ROS 맵 좌표, m) → 3D 지도 정규화 좌표(nx,nz ∈ -1~1)
+#  맵 실측은 automato_map.yaml(resolution·origin) + .pgm 헤더(픽셀 크기)에서 읽는다.
+#    실측 크기(m) = 픽셀 × resolution,  origin = 맵 좌하단의 월드 좌표
+#  파일을 못 찾으면 2026-07-30 실측값(39×64px, 0.030m/px, origin[-0.193,-0.632] = 1.17×1.92m)
+#  으로 폴백한다. FARM_MAP_YAML 로 경로를 덮어쓸 수 있다.
+# ============================================================================
+def _read_pgm_size(path):
+    """PGM 헤더에서 (가로, 세로) 픽셀. 주석(#)과 줄바꿈 위치가 제각각이라 토큰으로 읽는다."""
+    with open(path, "rb") as f:
+        head = f.read(256).decode("latin-1")
+    toks = []
+    for line in head.splitlines():
+        line = line.split("#", 1)[0]
+        toks.extend(line.split())
+    return int(toks[1]), int(toks[2])            # toks[0] = "P5"
+
+
+def _load_map_extent():
+    """(origin_x, origin_y, 가로 m, 세로 m). 실패하면 실측 폴백값."""
+    ox, oy, res, w_px, h_px = -0.193, -0.632, 0.030, 39, 64
+    cands = [os.environ.get("FARM_MAP_YAML", ""),
+             os.path.join(BASE, "map", "automato_map.yaml"),
+             os.path.join(BASE, "..", "..", "equip", "automato_ws", "map", "automato_map.yaml")]
+    for p in cands:
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            for line in open(p, encoding="utf-8"):
+                line = line.split("#", 1)[0].strip()
+                if line.startswith("resolution:"):
+                    res = float(line.split(":", 1)[1])
+                elif line.startswith("origin:"):
+                    nums = line.split("[", 1)[1].split("]", 1)[0].split(",")
+                    ox, oy = float(nums[0]), float(nums[1])
+            w_px, h_px = _read_pgm_size(os.path.join(os.path.dirname(p), "automato_map.pgm"))
+            break
+        except Exception:                        # noqa: BLE001 (맵 파싱 실패 → 폴백값 사용)
+            continue
+    return ox, oy, w_px * res, h_px * res
+
+
+_MAP_OX, _MAP_OY, _MAP_W, _MAP_H = _load_map_extent()
+
+
+def _map_to_norm(x, y):
+    """ROS 맵 좌표(m) → 3D 지도 정규화 좌표(-1~1). 맵 밖이면 가장자리로 자른다.
+       좌표를 못 읽으면 None → 호출부가 '위치 미확인' 으로 처리한다."""
+    try:
+        fx, fy = float(x), float(y)
+    except (TypeError, ValueError):
+        return None
+    if not (_MAP_W > 0 and _MAP_H > 0):
+        return None
+    nx = (fx - (_MAP_OX + _MAP_W / 2.0)) / (_MAP_W / 2.0)
+    nz = (fy - (_MAP_OY + _MAP_H / 2.0)) / (_MAP_H / 2.0)
+    return round(max(-1.0, min(1.0, nx)), 4), round(max(-1.0, min(1.0, nz)), 4)
+
+
+def _telemetry_fresh():
+    """ACS 텔레메트리가 지금 흐르고 있나 (ROBOT_OFFLINE_SEC 이내 수신)."""
+    age = (time.time() - _TELEMETRY["recv_at"]) if _TELEMETRY["recv_at"] else None
+    return (age is not None) and (age <= ROBOT_OFFLINE_SEC)
+
+# ============================================================================
 #  자체 함대 (ACS 없이 라이브 단독 구동용) — CONTROL_SERVICE_URL 없으면 Web이 ACS 대역 겸함.
 #  값·역할·임계값을 mock_control_service._ROBOTS 와 동일하게 유지 → localhost(mock)와
 #  라이브(pythonanywhere)가 같은 화면·같은 동작(dg_01/02/03, 스펙 준수)이 되도록.
@@ -1093,9 +1166,17 @@ def patrol_available():
         return jsonify({"requested_at": _sim_now(),      # 스펙 E1-0 필수 필드
                         "min_battery_percent": MIN_BAT_PATROL, "robots": robots, "farm_online": True,
                         "available_count": sum(1 for r in robots if r.get("available"))})
+    if ACS_MODE:
+        # ACS 연동 중인데 조회에 실패했다(ACS 다운 등). 자체 함대를 보여주면 실제로는 꺼져 있는
+        # 로봇이 '배터리 78% 배정 가능' 으로 떠서 관리자가 그걸 고른다(2026-07-30 발견). 비워서 반환.
+        wlog("⚠ ACS 조회 불가 → 순찰 가용 목록을 비워 반환(데모 폴백 차단)")
+        return jsonify({"requested_at": _sim_now(), "min_battery_percent": MIN_BAT_PATROL,
+                        "source": "none", "robots": [], "available_count": 0,
+                        "warning": "제어 서비스(ACS)에서 로봇 상태를 가져오지 못했습니다."})
     # ACS·원격농장 없음(라이브 단독 구동) → 자체 함대(dg_01/02/03)로 스펙 E1-0 형식 반환
     robots = _demo_available("patrol")
     return jsonify({"requested_at": _sim_now(), "min_battery_percent": MIN_BAT_PATROL,
+                    "source": "demo",
                     "robots": robots, "available_count": sum(1 for r in robots if r["available"])})
 
 
@@ -1216,6 +1297,7 @@ def internal_detections_notify():
                  "ripe_percent": d.get("ripe_percent"), "unripe_percent": d.get("unripe_percent"),
                  "rotten_percent": d.get("rotten_percent"), "disease_percent": d.get("disease_percent"),
                  "detected_at": d.get("detected_at")})
+    _apply_detection_to_heat(d)      # '작물 상태' 카드에 반영 (구버전은 받고 버렸다)
     return jsonify({"success": True})
 
 
@@ -1621,10 +1703,42 @@ def save_heat(d):
         pass
 
 
+def _apply_detection_to_heat(d):
+    """E2-9 검출 콜백(ACS→Web)의 작물 비율을 '작물 상태' 카드에 반영한다.
+
+       콜백은 퍼센트(ripe/unripe/rotten/disease)로 오고 heat.json 은 개수로 저장한다.
+       화면은 개수의 합으로 비율을 다시 계산하므로, 1000 스케일 개수로 환산하면
+       화면 비율 = 콜백 퍼센트가 그대로 된다.
+       ⚠ 값이 하나도 없는 콜백이면 아무것도 덮어쓰지 않는다(0% 로 지워버리지 않도록)."""
+    keys = (("ripe", "ripe_percent"), ("unripe", "unripe_percent"),
+            ("rot", "rotten_percent"), ("pest", "disease_percent"))
+    pcts = {}
+    for name, field in keys:
+        v = d.get(field)
+        if isinstance(v, (int, float)):
+            pcts[name] = float(v)
+    if not pcts:
+        return
+    with LOCK:
+        h = load_heat()
+        crop = dict(h.get("crop", HEAT_DEFAULT["crop"]))
+        for name, v in pcts.items():
+            crop[name] = int(round(v * 10))          # % → 1000 스케일 개수
+        h["crop"] = crop
+        h["patrol_count"] = h.get("patrol_count", 0) + 1
+        h["updated_at"] = time.strftime("%m/%d %H:%M")
+        h["source"] = "acs"
+        save_heat(h)
+    wlog("  ↳ 작물 상태 갱신(ACS 검출): %s" % ", ".join("%s %.1f%%" % (k, v) for k, v in pcts.items()))
+
+
 def _evolve_heat():
     """순찰 1회 = 새 스캔. 실기 연동 전까지 데모용으로 값을 흔들어 '매 순찰 변화'를 재현.
-       실기 연동 시엔 로봇/비전이 POST /api/heatmap 으로 실제값을 덮어씀."""
+       실기 연동 시엔 로봇/비전이 POST /api/heatmap 으로 실제값을 덮어씀.
+       ⚠ ACS 연동 중엔 실행하지 않는다 — 실검출값을 난수로 덮어쓰면 안 된다."""
     import random
+    if ACS_MODE:
+        return
     with LOCK:
         d = load_heat()
         d["pillars"] = [round(min(1.0, max(0.45, p + random.uniform(-0.15, 0.18))), 2)
@@ -1642,8 +1756,18 @@ def _evolve_heat():
 
 @app.get("/api/heatmap")
 def get_heatmap():
-    """웹앱이 밀집 히트맵/작물 상태를 그릴 때 폴링."""
-    return jsonify(load_heat())
+    """웹앱이 밀집 히트맵/작물 상태를 그릴 때 폴링.
+
+       ACS 연동 중에는 **실제 순찰 검출이 한 번이라도 들어오기 전까지 값을 주지 않는다**
+       (crop/pillars = null). 시드값(익음34.2%/병해충4.7%)을 그대로 내보내면, 순찰을 한 적도
+       없는데 '⚠ 주의 — 병해충 4.7% 관찰' 경보가 뜬다(2026-07-30 통합시험에서 발견).
+       경보는 로봇이 실제로 발견했을 때만 떠야 한다."""
+    d = load_heat()
+    if ACS_MODE and d.get("source") != "acs":
+        return jsonify({"pillars": None, "crop": None, "patrol_count": 0,
+                        "updated_at": None, "awaiting_patrol": True,
+                        "note": "아직 순찰 검출 결과가 없습니다. 순찰이 완료되면 채워집니다."})
+    return jsonify(d)
 
 
 @app.post("/api/heatmap")
@@ -1751,8 +1875,12 @@ def harvest_available():
             robots.append(rr)
         wlog("⚠ HARVEST_ROBOT_IDS(%s) 에 해당하는 로봇이 텔레메트리에 없음 → 전체 로봇 표시(로봇팔 미확인). "
              "실제 ID 를 HARVEST_ROBOT_IDS 로 지정하세요." % ",".join(HARVEST_ROBOT_IDS))
-    if not robots:                                    # 텔레메트리 없음/미설정 → 라이브 단독 구동
+    if not robots and not ACS_MODE:                   # 라이브 단독 구동일 때만 자체 함대
         robots = _demo_available("harvest")
+    elif not robots:
+        # ACS 연동 중인데 텔레메트리가 없다(ACS 다운/기동 전). 여기서 데모 함대를 채우면
+        # 존재하지 않는 로봇이 '배정 가능' 으로 떠서 관리자가 그걸 고르게 된다. 비워 둔다.
+        src = "none"
 
     # [시나리오2 E1-3-1] 수확은 **전역 1건**(로봇팔 1대). 다른 로봇이 수확 중이면
     # 나머지 로봇도 요청해봤자 409 HARVEST_IN_PROGRESS 로 거절된다.
@@ -1803,6 +1931,12 @@ def harvest_request():
             return jsonify({"status": "REJECTED", "reason": "ROBOT_OFFLINE",
                             "message": "제어 서비스(ACS)에 연결할 수 없어 수확을 시작하지 못했습니다. "
                                        "제어 서비스 상태를 확인해 주세요."}), 503
+    if ACS_MODE:
+        # ACS 주소는 있는데 중계할 수 없는 상태(requests 미설치 등). 자체 함대로 '가짜 수확'을
+        # 하면 실제 로봇은 가만히 있는데 수확량만 늘어난다. 거절한다.
+        wlog("🛑 ACS 연동 모드인데 중계 불가 → 수확 요청 거절(가짜 수확 방지)")
+        return jsonify({"status": "REJECTED", "reason": "ROBOT_OFFLINE",
+                        "message": "제어 서비스(ACS)로 요청을 전달할 수 없습니다."}), 503
     # ACS 없음(라이브 단독) → 자체 함대(dg_01·dg_02=수확)로 처리.
     with LOCK:
         # [시나리오2 E1-3-1] 로봇팔 1대 = 동시 수확 1건. 진행 중이면 409 HARVEST_IN_PROGRESS
@@ -1906,12 +2040,52 @@ def fleet_pos():
     return jsonify({"ok": True})
 
 
+def _telemetry_from_acs(tk):
+    """실연동: 3D 지도·센서/배터리 패널 데이터를 ACS 텔레메트리(1Hz)만으로 만든다.
+
+       ACS 가 주는 건 주행 상태(위치·배터리·nav_status)뿐이다. 로봇팔 관절온도·초음파·
+       LiDAR 같은 값은 오지 않으므로 **지어내지 않고 None 으로 비운다** — 화면엔 '미제공'
+       으로 표시된다. (구버전은 여기서 sin() 궤적과 가짜 관절온도를 만들어, 3D 지도의
+       로봇이 실제와 무관하게 돌아다녔다. 2026-07-30 발견.)"""
+    fresh = _telemetry_fresh()
+    by_id = {}
+    if fresh:
+        for r in (_TELEMETRY.get("robots") or []):
+            if isinstance(r, dict) and r.get("robot_id"):
+                by_id[r["robot_id"]] = r
+    robots = []
+    for rid in sorted(set(list(by_id) + list(_DEMO_FLEET))):     # _DEMO_FLEET 은 ID 명단으로만 사용
+        t = by_id.get(rid)
+        pos = (t or {}).get("position") or {}
+        n = _map_to_norm(pos.get("x"), pos.get("y")) if t else None
+        robots.append({
+            "robot_id": rid,
+            "has_arm": rid in HARVEST_ROBOT_IDS,
+            "online": t is not None,
+            "nav_status": (t or {}).get("nav_status"),
+            "position": ({"nx": n[0], "nz": n[1], "yaw": pos.get("yaw") or 0.0, "live": True}
+                         if n else {"nx": 0.0, "nz": 0.0, "yaw": 0.0, "live": False}),
+            "map_position": {"x": pos.get("x"), "y": pos.get("y")} if t else None,
+            "pinky": {"battery_pct": (t or {}).get("battery_percent"),
+                      "battery_v": None, "lidar": None, "ultrasonic_cm": None,
+                      "imu": None, "motor_temp": None, "led": None},
+            # arm 키 없음 = 관절 데이터 미제공. GUI 가 has_arm 과 arm 존재를 함께 확인한다.
+        })
+    return {"ts": tk, "source": "acs", "connected": bool(_TELEMETRY["connected"] and fresh),
+            "map": {"origin_x": _MAP_OX, "origin_y": _MAP_OY,
+                    "width_m": round(_MAP_W, 3), "height_m": round(_MAP_H, 3)},
+            "robots": robots}
+
+
 @app.get("/api/telemetry")
 def telemetry():
-    """각 로봇의 센서·모터 실시간 상태. 실서비스에선 fleet_telemetry 구독.
-       DG1·DG2=로봇팔+주행 / DG3=주행만. (데모: 값이 실시간으로 요동)"""
+    """각 로봇의 센서·모터 실시간 상태.
+       ACS 연동 시 → 실제 텔레메트리(_telemetry_from_acs).
+       미연동(라이브 단독) 시에만 → DG1·DG2=로봇팔+주행 / DG3=주행만 데모값이 요동."""
     import math as _math
     tk = int(time.time())
+    if ACS_MODE:
+        return jsonify(_telemetry_from_acs(tk))
     specs = [("DG1", True, 85, 0), ("DG2", True, 74, 3), ("DG3", False, 62, 6)]
     robots = []
     for idx, (rid, has_arm, bat, ph) in enumerate(specs):

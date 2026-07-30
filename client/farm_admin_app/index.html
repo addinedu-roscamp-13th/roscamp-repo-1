@@ -1049,8 +1049,13 @@ window._heatDens=window._heatDens||null; window._heatCrop=window._heatCrop||null
 async function loadHeat(){
   try{
     const d=await(await fetch('/api/heatmap?t='+Date.now())).json();
-    if(Array.isArray(d.pillars)) window._heatDens=d.pillars;
-    if(d.crop) window._heatCrop=d.crop;
+    // awaiting_patrol = 실연동인데 아직 순찰 검출이 없음 → 이전 값도 비운다(시드가 남지 않게)
+    window._heatAwaiting=!!d.awaiting_patrol;
+    if(d.awaiting_patrol){ window._heatDens=null; window._heatCrop=null; }
+    else{
+      if(Array.isArray(d.pillars)) window._heatDens=d.pillars;
+      if(d.crop) window._heatCrop=d.crop;
+    }
     window._heatMeta={count:d.patrol_count,at:d.updated_at};
   }catch(e){}
   if(document.getElementById('farmHeat')) drawFarmHeat();     // 밀집 히트맵 다시 그림(서버 밀집도)
@@ -1061,7 +1066,13 @@ async function loadHeat(){
 function patrolCropCard(){ return '<div class="card" id="cropCardBox" style="margin-top:14px">순찰 결과 불러오는 중…</div>'; }
 function renderCropCard(){
   var box=document.getElementById('cropCardBox'); if(!box)return;
-  var cr=window._heatCrop||{ripe:342,unripe:588,pest:47,rot:23};
+  if(!window._heatCrop){   // 아직 순찰 검출 없음 — 시드값을 실측처럼 보여주지 않는다
+    box.innerHTML='<div style="padding:22px;text-align:center;color:var(--muted);font-size:14.5px">'
+      +'🚜 아직 순찰 검출 결과가 없습니다<div style="font-size:13px;margin-top:6px;opacity:.85">'
+      +'순찰이 완료되면 익음·안익음·병해충·썩음 비율이 여기에 채워집니다.</div></div>';
+    return;
+  }
+  var cr=window._heatCrop;
   var C=[['익음','수확 대상',cr.ripe||0,'#e0483a'],['안익음','관찰',cr.unripe||0,'#3f9a4e'],['병충해','방제 필요',cr.pest||0,'#e8912d'],['썩음','제거 필요',cr.rot||0,'#7a5b46']];
   var tot=C.reduce(function(s,c){return s+c[2];},0)||1;
   var bar=C.map(function(c){return '<div style="width:'+(c[2]/tot*100)+'%;background:'+c[3]+'"></div>';}).join('');
@@ -1142,30 +1153,40 @@ async function loadSensors(){
     const d=await(await fetch('/api/telemetry?t='+Date.now())).json();
     const box=document.getElementById('sensorBox');if(!box)return;
     let html='<div style="display:flex;gap:12px;flex-wrap:wrap">';
+    // ACS 는 주행 상태만 준다 — 안 오는 값(라이다·초음파·서보온도 등)은 '—' 로 비운다.
+    // 없는 값을 그럴듯한 숫자로 채우면 관리자가 점검 판단을 잘못하게 된다.
+    const has=function(v){return v!==null&&v!==undefined;};
+    const na=function(){return '<span style="color:var(--muted)">—</span>';};
     d.robots.forEach(function(r){
-      const p=r.pinky;let issues=[],maxTemp=0,ovl=false;
-      if(r.has_arm){r.arm.joints.forEach(function(j){maxTemp=Math.max(maxTemp,j.temp);if(j.overload)ovl=true;});if(maxTemp>=65)issues.push('서보 과열');if(ovl)issues.push('과부하');}
+      const p=r.pinky||{};let issues=[],maxTemp=0,ovl=false;
+      const arm=(r.has_arm&&r.arm&&r.arm.joints)?r.arm:null;
+      if(arm){arm.joints.forEach(function(j){maxTemp=Math.max(maxTemp,j.temp);if(j.overload)ovl=true;});if(maxTemp>=65)issues.push('서보 과열');if(ovl)issues.push('과부하');}
+      const off=(r.online===false);
+      if(off)issues.push('오프라인');
       const ok=issues.length===0;
-      const bc=p.battery_pct>50?'#1d8a3e':(p.battery_pct>=20?'#e8912d':'#e0483a');
-      html+='<div class="card" style="flex:1;min-width:290px;padding:14px">'
+      const bp=p.battery_pct;
+      const bc=bp>50?'#1d8a3e':(bp>=20?'#e8912d':'#e0483a');
+      html+='<div class="card" style="flex:1;min-width:290px;padding:14px'+(off?';opacity:.55':'')+'">'
         +'<div style="display:flex;justify-content:space-between;align-items:center"><b style="font-size:16px">'+r.robot_id+'</b>'
-        +'<span style="font-size:13px;padding:2px 10px;border-radius:20px;background:'+(ok?'#eef7ec':'#fbeaea')+';color:'+(ok?'#1d6a35':'#b0392b')+';font-weight:700">'+(ok?'🟢 정상':'🔧 점검 필요')+'</span></div>'
+        +'<span style="font-size:13px;padding:2px 10px;border-radius:20px;background:'+(ok?'#eef7ec':'#fbeaea')+';color:'+(ok?'#1d6a35':'#b0392b')+';font-weight:700">'+(ok?'🟢 정상':(off?'⚫ 오프라인':'🔧 점검 필요'))+'</span></div>'
         +'<div style="height:6px"></div>'
-        +'<div style="font-size:14px;margin-bottom:2px">🔋 배터리 <b style="color:'+bc+'">'+p.battery_pct+'%</b> <span style="color:var(--muted)">('+p.battery_v+'V)</span></div>'
-        +'<div style="height:7px;background:#eef2f0;border-radius:4px;margin-bottom:10px"><div style="width:'+p.battery_pct+'%;height:100%;background:'+bc+';border-radius:4px"></div></div>'
+        +'<div style="font-size:14px;margin-bottom:2px">🔋 배터리 '+(has(bp)?'<b style="color:'+bc+'">'+bp+'%</b>':na())
+        +(has(p.battery_v)?' <span style="color:var(--muted)">('+p.battery_v+'V)</span>':'')+'</div>'
+        +'<div style="height:7px;background:#eef2f0;border-radius:4px;margin-bottom:10px"><div style="width:'+(has(bp)?bp:0)+'%;height:100%;background:'+bc+';border-radius:4px"></div></div>'
         +'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(70px,1fr));gap:6px">'
-        +srTile('🛰️',p.lidar==='정상'?'정상':'이상','라이다',p.lidar==='정상'?'#1d8a3e':'#e0483a')
-        +srTile('📡',p.ultrasonic_cm+'cm','초음파',null)
-        +srTile('🧭',p.imu==='정상'?'정상':'이상','IMU',p.imu==='정상'?'#1d8a3e':'#e0483a')
-        +srTile('🌡️',p.motor_temp+'℃','모터',srTempCol(p.motor_temp))
-        +(r.has_arm?srTile('🦾',maxTemp+'℃','서보최고',srTempCol(maxTemp))+srTile('⚡',ovl?'있음':'없음','과부하',ovl?'#e0483a':'#1d8a3e')+srTile('✊',r.arm.gripper+'%','그리퍼','#2f7fd0'):'')
+        +(has(p.lidar)?srTile('🛰️',p.lidar==='정상'?'정상':'이상','라이다',p.lidar==='정상'?'#1d8a3e':'#e0483a'):srTile('🛰️','—','라이다',null))
+        +(has(p.ultrasonic_cm)?srTile('📡',p.ultrasonic_cm+'cm','초음파',null):srTile('📡','—','초음파',null))
+        +(has(p.imu)?srTile('🧭',p.imu==='정상'?'정상':'이상','IMU',p.imu==='정상'?'#1d8a3e':'#e0483a'):srTile('🧭','—','IMU',null))
+        +(has(p.motor_temp)?srTile('🌡️',p.motor_temp+'℃','모터',srTempCol(p.motor_temp)):srTile('🌡️','—','모터',null))
+        +(arm?srTile('🦾',maxTemp+'℃','서보최고',srTempCol(maxTemp))+srTile('⚡',ovl?'있음':'없음','과부하',ovl?'#e0483a':'#1d8a3e')+srTile('✊',arm.gripper+'%','그리퍼','#2f7fd0'):'')
         +'</div>';
-      if(!ok)html+='<div style="margin-top:8px;font-size:12px;color:#b0392b;background:#fdf0ef;border-radius:8px;padding:6px 9px">⚠️ '+issues.join(', ')+' — 엔지니어 점검 권장 (QT 콘솔에서 상세 확인)</div>';
+      if(r.has_arm&&!arm)html+='<div style="margin-top:8px;font-size:12px;color:var(--muted)">🦾 로봇팔 관절 데이터는 ACS 텔레메트리에 포함되지 않습니다 (QT 콘솔에서 확인)</div>';
+      if(!ok&&!off)html+='<div style="margin-top:8px;font-size:12px;color:#b0392b;background:#fdf0ef;border-radius:8px;padding:6px 9px">⚠️ '+issues.join(', ')+' — 엔지니어 점검 권장 (QT 콘솔에서 상세 확인)</div>';
       html+='</div>';
     });
     box.innerHTML=html+'</div>';
     const now=new Date().toLocaleTimeString('ko-KR',{hour12:false});
-    d.robots.forEach(function(r){var t=r.has_arm?Math.max.apply(null,r.arm.joints.map(function(j){return j.temp;})):r.pinky.motor_temp;if(!liveBuf[r.robot_id])liveBuf[r.robot_id]=[];liveBuf[r.robot_id].push(t);if(liveBuf[r.robot_id].length>60)liveBuf[r.robot_id].shift();});
+    d.robots.forEach(function(r){var a=(r.has_arm&&r.arm&&r.arm.joints)?r.arm:null;var t=a?Math.max.apply(null,a.joints.map(function(j){return j.temp;})):((r.pinky||{}).motor_temp);if(t===null||t===undefined)return;if(!liveBuf[r.robot_id])liveBuf[r.robot_id]=[];liveBuf[r.robot_id].push(t);if(liveBuf[r.robot_id].length>60)liveBuf[r.robot_id].shift();});
     liveLabels.push(now);if(liveLabels.length>60)liveLabels.shift();
     if(sensorMode==='live')drawSensorChart(liveLabels,liveBuf);
   }catch(e){}
@@ -1483,7 +1504,13 @@ function buildFarmScene(){
   function fetchFleet(){
     if(!document.getElementById('farm3d')){clearInterval(window._fleetTimer);window._fleetTimer=null;return;}
     fetch('/api/telemetry?t='+Date.now()).then(function(r){return r.json();}).then(function(d){
-      window._fleetPos=(d.robots||[]).map(function(r){return r.position||null;});
+      // robot_id 로 매칭한다. 인덱스로 맞추면 ACS가 일부 로봇만 보고할 때(dg_03만 온라인)
+      // 엉뚱한 로봇 자리에 위치가 들어간다. 데모 응답(DG1..)은 dg_01.. 로 맞춰 읽는다.
+      var m={}; (d.robots||[]).forEach(function(r,i){
+        var id=String(r.robot_id||'').toLowerCase().replace(/^dg(\d)$/,'dg_0$1');
+        m[id||('dg_0'+(i+1))]={pos:r.position||null, online:(r.online!==false)};
+      });
+      window._fleetPos=m;
     }).catch(function(){});
   }
   fetchFleet(); window._fleetTimer=setInterval(fetchFleet,1000);
@@ -1494,7 +1521,11 @@ function buildFarmScene(){
     if(auto)ang+=0.0012;
     pt+=0.00055;
     pinkies.forEach(function(pk,k){
-      var fp=window._fleetPos&&window._fleetPos[k];
+      var ent=window._fleetPos&&window._fleetPos['dg_0'+(k+1)];
+      var fp=ent&&ent.pos;
+      // 안 켜진 로봇은 지도에서 숨긴다 — 있지도 않은 로봇이 순찰하는 것처럼 보이면 안 된다
+      pk.visible=!ent||ent.online!==false;
+      if(!pk.visible)return;
       if(fp&&fp.live){  // 실제 로봇 실시간 위치(정규화 -1~1)만 반영
         var tx=fp.nx*F.HX, tz=fp.nz*F.HZ;
         pk.position.x+=(tx-pk.position.x)*0.12; pk.position.z+=(tz-pk.position.z)*0.12;
@@ -1519,14 +1550,16 @@ async function loadBatt(){
     const box=document.getElementById('battBox'); if(!box)return;
     let html='<div style="display:flex;gap:14px;flex-wrap:wrap">';
     (d.robots||[]).forEach(function(r){
-      const p=r.pinky, pct=p.battery_pct;
+      const p=r.pinky||{}, pct=p.battery_pct;
+      const off=(r.online===false), none=(pct===null||pct===undefined);
       const bc=pct>50?'#1d8a3e':(pct>=20?'#e8912d':'#e0483a');
-      const stt=pct>50?'양호':(pct>=20?'충전 권장':'⚠️ 곧 충전 필요');
-      html+='<div class="card" style="flex:1;min-width:230px;padding:18px">'
+      // 값이 없으면 숫자를 지어내지 않고 '—' 로 둔다 (오프라인 로봇 등)
+      const stt=none?(off?'오프라인':'값 미수신'):(pct>50?'양호':(pct>=20?'충전 권장':'⚠️ 곧 충전 필요'));
+      html+='<div class="card" style="flex:1;min-width:230px;padding:18px'+(off?';opacity:.55':'')+'">'
         +'<div style="font-size:17px;font-weight:800;margin-bottom:12px">'+r.robot_id+'</div>'
-        +'<div style="font-size:36px;font-weight:800;color:'+bc+';line-height:1">'+pct+'<small style="font-size:17px">%</small></div>'
-        +'<div style="font-size:14px;color:var(--muted);margin:6px 0 12px">'+p.battery_v+'V · '+stt+'</div>'
-        +'<div style="height:13px;background:#eef2f0;border-radius:7px;overflow:hidden"><div style="width:'+pct+'%;height:100%;background:'+bc+';border-radius:7px;transition:width .3s"></div></div>'
+        +'<div style="font-size:36px;font-weight:800;color:'+(none?'var(--muted)':bc)+';line-height:1">'+(none?'—':pct+'<small style="font-size:17px">%</small>')+'</div>'
+        +'<div style="font-size:14px;color:var(--muted);margin:6px 0 12px">'+(p.battery_v?p.battery_v+'V · ':'')+stt+'</div>'
+        +'<div style="height:13px;background:#eef2f0;border-radius:7px;overflow:hidden"><div style="width:'+(none?0:pct)+'%;height:100%;background:'+bc+';border-radius:7px;transition:width .3s"></div></div>'
         +'</div>';
     });
     box.innerHTML=html+'</div>';
@@ -1643,8 +1676,10 @@ function drawFarmHeat(){
   for(var gx=-6;gx<=6;gx+=2){ g.beginPath(); g.moveTo(sx(gx),sy(-F.HZ)); g.lineTo(sx(gx),sy(F.HZ)); g.stroke(); }
   for(var gz=-12;gz<=12;gz+=2){ g.beginPath(); g.moveTo(sx(-F.HX),sy(gz)); g.lineTo(sx(F.HX),sy(gz)); g.stroke(); }
   // 밀집 히트(재배 베드 주변, 부드러운 열지도 빨강→주황→노랑→연두)
-  var dens=window._heatDens||[0.95,0.9,0.72];   // 서버(/api/heatmap) 밀집도 · 순찰마다 변함
-  F.pillars.forEach(function(p,i){
+  // 순찰 검출이 아직 없으면(_heatAwaiting) 열지도를 아예 그리지 않는다 — 시드 밀집도를
+  // 칠해두면 스캔한 적도 없는 구역이 '완숙 밀집'으로 보인다.
+  var dens=window._heatDens;
+  F.pillars.forEach(dens?function(p,i){
     var rx,ry;
     if(p.face==='x'){ rx=sw(p.w)*3.0; ry=sh(p.d)*0.92; } else { rx=sw(p.d)*0.92; ry=sh(p.w)*3.0; }
     var cx=sx(p.x), cy=sy(p.z), d=dens[i]||0.6, R=Math.max(rx,ry);
@@ -1656,7 +1691,7 @@ function drawFarmHeat(){
     grd.addColorStop(0.8,'rgba(180,214,90,'+(0.2*d)+')');
     grd.addColorStop(1,'rgba(150,205,110,0)');
     g.fillStyle=grd; g.beginPath(); g.ellipse(0,0,rx,ry,0,0,7); g.fill(); g.restore();
-  });
+  }:function(){});
   // 로봇팔 위(맵 상단 바깥) 방울토마토 = 그림 대신 밀집 색으로 표시 (히트맵 일관성)
   F.arms.forEach(function(a){
     var cx=sx(a.x), cy=sy(a.z)-30, rx=Math.max(34,sw(1.8)), ry=19, d=0.92;
