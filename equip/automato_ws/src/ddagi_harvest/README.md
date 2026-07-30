@@ -29,11 +29,25 @@
 ```bash
 export ROS_DOMAIN_ID=10                                     # 전 로봇 공통
 export ARM_IP=192.168.3.12                                  # ★ 로봇마다 다름
-export DG_AI_MODEL_PATH=$HOME/Downloads/tomato_4cls_v8.pt   # YOLO 가중치
+export DG_AI_MODEL_PATH=$HOME/roscamp-repo-1/equip/automato_ws/src/dg_ai_service/models/tomato_4cls_v8.pt
 export AUTOMATO_PYTHON=$HOME/venv/automato/bin/python3      # venv 경로가 다르면
 ```
 
 `ARM_IP` 는 그 로봇의 Pi 주소다. 모르면 9010 포트가 열린 호스트를 찾는다(문제해결 참고).
+
+**가중치(.pt) 배치** — `.gitignore` 로 커밋이 금지돼 있다(18MB, 재학습마다 누적).
+각 PC 가 직접 받아서 아래 위치에 둔다. `Downloads` 같은 개인 폴더가 아니라
+**프로젝트 안의 정해진 자리**에 두면 PC 마다 경로가 같아진다.
+
+```bash
+mkdir -p ~/roscamp-repo-1/equip/automato_ws/src/dg_ai_service/models
+cp <받은 파일>/tomato_4cls_v8.pt ~/roscamp-repo-1/equip/automato_ws/src/dg_ai_service/models/
+```
+
+> `DG_AI_MODEL_PATH` 를 반드시 설정해야 한다. `dg_ai_service` 의 기본 경로는
+> `os.path.realpath(__file__)` 기준이라 **install 공간**(`install/dg_ai_service/.../models/`)
+> 으로 해석되는데, 거기엔 파일이 없고 `rm -rf install` 로 날아간다. src 에 두고
+> 환경변수로 가리키는 것이 안전하다.
 
 > ⚠ **`raspi.local`(mDNS)을 쓰지 말 것.** Pi 들의 호스트명이 모두 `raspi` 라
 > 먼저 응답한 쪽으로 해석된다. 실측에서 같은 세션 안에 다른 기계 두 곳을 가리켰다 —
@@ -60,7 +74,8 @@ ros2 launch ddagi_harvest harvest_with_ai.launch.py
 
 ```bash
 ros2 launch ddagi_harvest harvest_with_ai.launch.py \
-  arm_ip:=192.168.3.12 model:=$HOME/Downloads/tomato_4cls_v8.pt
+  arm_ip:=192.168.3.12 \
+  model:=$HOME/roscamp-repo-1/equip/automato_ws/src/dg_ai_service/models/tomato_4cls_v8.pt
 ```
 
 ### 4) rviz (선택 — 검출 결과 확인)
@@ -98,7 +113,7 @@ Goal 이 들어오면 로그가 이렇게 시작한다:
 | 인자 | 기본값 | 설명 |
 |---|---|---|
 | `arm_ip` | `$ARM_IP` 또는 `192.168.3.12` | Pi 의 `arm_server.py` 주소 (9010) |
-| `model` | `$DG_AI_MODEL_PATH` 또는 `~/Downloads/tomato_4cls_v8.pt` | YOLO 가중치 |
+| `model` | 비움 → `dg_ai_service` 기본값(`$DG_AI_MODEL_PATH`) | YOLO 가중치. 관례를 두 곳에 두지 않으려 위임 |
 | `python` | `$AUTOMATO_PYTHON` 또는 `~/venv/automato/bin/python3` | ultralytics 가 있는 파이썬 |
 | `dry_run` | `false` | `true` = 파지 없이 검출·마커만 |
 | `conf` | `0.4` | YOLO 신뢰도 임계 |
@@ -192,6 +207,16 @@ $AUTOMATO_PYTHON -c "
 import pyrealsense2 as rs, time
 d = rs.context().query_devices()[0]; d.hardware_reset(); time.sleep(6)
 print('재검출:', len(rs.context().query_devices()), '대')"
+```
+
+### AI 서비스가 뜨자마자 죽는다 (모델을 못 찾음)
+
+`DG_AI_MODEL_PATH` 가 없으면 기본 경로가 **install 공간**으로 해석되는데 가중치는
+거기에 없다. 확인:
+
+```bash
+echo $DG_AI_MODEL_PATH        # 비어 있으면 그것이 원인
+ls -la $DG_AI_MODEL_PATH      # 파일이 실제로 있는지
 ```
 
 ### `ModuleNotFoundError: ultralytics`

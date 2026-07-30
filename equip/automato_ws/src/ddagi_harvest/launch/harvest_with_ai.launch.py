@@ -23,7 +23,7 @@ AI 서비스가 카메라를 쓰므로 수확 노드는 반드시 detector:=ros 
 
 인자:
     python      두 노드를 실행할 파이썬 (ultralytics 가 있는 것)
-    model       YOLO 가중치 .pt 경로
+    model       YOLO 가중치 .pt. 비우면 dg_ai_service 기본값을 쓴다
     arm         network | fake (fake 는 팔 없이 launch 배선만 확인할 때)
     arm_ip      Pi 의 arm_server.py 주소 (9010)
     dry_run     true 면 파지 없이 검출·마커만
@@ -42,14 +42,18 @@ from launch_ros.parameter_descriptions import ParameterValue
 # 로봇팔 PC 마다 사용자명·팔 IP 가 다르므로 기본값을 절대경로로 박지 않는다.
 # 홈 기준 경로 + 환경변수로 두면 다른 PC 에서 코드를 고치지 않고 쓸 수 있다.
 #   AUTOMATO_PYTHON     ultralytics·pyrealsense2 가 있는 파이썬
-#   DG_AI_MODEL_PATH    YOLO 가중치 (.pt) — AI 서비스가 쓰는 것과 같은 변수명
 #   ARM_IP              그 로봇의 Pi 주소 (로봇마다 다르다)
 _HOME = os.path.expanduser("~")
 DEFAULT_VENV_PYTHON = os.environ.get(
     "AUTOMATO_PYTHON", os.path.join(_HOME, "venv/automato/bin/python3"))
-DEFAULT_MODEL = os.environ.get(
-    "DG_AI_MODEL_PATH", os.path.join(_HOME, "Downloads/tomato_4cls_v8.pt"))
 DEFAULT_ARM_IP = os.environ.get("ARM_IP", "192.168.3.12")
+
+# ⚠ 모델 경로 기본값을 여기서 정하지 않는다. dg_ai_service 가 이미
+#   DG_AI_MODEL_PATH 또는 <패키지>/models/tomato_4cls_v8.pt 로 정해 두었고,
+#   여기서 또 정하면 관례가 두 곳에 생겨 한쪽만 고치는 사고가 난다.
+#   빈 문자열을 넘기면 그쪽 기본값이 쓰인다(model_path 를 `or None` 으로 받는다).
+#   가중치는 .gitignore 로 커밋 금지(18MB, 재학습마다 누적)이므로 각 PC 가
+#   src/dg_ai_service/models/ 에 두거나 DG_AI_MODEL_PATH 로 가리킨다.
 
 
 def generate_launch_description():
@@ -57,8 +61,9 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument("python", default_value=DEFAULT_VENV_PYTHON,
                               description="ultralytics·pyrealsense2 가 있는 파이썬"),
-        DeclareLaunchArgument("model", default_value=DEFAULT_MODEL,
-                              description="YOLO 가중치 .pt (저장소에 없으므로 경로 필요)"),
+        DeclareLaunchArgument("model", default_value="",
+                              description="YOLO 가중치 .pt. 비우면 dg_ai_service 기본값"
+                                          "(DG_AI_MODEL_PATH 또는 패키지 models/)"),
         DeclareLaunchArgument("arm_ip", default_value=DEFAULT_ARM_IP,
                               description="Pi 의 arm_server.py 주소 (9010)"),
         DeclareLaunchArgument("dry_run", default_value="false",
