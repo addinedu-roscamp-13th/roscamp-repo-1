@@ -10,6 +10,7 @@ IK 해가 매번 달라져 경로가 튀는 문제를 피하려면 관절각 재
     확인:  python3 ddagi_harvest/teach_unload.py show
     검사:  python3 ddagi_harvest/teach_unload.py check
     재생:  python3 ddagi_harvest/teach_unload.py run
+    털기여유: python3 ddagi_harvest/teach_unload.py shakeroom
     털기튜닝: python3 ddagi_harvest/teach_unload.py shaketest
 
 티칭은 두 모드를 오간다. **드래그로 대충 잡고 조그로 다듬는다.**
@@ -88,17 +89,40 @@ WAIT_SEC = 3.0            # 'w' 스텝 기본 대기 (Unload.action 의 shake_de
 # 여러 관절을 함께 흔들면 바구니가 훨씬 격하게 요동친다. sign 이 반대면 반대 위상으로
 # 움직여 손목이 꺾이는 동시에 팔꿈치가 반대로 가 흔들림이 커진다.
 # 비우면 SHAKE_JOINT 하나만 쓴다.
+#
+# ⚠ 진폭은 '기준 자세에서 그 관절이 남긴 여유'를 못 넘는다. 쏟는 자세는 손목을 끝까지
+# 꺾은 자리라 J5 여유가 거의 없다(실측: 기준 -154.5°, 한계 -155° → 음의 반주기가
+# 통째로 잘려 실효 진폭이 의도의 50%). 그래서 **여유가 남은 관절에 진폭을 싣는다.**
+#   J2·J3 : 상하 바운스. 여유가 압도적이고 관성으로 열매를 실제로 털어낸다
+#   J6    : 비틀기. 같은 각도라도 시각적으로 가장 역동적
+#   J4    : 기울기 보조
+# shakeroom 으로 기준 자세의 관절별 여유를 먼저 확인할 것.
 SHAKE_PATTERN = [
-    {"joint": 5, "amp": 15.0, "sign": +1},   # 손목 피치 — 바구니를 까딱
-    {"joint": 4, "amp": 8.0, "sign": -1},    # 팔꿈치 반대 위상 — 진폭을 키운다
+    {"joint": 2, "amp": 5.0, "sign": +1},    # 상하 바운스 — 관성으로 털어낸다
+    {"joint": 3, "amp": 6.0, "sign": -1},    # 반대 위상 → 손끝 상하 진폭을 키운다
+    {"joint": 6, "amp": 10.0, "sign": +1},   # 비틀기 — 보이는 역동성
+    {"joint": 5, "amp": 4.0, "sign": +1},    # 손목은 남은 여유만큼만
 ]
+
+# 한 방향으로만 튕긴다(기준 ↔ 기준+진폭). 대칭 왕복은 반주기의 절반을 '이미 한계인
+# 자리로 또 가라'는 명령에 쓰게 되는데, 한계에 붙은 자세에서는 그 절반이 통째로 허공에
+# 버려진다. 한 방향이면 매 반주기가 실제 움직임을 만들어 **같은 횟수로 두 배 활발해
+# 보인다.** 사람이 뭘 털 때 하는 동작도 대칭 진동이 아니라 한쪽으로 튕기고 돌아오기다.
+SHAKE_ONEWAY = True
+
+# 리듬 — 이만큼 왕복한 뒤 잠깐 멈추고 반복한다. 균일한 12회보다 '4회·쉼·4회'가
+# "털었다"로 읽힌다. 0 이면 리듬 없이 연속.
+SHAKE_BURST = 4
+SHAKE_BURST_PAUSE = 0.25
 SHAKE_JOINT = 5           # 1-indexed (J5). SHAKE_PATTERN 이 비었을 때 쓰인다
 SHAKE_AMPLITUDE = 12.0    # ±도. 크면 그리퍼가 손잡이를 놓칠 수 있으니 올릴 땐 단계적으로
-# 실측: J5 왕복 진폭은 반주기를 늘려도 14° p-p 에서 더 안 는다(명령 30° 대비 47%).
-# 짐을 든 소형 서보의 물리 한계다. 진폭으로는 못 이기니 **지속 시간**으로 간다 —
-# 0.10s 반주기로 12회 왕복하면 2.4초 동안 끊김 없이 진동한다. 4회(0.8초)는
-# "한 번 까딱"으로 보이고, 12회는 "털고 있다"로 보인다.
-SHAKE_CYCLES = 12
+# ⚠ 정정: 한때 "실측 14° p-p 가 서보의 물리 한계"로 결론냈는데 **틀렸다.** 당시 기준
+# 자세의 J5 가 -154.5°(한계 -155°)여서 음의 반주기가 통째로 잘렸고, 실효 명령이 30°가
+# 아니라 15° 였다. 그 15° 중 14° 를 냈으니 서보 도달률은 93% — 잘 따라가고 있었다.
+# 반주기를 0.35~0.10s 로 바꿔도 진폭이 안 변한 것이 서보 속도 한계가 아니라 기하학적
+# 벽이었다는 증거였는데, 그걸 반대로 읽었다. 진폭이 안 나오면 먼저 shakeroom 으로
+# 여유를 볼 것.
+SHAKE_CYCLES = 8      # '털고 있다'로 읽히는 최소치. 리듬(burst)이 있으면 더 줄여도 된다
 SHAKE_SPEED = 100         # 최대. 털려면 반전 자체가 빨라야 한다
 SHAKE_RETURN_SETTLE = 0.8  # 복귀 후 고정 대기(s). 정지 감지 대신 쓴다(위 주석 참조)
 # ⚠ 반주기 대기(s). **도달을 기다리지 않고** 이만큼만 두고 반대로 꺾는다. 동기 이동으로
@@ -113,7 +137,7 @@ JOINT_LIMITS = {1: (-168, 168), 2: (-140, 140), 3: (-150, 150),
                 4: (-150, 150), 5: (-155, 160), 6: (-180, 180)}
 CLAMP_MARGIN = 0.5
 
-ARM_IP = os.environ.get("ARM_IP", "192.168.100.12")
+ARM_IP = os.environ.get("ARM_IP", "raspi.local")
 
 _ACT_LABEL = {"grip": "손잡이 파지", "open": "손잡이 놓기",
               "wait": f"{WAIT_SEC:.0f}초 대기", "shake": "털기"}
@@ -417,8 +441,9 @@ def do_shake(arm, base_angles, cfg: dict, watch=None, samples=None) -> None:
     cycles = int(cfg.get("cycles", SHAKE_CYCLES))
     speed = int(cfg.get("speed", SHAKE_SPEED))
     dwell = float(cfg.get("dwell", SHAKE_DWELL))
-    desc = " + ".join(f"J{p['joint']}±{p['amp']:.0f}°" for p in pattern)
-    print(f"    털기: {desc} × {cycles}회 (속도 {speed}, 반주기 {dwell}s)")
+    oneway = bool(cfg.get("oneway", SHAKE_ONEWAY))
+    burst = int(cfg.get("burst", SHAKE_BURST))
+    burst_pause = float(cfg.get("burst_pause", SHAKE_BURST_PAUSE))
 
     def pose(sign):
         a = list(base_angles)
@@ -426,12 +451,28 @@ def do_shake(arm, base_angles, cfg: dict, watch=None, samples=None) -> None:
             a[int(p["joint"]) - 1] += sign * int(p.get("sign", 1)) * float(p["amp"])
         return clamp_angles(a)[0]
 
-    lo_pose, hi_pose = pose(-1), pose(+1)
+    home = clamp_angles(base_angles)[0]
+    # 한 방향이면 기준↔기준+진폭, 대칭이면 기준-진폭↔기준+진폭.
+    a_pose, b_pose = (pose(+1), home) if oneway else (pose(+1), pose(-1))
+
+    # 실효 진폭을 미리 알려준다 — 한계에 걸려 잘리면 여기서 드러난다.
+    eff = [(int(p["joint"]), abs(a_pose[int(p["joint"]) - 1] - b_pose[int(p["joint"]) - 1]))
+           for p in pattern]
+    desc = " + ".join(f"J{j}{'→' if oneway else '±'}{d:.0f}°" for j, d in eff)
+    cut = [f"J{j}" for (j, d), p in zip(eff, pattern)
+           if d < (1 if oneway else 2) * float(p["amp"]) - 0.6]
+    print(f"    털기: {desc} × {cycles}회 "
+          f"({'한방향' if oneway else '대칭'}, 속도 {speed}, 반주기 {dwell}s"
+          + (f", {burst}회마다 {burst_pause}s 쉼" if burst else "") + ")")
+    if cut:
+        print(f"      ⚠ 관절 한계로 진폭이 잘린 축: {', '.join(cut)}"
+              f" — 기준 자세를 한계에서 떼거나 여유 있는 축으로 진폭을 옮기세요")
+
     # 도달을 기다리지 않고 반대로 꺾는다. 그래야 왕복이 이어져 '진동'이 된다.
     t0 = time.time()
-    for _ in range(cycles):
-        for p in (hi_pose, lo_pose):
-            arm.move_angles_nowait(p, speed)
+    for c in range(cycles):
+        for tgt in (a_pose, b_pose):
+            arm.move_angles_nowait(tgt, speed)
             if watch is None:
                 time.sleep(dwell)
                 continue
@@ -443,12 +484,43 @@ def do_shake(arm, base_angles, cfg: dict, watch=None, samples=None) -> None:
                 a = arm.get_angles()
                 if isinstance(a, (list, tuple)) and len(a) > watch:
                     samples.append(a[watch])
+        # 리듬 — 균일한 연속보다 '몇 번 털고 쉼'이 의도한 동작으로 읽힌다.
+        if burst and (c + 1) % burst == 0 and c + 1 < cycles:
+            time.sleep(burst_pause)
     # 복귀는 명령만 던지고 고정 시간만 기다린다. 정지 감지를 쓰면 방금 흔든 진동이
     # 남아 '아직 이동 중'으로 읽혀 타임아웃(15s)을 통째로 쓴다 — 실측 12~14초.
     # 털기 뒤엔 어차피 잔진동이 있으므로 '완전 정지'를 기다리는 것 자체가 무의미하다.
     arm.move_angles_nowait(clamp_angles(base_angles)[0], speed)
     time.sleep(float(cfg.get("return_settle", SHAKE_RETURN_SETTLE)))
     print(f"      완료 {time.time() - t0:.1f}s")
+
+
+def do_shakeroom() -> None:
+    """털기 기준 자세에서 **관절별로 남은 여유**를 보여준다(하드웨어 불필요).
+
+    진폭은 여유를 못 넘는다. 쏟는 자세는 손목을 끝까지 꺾은 자리라 J5 여유가 거의
+    없는 일이 흔하고, 그러면 명령한 진폭의 절반이 통째로 잘린다(실측: 실효 50%).
+    어느 축에 진폭을 실을 수 있는지 먼저 보고 SHAKE_PATTERN 을 정하는 것이 순서다.
+    """
+    steps = load()["steps"]
+    idx = next((i for i, s in enumerate(steps) if s.get("act") == "shake"), None)
+    if idx is None:
+        raise SystemExit("'털기' 스텝이 없습니다. 먼저 teach 로 s 를 기록하세요.")
+    base, over = clamp_angles(steps[idx]["angles"])
+    print(f"털기 기준 자세 (스텝 {idx + 1}): {[round(a, 1) for a in base]}")
+    if over:
+        print("  ⚠ 티칭값이 한계를 넘어 조여진 축: "
+              + ", ".join(f"J{j} {o:.1f}°→{c:.1f}°" for j, o, c in over))
+    print(f"\n{'축':>3} {'현재':>8} {'한계':>16} {'- 여유':>8} {'+ 여유':>8}  권장")
+    for j, a in enumerate(base, start=1):
+        lo, hi = JOINT_LIMITS[j]
+        dn, up = a - (lo + CLAMP_MARGIN), (hi - CLAMP_MARGIN) - a
+        room = min(dn, up)
+        tip = ("여유 큼 — 진폭 싣기 좋다" if room > 30 else
+               "보통" if room > 12 else "⚠ 여유 없음 — 진폭 실으면 잘린다")
+        print(f"J{j:<2} {a:>8.1f} {f'{lo}~{hi}':>16} {dn:>8.1f} {up:>8.1f}  {tip}")
+    print("\n한 방향(oneway)이면 '진폭 ≤ 해당 방향 여유' 만 맞으면 된다 —")
+    print("대칭 왕복은 양쪽 여유를 다 봐야 하므로 한계 근처에서는 한 방향이 유리하다.")
 
 
 def do_shaketest(arm) -> None:
@@ -568,6 +640,9 @@ def main() -> int:
         return 0
     if mode == "check":
         do_check()
+        return 0
+    if mode == "shakeroom":
+        do_shakeroom()
         return 0
     if mode not in ("teach", "run", "shaketest"):
         print(__doc__)

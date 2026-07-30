@@ -12,7 +12,7 @@
 
 실행 (노트북, 팔 연결. arm_server 가 Pi 에서 떠 있어야 함):
     ~/venv/automato/bin/python ddagi_harvest/teach_basket.py
-    ARM_IP=192.168.x.x ... (기본 192.168.100.12)
+    ARM_IP=192.168.x.x ... (기본 raspi.local)
 
 !! 서보를 풀면 팔이 중력으로 처진다. 반드시 손으로 받친 뒤 진행.
 """
@@ -34,7 +34,7 @@ def _fmt(vals) -> str:
 
 
 def main() -> int:
-    ip = os.environ.get("ARM_IP", "192.168.100.12")
+    ip = os.environ.get("ARM_IP", "raspi.local")
     arm = NetworkArm(ip)
     captured: dict = {}
     try:

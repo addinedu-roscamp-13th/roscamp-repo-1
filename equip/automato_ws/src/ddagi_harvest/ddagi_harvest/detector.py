@@ -294,7 +294,7 @@ class RosDetector(TomatoDetector):
     """
 
     def __init__(self, node, service_name: str = "/ai/detect_tomatoes",
-                 task_id: int = 0, timeout_sec: float = 10.0,
+                 task_id: int = 0, timeout_sec: float = 20.0,
                  wait_server_sec: float = 5.0, angles_provider=None):
         from automato_interfaces.srv import DetectTomatoes
         from rclpy.callback_groups import ReentrantCallbackGroup
@@ -325,17 +325,24 @@ class RosDetector(TomatoDetector):
         while not future.done() and _t.time() < deadline:
             _t.sleep(0.02)          # 실행기는 다른 스레드에서 돈다(ReentrantCallbackGroup)
         if not future.done():
+            # 서버가 응답 전에 YOLO 추론 + depth 조회를 다 끝내므로 오래 걸릴 수 있다
+            # (AI 가이드 4절). 시간초과도 '검출 실패'이지 '열매 없음'이 아니다.
             self._node.get_logger().error(
-                f"[RosDetector] 검출 응답 시간초과({self.timeout_sec}s) — 이번 라운드 0개 처리")
+                f"[RosDetector] 검출 응답 시간초과({self.timeout_sec}s) — 이번 라운드 건너뜀")
             future.cancel()
-            return []
+            return None
 
         res = future.result()
         if res is None or not res.success:
+            # ⚠ 빈 리스트를 돌려주면 안 된다. 수확 루프는 '검출 0개'를 '밭에 딸 게
+            # 없다'로 읽어 DEPLETED 로 종료하는데, 그러면 카메라가 아직 안 열린 것이
+            # "밭이 비었다"로 보고된다. AI 가이드도 CAMERA_NOT_AVAILABLE 을 영구 실패로
+            # 보지 말고 다음 라운드에 재시도하라고 명시한다(서버가 매 요청마다 재오픈).
+            # None = '이번 라운드 검출 자체가 실패' → 루프가 라운드를 넘긴다.
             code = getattr(res, "error_code", "?") if res else "NO_RESPONSE"
             msg = getattr(res, "message", "") if res else ""
             self._node.get_logger().error(f"[RosDetector] 검출 실패 {code}: {msg}")
-            return []
+            return None
 
         out: list[dict] = []
         for tom in res.tomatoes:
@@ -347,10 +354,29 @@ class RosDetector(TomatoDetector):
                     f"[RosDetector] 작업공간 밖 — id={tom.tomato_id} "
                     f"base={[round(c, 1) for c in base]}")
                 continue
+            if tom.grade not in ("NORMAL", "DISCARD"):
+                # 가이드상 오지 않지만, 오면 harvest 의 등급별 카운터에서 KeyError 로
+                # Goal 이 통째로 죽는다. 경고만 남기고 건너뛴다.
+                self._node.get_logger().warning(
+                    f"[RosDetector] 알 수 없는 grade '{tom.grade}' — id={tom.tomato_id} 건너뜀")
+                continue
             out.append({"base": base, "grade": tom.grade, "uv": None,
                         "depth_cm": cam[2] / 10.0, "color": tom.grade,
                         "tomato_id": int(tom.tomato_id)})
         return out
+
+
+    def close(self) -> None:
+        """서비스 클라이언트를 정리한다.
+
+        검출기는 **Goal 마다 새로 만들어진다**(task_id·라운드 카운터가 Goal 에 매이므로).
+        정리하지 않으면 같은 노드에 클라이언트가 계속 쌓인다 — 데모에서 몇 번 돌릴 때는
+        티가 안 나지만, 수확 명령이 반복되는 운영에서는 누적된다.
+        """
+        try:
+            self._node.destroy_client(self._cli)
+        except Exception:
+            pass
 
 
 class ListDetector(TomatoDetector):
@@ -371,7 +397,7 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from ddagi_harvest.arm_backend import NetworkArm
 
-    ip = os.environ.get("ARM_IP", "192.168.100.12")
+    ip = os.environ.get("ARM_IP", "raspi.local")
     weights = os.environ.get("WEIGHTS", "")
     arm = NetworkArm(ip)
     print(f"팔 연결 {ip} — 관측자세로 이동")
