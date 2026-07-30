@@ -140,7 +140,7 @@ JOINT_LIMITS = {1: (-168, 168), 2: (-140, 140), 3: (-150, 150),
                 4: (-150, 150), 5: (-155, 160), 6: (-180, 180)}
 CLAMP_MARGIN = 0.5
 
-ARM_IP = os.environ.get("ARM_IP", "raspi.local")
+ARM_IP = os.environ.get("ARM_IP", "192.168.3.12")
 
 _ACT_LABEL = {"grip": "손잡이 파지", "open": "손잡이 놓기",
               "wait": f"{WAIT_SEC:.0f}초 대기", "shake": "털기"}

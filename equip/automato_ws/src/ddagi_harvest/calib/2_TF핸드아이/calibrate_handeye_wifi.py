@@ -12,7 +12,7 @@
 pymycobot의 rx,ry,rz 오일러 규약이 애매 → 여러 규약을 다 풀고, "보드는 고정"
 이라는 사실로 자가검증(계산한 보드위치 퍼짐 최소인 규약 채택).
 
-로봇: aac0 @raspi.local, 토픽 /automato/{manual_cmd,arm_coords}, ROS_DOMAIN_ID=20
+로봇: aac0 @192.168.3.12, 토픽 /automato/{manual_cmd,arm_coords}, ROS_DOMAIN_ID=20
 보드: DICT_5X5_100, 5x7, square 30mm, marker 23mm  (네 보드)
 """
 import json, os, time, math
@@ -20,7 +20,7 @@ import numpy as np, cv2
 import pyrealsense2 as rs
 import paramiko
 
-ROBOT_IP="raspi.local"; USER="jetcobot"; PW="1"
+ROBOT_IP="192.168.3.12"; USER="jetcobot"; PW="1"
 SQUARES=(5,7); DICT=cv2.aruco.DICT_5X5_100; SQ=0.030; MK=0.023
 SAVE=os.path.expanduser("~/Desktop/tomato_pkg_extract/deploy/evidence/2026-07-16_②핸드아이")
 os.makedirs(SAVE, exist_ok=True)

@@ -61,7 +61,7 @@ def main():
         print("RealSense 없음")
         return 1
 
-    ip = os.environ.get("ARM_IP", "raspi.local")
+    ip = os.environ.get("ARM_IP", "192.168.3.12")
     print(f"팔 연결 → {ip}:9010")
     arm = NetworkArm(ip)
     print("관측자세 이동...")
