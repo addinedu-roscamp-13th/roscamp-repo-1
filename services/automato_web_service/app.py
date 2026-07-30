@@ -1849,6 +1849,8 @@ for _pair in os.environ.get("HARVEST_BAY_MAP", "dg_01:HARVEST_01,dg_02:HARVEST_0
 # 순찰 후보로 화면에 뜬다(역할과 어긋난 배정으로 이어진다).
 PATROL_ROBOT_IDS = tuple(x.strip() for x in
                          os.environ.get("PATROL_ROBOT_IDS", "dg_03").split(",") if x.strip())
+# 역방향(수확대 → 담당 로봇). 관리자가 화면에서 고르는 건 '수확대' 라서 이쪽이 주 경로다.
+ROBOT_BY_HARVEST_BAY = {b: r for r, b in HARVEST_BAY_BY_ROBOT.items()}
 HARVEST_REJECT_MSG = {        # 409 reason → 사용자 문구 (스펙 reason Enum)
     "NO_AVAILABLE_ROBOT":  "요청 가능한 로봇이 없습니다.",
     "ROBOT_OFFLINE":       "지정한 로봇의 텔레메트리가 3초 이상 수신되지 않았습니다.",
@@ -1983,9 +1985,37 @@ def harvest_request():
     loc = data.get("harvest_location")
 
     # ── 로봇 ↔ 수확대 1:1 결속 (dg_01=HARVEST_01, dg_02=HARVEST_02) ──────────
-    # auto 면 가용 목록에서 로봇을 먼저 정한다. '어느 로봇이냐'가 곧 '어느 수확대냐'라서,
-    # 로봇을 모르면 수확대를 정할 수 없다. (구버전은 무조건 HARVEST_01 로 나갔다)
-    if sel == "auto" and not rid_req:
+    # 1:1 이라 어느 쪽을 알든 나머지가 정해진다. 그래서 '거절' 이 아니라 '유도' 로 처리한다.
+    #   수확대를 골랐으면      → 그 수확대 전용 로봇을 자동 배정  (관리자가 클릭하는 건 수확대다)
+    #   로봇만 골랐으면        → 그 로봇 전용 수확대를 자동 선택
+    #   둘 다 안 골랐으면      → 가용 로봇 중 배터리 높은 쪽, 그 로봇의 수확대
+    # ⚠ 구버전은 auto + HARVEST_02 를 거절했다. auto 가 배터리 높은 dg_01 을 먼저 뽑고
+    #   그게 HARVEST_02 와 안 맞았기 때문이다 — 수확대2 를 고르면 아무것도 못 하는 버그였다.
+    if loc:
+        if loc not in HARVEST_LOCATIONS:
+            return jsonify({"status": "REJECTED", "reason": "INVALID_HARVEST_LOCATION",
+                            "message": "수확 위치는 %s 중 하나여야 합니다."
+                                       % ", ".join(HARVEST_LOCATIONS)}), 400
+        owner = ROBOT_BY_HARVEST_BAY.get(loc)
+        if owner and rid_req and rid_req != owner:
+            # 관리자가 로봇과 수확대를 어긋나게 골랐다. 수확대가 이긴다(화면에서 고른 게 수확대이고,
+            # 어느 팔이 그 수확대를 담당하는지는 설비 결속이라 관리자가 바꿀 수 있는 값이 아니다).
+            wlog("⚠ %s 는 %s 전용 → 요청된 %s 대신 %s 로 배정한다"
+                 % (loc, owner, rid_req, owner))
+        if owner:
+            rid_req = owner
+            sel = "manual"
+    elif rid_req:
+        bound = HARVEST_BAY_BY_ROBOT.get(rid_req)
+        if not bound:
+            # dg_03(순찰 전용) 처럼 로봇팔이 없는 로봇으로 수확을 요청한 경우
+            wlog("🛑 수확 요청 거절: %s 는 수확 로봇이 아니다(수확 가능: %s)"
+                 % (rid_req, ",".join(HARVEST_ROBOT_IDS)))
+            return jsonify({"status": "REJECTED", "reason": "NO_AVAILABLE_ROBOT",
+                            "message": "%s 는 로봇팔이 없어 수확할 수 없습니다. (수확 로봇: %s)"
+                                       % (rid_req, ", ".join(HARVEST_ROBOT_IDS))}), 409
+        loc = bound
+    else:
         cand = [r for r in _harvest_candidates() if r.get("available")]
         if not cand:
             return jsonify({"status": "REJECTED", "reason": "NO_AVAILABLE_ROBOT",
@@ -1993,25 +2023,12 @@ def harvest_request():
         # 배터리 높은 쪽. 동률이면 ID 순으로 고정해 매번 같은 결과가 나오게 한다.
         cand.sort(key=lambda r: (-(r.get("battery_percent") or 0), r.get("robot_id") or ""))
         rid_req = cand[0].get("robot_id")
+        loc = HARVEST_BAY_BY_ROBOT.get(rid_req) or HARVEST_LOCATIONS[0]
         sel = "manual"
-        data = dict(data); data["robot_selection"] = "manual"; data["robot_id"] = rid_req
-        wlog("  ↳ auto 배정 → %s (수확대는 로봇 전용 결속으로 결정)" % rid_req)
 
-    bound = HARVEST_BAY_BY_ROBOT.get(rid_req) if rid_req else None
-    if bound:
-        if loc and loc != bound:
-            wlog("🛑 수확 요청 거절: %s 는 %s 전용인데 %s 를 요청했다" % (rid_req, bound, loc))
-            return jsonify({"status": "REJECTED", "reason": "INVALID_HARVEST_LOCATION",
-                            "message": "%s 는 %s 전용입니다. (%s 는 사용할 수 없습니다)"
-                                       % (rid_req, bound, loc)}), 400
-        loc = bound                                                # 로봇이 정해지면 수확대도 자동 결정
-    elif rid_req and rid_req not in HARVEST_ROBOT_IDS:
-        # dg_03(순찰 전용) 처럼 로봇팔이 없는 로봇으로 수확을 요청한 경우
-        wlog("🛑 수확 요청 거절: %s 는 수확 로봇이 아니다(수확 가능: %s)"
-             % (rid_req, ",".join(HARVEST_ROBOT_IDS)))
-        return jsonify({"status": "REJECTED", "reason": "NO_AVAILABLE_ROBOT",
-                        "message": "%s 는 로봇팔이 없어 수확할 수 없습니다. (수확 로봇: %s)"
-                                   % (rid_req, ", ".join(HARVEST_ROBOT_IDS))}), 409
+    if rid_req:
+        data = dict(data); data["robot_selection"] = sel; data["robot_id"] = rid_req
+        wlog("  ↳ 배정: %s ↔ %s" % (rid_req, loc))
     loc = loc or HARVEST_LOCATIONS[0]
     if loc not in HARVEST_LOCATIONS:                               # 스펙: HARVEST_01/02 만 허용
         return jsonify({"status": "REJECTED", "reason": "INVALID_HARVEST_LOCATION",
