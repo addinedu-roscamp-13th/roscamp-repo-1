@@ -311,6 +311,10 @@ def service_config():
         "telegram_configured": bool(tok and cid),
         "robot_offline_sec": ROBOT_OFFLINE_SEC,
         "min_battery": {"patrol": MIN_BAT_PATROL, "harvest": MIN_BAT_HARVEST},
+        # 역할 분담이 실제로 적용됐는지 통합시험 중에 바로 확인할 수 있게 노출한다
+        "patrol_robot_ids": list(PATROL_ROBOT_IDS),
+        "harvest_robot_ids": list(HARVEST_ROBOT_IDS),
+        "harvest_bay_map": HARVEST_BAY_BY_ROBOT,
     })
 
 @app.get("/api/v1/telemetry")
@@ -1151,6 +1155,18 @@ def patrol_available():
                 rl = []
             wlog("◀ ACS 응답:", [(x.get("robot_id"), "가능" if x.get("available") else x.get("unavailable_reason"))
                                  for x in rl if isinstance(x, dict)], "→ App 반환")
+            # 순찰 자격(PATROL_ROBOT_IDS=dg_03) 로봇만 남긴다. ACS 는 함대 전체를 주므로
+            # 그대로 넘기면 수확 전용 dg_01·dg_02 가 순찰 후보로 화면에 떠 잘못 배정된다.
+            kept = [x for x in rl if isinstance(x, dict) and x.get("robot_id") in PATROL_ROBOT_IDS]
+            if kept or not rl:
+                js = dict(js); js["robots"] = kept; js["source"] = "acs"
+                js["available_count"] = sum(1 for x in kept if x.get("available"))
+            else:
+                # ACS 는 로봇을 주는데 PATROL_ROBOT_IDS 에 걸리는 게 없다 = 상대 ID 가 다르다.
+                # 목록을 비워 '순찰 로봇 없음' 으로 보이면 원인을 못 찾으니, 전체를 보여주고 알린다.
+                js = dict(js); js["source"] = "acs_unfiltered"; js["patrol_role_unknown"] = True
+                wlog("⚠ PATROL_ROBOT_IDS(%s) 에 해당하는 로봇이 ACS 응답에 없음 → 전체 표시. "
+                     "실제 순찰 로봇 ID 를 PATROL_ROBOT_IDS 로 지정하세요." % ",".join(PATROL_ROBOT_IDS))
             return (jsonify(js), r.status_code)
         except Exception as e:
             wlog("⚠ ACS 조회 실패, 로컬 폴백:", e)
@@ -1819,6 +1835,20 @@ HARVEST_LOCATIONS = ("HARVEST_01", "HARVEST_02")
 # 내일 보연님 로봇 ID 가 다르면 HARVEST_ROBOT_IDS=dg_01,dg_05 처럼 환경변수로만 바꾸면 된다.
 HARVEST_ROBOT_IDS = tuple(x.strip() for x in
                           os.environ.get("HARVEST_ROBOT_IDS", "dg_01,dg_02").split(",") if x.strip())
+# 로봇 ↔ 수확대 1:1 전용 (2026-07-30 팀 확인): dg_01 은 HARVEST_01 만, dg_02 는 HARVEST_02 만 쓴다.
+# 이게 없으면 harvest_location 이 robot_id 와 무관하게 정해져(기본 HARVEST_01),
+# dg_02 로 요청해도 HARVEST_01 로 나가고 dg_01+HARVEST_02 같은 잘못된 조합도 통과한다.
+#   형식: "dg_01:HARVEST_01,dg_02:HARVEST_02"
+HARVEST_BAY_BY_ROBOT = {}
+for _pair in os.environ.get("HARVEST_BAY_MAP", "dg_01:HARVEST_01,dg_02:HARVEST_02").split(","):
+    if ":" in _pair:
+        _r, _b = _pair.split(":", 1)
+        if _r.strip() and _b.strip():
+            HARVEST_BAY_BY_ROBOT[_r.strip()] = _b.strip()
+# 순찰 자격 로봇 — dg_03 만 순찰·운반. 없으면 ACS 응답을 그대로 넘겨 dg_01·dg_02 도
+# 순찰 후보로 화면에 뜬다(역할과 어긋난 배정으로 이어진다).
+PATROL_ROBOT_IDS = tuple(x.strip() for x in
+                         os.environ.get("PATROL_ROBOT_IDS", "dg_03").split(",") if x.strip())
 HARVEST_REJECT_MSG = {        # 409 reason → 사용자 문구 (스펙 reason Enum)
     "NO_AVAILABLE_ROBOT":  "요청 가능한 로봇이 없습니다.",
     "ROBOT_OFFLINE":       "지정한 로봇의 텔레메트리가 3초 이상 수신되지 않았습니다.",
@@ -1838,6 +1868,29 @@ HARVEST_EXIT_MSG = {
 
 # (구) _harvest_reason() 은 삭제했다 — 호출부가 없는 죽은 함수인데 IMMOBILIZED 검사가 빠져 있어
 #     나중에 재사용하면 확정 우선순위를 어기게 된다. 수확 사유 판정도 _demo_reason() 하나만 쓴다.
+
+
+def _harvest_candidates():
+    """수확 자격 로봇의 현재 가용 상태만 뽑는다(요청 시 auto 배정에 쓴다).
+       harvest_available() 과 같은 기준을 쓰되, 화면용 부가 필드는 만들지 않는다."""
+    out = []
+    tele = _TELEMETRY.get("robots") or []
+    if TELEMETRY_WS_URL and _telemetry_fresh() and tele:
+        for r in tele:
+            if not isinstance(r, dict) or r.get("robot_id") not in HARVEST_ROBOT_IDS:
+                continue
+            reason = r.get("unavailable_reason")
+            bat = r.get("battery_percent")
+            if reason is None and isinstance(bat, (int, float)) and bat < MIN_BAT_HARVEST:
+                reason = "BATTERY_TOO_LOW"
+            out.append({"robot_id": r.get("robot_id"), "battery_percent": bat,
+                        "available": reason is None, "unavailable_reason": reason})
+        return out
+    if not ACS_MODE:                              # 라이브 단독 구동일 때만 자체 함대
+        return [{"robot_id": r["robot_id"], "battery_percent": r["battery_percent"],
+                 "available": _demo_reason(r) is None, "unavailable_reason": _demo_reason(r)}
+                for r in _DEMO_FLEET.values() if r["robot_id"] in HARVEST_ROBOT_IDS]
+    return []                                     # ACS 연동인데 텔레메트리 없음 → 배정 불가
 
 
 @app.get("/api/v1/robots/harvest/available")
@@ -1926,11 +1979,44 @@ def harvest_request():
        Control 연동 시 /internal/v1/tasks/harvest 로 중계(대시보드=요청 일치). 아니면 로컬 데모."""
     data = body()
     sel = data.get("robot_selection", "auto")
-    loc = data.get("harvest_location") or HARVEST_LOCATIONS[0]     # 미지정 시 HARVEST_01
+    rid_req = data.get("robot_id")
+    loc = data.get("harvest_location")
+
+    # ── 로봇 ↔ 수확대 1:1 결속 (dg_01=HARVEST_01, dg_02=HARVEST_02) ──────────
+    # auto 면 가용 목록에서 로봇을 먼저 정한다. '어느 로봇이냐'가 곧 '어느 수확대냐'라서,
+    # 로봇을 모르면 수확대를 정할 수 없다. (구버전은 무조건 HARVEST_01 로 나갔다)
+    if sel == "auto" and not rid_req:
+        cand = [r for r in _harvest_candidates() if r.get("available")]
+        if not cand:
+            return jsonify({"status": "REJECTED", "reason": "NO_AVAILABLE_ROBOT",
+                            "message": HARVEST_REJECT_MSG["NO_AVAILABLE_ROBOT"]}), 409
+        # 배터리 높은 쪽. 동률이면 ID 순으로 고정해 매번 같은 결과가 나오게 한다.
+        cand.sort(key=lambda r: (-(r.get("battery_percent") or 0), r.get("robot_id") or ""))
+        rid_req = cand[0].get("robot_id")
+        sel = "manual"
+        data = dict(data); data["robot_selection"] = "manual"; data["robot_id"] = rid_req
+        wlog("  ↳ auto 배정 → %s (수확대는 로봇 전용 결속으로 결정)" % rid_req)
+
+    bound = HARVEST_BAY_BY_ROBOT.get(rid_req) if rid_req else None
+    if bound:
+        if loc and loc != bound:
+            wlog("🛑 수확 요청 거절: %s 는 %s 전용인데 %s 를 요청했다" % (rid_req, bound, loc))
+            return jsonify({"status": "REJECTED", "reason": "INVALID_HARVEST_LOCATION",
+                            "message": "%s 는 %s 전용입니다. (%s 는 사용할 수 없습니다)"
+                                       % (rid_req, bound, loc)}), 400
+        loc = bound                                                # 로봇이 정해지면 수확대도 자동 결정
+    elif rid_req and rid_req not in HARVEST_ROBOT_IDS:
+        # dg_03(순찰 전용) 처럼 로봇팔이 없는 로봇으로 수확을 요청한 경우
+        wlog("🛑 수확 요청 거절: %s 는 수확 로봇이 아니다(수확 가능: %s)"
+             % (rid_req, ",".join(HARVEST_ROBOT_IDS)))
+        return jsonify({"status": "REJECTED", "reason": "NO_AVAILABLE_ROBOT",
+                        "message": "%s 는 로봇팔이 없어 수확할 수 없습니다. (수확 로봇: %s)"
+                                   % (rid_req, ", ".join(HARVEST_ROBOT_IDS))}), 409
+    loc = loc or HARVEST_LOCATIONS[0]
     if loc not in HARVEST_LOCATIONS:                               # 스펙: HARVEST_01/02 만 허용
         return jsonify({"status": "REJECTED", "reason": "INVALID_HARVEST_LOCATION",
                         "message": "수확 위치는 %s 중 하나여야 합니다." % ", ".join(HARVEST_LOCATIONS)}), 400
-    data = dict(data); data["harvest_location"] = loc              # ACS 중계 시에도 기본값 채워 보냄
+    data = dict(data); data["harvest_location"] = loc              # ACS 중계 시에도 채워 보냄
     if _control_on():
         try:
             wlog("▶ App 요청: 수확 요청(robot_selection=%s robot_id=%s location=%s) → ACS 중계 POST /internal/v1/tasks/harvest"
