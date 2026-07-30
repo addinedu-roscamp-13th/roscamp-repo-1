@@ -16,7 +16,8 @@
 하는 일 —
    발행: /ddago/telemetry  (DdagoTelemetry, 기본 1Hz) — 진짜 로봇과 '같은 토픽/타입'.
      * 여러 가짜 로봇이 이 '한 토픽'에 함께 발행하고(다중 발행자 정상), 구분은
-       msg.robot_id(payload)로 한다 → dg_stub 이 robot_id 로 갈라 /{robot_id}/telemetry 로 올린다.
+       header.frame_id 로 한다 → dg_stub 이 그 값으로 갈라 /{robot_id}/telemetry 로 올린다.
+       (DdagoTelemetry 에 robot_id 필드가 있었으나 물리망 분리로 제거됐다.)
      * header.stamp 를 매번 '지금'(시스템 시각)으로 찍는다 → 계속 신선.
        멈추면(Ctrl+C) 3초 뒤 ACS 에서 자연히 ROBOT_OFFLINE 으로 뜬다.
    값(배터리·상태·좌표 등)은 파라미터로 주고 매 틱마다 다시 읽어 발행하므로, 실행 중에
@@ -34,7 +35,7 @@
    #   ros2 run automato_control_service fake_telemetry --ros-args -r __ns:=/dg_02
 
 주의 —
-   * dg_stub 은 /ddago/telemetry 를 구독해 msg.robot_id 로 가르므로, 가짜마다
+   * dg_stub 은 /ddago/telemetry 를 구독해 header.frame_id 로 가르므로, 가짜마다
      서로 다른 robot_id(=네임스페이스)를 주면 자동 취합된다(사전 목록 불필요).
    * 여러 가짜가 같은 토픽(/ddago/telemetry)에 함께 발행하는 건 정상(다중 발행자).
      단 robot_id 는 서로 달라야 한다 — 같으면 dg_stub 캐시에서 서로 덮어쓴다.
@@ -70,7 +71,7 @@ class FakeTelemetry(Node):
         rate = float(self.get_parameter("publish_rate_hz").value)
 
         # 진짜 로봇과 '같은 토픽/타입'(/ddago/telemetry) 으로 발행. 여러 가짜 로봇이 이
-        # 한 토픽에 함께 발행하고(다중 발행자), 구분은 msg.robot_id(payload)로 한다.
+        # 한 토픽에 함께 발행하고(다중 발행자), 구분은 header.frame_id 로 한다.
         # (실기는 물리망 분리라 익명으로 충분하지만, 테스트는 한 머신이라 id 로 가른다.)
         self._pub = self.create_publisher(DdagoTelemetry, "/ddago/telemetry", 10)
         self.create_timer(1.0 / rate if rate > 0.0 else 1.0, self._tick)
@@ -86,8 +87,9 @@ class FakeTelemetry(Node):
         msg = DdagoTelemetry()
         # header.stamp = '지금'(시스템 시각). ACS staleness(3초)를 통과 → 멈추면 자연히 STALE.
         msg.header.stamp = self.get_clock().now().to_msg()
+        # DdagoTelemetry 에는 robot_id 필드가 없다(물리망 분리로 제거). 테스트는 한 머신에서
+        # 가짜 여러 대가 한 토픽을 공유하므로, dg_stub 이 이 frame_id 로 로봇을 가른다.
         msg.header.frame_id = self._robot_id
-        msg.robot_id = self._robot_id                      # dg_stub 이 이 값으로 로봇을 가른다
         msg.task_id = int(g("task_id").value)
         msg.nav_status = str(g("nav_status").value)
         msg.is_charging = bool(g("is_charging").value)

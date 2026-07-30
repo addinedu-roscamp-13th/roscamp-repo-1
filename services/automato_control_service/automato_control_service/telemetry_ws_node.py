@@ -5,7 +5,9 @@ ACS 가 로봇별로 구독한 상태를 WebSocket 클라이언트(Automato Web 
 1Hz 로 브로드캐스트한다. QT 로 가는 원본(④)과 달리 여기는 관리자 화면용 **축약본**이다.
 
 RP-114 로 입력이 /{robot_id}/telemetry(RobotTelemetry, 로봇 수만큼)로 바뀌었다.
-옛 /automato/telemetry/fleet 는 팀원의 DG 이전이 끝날 때까지 함께 구독한다.
+이 노드는 주행 로봇(ddago)만 방송하는데, DdagoTelemetry 에서 robot_id 가 제거되면서
+옛 /automato/telemetry/fleet 로 온 ddago 는 어느 로봇인지 특정할 수 없게 됐다.
+가를 수단이 없는 폴백은 남겨도 아무 일도 못 하므로 옛 경로 구독을 걷어냈다.
 
 실행 구조(기존 automato_node 와 동일한 골격 — 두 세계가 한 프로세스에 공존):
   - [백그라운드 스레드]  rclpy 노드가 spin → fleet 구독 콜백이 FleetCache 에 최신 상태를 씀(writer)
@@ -20,13 +22,11 @@ RP-114 로 입력이 /{robot_id}/telemetry(RobotTelemetry, 로봇 수만큼)로 
 """
 import threading
 
-from automato_interfaces.msg import FleetTelemetry
 import rclpy
 from rclpy.node import Node
 
 from automato_control_service.fleet_collector import (
     DEFAULT_ROBOT_IDS,
-    LEGACY_FLEET_TOPIC,
     robot_telemetry_topic,
     subscribe_per_robot,
 )
@@ -88,18 +88,6 @@ class FleetCache:
                 self._robots[robot_id] = self._entry(robot_id, d)
         # with 블록을 벗어나면 열쇠를 자동 반납(예외가 나도 반드시 반납).
 
-    def update_from_fleet(self, msg) -> None:
-        """[삭제 예정] 옛 경로: FleetTelemetry 1건(로봇 3대분)을 로봇별로 나눠 저장한다.
-
-        옛 구조에는 네임스페이스가 없어 로봇 구분이 payload 의 robot_id 뿐이다.
-        robot_id 가 빈 항목은 어느 로봇인지 알 수 없어 건너뛴다.
-        """
-        with self._lock:
-            for d in msg.ddagos:
-                if not d.robot_id:
-                    continue
-                self._robots[d.robot_id] = self._entry(d.robot_id, d)
-
     def snapshot(self) -> list:
         """지금 알고 있는 모든 로봇의 최신 상태 '복사본' 리스트를 반환(reader, 방송 코루틴).
 
@@ -126,9 +114,7 @@ class TelemetryNode(Node):
         self._rx_since_report = set()
 
         self.declare_parameter("robot_ids", DEFAULT_ROBOT_IDS)
-        self.declare_parameter("legacy_input", True)
         robot_ids = list(self.get_parameter("robot_ids").value)
-        legacy_input = bool(self.get_parameter("legacy_input").value)
         # 주기 요약에서 '와야 하는데 안 온 로봇'을 가려내려면 기대 목록이 필요하다.
         self._robot_ids = robot_ids
 
@@ -136,15 +122,10 @@ class TelemetryNode(Node):
         subscribe_per_robot(self, robot_ids, self._on_robot_telemetry)
         # 수신 요약 타이머 — 콜백마다 찍는 대신 이 타이머가 한 줄로 묶어 낸다.
         self.create_timer(RX_REPORT_SEC, self._report_rx)
-        # [삭제 예정] 팀원의 DG 이전 전까지 옛 경로도 함께 받는다.
-        if legacy_input:
-            self.create_subscription(
-                FleetTelemetry, LEGACY_FLEET_TOPIC, self._on_fleet, 10)
 
         self.get_logger().info(
-            "텔레메트리 WS 노드 준비: 구독 %s → 캐시 갱신%s"
-            % ([robot_telemetry_topic(r) for r in robot_ids],
-               " (옛 %s 도 함께)" % LEGACY_FLEET_TOPIC if legacy_input else ""))
+            "텔레메트리 WS 노드 준비: 구독 %s → 캐시 갱신"
+            % ([robot_telemetry_topic(r) for r in robot_ids],))
 
     def _on_robot_telemetry(self, robot_id, msg) -> None:
         # 콜백(백그라운드 spin 스레드)에서 캐시에 쓴다(writer). 방송 루프(메인 스레드)가 읽는다.
@@ -181,14 +162,6 @@ class TelemetryNode(Node):
             % (", ".join(sorted(received)),
                " (미수신 %.0fs: %s)" % (RX_REPORT_SEC, ", ".join(missing))
                if missing else ""))
-
-    def _on_fleet(self, msg: FleetTelemetry) -> None:
-        """[삭제 예정] 옛 /automato/telemetry/fleet 경로."""
-        self.cache.update_from_fleet(msg)
-        self.get_logger().info(
-            "[삭제 예정] 옛 fleet 경로로 수신 중(ddago %d대) — DG 이전 후 "
-            "legacy_input 을 끄세요" % len(msg.ddagos),
-            throttle_duration_sec=30.0)
 
 
 # --------------------------------------------------------------------------- #

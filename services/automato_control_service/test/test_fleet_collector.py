@@ -31,12 +31,11 @@ from automato_control_service.fleet_collector import (  # noqa: E402
 # --------------------------------------------------------------------------- #
 # 픽스처 헬퍼
 # --------------------------------------------------------------------------- #
-def _make_ddago(robot_id='', stamp_sec=100, battery=78.5, nav='NAVIGATING'):
-    """로봇이 보내는 형태. robot_id 는 기본이 빈 문자열 — 물리망 분리 후 로봇은 채우지 않는다."""
+def _make_ddago(stamp_sec=100, battery=78.5, nav='NAVIGATING'):
+    """로봇이 보내는 형태. 메시지에 로봇 식별자가 없다(물리망 분리로 robot_id 제거)."""
     m = DdagoTelemetry()
     m.header.frame_id = 'map'
     m.header.stamp.sec = stamp_sec
-    m.robot_id = robot_id
     m.task_id = 1024
     m.nav_status = nav
     m.is_charging = False
@@ -73,7 +72,8 @@ def _make_ddagi(robot_id='', stamp_sec=100):
 def _make_robot_telemetry(with_arm=True, **kwargs):
     """DG 가 /{robot_id}/telemetry 로 올리는 형태(메시지 안에 robot_id 없음)."""
     m = RobotTelemetry()
-    m.ddagos = [_make_ddago(**kwargs)]
+    # ddago 에는 robot_id 가 없다 — 넘어온 robot_id 는 ddagi 전용.
+    m.ddagos = [_make_ddago(**{k: v for k, v in kwargs.items() if k != 'robot_id'})]
     if with_arm:
         # ddagi 는 배터리·주행상태가 없으므로 공통 인자만 골라 넘긴다.
         arm_kwargs = {k: v for k, v in kwargs.items()
@@ -166,19 +166,21 @@ def test_build_preserves_robot_stamp():
     assert out.robots[0].telemetry.ddagos[0].header.stamp.sec == 100
 
 
-def test_build_backfills_robot_id_into_legacy_fields():
-    """[삭제 예정] 하위호환의 핵심 — 옛 필드로 평탄화할 때 ACS 가 robot_id 를 채워 넣는다.
+def test_build_backfills_robot_id_into_legacy_ddagi():
+    """[삭제 예정] 하위호환 — 옛 ddagi 필드로 평탄화할 때 ACS 가 robot_id 를 채워 넣는다.
 
     로봇은 더 이상 robot_id 를 채우지 않으므로(네임스페이스로 대체) 그대로 흘리면
-    옛 필드를 읽는 QT 가 로봇을 구분하지 못한다.
+    옛 필드를 읽는 소비자가 로봇을 구분하지 못한다.
+    ddago 는 robot_id 필드 자체가 없어져 채울 것이 없다 — 값은 그대로 실리지만
+    옛 필드만 보는 소비자는 로봇을 구분할 수 없다(robots[] 를 봐야 한다).
     """
     c = FleetCollector()
-    c.update('dg_01', _make_robot_telemetry())          # robot_id 는 빈 문자열
+    c.update('dg_01', _make_robot_telemetry())
     c.update('dg_02', _make_robot_telemetry(with_arm=False))
 
     out = c.build_fleet_message(_stamp(1))
 
-    assert [d.robot_id for d in out.ddagos] == ['dg_01', 'dg_02']
+    assert len(out.ddagos) == 2
     assert [a.robot_id for a in out.ddagis] == ['dg_01']
     # 옛 필드에도 원본 값이 손실 없이 실린다(QT 가 진단용으로 전부 읽는다).
     assert out.ddagos[0].nav_status == 'NAVIGATING'
@@ -190,7 +192,7 @@ def test_build_does_not_mutate_cached_original():
     c = FleetCollector()
     c.update('dg_01', _make_robot_telemetry())
     c.build_fleet_message(_stamp(1))
-    assert c.get('dg_01').ddagos[0].robot_id == '', '캐시 원본이 변조됐다'
+    assert c.get('dg_01').ddagis[0].robot_id == '', '캐시 원본이 변조됐다'
 
 
 def test_build_empty_when_nothing_received():
@@ -211,31 +213,31 @@ def _make_legacy_fleet(ddagos, ddagis):
     return fleet
 
 
-def test_legacy_fleet_split_by_payload_robot_id():
-    """옛 구조엔 네임스페이스가 없어 payload robot_id 로만 로봇을 가를 수 있다."""
+def test_legacy_fleet_drops_ddago_and_splits_ddagi():
+    """옛 구조엔 네임스페이스가 없어 payload robot_id 로만 가를 수 있는데, ddago 는
+    그 필드가 제거돼 가를 수단이 없다 → 통째로 버리고 ddagi 만 가른다.
+    버린 수는 호출부가 경고할 수 있도록 반환한다."""
     c = FleetCollector()
-    skipped = c.update_from_legacy_fleet(_make_legacy_fleet(
-        [_make_ddago('dg_01'), _make_ddago('dg_02')],
+    dropped_ddago, skipped_ddagi = c.update_from_legacy_fleet(_make_legacy_fleet(
+        [_make_ddago(), _make_ddago()],
         [_make_ddagi('dg_01')],
     ))
 
-    assert skipped == (0, 0)
-    assert c.robot_ids() == ['dg_01', 'dg_02']
-    assert len(c.get('dg_01').ddagos) == 1
+    assert (dropped_ddago, skipped_ddagi) == (2, 0)
+    assert c.robot_ids() == ['dg_01'], '식별할 수 없는 ddago 가 캐시에 들어갔다'
     assert len(c.get('dg_01').ddagis) == 1
-    assert len(c.get('dg_02').ddagis) == 0
+    assert len(c.get('dg_01').ddagos) == 0
 
 
 def test_legacy_fleet_skips_empty_robot_id():
-    """robot_id 가 빈 항목은 건너뛴다 — 이름 없는 유령 로봇이 가용 목록에 뜨면
+    """robot_id 가 빈 ddagi 는 건너뛴다 — 이름 없는 유령 로봇이 가용 목록에 뜨면
     순찰이 존재하지 않는 로봇에 배차를 시도한다. 건너뛴 수는 호출부가 경고하도록 반환."""
     c = FleetCollector()
-    skipped = c.update_from_legacy_fleet(_make_legacy_fleet(
-        [_make_ddago('dg_01'), _make_ddago('')],   # 두 번째는 robot_id 없음
-        [_make_ddagi('')],
+    dropped_ddago, skipped_ddagi = c.update_from_legacy_fleet(_make_legacy_fleet(
+        [], [_make_ddagi('dg_01'), _make_ddagi('')],   # 두 번째는 robot_id 없음
     ))
 
-    assert skipped == (1, 1)
+    assert (dropped_ddago, skipped_ddagi) == (0, 1)
     assert c.robot_ids() == ['dg_01'], '빈 robot_id 가 캐시에 들어갔다'
 
 
@@ -243,8 +245,8 @@ def test_legacy_and_new_path_merge_into_same_cache():
     """DG 가 섞여 있어도(일부만 새 버전) 같은 캐시에 병합돼 한 배열로 발행된다."""
     c = FleetCollector()
     c.update('dg_01', _make_robot_telemetry())                       # 새 경로
-    c.update_from_legacy_fleet(_make_legacy_fleet(                   # 옛 경로
-        [_make_ddago('dg_02')], []))
+    c.update_from_legacy_fleet(_make_legacy_fleet(                   # 옛 경로(ddagi 만)
+        [], [_make_ddagi('dg_02')]))
 
     out = c.build_fleet_message(_stamp(1))
     assert [m.robot_id for m in out.robots] == ['dg_01', 'dg_02']

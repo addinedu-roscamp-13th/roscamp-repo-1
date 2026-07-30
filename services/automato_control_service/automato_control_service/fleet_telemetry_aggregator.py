@@ -110,18 +110,18 @@ class FleetTelemetryAggregator(Node):
 
     def _on_legacy_fleet(self, msg):
         """[삭제 예정] 옛 /automato/telemetry/fleet 수신 → 로봇별로 갈라 같은 캐시에 병합."""
-        skipped_ddago, skipped_ddagi = self._collector.update_from_legacy_fleet(msg)
+        dropped_ddago, skipped_ddagi = self._collector.update_from_legacy_fleet(msg)
         now = time.time()
         for robot_id in self._collector.robot_ids():
             self._last_rx[robot_id] = now
 
-        if skipped_ddago or skipped_ddagi:
-            # robot_id 가 빈 항목은 어느 로봇인지 알 수 없어 버렸다. 조용히 사라지면
-            # "왜 로봇이 안 보이지"를 추적할 수 없으므로 반드시 남긴다.
+        if dropped_ddago or skipped_ddagi:
+            # 로봇을 특정할 수 없어 버린 것들. 조용히 사라지면 "왜 로봇이 안 보이지"를
+            # 추적할 수 없으므로 반드시 남긴다.
             self.get_logger().warn(
-                '옛 fleet 에서 robot_id 없는 항목 무시: ddago %d / ddagi %d '
-                '— DG 가 payload robot_id 를 채우는지 확인 필요'
-                % (skipped_ddago, skipped_ddagi),
+                '옛 fleet 에서 로봇 특정 불가로 무시: ddago %d(식별자 필드 없음) / '
+                'ddagi %d(robot_id 빔) — DG 는 /{robot_id}/telemetry 로 보내야 한다'
+                % (dropped_ddago, skipped_ddagi),
                 throttle_duration_sec=10.0)
         self.get_logger().info(
             '[삭제 예정] 옛 fleet 경로로 수신 중 — DG 이전 후 legacy_input 을 끄세요',

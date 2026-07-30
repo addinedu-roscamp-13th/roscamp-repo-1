@@ -84,21 +84,16 @@ class TelemetryCache:
                 entry["ddagi"] = _ddagi_fields(a)
                 entry["ddagi_stamp"] = _stamp_sec(a.header)
 
-    def update_from_fleet(self, msg: FleetTelemetry, rx_wall: float) -> None:
+    def update_from_fleet(self, msg: FleetTelemetry) -> None:
         """[삭제 예정] 옛 경로: FleetTelemetry 1건(로봇 3대분)을 로봇별로 병합 저장한다.
 
         옛 구조에는 네임스페이스가 없어 로봇 구분이 payload 의 robot_id 뿐이다.
+        DdagoTelemetry 에서 robot_id 가 제거되어 ddago 는 더 이상 가를 수단이 없으므로
+        이 경로의 ddago 는 처리하지 않는다(어느 로봇인지 특정 불가). ddagi 만 가른다.
         robot_id 가 빈 항목은 어느 로봇인지 알 수 없어 건너뛴다.
         팀원의 DG 이전이 끝나면 이 메서드를 제거한다.
         """
         with self._lock:
-            for d in msg.ddagos:
-                if not d.robot_id:
-                    continue
-                entry = self._data.setdefault(d.robot_id, {"robot_id": d.robot_id})
-                entry["ddago"] = _ddago_fields(d)
-                entry["ddago_stamp"] = _stamp_sec(d.header)
-                entry["local_rx"] = rx_wall
             for a in msg.ddagis:
                 if not a.robot_id:
                     continue

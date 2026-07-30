@@ -51,7 +51,7 @@ def _wait_until(predicate, timeout=8.0):
 
 
 def _make_ddago(task_id, x, y, battery, nav_status):
-    """로봇이 보내는 형태 — robot_id 를 채우지 않는다(네임스페이스가 대신한다)."""
+    """로봇이 보내는 형태 — 메시지에 robot_id 가 없다(네임스페이스가 대신한다)."""
     m = DdagoTelemetry()
     m.header.frame_id = 'map'
     m.header.stamp.sec = 100
@@ -162,12 +162,17 @@ def test_aggregates_per_robot_topics(ctx):
     assert len(out.robots[1].telemetry.ddagis) == 0
 
     # --- [삭제 예정] 옛 필드도 함께 채워 QT 무수정 동작을 유지 ---
-    assert [d.robot_id for d in out.ddagos] == ['dg_01', 'dg_02']
+    # ddago 는 robot_id 필드가 제거돼 로봇 표시가 없다(값만 실린다).
+    assert len(out.ddagos) == 2
     assert [a.robot_id for a in out.ddagis] == ['dg_01']
 
 
 def test_legacy_fleet_input_still_works(ctx):
-    """[삭제 예정] 팀원의 DG 이전 전까지 옛 경로로 들어오는 길도 살아 있어야 한다."""
+    """[삭제 예정] 팀원의 DG 이전 전까지 옛 경로로 들어오는 길도 살아 있어야 한다.
+
+    ddago 는 robot_id 가 제거돼 옛 경로로 들어와도 가를 수 없다(버려진다).
+    payload robot_id 가 남아 있는 ddagi 로만 이 길을 검증한다.
+    """
     _agg, helper = ctx
     received = []
     helper.create_subscription(
@@ -176,9 +181,9 @@ def test_legacy_fleet_input_still_works(ctx):
 
     # 옛 구조엔 네임스페이스가 없어 payload robot_id 로만 로봇을 가른다.
     legacy = FleetTelemetry()
-    d = _make_ddago(7, 1.0, 2.0, 55.0, 'IDLE')
-    d.robot_id = 'dg_09'          # robot_ids 파라미터에 없는 로봇 → 옛 경로로만 들어온다
-    legacy.ddagos = [d]
+    a = _make_ddagi()
+    a.robot_id = 'dg_09'          # robot_ids 파라미터에 없는 로봇 → 옛 경로로만 들어온다
+    legacy.ddagis = [a]
 
     def arrived():
         pub.publish(legacy)

@@ -41,7 +41,7 @@ DB/메모리/rosbag2 저장 없이 실시간 스트리밍만 수행한다.
 
 발행:
   /ddago/telemetry                 automato_interfaces/DdagoTelemetry       1Hz
-  (ddago 는 자기 정체를 모른다 — msg.robot_id 는 비우고, 어느 로봇인지는 dcs 가 채운다.
+  (ddago 는 자기 정체를 모른다 — 메시지에 로봇 식별자가 없고, 어느 로봇인지는 dcs 가 안다.
    ddago/ddagi 가 같은 망을 공유하므로 /ddago 접두어만 붙여 타입 충돌을 피한다.
    구독 소스 토픽(odom, amcl_pose ...)은 bare 드라이버/Nav2 에 맞춰 상대명 그대로.)
 
@@ -288,7 +288,6 @@ class TelemetryPublisher(Node):
 
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = frame
-        # msg.robot_id 는 비워 둔다(기본 ''): 어느 로봇인지는 수신하는 dcs 가 채운다.
         msg.task_id = self._task_id
         msg.nav_status = self._nav_status
 

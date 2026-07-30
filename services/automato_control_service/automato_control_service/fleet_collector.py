@@ -73,14 +73,16 @@ class FleetCollector:
         """옛 FleetTelemetry(로봇 3대분 배열) 1건을 로봇별로 갈라 저장한다.
 
         옛 구조에는 네임스페이스가 없어 로봇 구분이 payload 의 robot_id 뿐이다.
-        그래서 여기서만은 msg.ddagos[].robot_id 를 보고 가른다.
+        그런데 DdagoTelemetry 에서 robot_id 가 제거되면서 ddago 는 가를 수단이 사라졌다
+        — 이 경로로 들어온 ddago 는 전부 버린다(어느 로봇인지 특정할 방법이 없다).
+        남은 ddagi 만 payload 의 robot_id 로 가른다.
 
-        robot_id 가 빈 로봇은 건너뛴다(어느 로봇인지 알 수 없어 캐시 키를 만들 수 없다).
-        반환값 = 건너뛴 개수를 호출부가 경고 로그로 남길 수 있도록 알려주는
-        (skipped_ddago, skipped_ddagi) 튜플.
+        robot_id 가 빈 ddagi 는 건너뛴다(캐시 키를 만들 수 없다).
+        반환값 = 호출부가 경고 로그로 남길 수 있도록 알려주는
+        (버린 ddago 수, 건너뛴 ddagi 수) 튜플.
         """
         per_robot = {}      # robot_id -> RobotTelemetry(조립 중)
-        skipped_ddago = 0
+        dropped_ddago = len(msg.ddagos)   # 식별 불가 → 통째로 버린 수(로그용)
         skipped_ddagi = 0
 
         def bucket(robot_id):
@@ -91,11 +93,6 @@ class FleetCollector:
                 per_robot[robot_id] = item
             return item
 
-        for d in msg.ddagos:
-            if not d.robot_id:
-                skipped_ddago += 1
-                continue
-            bucket(d.robot_id).ddagos.append(d)
         for a in msg.ddagis:
             if not a.robot_id:
                 skipped_ddagi += 1
@@ -104,7 +101,7 @@ class FleetCollector:
 
         with self._lock:
             self._robots.update(per_robot)
-        return skipped_ddago, skipped_ddagi
+        return dropped_ddago, skipped_ddagi
 
     # ------------------------------------------------------------------ #
     # 읽기
@@ -144,9 +141,10 @@ class FleetCollector:
         robots[] 와 함께 [삭제 예정] 필드 ddagos[]/ddagis[] 도 채운다. QT(system_admin_app)가
         아직 옛 필드를 순회하고 있어, 그쪽 이전 전까지 화면이 살아 있게 하는 하위호환 장치다.
 
-        옛 필드로 평탄화할 때 robot_id 를 ACS 가 채워 넣는다 — 로봇은 더 이상 robot_id 를
-        채우지 않으므로(네임스페이스로 대체) 그대로 흘리면 QT 가 로봇을 구분하지 못한다.
-        원본을 건드리지 않도록 복사본에 쓴다.
+        ddagi 는 평탄화할 때 robot_id 를 ACS 가 채워 넣는다 — 로봇은 더 이상 robot_id 를
+        채우지 않으므로(네임스페이스로 대체) 그대로 흘리면 구분이 안 된다. 원본을
+        건드리지 않도록 복사본에 쓴다.
+        ddago 는 robot_id 필드 자체가 없어져 채울 것이 없다(로봇 식별은 robots[] 몫).
         """
         out = FleetTelemetry()
         out.header.stamp = stamp
@@ -158,10 +156,9 @@ class FleetCollector:
             out.robots.append(member)
 
             # --- [삭제 예정] 아래 블록은 QT 이전이 끝나면 통째로 지운다 ---
-            for d in telemetry.ddagos:
-                legacy = copy.deepcopy(d)
-                legacy.robot_id = robot_id
-                out.ddagos.append(legacy)
+            # ddago 는 채워 넣을 robot_id 가 없으므로 복사 없이 그대로 싣는다.
+            # 이 필드만 보는 소비자는 로봇을 구분할 수 없다 → robots[] 를 봐야 한다.
+            out.ddagos.extend(telemetry.ddagos)
             for a in telemetry.ddagis:
                 legacy = copy.deepcopy(a)
                 legacy.robot_id = robot_id
