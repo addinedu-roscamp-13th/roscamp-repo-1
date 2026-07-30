@@ -48,6 +48,15 @@ MAX_ROUNDS = 5            # 촬영-수확 라운드 상한(시나리오2 스펙)
 #   튜닝·실측이 전부 base_x 로 이뤄졌으므로 기본값은 base_x 를 유지한다. 스펙 문언에
 #   맞추려면 이 한 줄만 'base_dist' 로 바꾸면 된다.
 SORT_KEY = "base_x"
+# 위 네 가지 기준의 (정렬 키 함수, 로그 라벨). 설명과 구현이 떨어져 있으면 기준을
+# 추가할 때 한쪽만 고치게 되므로 SORT_KEY 주석 바로 아래에 둔다.
+_SORT_MODES = {
+    "base_x": (lambda t: t["base"][0], "base x 가까운 순(팔 정면 거리)"),
+    "base_dist": (lambda t: math.sqrt(sum(c * c for c in t["base"])),
+                  "base 원점 거리 가까운 순"),
+    "base_z": (lambda t: t["base"][2], "낮은 순(base z)"),
+    "depth": (lambda t: t.get("depth_cm", 1e9), "카메라 depth 가까운 순"),
+}
 RETRY_Z_BUMP = 8.0        # 재시도마다 목표 z를 이만큼(mm) 위로 — 같은 실패 반복 방지(너무 아래 잡던 것 보정)
 EXCLUDE_RADIUS = 25.0     # 실패/수확한 자리 반경(mm) 내 재검출은 같은 것으로 보고 건너뜀.
                           # TF 노이즈(~10mm)보단 크고, 토마토 간격(~30mm+)보단 작게.
@@ -175,14 +184,7 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
                 log("검출 0개 — 수확 종료")
             exit_reason = "DEPLETED"
             break
-        keyfn = {"base_x": lambda t: t["base"][0],
-                 "base_dist": lambda t: math.sqrt(sum(c * c for c in t["base"])),
-                 "base_z": lambda t: t["base"][2],
-                 "depth": lambda t: t.get("depth_cm", 1e9)}[SORT_KEY]
-        label = {"base_x": "base x 가까운 순(팔 정면 거리)",
-                 "base_dist": "base 원점 거리 가까운 순",
-                 "base_z": "낮은 순(base z)",
-                 "depth": "카메라 depth 가까운 순"}[SORT_KEY]
+        keyfn, label = _SORT_MODES[SORT_KEY]
         batch.sort(key=keyfn)
         if on_detect is not None:            # 정렬 뒤에 넘긴다 — 마커의 번호가 파지 순서
             on_detect(batch)
@@ -297,9 +299,7 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
 
 
 def main() -> int:
-    import os
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    # os·sys 와 sys.path 보정은 모듈 상단에서 이미 끝났다(직접 실행 경로 지원).
     from ddagi_harvest.arm_backend import NetworkArm
     from ddagi_harvest.detector import MockColorDetector, YoloDetector
 

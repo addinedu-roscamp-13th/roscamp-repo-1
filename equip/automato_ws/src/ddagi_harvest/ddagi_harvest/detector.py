@@ -67,6 +67,25 @@ def _median_depth(depth, u: int, v: int, win: int = _DEPTH_WIN) -> float:
     return ds[len(ds) // 2]
 
 
+def _base_from_cam(cam_mm) -> list[float]:
+    """camera(optical) 좌표(mm) → 파지 루프가 쓰는 base 좌표(mm).
+
+    피팅 변환(observe_cam_to_flange)은 '손끝이 그 열매에 닿는 flange' 를 주므로 TCP 를
+    더해 손끝(=열매) 기준으로 돌려놓는다. pick.flange_target 이 파지할 때 같은 상수를
+    다시 뺀다 — 검출기 3종이 각자 이 두 줄을 복사해 두면 한쪽만 고쳐 어긋나므로 여기
+    한 곳에만 둔다.
+    """
+    flange = tf.observe_cam_to_flange(cam_mm)
+    return [float(flange[i]) + pk.TCP_CORRECTION[i] for i in range(3)]
+
+
+def _base_from_pixel(rs, intr, u: int, v: int, depth_m: float) -> list[float]:
+    """픽셀(u,v) + depth(m) → base 좌표(mm). RealSense 역투영 → _base_from_cam."""
+    cam = [c * 1000.0 for c in
+           rs.rs2_deproject_pixel_to_point(intr, [u, v], depth_m)]
+    return _base_from_cam(cam)
+
+
 class TomatoDetector(ABC):
     """검출기 공통. angles_provider 로 '검출 순간의 실제 관절각'을 받는다.
 
@@ -74,6 +93,11 @@ class TomatoDetector(ABC):
     OBSERVE_ANGLES 이면 팔이 그 각도에 못 미칠 때 모든 base 가 통째로 어긋난다
     (실측: J1~J4 가 매번 1~1.5° 미달 → base 5~7mm 편차). 검출 시점의 get_angles 를
     쓰면 이 오차가 자동으로 상쇄되고, 이후 드리프트에도 스스로 따라간다.
+
+    ⚠ 지금 좌표 변환은 관측자세 camera→flange **직접 피팅**(observe_cam_to_flange)이라
+      관절각을 입력으로 받지 않는다 — 위 오차도 그 측정에 이미 녹아 있다. angles_provider
+      는 FK 경로(camera_to_base_fk)로 되돌릴 때를 위해 배선만 남겨 둔 것이고, detect()
+      안에서 읽어 버리기만 하던 미사용 변수는 정리했다(2026-07-30).
     """
 
     angles_provider = None      # 콜러블() -> [j1..j6] 또는 None(상수 OBSERVE_ANGLES 사용)
@@ -119,7 +143,6 @@ class MockColorDetector(TomatoDetector):
         if not depth or not color:
             return []
         intr = color.profile.as_video_stream_profile().get_intrinsics()
-        ang = self._observe_angles()   # 검출 순간의 실제 관절각(없으면 상수)
         img = np.asanyarray(color.get_data())
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
@@ -152,10 +175,7 @@ class MockColorDetector(TomatoDetector):
                 d = _median_depth(depth, u, v)
                 if d == 0:
                     continue
-                cam = [c_ * 1000 for c_ in
-                       self._rs.rs2_deproject_pixel_to_point(intr, [u, v], d)]
-                base = [float(v) + pk.TCP_CORRECTION[i]
-                        for i, v in enumerate(tf.observe_cam_to_flange(cam))]
+                base = _base_from_pixel(self._rs, intr, u, v, d)
                 if not pk.in_workspace(base):
                     continue
                 out.append({"base": base, "grade": grade, "uv": (u, v),
@@ -209,7 +229,6 @@ class YoloDetector(TomatoDetector):
         if not depth or not color:
             return []
         intr = color.profile.as_video_stream_profile().get_intrinsics()
-        ang = self._observe_angles()   # 검출 순간의 실제 관절각(없으면 상수)
         img = np.asanyarray(color.get_data())
 
         res = self.model(img, conf=self.conf, verbose=False)[0]
@@ -224,10 +243,7 @@ class YoloDetector(TomatoDetector):
             d = _median_depth(depth, u, v, win)
             if d == 0:
                 continue
-            cam = [c_ * 1000 for c_ in
-                   self._rs.rs2_deproject_pixel_to_point(intr, [u, v], d)]
-            base = [float(v) + pk.TCP_CORRECTION[i]
-                    for i, v in enumerate(tf.observe_cam_to_flange(cam))]
+            base = _base_from_pixel(self._rs, intr, u, v, d)
             rec = {"base": base, "grade": grade, "uv": (u, v),
                    "depth_cm": d * 100, "color": cls_name,
                    "conf": float(box.conf[0])}
@@ -324,8 +340,7 @@ class RosDetector(TomatoDetector):
         out: list[dict] = []
         for tom in res.tomatoes:
             cam = [tom.x * 1000.0, tom.y * 1000.0, tom.z * 1000.0]   # m → mm
-            base = [float(v) + pk.TCP_CORRECTION[i]
-                    for i, v in enumerate(tf.observe_cam_to_flange(cam))]
+            base = _base_from_cam(cam)
             if not pk.in_workspace(base):
                 # 스펙상 AI 는 익은 것만 주지만 팔이 못 닿는 자리는 우리가 거른다.
                 self._node.get_logger().warning(

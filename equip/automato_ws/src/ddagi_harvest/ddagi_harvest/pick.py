@@ -449,7 +449,8 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
         ret_off = [RETREAT_OFFSET[0], RETREAT_OFFSET[1] * s, RETREAT_OFFSET[2]]
         pregrasp = _add(tgt, pre_off) + ori
         approach = _add(tgt, DESCEND_OFFSET) + ori
-        retreat = None   # 그랩 명령이 확정된 뒤 그 좌표 기준으로 만든다(순수 후진 보장)
+        # 후퇴 좌표는 여기서 만들지 않는다 — 그랩 명령이 확정된 뒤 그 좌표를 기준으로
+        # 계산해야 순수 후진이 보장된다(아래 참조).
 
     # 그랩점(approach)은 반드시 도달 가능해야 파지가 성립한다. 범위 밖이면 거부.
     if not in_workspace(approach):
@@ -506,8 +507,10 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
     grasp_cmd = grasp_xyz + ori
     # 후퇴는 '실제 명령한 그랩 좌표'에서 접근축으로만 뺀다 — 목표 기준으로 계산하면
     # 도착보정분이 좌우/상하 성분으로 섞여 물고 있는 열매에 전단력이 생긴다.
-    if retreat is None or True:
-        retreat = _add(grasp_xyz, ret_off) + ori
+    # 티칭 plan 경로가 주는 '왔던 길(pre-grasp) 역순' 후퇴도 같은 이유로 쓰지 않는다.
+    # 그래서 plan 유무와 무관하게 항상 여기서 다시 만든다(예전엔 `if retreat is None or
+    # True:` 라는 항상-참 조건으로 같은 일을 하고 있었다).
+    retreat = _add(grasp_xyz, ret_off) + ori
     cur = arm.get_coords() or []
     if cur:
         derr = [round(cur[i] - approach[i], 1) for i in range(3)]

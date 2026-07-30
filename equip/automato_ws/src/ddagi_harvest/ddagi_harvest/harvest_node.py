@@ -38,7 +38,7 @@ import threading
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 
 from automato_interfaces.action import Harvest
@@ -259,11 +259,16 @@ def main(args=None):
     executor.add_node(node)
     try:
         executor.spin()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # SIGINT/SIGTERM 을 받으면 rclpy 의 시그널 핸들러가 컨텍스트를 **이미** 닫고
+        # spin() 이 그냥 돌아온다. 거기서 shutdown() 을 또 부르면 RCLError("rcl_shutdown
+        # already called")로 죽어 종료 코드가 1이 된다 — launch 로그에 'process has died
+        # ... exit code 1' 로 남아 수확이 실패한 것처럼 보인다(실측: 정상 종료인데도).
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

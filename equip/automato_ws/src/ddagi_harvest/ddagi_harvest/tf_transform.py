@@ -253,8 +253,8 @@ def _selftest() -> bool:
     # 3) 예시 출력(크기 감각). 실제 base 정답은 관측자세 get_coords 실측으로 확정.
     print(f"[3] 예시: camera{p_cam.tolist()} , arm{arm}")
     print(f"        → base = [{p_base[0]:.1f}, {p_base[1]:.1f}, {p_base[2]:.1f}] mm")
-    print(f"    (건수님 실사용 로그 base=[448.9,-39.4,26.0] 은 '그때의 관측자세'에서 나온 값 —")
-    print(f"     숫자 일치는 그 자세의 get_coords 를 넣어야 재현됨. 여기선 임의 자세라 참고만.)")
+    print("    (건수님 실사용 로그 base=[448.9,-39.4,26.0] 은 '그때의 관측자세'에서 나온 값 —")
+    print("     숫자 일치는 그 자세의 get_coords 를 넣어야 재현됨. 여기선 임의 자세라 참고만.)")
 
     tip = gripper_tip_offset_base(arm)
     print(f"[4] 그리퍼 손끝 오프셋(base) = [{tip[0]:.1f}, {tip[1]:.1f}, {tip[2]:.1f}] mm")

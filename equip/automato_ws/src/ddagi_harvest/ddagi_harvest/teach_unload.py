@@ -249,8 +249,8 @@ def do_teach(arm) -> None:
                 arm.focus_servos()
                 time.sleep(0.6)
                 mode, target = "jog", list(cur)
-                print(f"\n[조그] 서보 ON — 팔이 그 자리에 섰습니다. "
-                      f"1~6 관절선택, ] [ 이동, . , 스텝")
+                print("\n[조그] 서보 ON — 팔이 그 자리에 섰습니다. "
+                      "1~6 관절선택, ] [ 이동, . , 스텝")
                 show_jog()
                 continue
             if key == "d" and mode == "jog":

@@ -50,7 +50,6 @@ class MarkerPublisher:
         self._node = node
         self._pub = node.create_publisher(MarkerArray, TOPIC, 1)
         self._show_zone = show_zone
-        self._last_n = 0
         self._publish_static_tf()
         # 기동 시 한 번 지운다. rviz 는 발행자가 죽어도 마커를 남겨 두므로, 노드를
         # 재시작하면 이전 세션의 검출 결과가 그대로 떠 있다 — "새로 띄웠는데 화면이
@@ -190,7 +189,6 @@ class MarkerPublisher:
             self._set_color(lb, (1.0, 1.0, 1.0, 0.9))
             lb.text = f"{i + 1}. {grade[:1]}"
             out.append(lb)
-        self._last_n = len(batch)
         self._publish(out)
 
     def show_idle(self) -> None:

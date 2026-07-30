@@ -43,6 +43,15 @@ class ArmBackend(ABC):
     def gripper_value(self) -> int:
         """현재 그리퍼 값."""
 
+    def close(self) -> None:
+        """연결 정리. 소켓을 쓰는 백엔드만 실제로 할 일이 있다.
+
+        호출부(harvest_node.destroy_node 등)는 백엔드 종류를 모른 채 close() 를 부른다.
+        기본 구현이 없으면 arm:=fake / arm:=real 로 띄운 노드가 **종료할 때마다**
+        AttributeError 로 죽는다(실측: FakeArm 으로 수확을 마친 뒤 destroy_node 에서
+        exit code 1). 검출기 쪽 TomatoDetector.close() 와 같은 no-op 규약을 맞춘다.
+        """
+
     def move_angles_nowait(self, angles, speed: int = 30) -> None:
         """도달을 기다리지 않고 명령만 던진다.
 
