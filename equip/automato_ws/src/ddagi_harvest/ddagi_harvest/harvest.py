@@ -14,7 +14,7 @@
   오면 pick(orientation=...)로 덮어쓴다.
 
 실행 (노트북, 팔·카메라 연결):
-    python3 ddagi_harvest/harvest.py            # 팔 IP 기본 192.168.100.12
+    python3 ddagi_harvest/harvest.py            # 팔 IP 기본 raspi.local
     DRY_RUN=1 python3 ddagi_harvest/harvest.py  # 파지 없이 검출·순서만 출력
 """
 from __future__ import annotations
@@ -317,7 +317,7 @@ def main() -> int:
     from ddagi_harvest.detector import MockColorDetector, YoloDetector
 
     dry = os.environ.get("DRY_RUN", "") not in ("", "0", "false")
-    ip = os.environ.get("ARM_IP", "192.168.100.12")
+    ip = os.environ.get("ARM_IP", "raspi.local")
     weights = os.environ.get("WEIGHTS", "")   # 실물 YOLO .pt 경로. 없으면 색 목업.
     log(f"팔 연결 {ip}:9010  (DRY_RUN={dry})")
     arm = NetworkArm(ip)

@@ -397,7 +397,7 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from ddagi_harvest.arm_backend import NetworkArm
 
-    ip = os.environ.get("ARM_IP", "192.168.100.12")
+    ip = os.environ.get("ARM_IP", "raspi.local")
     weights = os.environ.get("WEIGHTS", "")
     arm = NetworkArm(ip)
     print(f"팔 연결 {ip} — 관측자세로 이동")

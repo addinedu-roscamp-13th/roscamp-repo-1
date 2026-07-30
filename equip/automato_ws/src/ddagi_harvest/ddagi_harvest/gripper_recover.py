@@ -25,7 +25,7 @@ def _cmd(arm, value, speed=40):
 
 
 def main() -> int:
-    ip = os.environ.get("ARM_IP", "192.168.100.12")
+    ip = os.environ.get("ARM_IP", "raspi.local")
     arm = NetworkArm(ip)
     try:
         print(f"현재 그리퍼 값 = {arm.gripper_value()}\n")

@@ -36,7 +36,7 @@ class Bridge(Node):
         self.br=TransformBroadcaster(self)
         self.coords=[0,0,300,0,0,0]; self.lock=threading.Lock()
         self.ssh=paramiko.SSHClient(); self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self.ssh.connect("192.168.100.12",username="jetcobot",password="1",timeout=10)
+        self.ssh.connect("raspi.local",username="jetcobot",password="1",timeout=10)
         self.pre="source /opt/ros/jazzy/setup.bash; export ROS_DOMAIN_ID=42; "
         threading.Thread(target=self.poll, daemon=True).start()
         self.create_timer(0.05, self.publish)  # 20Hz TF
