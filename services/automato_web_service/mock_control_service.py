@@ -59,16 +59,18 @@ def _avail(r):
 #    ※ 실서비스에선 보연님 실제 ACS가 발행. 여기선 로컬 테스트용 대역.
 # ============================================================================
 def _unavailable_reason(r):
-    """우선순위 순서대로 처음 걸리는 하나만. ROBOT_OFFLINE 은 Web 이 자체판정하므로 여기선 제외."""
+    """우선순위 순서대로 처음 걸리는 하나만.
+       확정 순서(2026-07-29 팀 확인): IMMOBILIZED > ROBOT_BUSY > ROBOT_OFFLINE > CHARGING > BATTERY_TOO_LOW.
+       ROBOT_OFFLINE(3순위)은 텔레메트리 미수신 판정이라 Web 이 자체판정 → 여기선 제외."""
     if r.get("operational_status", "NORMAL") != "NORMAL":
-        return "IMMOBILIZED"
+        return "IMMOBILIZED"                        # 1순위
+    if r["status"] != "IDLE":
+        return "ROBOT_BUSY"                         # 2순위
     if r.get("is_charging"):
-        return "CHARGING"
+        return "CHARGING"                           # 4순위 (현 단계에선 발생하지 않음)
     thr = MIN_BAT_HARVEST if r.get("role") == "harvest" else MIN_BAT_PATROL   # 역할별 배터리 기준
     if r["battery_percent"] < thr:
-        return "BATTERY_TOO_LOW"
-    if r["status"] != "IDLE":
-        return "ROBOT_BUSY"
+        return "BATTERY_TOO_LOW"                    # 5순위
     return None
 
 
@@ -169,12 +171,70 @@ def _harvest_avail(r):
     return r.get("role") == "harvest" and _unavailable_reason(r) is None
 
 
-def _simulate_harvest(task_id, robot_id):
-    time.sleep(5)
+# ===== [시나리오2] 수확 상수 (Confluence 33784289) =====
+MAX_CAPACITY = 7          # 수확품 바구니 만차 기준
+MAX_ROUNDS = 5            # 촬영-수확 라운드 상한
+_BATCH = [0]              # harvest_batches 대용 시퀀스
+
+# 라운드별 검출 배치. (grade, 파지성공여부) — 3회 실패는 failed 로 집계되고 제외목록에 들어감.
+_HARVEST_PLAN = [
+    [("NORMAL", True), ("NORMAL", True), ("DISCARD", True), ("NORMAL", False)],   # 1라운드
+    [("NORMAL", True), ("NORMAL", True), ("DISCARD", True)],                      # 2라운드
+    [("NORMAL", True), ("NORMAL", True)],                                         # 3라운드
+    [],                                                                            # 4라운드 → DEPLETED
+]
+
+
+def _simulate_harvest(task_id, robot_id, location="HARVEST_01"):
+    """E2 이동·도킹 → E3 인식 → E4 파지루프 → E5 종료판정·예냉실 이송 → E6 하역·완료.
+       실제 ACS가 보낼 콜백(harvest/progress · harvest/completed)을 그대로 재현한다."""
+    normal = discard = failed = 0
+    exit_reason = "DEPLETED"
+    log("  ▶ [E2] %s 로 이동·ChArUco 도킹 (capture 전 구간 false)" % location)
+    time.sleep(1.0)
+
+    for rnd, batch in enumerate(_HARVEST_PLAN, start=1):
+        if rnd > MAX_ROUNDS:                                  # E3-2
+            exit_reason = "MAX_ROUNDS_EXCEEDED"
+            break
+        log("  ▶ [E3] 라운드%d 관측자세 복귀 → DetectTomatoes → 대상 %d개" % (rnd, len(batch)))
+        if not batch:                                         # E3-8 : 필터 후 0개
+            exit_reason = "DEPLETED"
+            break
+        for i, (grade, picked) in enumerate(batch):           # E4 루프 (토마토 1개 = 1사이클)
+            time.sleep(0.35)
+            if not picked:                                    # MAX_PICK_RETRY(3) 소진 → 제외목록
+                failed += 1
+            elif grade == "NORMAL":
+                normal += 1
+            else:
+                discard += 1
+            _post("/internal/v1/harvest/progress", {          # E4-3
+                "task_id": task_id, "robot_id": robot_id, "round": rnd,
+                "normal_count": normal, "discard_count": discard, "failed_count": failed,
+                "remaining_in_round": len(batch) - i - 1, "reported_at": _now()})
+            log("    · 토마토 %s %s → 수확품%d/폐기%d/실패%d" % (
+                grade, "성공" if picked else "3회실패", normal, discard, failed))
+            if normal >= MAX_CAPACITY:                        # E4-8 : 만차
+                exit_reason = "FULL"
+                break
+        if exit_reason == "FULL":
+            break
+    else:
+        exit_reason = "MAX_ROUNDS_EXCEEDED"                   # 계획을 다 돌았는데 종료조건 없음
+
+    log("  ▶ [E5] 수확 종료 exit_reason=%s → harvest_batches 저장 → 예냉실 이송" % exit_reason)
+    time.sleep(1.0)                                           # E5 예냉실 주행 + E6 도킹
+    _BATCH[0] += 1
+    _post("/internal/v1/harvest/completed", {                 # E6-3
+        "task_id": task_id, "robot_id": robot_id, "batch_id": 330 + _BATCH[0],
+        "normal_count": normal, "discard_count": discard, "failed_count": failed,
+        "exit_reason": exit_reason, "completed_at": _now()})
     with _LOCK:
         if robot_id in _ROBOTS:
-            _ROBOTS[robot_id]["status"] = "IDLE"
-    log("  ▶ 수확 완료 task_id=%s (%s 대기복귀)" % (task_id, robot_id))
+            _ROBOTS[robot_id]["status"] = "IDLE"              # 예냉실 도착 → 대기 복귀
+    log("  ▶ [E6] 수확 완료 task=%s 수확품%d/폐기%d/실패%d exit=%s (%s 대기복귀)" % (
+        task_id, normal, discard, failed, exit_reason, robot_id))
 
 
 @app.post("/internal/v1/tasks/harvest")
@@ -182,28 +242,44 @@ def tasks_harvest():
     data = request.get_json(force=True, silent=True) or {}
     sel = data.get("robot_selection", "auto")
     rid_req = data.get("robot_id")
-    log("◀ Web: POST tasks/harvest  robot_selection=%s robot_id=%s" % (sel, rid_req))
+    loc = data.get("harvest_location") or "HARVEST_01"
+    log("◀ Web: POST tasks/harvest  robot_selection=%s robot_id=%s location=%s" % (sel, rid_req, loc))
     with _LOCK:
-        avail = [r for r in _ROBOTS.values() if _harvest_avail(r)]
-        if not avail:
-            log("  → 거절: NO_AVAILABLE_ROBOT (수확 가능 로봇 없음)")
-            return jsonify({"status": "REJECTED", "reason": "NO_AVAILABLE_ROBOT",
-                            "message": "수확 가능한 로봇이 없습니다."}), 409
+        # E1-3-1 : 로봇팔 1대 = 동시 수확 1건 → 진행 중이면 409 HARVEST_IN_PROGRESS
+        if any(r["status"] == "HARVESTING" for r in _ROBOTS.values()):
+            log("  → 거절: HARVEST_IN_PROGRESS (이미 수확 진행 중)")
+            return jsonify({"status": "REJECTED", "reason": "HARVEST_IN_PROGRESS",
+                            "message": "이미 수확 작업이 진행 중입니다."}), 409
         if sel == "auto":
-            chosen = max(avail, key=lambda r: r["battery_percent"])
-        else:
-            chosen = next((r for r in avail if r["robot_id"] == rid_req), None)
-            if not chosen:
-                log("  → 거절: ROBOT_NOT_AVAILABLE (%s)" % rid_req)
-                return jsonify({"status": "REJECTED", "reason": "ROBOT_NOT_AVAILABLE",
-                                "message": "선택한 로봇을 지금 쓸 수 없습니다."}), 409
+            avail = [r for r in _ROBOTS.values() if _harvest_avail(r)]
+            if not avail:
+                log("  → 거절: NO_AVAILABLE_ROBOT (수확 가능 로봇 없음)")
+                return jsonify({"status": "REJECTED", "reason": "NO_AVAILABLE_ROBOT",
+                                "message": "요청 가능한 로봇이 없습니다."}), 409
+            chosen = max(avail, key=lambda r: (r["battery_percent"], [-ord(c) for c in r["robot_id"]]))
+        else:                                   # manual : 지정 로봇의 사유를 스펙 우선순위대로 반환
+            chosen = next((r for r in _ROBOTS.values() if r["robot_id"] == rid_req), None)
+            if chosen is None:
+                log("  → 거절: NO_AVAILABLE_ROBOT (%s 없음)" % rid_req)
+                return jsonify({"status": "REJECTED", "reason": "NO_AVAILABLE_ROBOT",
+                                "message": "요청 가능한 로봇이 없습니다."}), 409
+            if chosen.get("role") != "harvest":  # dg_03(순찰)은 로봇팔이 없다 — 가용해도 수확 불가
+                log("  → 거절: NO_ARM (%s 는 순찰 로봇)" % rid_req)
+                return jsonify({"status": "REJECTED", "reason": "NO_ARM",
+                                "message": "지정한 로봇은 로봇팔이 없어 수확할 수 없습니다."}), 409
+            why = _unavailable_reason(chosen)   # IMMOBILIZED / ROBOT_BUSY / ROBOT_OFFLINE / BATTERY_TOO_LOW
+            if why:
+                log("  → 거절: %s (%s)" % (why, rid_req))
+                return jsonify({"status": "REJECTED", "reason": why,
+                                "message": "지정한 로봇을 지금 사용할 수 없습니다."}), 409
         _SEQ[0] += 1
         task_id = _SEQ[0]
         chosen["status"] = "HARVESTING"
-    log("  → 수확 접수: task_id=%s robot=%s (상태 HARVESTING)" % (task_id, chosen["robot_id"]))
-    threading.Thread(target=_simulate_harvest, args=(task_id, chosen["robot_id"]), daemon=True).start()
+    log("  → 수확 접수: task_id=%s robot=%s location=%s (상태 HARVESTING)" % (task_id, chosen["robot_id"], loc))
+    threading.Thread(target=_simulate_harvest, args=(task_id, chosen["robot_id"], loc), daemon=True).start()
     return jsonify({"task_id": task_id, "assigned_robot_id": chosen["robot_id"],
-                    "status": "ACCEPTED", "message": "수확 요청이 접수되었습니다."})
+                    "status": "ACCEPTED", "harvest_location": loc,
+                    "message": "수확 요청이 접수되었습니다."})
 
 
 # waypoint별 AI 분석(퍼센트). wp2=disease 4%(스킵), wp3=disease 7%(알림) → 두 분기 모두 커버.

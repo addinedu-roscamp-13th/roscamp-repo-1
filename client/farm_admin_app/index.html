@@ -980,8 +980,12 @@ async function requestPatrol(){
 }
 async function patrolReset(){await fetch('/api/v1/patrol/reset',{method:'POST'});loadPatrol();loadHeat();}
 /* ===== 수확 요청 (로봇팔 필요 · 순찰과 동일 UX) ===== */
-const HARVEST_REASON={ROBOT_OFFLINE:'📡 오프라인(응답 없음)',IMMOBILIZED:'🛑 갇힘/정지 — 관리자 개입 필요',CHARGING:'⚡ 충전 중',NO_ARM:'🦾 로봇팔 없음(수확 불가)',BATTERY_TOO_LOW:'🔋 배터리 부족',ROBOT_BUSY:'🚧 작업 중',ALREADY_HARVESTING:'🍅 이미 수확 중(최대 1대)',NO_AVAILABLE_ROBOT:'가능한 로봇 없음'};
+const HARVEST_REASON={ROBOT_OFFLINE:'📡 오프라인(응답 없음)',IMMOBILIZED:'🛑 갇힘/정지 — 관리자 개입 필요',CHARGING:'⚡ 충전 중',NO_ARM:'🦾 로봇팔 없음(수확 불가)',BATTERY_TOO_LOW:'🔋 배터리 부족',ROBOT_BUSY:'🚧 작업 중',ALREADY_HARVESTING:'🍅 이미 수확 중(최대 1대)',HARVEST_IN_PROGRESS:'🍅 수확 진행 중 — 끝나야 요청 가능(전역 1건)',INVALID_HARVEST_LOCATION:'📍 수확 위치가 올바르지 않음',NO_AVAILABLE_ROBOT:'가능한 로봇 없음'};
 let harvestPick='auto', harvestSelId=null;
+// [시나리오2 E1] 수확 위치 — task_points.task_point_id (HARVEST_01 / HARVEST_02 만 가능)
+const HARVEST_LOCS=[{id:'HARVEST_01',name:'🍅 수확구역 1'},{id:'HARVEST_02',name:'🍅 수확구역 2'}];
+let harvestLoc='HARVEST_01';
+function setHarvestLoc(v){ harvestLoc=v; loadHarvest(); }
 function setHarvestPick(v){ harvestPick=v; if(v==='auto')harvestSelId=null; loadHarvest(); }
 function selectHarvestRobot(rid){ harvestSelId=(harvestSelId===rid?null:rid); loadHarvest(); }
 async function loadHarvest(){
@@ -1012,8 +1016,18 @@ async function loadHarvest(){
       html+='<div style="text-align:center;margin-top:12px"><button class="btn" style="background:#d9dcde;color:#6b7075;border:1px solid #c7cbce;cursor:not-allowed" onclick="requestHarvest()">🚫 수확 요청 불가</button></div>';
     }else{
       const ready=harvestPick==='auto'||(harvestPick==='manual'&&harvestSelId);
-      html+='<h3 style="margin:0 0 10px">3. 수확 요청</h3>';
-      html+='<button class="btn btn-green" style="font-size:15px;padding:12px 22px;'+(ready?'':'opacity:.45;cursor:not-allowed')+'" onclick="requestHarvest()">🍅 수확 요청'+(harvestPick==='manual'&&harvestSelId?' · '+harvestSelId:'')+'</button>';
+      // [시나리오2 E1] harvest_location — task_points 의 HARVEST_01 / HARVEST_02 중 선택
+      html+='<h3 style="margin:0 0 10px">3. 수확 위치</h3>';
+      html+='<div style="display:flex;gap:10px;margin-bottom:14px">';
+      HARVEST_LOCS.forEach(function(L){
+        const on=(harvestLoc===L.id);
+        html+='<button onclick="setHarvestLoc(\''+L.id+'\')" style="flex:1;padding:12px 10px;border-radius:12px;cursor:pointer;font-weight:700;font-size:14px;'
+          +(on?'background:#1d8a3e;color:#fff;border:2px solid #1d8a3e':'background:#fff;color:#3c4145;border:2px solid #d7dbde')+'">'
+          +(on?'✓ ':'')+L.name+'<div style="font-weight:400;font-size:12px;margin-top:3px;opacity:.85">'+L.id+'</div></button>';
+      });
+      html+='</div>';
+      html+='<h3 style="margin:0 0 10px">4. 수확 요청</h3>';
+      html+='<button class="btn btn-green" style="font-size:15px;padding:12px 22px;'+(ready?'':'opacity:.45;cursor:not-allowed')+'" onclick="requestHarvest()">🍅 수확 요청 · '+harvestLoc+(harvestPick==='manual'&&harvestSelId?' · '+harvestSelId:'')+'</button>';
       if(harvestPick==='manual'&&!harvestSelId)html+='<div style="font-size:13px;color:#b0392b;margin-top:7px">👆 먼저 수확 보낼 로봇 1대를 선택하세요.</div>';
     }
     html+='<div id="harvestResult" style="margin-top:16px"></div></div>';
@@ -1021,11 +1035,11 @@ async function loadHarvest(){
   }catch(e){}
 }
 async function requestHarvest(){
-  const body={robot_selection:harvestPick};
+  const body={robot_selection:harvestPick, harvest_location:harvestLoc};   // 스펙 E1: harvest_location 필수
   if(harvestPick==='manual'){ if(!harvestSelId){alert('수확 보낼 로봇 1대를 먼저 선택하세요');return;} body.robot_id=harvestSelId; }
   const r=await fetch('/api/v1/harvest/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const d=await r.json();const res=document.getElementById('harvestResult');
-  if(r.ok&&res)res.innerHTML='<div style="background:#eef7ec;border:1px solid #9fd3ab;color:#1d6a35;border-radius:10px;padding:12px"><b>✅ '+d.message+'</b><br>배정 로봇: '+(d.assigned_robot_id||'농장에서 배정 중')+' · 작업번호 #'+d.task_id+'</div>';
+  if(r.ok&&res)res.innerHTML='<div style="background:#eef7ec;border:1px solid #9fd3ab;color:#1d6a35;border-radius:10px;padding:12px"><b>✅ '+d.message+'</b><br>배정 로봇: '+(d.assigned_robot_id||'농장에서 배정 중')+' · 수확 위치: '+(d.harvest_location||harvestLoc)+' · 작업번호 #'+d.task_id+'</div>';
   else if(res)res.innerHTML='<div style="background:#fbeaea;border:1px solid #e6b0aa;color:#b0392b;border-radius:10px;padding:12px"><b>❌ '+(d.message||'요청 실패')+'</b><div style="font-weight:400;font-size:12px;margin-top:5px;color:#8a4a44">Automato Control Service 응답: <b>HTTP '+r.status+'</b>'+(d.reason?' · '+d.reason:'')+'</div></div>';
   setTimeout(function(){loadHarvest();},1300);
 }
@@ -1571,14 +1585,16 @@ function renderFarm(v){
   if(v==='f_report'){ el.innerHTML=`
     <div class="page-h"><div><h2>수확 보내기</h2><div class="lead">수확할 로봇을 배정해 보냅니다 (완숙 밀집은 대시보드 히트맵 참고)</div></div>
       <button class="btn btn-ghost" onclick="harvestReset()">↺ 데모 초기화</button></div>
+    <div id="harvestLive" class="card" style="margin-bottom:14px;border-left:4px solid #e5462f;display:none"></div>
     <div class="card"><div class="ch"><h3>🍅 수확 요청 · 로봇 배정</h3></div>
-      <div id="harvestBox">불러오는 중…</div></div>`; loadHarvest(); }
+      <div id="harvestBox">불러오는 중…</div></div>`; loadHarvest(); try{renderHarvestLive();}catch(e){} }
   if(v==='f_patrol'){ el.innerHTML=`
     <div class="page-h"><div><h2>순찰 보내기</h2><div class="lead">순찰 로봇을 배정하고, 감지된 방울토마토 상태를 확인합니다</div></div>
       <button class="btn btn-ghost" onclick="patrolReset()">↺ 데모 초기화</button></div>
     <div id="patrolLive" class="card" style="margin-bottom:14px;border-left:4px solid var(--leaf)"></div>
+    <div id="harvestLive" class="card" style="margin-bottom:14px;border-left:4px solid #e5462f;display:none"></div>
     <div id="fleetLive" class="card" style="margin-bottom:14px">🛰️ 로봇 실시간 상태 불러오는 중…</div>
-    <div id="patrolBox" class="card">불러오는 중…</div>`; loadPatrol(); try{renderPatrolLive();}catch(e){} try{startFleetLive();}catch(e){} }
+    <div id="patrolBox" class="card">불러오는 중…</div>`; loadPatrol(); try{renderPatrolLive();}catch(e){} try{renderHarvestLive();}catch(e){} try{startFleetLive();}catch(e){} }
   if(v==='f_sensor'){ el.innerHTML=`
     <div class="page-h"><div><h2>로봇 상태·센서</h2><div class="lead">각 로봇의 연결·배터리·센서·모터를 실시간으로 확인합니다</div></div></div>
     <div id="sensorBox">불러오는 중…</div>
@@ -1844,6 +1860,36 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
   window._evSeq = window._evSeq || 0;
   window._patrolLive = window._patrolLive || null;
 
+  /* ── 방어 헬퍼 (2026-07-29 견고성 감사 반영) ─────────────────────────────
+     이벤트 값은 결국 다른 팀(ACS)이 만든 데이터다. 타입·존재를 믿지 않는다. */
+
+  // 서버 문자열을 innerHTML 에 넣기 전에 이스케이프. 이게 없어서 message/image_path 에
+  // '<' 하나만 섞여도 배너 DOM 이 깨졌고, onerror= 같은 속성 주입도 가능했다.
+  function esc(v){
+    if(v===null||v===undefined) return '';
+    return String(v).replace(/[&<>"']/g, function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+  // 무엇이 오든 배열로 만든다. "3,4" 같은 CSV 문자열도 살려서 쓴다.
+  function normList(v){
+    if(Array.isArray(v)) return v;
+    if(v===null||v===undefined||v==='') return [];
+    if(typeof v==='string') return v.split(',').map(function(x){return x.trim();}).filter(Boolean);
+    if(typeof v==='number') return [v];
+    return [];
+  }
+  // 숫자로 못 바꾸면 대시. 'undefined%' 가 화면에 뜨는 걸 막는다.
+  function num(v, dash){
+    var n=Number(v);
+    return (v===null||v===undefined||v===''||!isFinite(n)) ? (dash===undefined?'-':dash) : n;
+  }
+  // 값이 없으면 대시. 'WPundefined' 방지.
+  function val(v, dash){
+    return (v===null||v===undefined||v==='') ? (dash===undefined?'-':dash) : esc(v);
+  }
+  window._esc=esc; window._normList=normList;
+
   function notify(title, body, urgent){
     try{
       if('Notification' in window && Notification.permission==='granted'){
@@ -1870,8 +1916,20 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
     var p=window._patrolLive;
     if(!p){ el.innerHTML='<div style="color:var(--muted);font-size:14px">🚓 진행 중인 순찰이 없습니다</div>'; return; }
     el.innerHTML='<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center">'
-      +'<div style="font-weight:800;font-size:15px">🚓 순찰 진행 중 · '+(p.robot_id||'')+' · WP'+p.waypoint_id+'</div>'
-      +'<div style="font-size:14px;color:var(--muted)">🍅 익음 '+p.ripe+'% · 🟢 안익음 '+p.unripe+'% · 🟠 썩음 '+p.rotten+'% · 🐛 병해충 '+p.disease+'%</div></div>';
+      +'<div style="font-weight:800;font-size:15px">🚓 순찰 진행 중 · '+val(p.robot_id,'')+' · WP'+val(p.waypoint_id)+'</div>'
+      +'<div style="font-size:14px;color:var(--muted)">🍅 익음 '+num(p.ripe)+'% · 🟢 안익음 '+num(p.unripe)+'% · 🟠 썩음 '+num(p.rotten)+'% · 🐛 병해충 '+num(p.disease)+'%</div></div>';
+  };
+  // [시나리오2 E4] 수확 진행 실시간 표시 — 순찰(renderPatrolLive)과 같은 자리에 붙는다
+  window.renderHarvestLive=function(){
+    var el=document.getElementById('harvestLive'); if(!el)return;
+    var h=window._harvestLive;
+    if(!h){ el.innerHTML=''; el.style.display='none'; return; }
+    el.style.display='';
+    el.innerHTML='<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center">'
+      +'<div style="font-weight:800;font-size:15px">🍅 수확 진행 중 · '+val(h.robot_id,'')+' · 라운드 '+num(h.round,1)+'</div>'
+      +'<div style="font-size:14px;color:var(--muted)">✅ 수확품 <b>'+num(h.normal,0)+'</b>개 · 🗑 폐기 <b>'+num(h.discard,0)+'</b>개'
+      +(h.failed?(' · ⚠️ 실패 <b>'+num(h.failed,0)+'</b>개'):'')
+      +(h.remaining!=null?(' · 이번 라운드 남은 '+num(h.remaining,0)+'개'):'')+'</div></div>';
   };
   function handle(e){
     if(e.event==='patrol_progress'){
@@ -1881,16 +1939,18 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
       window.renderPatrolLive();
       if(!wasLive){ try{loadPatrol();}catch(_){} }   // 순찰 시작 → 순찰 화면(양 탭) 즉시 '요청 불가'로
     } else if(e.event==='disease_alert'){
-      var msg='병해충 발견 · '+(e.robot_id||'로봇')+' · WP'+e.waypoint_id+' · '+e.disease_percent+'%';
-      var thumb=e.image_path?('<img src="/detections/'+e.image_path+'" onerror="this.parentNode.innerHTML=\'🐛\'" style="width:100%;height:100%;object-fit:cover">'):'🐛';
+      var msg='병해충 발견 · '+val(e.robot_id,'로봇')+' · WP'+val(e.waypoint_id)+' · '+num(e.disease_percent)+'%';
+      // image_path 는 ACS 가 준 값이다. 속성값에 그대로 넣으면 따옴표를 닫고 onload= 를 주입할 수 있어
+      // encodeURI + esc 로 이중 처리한다(2026-07-29 감사 지적).
+      var thumb=e.image_path?('<img src="/detections/'+esc(encodeURI(String(e.image_path)))+'" onerror="this.parentNode.innerHTML=\'🐛\'" style="width:100%;height:100%;object-fit:cover">'):'🐛';
       banner(
         '<div style="background:linear-gradient(180deg,#e5462f,#c0392b);color:#fff;border-radius:16px;padding:15px 16px;display:flex;gap:14px;align-items:center;animation:dzIn .3s ease, dzGlow 1.9s ease-in-out infinite">'
         +'<div style="width:56px;height:56px;flex:none;border-radius:12px;overflow:hidden;background:rgba(255,255,255,.2);display:flex;align-items:center;justify-content:center;font-size:30px">'+thumb+'</div>'
         +'<div style="flex:1;min-width:0">'
           +'<div style="font-size:19px;font-weight:800;letter-spacing:-.3px">🐛 병해충 발견</div>'
-          +'<div style="font-size:15px;font-weight:600;margin-top:3px;opacity:.97;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+(e.robot_id||'로봇')+' · WP'+e.waypoint_id+' 지점</div>'
+          +'<div style="font-size:15px;font-weight:600;margin-top:3px;opacity:.97;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+val(e.robot_id,'로봇')+' · WP'+val(e.waypoint_id)+' 지점</div>'
         +'</div>'
-        +'<div style="flex:none;text-align:center;padding:0 4px"><div style="font-size:32px;font-weight:800;line-height:1">'+e.disease_percent+'<span style="font-size:15px">%</span></div><div style="font-size:11px;opacity:.85;margin-top:1px">병해충</div></div>'
+        +'<div style="flex:none;text-align:center;padding:0 4px"><div style="font-size:32px;font-weight:800;line-height:1">'+num(e.disease_percent)+'<span style="font-size:15px">%</span></div><div style="font-size:11px;opacity:.85;margin-top:1px">병해충</div></div>'
         +'<button onclick="var x=document.getElementById(\'diseaseBanner\');if(x)x.style.display=\'none\'" title="닫기" style="flex:none;align-self:flex-start;background:rgba(255,255,255,.22);border:none;color:#fff;width:28px;height:28px;border-radius:50%;font-size:14px;line-height:1;cursor:pointer">✕</button>'
         +'</div>'
       );
@@ -1900,14 +1960,42 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
       var s=e.summary||{};
       // 스펙 E2-10: status(COMPLETED/COMPLETED_PARTIAL) + unvisited_waypoint_ids 로 문구 분기
       var partial=(e.status==='COMPLETED_PARTIAL');
-      var uv=e.unvisited_waypoint_ids||[];
+      // 배열이 아닌 값(CSV 문자열 "3,4" · 객체 · 숫자)이 와도 죽지 않게 정규화한다.
+      // 구버전은 ||[] 뿐이라 문자열이 오면 uv.map 이 없어 TypeError → 순찰완료 처리가 통째로 중단되고
+      // '순찰 진행 중' 표시가 사라지지 않아 요청 버튼이 영구히 잠겼다.
+      var uv=normList(e.unvisited_waypoint_ids);
       var head=partial?'순찰 완료 (일부 지점 미방문)':'순찰 완료';
-      var uvtxt=partial&&uv.length?(' — '+uv.map(function(x){return x+'번';}).join(', ')+'. 통로 막힘으로 도달하지 못했습니다.'):'';
+      var uvtxt=partial&&uv.length?(' — '+uv.map(function(x){return esc(x)+'번';}).join(', ')+'. 통로 막힘으로 도달하지 못했습니다.'):'';
       var m='✅ '+head+uvtxt+' · '+(e.robot_id||'')+' (익음 '+(s.ripe_percent||0)+'% · 병해충 '+(s.disease_percent||0)+'%)';
       notify(partial?'⚠️ 순찰 완료 (일부 미방문)':'✅ 순찰 완료', m, partial);
       try{toast(m);}catch(_){}
       window._patrolLive=null; window.renderPatrolLive();
       try{loadPatrol();}catch(_){}   // 순찰 완료 → 순찰 화면 다시 '배정 가능'으로
+    } else if(e.event==='harvest_progress'){
+      // [시나리오2 E4-4] 토마토 1개 처리할 때마다 누적 카운트 갱신
+      var wasH=!!window._harvestLive;
+      window._harvestLive={robot_id:e.robot_id,task_id:e.task_id,round:e.round,
+        normal:e.normal_count||0,discard:e.discard_count||0,failed:e.failed_count||0,
+        remaining:e.remaining_in_round};
+      window.renderHarvestLive();
+      if(!wasH){ try{loadHarvest();}catch(_){} }    // 수확 시작 → 요청 화면 '요청 불가'로
+    } else if(e.event==='harvest_completed'){
+      // [시나리오2 E6-3] exit_reason 별 문구 3종 (스펙 표 그대로)
+      var HX={
+        DEPLETED:{t:'수확 완료',u:false},
+        FULL:{t:'수확 완료 (바구니 만차) — 잔여 작물 있음. 재출동 필요',u:false},
+        MAX_ROUNDS_EXCEEDED:{t:'수확 중단 — 재시도 한계 도달. 점검 필요',u:true}
+      };
+      // 모르는 exit_reason 을 '수확 완료'로 뭉개면 '중단(점검 필요)'이 정상처럼 보인다(조용한 오보).
+      // 알 수 없는 값은 값 그대로 노출하고 주의 표시한다.
+      var hx=HX[e.exit_reason]||{t:'수확 종료 (알 수 없는 사유: '+val(e.exit_reason,'없음')+') — 확인 필요',u:true};
+      var hm='🍅 '+hx.t+' — 수확품 '+num(e.normal_count,0)+'개 / 폐기 '+num(e.discard_count,0)+'개'
+             +((e.failed_count||0)?(' / 실패 '+num(e.failed_count,0)+'개'):'')+' · '+val(e.robot_id,'');
+      notify((hx.u?'⚠️ ':'✅ ')+hx.t, hm, hx.u);
+      try{toast(hm);}catch(_){}
+      window._harvestLive=null; window.renderHarvestLive();
+      try{loadHarvest();}catch(_){}                 // 수확 완료 → 다시 '배정 가능'으로
+      try{loadHarvestStats&&loadHarvestStats();}catch(_){}
     } else if(e.event==='task_failed'){
       // 스펙 E2-14: 작업 실패 알림. reason별 문구·심각도(긴급/경고).
       var RE={
@@ -1917,15 +2005,16 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
         BATTERY_DEPLETED:{t:'작업 중 배터리가 소진되었습니다.',u:true},
         HARDWARE_ERROR:{t:'로봇 하드웨어 이상이 발생했습니다.',u:true}
       };
-      var r=RE[e.reason]||{t:(e.message||'작업이 실패했습니다.'),u:true};
-      var rid=e.robot_id||'로봇';
-      var body=e.message||(rid+'이(가) '+r.t);
+      // 알 수 없는 reason 이면 message 가 그대로 본문이 된다 → 반드시 이스케이프해야 한다.
+      var r=RE[e.reason]||{t:(esc(e.message)||'작업이 실패했습니다.'),u:true};
+      var rid=val(e.robot_id,'로봇');
+      var body=esc(e.message)||(rid+'이(가) '+r.t);
       banner(
         '<div style="background:linear-gradient(180deg,'+(r.u?'#e5462f,#c0392b':'#f0a020,#d4870f')+');color:#fff;border-radius:16px;padding:15px 16px;display:flex;gap:14px;align-items:center;animation:dzIn .3s ease'+(r.u?', dzGlow 1.9s ease-in-out infinite':'')+'">'
         +'<div style="width:56px;height:56px;flex:none;border-radius:12px;background:rgba(255,255,255,.2);display:flex;align-items:center;justify-content:center;font-size:30px">'+(r.u?'🚨':'⚠️')+'</div>'
         +'<div style="flex:1;min-width:0">'
           +'<div style="font-size:19px;font-weight:800;letter-spacing:-.3px">'+(r.u?'🛑 로봇 긴급 상황':'⚠️ 작업 실패')+'</div>'
-          +'<div style="font-size:14px;font-weight:600;margin-top:3px;opacity:.97">'+rid+' · 작업 #'+(e.task_id||'')+'</div>'
+          +'<div style="font-size:14px;font-weight:600;margin-top:3px;opacity:.97">'+rid+' · 작업 #'+val(e.task_id,'')+'</div>'
           +'<div style="font-size:14px;margin-top:4px;opacity:.95">'+body+'</div>'
         +'</div>'
         +'<button onclick="var x=document.getElementById(\'diseaseBanner\');if(x)x.style.display=\'none\'" title="닫기" style="flex:none;align-self:flex-start;background:rgba(255,255,255,.22);border:none;color:#fff;width:28px;height:28px;border-radius:50%;font-size:14px;line-height:1;cursor:pointer">✕</button>'
@@ -1936,13 +2025,46 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
       try{loadPatrol();}catch(_){}   // 실패 로봇 상태 갱신
     }
     // 스펙 E2-10/E2-14/E3-2: 앱이 텔레그램 발송 (토큰 노출 방지 위해 Web 릴레이 호출, seq로 중복방지)
-    if(e.event==='disease_alert'||e.event==='patrol_completed'||e.event==='task_failed'){
+    if(e.event==='disease_alert'||e.event==='patrol_completed'||e.event==='task_failed'||e.event==='harvest_completed'){
       try{ fetch('/api/v1/notify/telegram',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(e)}); }catch(_){}
     }
   }
   // seq 기준 1회만 처리(WebSocket·폴링 이중수신 방지)
+  //  ⚠ 구버전 문제 2가지를 여기서 고쳤다(2026-07-29 감사):
+  //   ① seq 를 handle() **전에** 올려서, handle 안에서 예외가 나면 그 이벤트가 영구 소실됐다
+  //      (폴링이 since=_evSeq 로 요청하므로 서버가 재전송해도 다시 안 옴).
+  //      → handle() 이 성공한 뒤에 올린다.
+  //   ② 예외를 catch(_){} 로 삼켜 콘솔에도 흔적이 없었다 → console.error 로 반드시 남긴다.
+  //   ③ seq 가 없거나 0 이면 중복제거가 무력화돼 텔레그램이 두 번 나갔다
+  //      → event+주요필드로 만든 지문(fingerprint)으로 최근 것과 대조한다.
+  window._evFp = window._evFp || [];
+  function fingerprint(e){
+    try{ return [e.event,e.task_id,e.waypoint_id,e.robot_id,e.status,e.exit_reason,
+                 e.reason,e.round,e.normal_count,e.detected_at,e.completed_at,
+                 e.failed_at,e.reported_at].join('|'); }catch(_){ return null; }
+  }
   function dispatch(e){ if(!e||!e.event||e.event==='ping'||e.event==='connected')return;
-    if(e.seq){ if(e.seq<=window._evSeq)return; window._evSeq=e.seq; } handle(e); }
+    if(e.seq){
+      if(e.seq<=window._evSeq) return;
+    }else{
+      var fp=fingerprint(e);                       // seq 없는 이벤트도 중복 차단
+      if(fp){
+        if(window._evFp.indexOf(fp)>=0) return;
+        window._evFp.push(fp);
+        if(window._evFp.length>200) window._evFp.shift();
+      }
+    }
+    try{
+      handle(e);
+    }catch(err){
+      // seq 는 실패해도 **반드시** 올린다. 안 올리면 폴링이 since=_evSeq 로 계속 되돌아와
+      // 그 뒤 이벤트들이 0.8초마다 중복 처리된다(원래 버그보다 나쁨).
+      // 대신 조용히 넘어가지 않고 콘솔·토스트로 크게 남겨 원인 추적이 가능하게 한다.
+      console.error('[Automato] 이벤트 처리 실패 — 화면에 반영되지 않았습니다.', e && e.event, err, e);
+      try{ toast('⚠️ 이벤트 표시 실패 ('+val(e.event,'?')+') — 콘솔(F12) 확인'); }catch(_){}
+    }
+    if(e.seq) window._evSeq=e.seq;
+  }
   // ── 1순위: WebSocket (스펙 /ws/farm-admin) ──
   var wsOk=false, pollTimer=null;
   function startPolling(){ if(pollTimer)return;
