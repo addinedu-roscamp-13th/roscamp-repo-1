@@ -44,8 +44,10 @@ CL_PLAN_BACKUP_MAX = 0.15         # PLAN서 근접이면 후진 한계 [m]
 #  재획득, 한도 넘으면 SEARCH(무한대기 방지). (ddago01 실주행 검증)
 CL_VERIFY_D = 0.25               # 재확인 최소 거리 [m] (yaw 신뢰거리보다 살짝 위)
 CL_MAX_REPLANS = 2               # 재계획 최대 횟수(초과 시 현재 정렬로 진행)
-VERIFY_BACKUP_MAX = 0.30         # VERIFY 재획득 후진 한도 [m]
-VERIFY_TIMEOUT = 8.0             # VERIFY 재획득 제한시간 [s] (초과 시 SEARCH)
+# 중심선 기동 목표점 거리 [m]. 스테이징(D_STAGE)이 아니라 신뢰거리(≥YAW_RELIABLE_D)에 두어,
+#  기동이 끝난 자리서 VERIFY 가 후진 없이 바로 판정하게 한다(불필요한 후진 제거). ALIGN 이 이후
+#  D_STAGE 까지 접근. 07-28: VERIFY 왕복 후진 제거 목적.
+CL_TARGET_D = 0.26
 # ── 180도 회전 ──
 TURN_W = 0.25
 TURN_TOL = math.radians(0.8)
@@ -68,7 +70,7 @@ _TUNABLE = (
     'D_STAGE', 'LATERAL_OFFSET', 'WALL_GAP_TARGET', 'REVERSE_K', 'CROSSBAR_TO_WALL',
     'DYNAMIC_REVERSE', 'REV_MIN', 'REV_MAX', 'REVERSE_DIST', 'V_APPROACH', 'V_REVERSE',
     'SEARCH_W', 'TURN_W', 'FACE_TIMEOUT', 'STAGE_SETTLE_SEC', 'CL_VERIFY_D',
-    'CL_MAX_REPLANS', 'VERIFY_BACKUP_MAX', 'VERIFY_TIMEOUT', 'POST_DOCK_HOLD_SEC', 'V_ADVANCE',
+    'CL_MAX_REPLANS', 'CL_TARGET_D', 'POST_DOCK_HOLD_SEC', 'V_ADVANCE',
 )
 
 
@@ -112,8 +114,8 @@ def square_geometry(center, heading):
     bearing = math.atan2(Sr, Sf)
     yaw = _ang_norm(-face_dir)
     N = _ang_norm(face_dir + math.pi)
-    gx = Cx + D_STAGE * math.cos(N)
-    gy = Cy + D_STAGE * math.sin(N)
+    gx = Cx + CL_TARGET_D * math.cos(N)   # 중심선 기동 목표 = 신뢰거리(ALIGN 이 D_STAGE 까지 접근)
+    gy = Cy + CL_TARGET_D * math.sin(N)
     th1 = math.atan2(gy, gx)
     dist = math.hypot(gx, gy)
     th2 = _ang_norm(face_dir - th1)
@@ -174,6 +176,8 @@ class DockFsm:
         self.post_advance_m = 0.0     # >0 이면 REVERSE 완료 후 HOLD→전진(반복 테스트용) → DONE
         self.hold_start = None        # HOLD(도킹완료 정지) 시작시각
         self.adv_xy0 = None
+        self.obstacle_ahead = False   # 노드가 라이다로 세팅. ADVANCE 중 True면 조기 완료(정지)
+        self.obstacle_behind = False  # 노드가 세팅. PLAN 후진 중 True면 후진 중지 → ALIGN 폴백
         self.reverse_odom_used = None  # REVERSE 완료 시: odom 실거리(True)/시간폴백(False)
         self.reverse_trav = 0.0        # REVERSE 실이동거리 [m] (계측)
         self.note = ""                # 이상/폴백 사유 + 동적후진 요약
@@ -267,8 +271,11 @@ class DockFsm:
             if odom_xy is None or self.adv_xy0 is None:
                 self.state = "DONE"
                 return 0.0, 0.0
-            if math.hypot(odom_xy[0] - self.adv_xy0[0],
-                          odom_xy[1] - self.adv_xy0[1]) >= self.post_advance_m:
+            trav = math.hypot(odom_xy[0] - self.adv_xy0[0], odom_xy[1] - self.adv_xy0[1])
+            # 목표 도달 or 전방 장애물(노드가 obstacle_ahead 세팅) → 조기 정지·완료(ABORT 아님, 다음 진행)
+            if trav >= self.post_advance_m or self.obstacle_ahead:
+                if self.obstacle_ahead:
+                    self._warn('ADVANCE 중 전방 장애물 — %.0fmm 전진 후 정지·완료' % (trav * 1000))
                 self.state = "DONE"
                 return 0.0, 0.0
             return V_ADVANCE, 0.0
@@ -304,9 +311,12 @@ class DockFsm:
                     if odom_xy is not None and self.cl_plan_xy0 is not None:
                         backed = math.hypot(odom_xy[0] - self.cl_plan_xy0[0],
                                             odom_xy[1] - self.cl_plan_xy0[1])
-                    if (now - self.cl_plan_since > CL_PLAN_TIMEOUT
+                    # 후방 장애물이면 더 못 물러남 → 즉시 ALIGN 폴백(충돌 방지, 다음 진행).
+                    if (self.obstacle_behind or now - self.cl_plan_since > CL_PLAN_TIMEOUT
                             or backed >= CL_PLAN_BACKUP_MAX):
-                        self._warn('중심선 계획 실패(%.0fcm 후진) — ALIGN 폴백' % (backed * 100))
+                        why = ('후방 장애물' if self.obstacle_behind
+                               else '%.0fcm 후진/시간초과' % (backed * 100))
+                        self._warn('중심선 계획 불가(%s) — ALIGN 접근 폴백' % why)
                         self.state = "ALIGN"       # 계획 실패 → 접근 폴백(cl_done=False)
                         return 0.0, 0.0
                     if found and d < D_STAGE + CL_PLAN_BACKUP_MAX and odom_xy is not None:
@@ -316,6 +326,13 @@ class DockFsm:
                     self._abort('odom 없음 — 중심선 기동 불가 (bringup 미실행?)')
                     return 0.0, 0.0
                 self.cl_th1, self.cl_dist, self.cl_th2 = plan
+                # 이미 정렬(신뢰거리서 bearing·yaw 작음)이면 turn-drive-turn 스킵 → 바로 ALIGN.
+                if abs(bearing) < BEARING_TOL and abs(yaw) < YAW_TOL:
+                    self._warn('이미 정렬됨 — 중심선 기동 스킵 → ALIGN')
+                    self.state = "ALIGN"
+                    self.cl_done = True
+                    self.lost_since = None
+                    return 0.0, 0.0
                 self.cl_odom0 = odom_yaw
                 self.cl_plan = (math.degrees(self.cl_th1), self.cl_dist * 100,
                                 math.degrees(self.cl_th2))
@@ -353,27 +370,13 @@ class DockFsm:
                     return 0.0, 0.0
                 return 0.0, _clamp(K_TURN * err, TURN_W)
             if self.cl_phase == "VERIFY":
-                if self.cl_verify_since is None:
-                    self.cl_verify_since = now
-                    self.cl_verify_xy0 = odom_xy
-                # 검출 상실/근접 → 신뢰거리 확보까지 직진 후진(놓침=근접클리핑, 물러나면 재획득).
-                #  한도(시간/후진거리) 넘도록 못 잡으면 SEARCH 재탐색(★무한대기 방지).
-                if (not found) or d < CL_VERIFY_D:
-                    backed = 0.0
-                    if odom_xy is not None and self.cl_verify_xy0 is not None:
-                        backed = math.hypot(odom_xy[0] - self.cl_verify_xy0[0],
-                                            odom_xy[1] - self.cl_verify_xy0[1])
-                    if (now - self.cl_verify_since > VERIFY_TIMEOUT
-                            or backed > VERIFY_BACKUP_MAX):
-                        self._warn('VERIFY 재획득 실패(%.1fs/%.0fcm) — SEARCH 재탐색'
-                                   % (now - self.cl_verify_since, backed * 100))
-                        self.cl_verify_since = None
-                        self.state = "SEARCH"
-                        self.search_start = None
-                        self.lost_since = None
-                        return 0.0, 0.0
-                    return -V_APPROACH, 0.0              # 후진하며 재획득/신뢰거리 확보
-                self.cl_verify_since = None              # 확보됨 → 판정
+                # 기동이 신뢰거리(CL_TARGET_D≥YAW_RELIABLE_D)에서 끝났으므로 ★후진 없이★ 그 자리서
+                #  판정. 미검출/근접(yaw 불신)이면 계획을 신뢰하고 진행(불필요한 후진 제거, 07-28).
+                if (not found) or d < YAW_RELIABLE_D:
+                    self.state = "ALIGN"
+                    self.cl_done = True
+                    self.lost_since = None
+                    return 0.0, 0.0
                 if abs(bearing) < BEARING_TOL and abs(yaw) < YAW_TOL:
                     self.state = "ALIGN"
                     self.cl_done = True                  # 검증 통과 → 근접 yaw 신뢰(FACE)
