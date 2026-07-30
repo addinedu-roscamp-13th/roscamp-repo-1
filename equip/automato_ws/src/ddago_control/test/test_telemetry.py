@@ -152,8 +152,6 @@ def test_defaults_before_sources(ctx):
     _subscribe_telemetry(helper, received)
     assert _wait_until(lambda: len(received) >= 1, timeout=5.0)
     msg = received[0]
-    # ddago 는 robot_id 를 채우지 않는다(빈 문자열) — 로봇 식별은 dcs 몫.
-    assert msg.robot_id == ''
     assert msg.nav_status == 'IDLE'
     assert msg.task_id == 0          # goal 을 한 번도 받지 않았으면 0
     assert msg.x == pytest.approx(0.0)
@@ -180,7 +178,6 @@ def test_fields_reflect_sources(ctx):
         '텔레메트리에 소스값이 반영되지 않음'
 
     msg = received[-1]
-    assert msg.robot_id == ''   # ddago 는 robot_id 를 안 채운다(dcs 가 채움)
     assert msg.x == pytest.approx(1.0)             # amcl 우선
     assert msg.y == pytest.approx(2.0)
     assert msg.yaw == pytest.approx(amcl_yaw, abs=1e-3)

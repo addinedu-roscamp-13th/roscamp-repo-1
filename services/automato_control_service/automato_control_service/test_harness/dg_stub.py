@@ -11,11 +11,13 @@ RP-78 때 이 파일은 fleet_aggregator 였다 — 로봇 3대분을 FleetTelem
 실기와 다른 점 —
   실기 dcs 는 로봇 세트마다 한 프로세스씩 뜨고, 물리망이 분리돼 있어 자기 로봇만 본다
   (그래서 메시지 안에 robot_id 가 필요 없다). 이 대역은 한 머신에서 도는 테스트용이라
-  물리 분리가 없다. 그래서 fake_telemetry 가 payload 에 실어주는 msg.robot_id 로 로봇을
-  가르고, 한 프로세스가 DG 여러 개인 척 로봇별 토픽에 나눠 발행한다.
+  물리 분리가 없다. 그래서 fake_telemetry 가 실어주는 식별자로 로봇을 가르고,
+  한 프로세스가 DG 여러 개인 척 로봇별 토픽에 나눠 발행한다.
+  식별자는 메시지마다 다르다 — ddago 는 header.frame_id(robot_id 필드가 제거됨),
+  ddagi 는 아직 남아 있는 payload robot_id.
 
 하는 일:
-  구독:  /ddago/telemetry  (DdagoTelemetry)   ← 모든 로봇이 '한 토픽'에 발행, robot_id 로 구분
+  구독:  /ddago/telemetry  (DdagoTelemetry)   ← 모든 로봇이 '한 토픽'에 발행, frame_id 로 구분
          /ddagi/telemetry  (DdagiTelemetry)   ← 팔 있는 로봇만(없으면 비어도 정상)
   발행:  /{robot_id}/telemetry  (RobotTelemetry, 기본 1Hz) — 로봇마다 하나씩
 
@@ -51,8 +53,9 @@ class DgStub(Node):
         # 처음 보는 robot_id 가 오면 그때 발행자를 만든다.
         self._pubs = {}
 
-        # 모든 로봇이 한 토픽에 발행(익명) → 각 소스 토픽을 '한 번만' 구독하고 payload
-        # msg.robot_id 로 가른다. telemetry_publisher 가 기본 QoS(RELIABLE,10) 발행 → 맞춤.
+        # 모든 로봇이 한 토픽에 발행(익명) → 각 소스 토픽을 '한 번만' 구독하고 payload 로
+        # 가른다(ddago=header.frame_id, ddagi=robot_id).
+        # telemetry_publisher 가 기본 QoS(RELIABLE,10) 발행 → 맞춤.
         self.create_subscription(
             DdagoTelemetry, "/ddago/telemetry", self._on_ddago, 10)
         self.create_subscription(
@@ -63,18 +66,24 @@ class DgStub(Node):
 
         self.get_logger().info(
             f"[TEST] DG 대역 준비: /ddago·/ddagi/telemetry → /<robot_id>/telemetry "
-            f"({rate:.1f}Hz). robot_id(payload)로 로봇 구분. ※ 테스트 스탠드인")
+            f"({rate:.1f}Hz). ddago=header.frame_id / ddagi=robot_id 로 구분. "
+            f"※ 테스트 스탠드인")
 
-    # 수신마다 robot_id 로 덮어씀(원본 보존).
+    # 수신마다 로봇 식별자로 덮어씀(원본 보존).
     def _on_ddago(self, msg: DdagoTelemetry) -> None:
-        if not msg.robot_id:
+        # DdagoTelemetry 에 robot_id 필드가 없으므로(물리망 분리로 제거) fake_telemetry 가
+        # header.frame_id 에 실어주는 값으로 가른다.
+        # ⚠️ 이 대역은 가짜 로봇 전용이다. 진짜 telemetry_publisher 는 frame_id 에 좌표
+        #    프레임('map'/'odom')을 넣으므로, 섞어 띄우면 'map' 이라는 로봇이 생긴다.
+        robot_id = msg.header.frame_id
+        if not robot_id:
             # 실기라면 물리망이 알려주지만 이 대역은 payload 로만 로봇을 안다.
             self.get_logger().warn(
-                "[TEST] robot_id 없는 ddago 텔레메트리 무시 — fake_telemetry 는 "
-                "네임스페이스(-r __ns:=/dg_02)로 robot_id 를 준다",
+                "[TEST] 식별자 없는 ddago 텔레메트리 무시 — fake_telemetry 는 "
+                "네임스페이스(-r __ns:=/dg_02)로 header.frame_id 를 채운다",
                 throttle_duration_sec=10.0)
             return
-        self._ddago[msg.robot_id] = msg
+        self._ddago[robot_id] = msg
 
     def _on_ddagi(self, msg: DdagiTelemetry) -> None:
         if not msg.robot_id:

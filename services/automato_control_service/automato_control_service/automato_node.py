@@ -131,7 +131,7 @@ class AutomatoControlNode(Node):
 
     def _on_fleet(self, msg: FleetTelemetry) -> None:
         """[삭제 예정] 옛 /automato/telemetry/fleet 경로."""
-        self.cache.update_from_fleet(msg, time.time())
+        self.cache.update_from_fleet(msg)
         self.get_logger().info(
             "[삭제 예정] 옛 fleet 경로로 텔레메트리 수신 중 — DG 이전 후 "
             "legacy_input 을 끄세요", throttle_duration_sec=30.0)
