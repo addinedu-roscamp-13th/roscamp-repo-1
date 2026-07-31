@@ -7,6 +7,7 @@ detection_service 는 detection_db(psycopg)를 '지연 임포트'하므로, DB �
 실행:
   PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest test/test_detection_service.py -v
 """
+import base64
 import os
 import sys
 from datetime import datetime, timezone
@@ -59,6 +60,24 @@ def test_alert_payload_keeps_image_path():
         task_id=7, waypoint_id=3, robot_id="dg_01", disease_percent=9,
         image_path="2026-07-09/wp3_dg_01_123456.jpg", detected_at=FIXED)
     assert p["image_path"] == "2026-07-09/wp3_dg_01_123456.jpg"
+
+
+def test_alert_payload_carries_image_data_base64():
+    # 웹 서비스가 다른 머신이라 경로로는 파일을 못 읽는다 → 사진 실물을 base64 로 동봉.
+    p = ds.build_alert_payload(
+        task_id=7, waypoint_id=3, robot_id="dg_01", disease_percent=9,
+        image_path="2026-07-09/wp3_dg_01_123456.jpg", detected_at=FIXED,
+        image_bytes=b"\xff\xd8jpeg-bytes")
+    assert base64.b64decode(p["image_data"]) == b"\xff\xd8jpeg-bytes"  # 왕복 복원됨
+    assert isinstance(p["image_data"], str)      # JSON 직렬화 가능한 문자열
+
+
+def test_alert_payload_empty_image_data_when_no_bytes():
+    # 필드는 항상 존재하고, 바이트가 없을 때만 "" (수신측이 키 유무를 따지지 않게)
+    p = ds.build_alert_payload(
+        task_id=7, waypoint_id=3, robot_id="dg_01", disease_percent=9,
+        image_path=None, detected_at=FIXED)
+    assert p["image_data"] == ""
 
 
 # =========================================================================== #
@@ -211,12 +230,23 @@ def test_db_failure_still_notifies_and_alerts_and_success_false():
     assert len(calls["alert"]) == 1            # 그래도 alert 발송(안전)
 
 
+def test_alert_carries_image_data_from_received_bytes():
+    # 받은 바이트를 그대로 alert 에 실어 보낸다(파일을 다시 읽지 않음).
+    h, calls = _make_handler(store_return="2026-07-09/wp3_dg_01_123456.jpg")
+    h._process(**_args(10, image_bytes=b"\xff\xd8jpeg"))
+    assert base64.b64decode(calls["alert"][0]["image_data"]) == b"\xff\xd8jpeg"
+    # 수신측은 image_data + image_path 가 둘 다 있어야 파일로 저장한다.
+    assert calls["alert"][0]["image_path"] == "2026-07-09/wp3_dg_01_123456.jpg"
+
+
 def test_image_write_failure_alert_gets_empty_path():
     # 게이트는 통과하지만 이미지 쓰기 실패(store_return=None) → alert image_path=""
     h, calls = _make_handler(store_return=None)
     success, msg = h._process(**_args(10, image_bytes=b"jpeg"))
     assert calls["db"][0]["image_path"] is None
     assert calls["alert"][0]["image_path"] == ""
+    # 로컬 저장이 실패해도 사진 자체는 알림에 붙는다(현행 유지: 수신측 파일 저장만 못 함)
+    assert base64.b64decode(calls["alert"][0]["image_data"]) == b"jpeg"
 
 
 def test_gate_but_no_image_bytes_skips_store_but_still_alerts():
@@ -227,6 +257,7 @@ def test_gate_but_no_image_bytes_skips_store_but_still_alerts():
     assert calls["db"][0]["image_path"] is None
     assert len(calls["alert"]) == 1
     assert calls["alert"][0]["image_path"] == ""
+    assert calls["alert"][0]["image_data"] == ""      # 보낼 사진이 없음
 
 
 def test_detected_at_shared_across_db_notify_alert():

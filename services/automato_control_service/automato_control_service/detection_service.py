@@ -30,6 +30,7 @@ HTTP 클라이언트:
   수신처(대시보드/알림 백엔드)는 아직 미정이라 base URL 을 설정값(AUTOMATO_WEB_SERVICE_URL)으로
   빼둔다. 경로는 계약이라 상수로 고정한다.
 """
+import base64
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -107,14 +108,26 @@ def build_notify_payload(*, task_id, waypoint_id, robot_id, detection_id,
 
 
 def build_alert_payload(*, task_id, waypoint_id, robot_id, disease_percent,
-                        image_path, detected_at: datetime) -> dict:
-    """병해충 알림(alert) 몸통. image_path 가 없으면(쓰기 실패 등) "" 로 보낸다."""
+                        image_path, detected_at: datetime,
+                        image_bytes: bytes = b"") -> dict:
+    """병해충 알림(alert) 몸통. image_path 가 없으면(쓰기 실패 등) "" 로 보낸다.
+
+    image_data 는 사진 **실물**(JPEG 바이트의 base64 문자열). image_path 는 ACS 로컬
+    디스크의 상대경로일 뿐이라, 웹 서비스가 다른 머신에서 돌면 그 경로로는 파일을 못 읽는다.
+    그래서 경로와 함께 바이트도 실어 보내고, 수신측이 자기 쪽 detections 폴더에 같은
+    상대경로로 저장한다(웹앱·텔레그램은 그 파일을 표시). 둘 다 있어야 저장되므로
+    image_path 는 계속 함께 보낸다.
+
+    바이트가 없으면(게이트 미만·이미지 미수신·인코딩 실패) "" — 필드 자체는 항상 있다.
+    JSON 은 바이너리를 못 담기 때문에 base64(약 4/3 배로 커짐)로 감싼다.
+    """
     return {
         "task_id": int(task_id),
         "waypoint_id": int(waypoint_id),
         "robot_id": robot_id,
         "disease_percent": int(disease_percent),
         "image_path": image_path or "",
+        "image_data": base64.b64encode(image_bytes).decode("ascii") if image_bytes else "",
         "detected_at": detected_at.isoformat(),
     }
 
@@ -209,13 +222,16 @@ def send_disease_alert(base_url: str, payload: dict, timeout: float = 3.0,
     url = base_url.rstrip("/") + ALERT_PATH
     attempts = max(1, int(retries))
     last_err = None
+    # 사진(base64)이 실리면 페이로드가 수백 KB 가 된다 → 실렸는지/크기를 로그로 남긴다.
+    img_kb = len(payload.get("image_data") or "") // 1024
+    img_desc = f"사진 {img_kb}KB" if img_kb else "사진 없음"
     for i in range(1, attempts + 1):
         try:
             status = post_json(url, payload, timeout)
             if log is not None:
                 log.info(
                     f"disease alert 발송 OK({status}) "
-                    f"wp={payload.get('waypoint_id')} (시도 {i}/{attempts})")
+                    f"wp={payload.get('waypoint_id')} {img_desc} (시도 {i}/{attempts})")
             return True
         except Exception as exc:  # noqa: BLE001
             last_err = exc
@@ -353,10 +369,12 @@ class DetectionHandler:
 
         # 4) 병해충 알림 — 게이트 통과일 때만. DB 실패해도 안전 위해 발송.
         if gate:
+            # image_bytes 를 그대로 실어 보낸다 — 파일을 다시 읽지 않는다.
+            # (저장이 실패해 image_path 가 None 이어도 사진은 알림에 붙는다)
             alert_payload = build_alert_payload(
                 task_id=task_id, waypoint_id=waypoint_id, robot_id=robot_id,
                 disease_percent=disease_percent, image_path=image_path,
-                detected_at=detected_at)
+                detected_at=detected_at, image_bytes=image_bytes or b"")
             self._dispatch(
                 lambda: self._alert_fn(
                     self._base_url, alert_payload,

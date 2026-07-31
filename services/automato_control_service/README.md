@@ -108,6 +108,12 @@ ros2 run automato_control_service automato_node
 - 발신(HTTP, RP-79): `POST {AUTOMATO_WEB_SERVICE_URL}/internal/v1/detections/notify` (순찰 현황),
   `POST {AUTOMATO_WEB_SERVICE_URL}/internal/v1/alerts/disease` (병해충 알림)
 
+병해충 알림은 사진 **실물**을 `image_data`(JPEG 의 base64 문자열)로 동봉한다.
+`image_path` 는 ACS 로컬 디스크의 상대경로일 뿐이라, 웹 서비스가 다른 머신에서 돌면
+그 경로로는 파일을 못 읽기 때문이다. 수신측은 `image_data` 와 `image_path` 가 **둘 다**
+있을 때 자기 쪽 detections 폴더에 같은 상대경로로 저장하므로, 경로도 함께 보낸다.
+보낼 사진이 없으면(게이트 미만·이미지 미수신·인코딩 실패) `image_data` 는 `""`.
+
 ### 설정(환경변수) — RP-79
 
 | 변수 | 기본값 | 용도 |
