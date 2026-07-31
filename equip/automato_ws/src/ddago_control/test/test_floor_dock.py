@@ -99,7 +99,7 @@ def test_staged_to_turn_to_reverse_to_done():
 def test_centerline_plan_only_at_reliable_distance():
     """근접(d<0.24)선 PLAN 안 잡고 후진 시도, 신뢰거리(d≥0.24)면 PLAN→TURN1."""
     F.configure(D_STAGE=0.20)
-    plan = (0.1, 0.05, 0.1)
+    plan = (0.1, 0.10, 0.1)          # dist 0.10 ≥ CL_MIN_DIST → 기동 스킵 안 걸림(TURN1 검증)
     # 근접: d=0.20 → 계획 안 됨(후진 명령 v<0)
     fsm = F.DockFsm()
     fsm.state = 'CENTERLINE'
@@ -147,6 +147,59 @@ def test_plan_lost_backs_straight_before_timeout():
     v, w = fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.0, 0.0))
     assert fsm.state == 'CENTERLINE'
     assert v < 0.0 and abs(w) < 1e-9        # 직진 후진(회전 X)
+
+
+def test_plan_reliable_window_gates():
+    """로봇별 신뢰창(D_RELIABLE_MIN/MAX): 창 밖이면 계획 안 함.
+    d>MAX → 접근(전진), 창 안 → 계획(TURN1). far 부정확 회피 + 헛후진 방지."""
+    try:
+        F.configure(D_STAGE=0.20, D_RELIABLE_MIN=0.20, D_RELIABLE_MAX=0.29)
+        plan = (0.1, 0.10, 0.1)          # dist 0.10 ≥ CL_MIN_DIST → 기동 스킵 안 걸림(TURN1 검증)
+        # d=0.40 > MAX(0.29): 계획 말고 전진 접근
+        fsm = F.DockFsm(); fsm.state = 'CENTERLINE'; fsm.cl_phase = 'PLAN'
+        v, w = fsm.update(True, 0.40, 0.0, math.radians(10.0), 0.0, 0, 0,
+                          plan=plan, odom_xy=(0.0, 0.0), n=99)
+        assert v > 0.0                       # 너무 멂 → 접근(전진)
+        assert fsm.cl_phase == 'PLAN'         # 아직 계획 전
+        # d=0.25 in [0.20,0.29]: 계획됨(미정렬 yaw10° → TURN1)
+        fsm2 = F.DockFsm(); fsm2.state = 'CENTERLINE'
+        fsm2.update(True, 0.25, 0.0, math.radians(10.0), 0.0, 0, 0,
+                    plan=plan, odom_xy=(0.0, 0.0), n=99)
+        assert fsm2.cl_phase == 'TURN1'
+    finally:
+        F.configure(D_RELIABLE_MIN=0.24, D_RELIABLE_MAX=10.0)   # 기본 복원(교차오염 방지)
+
+
+def test_centerline_backward_drive_when_target_behind():
+    """근접(d<CL_TARGET_D, 중심선 위)이면 목표 G가 로봇 뒤 → 전진안은 th1≈±180° 왕복.
+    후진안(dist<0) 자동선택으로 회전 최소(th1·th2≈0) → 헛턴 제거."""
+    F.configure(D_STAGE=0.20, CL_TARGET_D=0.26, LATERAL_OFFSET=0.0)
+    _d, _b, _y, plan, _gx, _gy = F.square_geometry((0.0, 0.24), 0.0)  # 정면·중심선, d=0.24<0.26
+    th1, dist, th2 = plan
+    assert dist < 0                              # 후진 선택
+    assert abs(math.degrees(th1)) < 5            # 180° 왕복 아님
+    assert abs(math.degrees(th2)) < 5
+
+
+def test_centerline_forward_drive_when_target_ahead():
+    """d>CL_TARGET_D면 목표 G가 앞 → 전진(dist>0), 회전 작음."""
+    F.configure(D_STAGE=0.20, CL_TARGET_D=0.26, LATERAL_OFFSET=0.0)
+    _d, _b, _y, plan, _gx, _gy = F.square_geometry((0.0, 0.30), 0.0)  # d=0.30>0.26
+    th1, dist, th2 = plan
+    assert dist > 0
+    assert abs(math.degrees(th1)) < 5
+
+
+def test_align_decelerates_near_stage():
+    """ALIGN 접근이 목표(D_STAGE) 근처서 감속 → 오버슛(신뢰창 아래) 방지. 먼 데선 최대속."""
+    F.configure(D_STAGE=0.20)
+    fsm = F.DockFsm(); fsm.state = 'ALIGN'
+    v_far, _ = fsm.update(True, 0.40, 0.0, 0.0, 0.0, 0, 0)     # 목표+decel_zone 밖 → 최대속
+    fsm2 = F.DockFsm(); fsm2.state = 'ALIGN'
+    v_near, _ = fsm2.update(True, 0.21, 0.0, 0.0, 0.0, 0, 0)   # 목표 바로 앞 → 감속
+    assert abs(v_far - F.V_APPROACH) < 1e-9
+    assert 0 < v_near < F.V_APPROACH
+    assert v_near >= F.V_APPROACH * F.V_STAGE_MIN_FRAC - 1e-9  # 하한 이상
 
 
 def test_face_timeout_aborts_when_unaligned():
@@ -243,8 +296,10 @@ def test_advance_obstacle_early_stop():
 
 
 def test_post_advance_after_reverse():
-    """post_advance_m>0 이면 REVERSE 완료 → HOLD → ADVANCE(odom 전진) → DONE."""
-    F.configure(STAGE_SETTLE_SEC=0.0, POST_DOCK_HOLD_SEC=0.0)   # 테스트선 홀드 0
+    """post_advance_m>0: REVERSE→HOLD→ADVANCE→DONE. ADVANCE 거리=rev_dist+margin
+    (후진 되돌리기+여유) → 재획득 d≈D_STAGE+margin(신뢰창 안). 고정거리 아님."""
+    F.configure(STAGE_SETTLE_SEC=0.0, POST_DOCK_HOLD_SEC=0.0, D_STAGE=0.20,
+                D_RELIABLE_MAX=10.0)   # 창 상한 없음 → margin=post_advance_m
     fsm = F.DockFsm()
     fsm.post_advance_m = 0.10
     fsm.state = 'REVERSE'
@@ -255,13 +310,33 @@ def test_post_advance_after_reverse():
     fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.05, 0.0))   # 후진완료 → HOLD
     assert fsm.state == 'HOLD'
     assert fsm.reverse_odom_used is True
-    fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.05, 0.0))   # 홀드 0초 경과 → ADVANCE
+    fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.05, 0.0))   # 홀드 0초 → ADVANCE
     assert fsm.state == 'ADVANCE'
-    fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.05, 0.0))   # adv 기준점 잡고 전진
+    assert abs(fsm.adv_target - (0.05 + 0.10)) < 1e-9           # rev_dist + margin = 0.15
+    fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.05, 0.0))   # adv 기준점(adv_xy0=0.05)
     assert fsm.state == 'ADVANCE'
-    fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.16, 0.0))   # 전진 0.11≥0.10 → DONE
+    fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.16, 0.0))   # 전진 0.11 < 0.15 → 아직 ADVANCE
+    assert fsm.state == 'ADVANCE'
+    fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.21, 0.0))   # 전진 0.16 ≥ 0.15 → DONE
     assert fsm.state == 'DONE'
     assert fsm.result_code == 0
+
+
+def test_advance_target_clamped_to_window():
+    """과도한 post_advance_m 이라도 margin 은 신뢰창 far 끝까지만 → 재획득 d≤MAX(창 밖 착지 방지)."""
+    try:
+        F.configure(POST_DOCK_HOLD_SEC=0.0, D_STAGE=0.20, D_RELIABLE_MAX=0.2875)
+        fsm = F.DockFsm()
+        fsm.post_advance_m = 0.30           # 과도 요청(고정 0.30 → 창 초과하던 값)
+        fsm.rev_dist = 0.18
+        fsm.state = 'HOLD'
+        fsm.hold_start = 0.0
+        fsm.update(False, 0, 0, 0, 0.0, 0, 0, odom_xy=(0.0, 0.0))   # HOLD→ADVANCE, adv_target 계산
+        assert fsm.state == 'ADVANCE'
+        # margin=min(0.30, MAX−D_STAGE=0.0875)=0.0875 → 재획득 d=D_STAGE+margin=0.2875=MAX(안 넘음)
+        assert abs(fsm.adv_target - (0.18 + 0.0875)) < 1e-6
+    finally:
+        F.configure(D_RELIABLE_MAX=10.0)
 
 
 def test_single_dock_no_hold_no_advance():

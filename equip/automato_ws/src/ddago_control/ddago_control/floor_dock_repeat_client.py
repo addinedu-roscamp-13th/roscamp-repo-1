@@ -7,21 +7,24 @@ floor_pose.py 의 '자동 반복'을 서버 밖(클라이언트)에서 재현 �
 
 '벽에서 후퇴'(다음 회차가 마커를 다시 보게)는 **클라이언트가 회차별로 서버
 파라미터 `post_advance_m` 을 설정**해서 제어한다:
-  * i < count  → post_advance_m = `post_advance_m`(기본 0.30)  (후퇴 후 다음 도킹)
+  * i < count  → post_advance_m = `post_advance_m`(기본 0.05)  (후퇴 후 다음 도킹)
   * 마지막/단발 → post_advance_m = 0  (**후퇴 없이 도킹 상태로 종료**)
+  ※ post_advance_m 은 '고정 후퇴거리'가 아니라 **STAGED 복귀(rev_dist) 뒤 여유(margin)**.
+    ADVANCE 실제거리 = rev_dist + margin → 재획득 d ≈ D_STAGE + margin (신뢰창 안).
+    신뢰창을 넘으면 데이터가 없어 복구 불가라, margin 은 창 far 끝까지로 클램프된다.
 
 한 회차라도 실패(거절/ABORT/미검출)하면 **즉시 중단하고 요약을 출력**한다.
 
 실행 예 (서버 launch 는 post_advance_m 불필요 — 클라이언트가 회차별로 덮어씀):
   ros2 launch ddago_control ddago_floor_dock.launch.py robot_id:=dg_03
   ros2 run ddago_control floor_dock_repeat_client --ros-args \\
-    -p count:=5 -p wall_gap_m:=0.03 -p post_advance_m:=0.30 -p pause_s:=2.0
+    -p count:=5 -p wall_gap_m:=0.03 -p post_advance_m:=0.05 -p pause_s:=2.0
 
 파라미터:
   count(int=5)          반복 횟수 (1이면 단발 → 후퇴 없이 도킹 종료)
   wall_gap_m(float=0)   목표 후면~벽 [m] (0=서버 기본)
   lateral_offset_m(0)   횡 오프셋 [m] (0=서버 기본)
-  post_advance_m(0.30)  회차 사이 후퇴 [m] (마지막 회차엔 0 강제)
+  post_advance_m(0.05)  STAGED 복귀 후 여유 margin [m] (실제 ADVANCE=rev_dist+margin, 창 클램프)
   task_point_id('TEST') goal 라벨
   pause_s(float=2.0)    회차 사이 대기 [s]
   action_name('/ddago/floor_dock')
@@ -51,7 +54,7 @@ class FloorDockRepeatClient(Node):
         self.declare_parameter('stop_on_fail', True)
         # 회차 사이 후퇴[m]. 클라이언트가 서버 파라미터를 회차별로 설정한다:
         #  i<count → 이 값(다음 마커 보려 후퇴), 마지막/단발 → 0(도킹 상태로 종료).
-        self.declare_parameter('post_advance_m', 0.30)
+        self.declare_parameter('post_advance_m', 0.05)
         self.declare_parameter('server_node', 'ddago_floor_dock_server')
 
         g = self.get_parameter

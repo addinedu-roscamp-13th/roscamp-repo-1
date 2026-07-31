@@ -13,6 +13,13 @@
 #
 # ⚠️ bringup(odom·cmd_vel·scan) 먼저 떠 있어야 함. cmd_vel 워치독 없음 → Ctrl+C 준비.
 # ============================================================================
+# 실행 중 bringup(odom·scan)의 ROS_DOMAIN_ID 를 자동으로 따라간다(도메인 불일치=no scan 방지).
+#  로봇마다 도메인이 달라(ddago02=10, 옛 ddago03=12) 하드코딩하면 스캔/odom 을 못 받는다.
+BP=$(pgrep -f bringup 2>/dev/null | head -1)
+if [ -n "$BP" ] && [ -r "/proc/$BP/environ" ]; then
+  BD=$(tr '\0' '\n' < "/proc/$BP/environ" | sed -n 's/^ROS_DOMAIN_ID=//p' | head -1)
+  [ -n "$BD" ] && ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-$BD}
+fi
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-12}
 export RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
 WS=${WS:-~/roscamp-repo-1/equip/automato_ws}
@@ -21,8 +28,9 @@ source /opt/ros/jazzy/setup.bash 2>/dev/null
 source "${WS/#\~/$HOME}/install/setup.bash" 2>/dev/null || {
   echo "워크스페이스 소싱 실패: $WS/install/setup.bash"; exit 1; }
 
-ROBOT=${ROBOT:-dg_03}
+ROBOT=${ROBOT:-dg_03}          # ⚠️ ddago02 는 ROBOT=dg_02 로 실행할 것
 ACTION=/ddago/floor_dock
+echo "[floor_dock] ROS_DOMAIN_ID=$ROS_DOMAIN_ID  RMW=$RMW_IMPLEMENTATION  ROBOT=$ROBOT"
 
 case "$1" in
   server)
@@ -44,7 +52,7 @@ case "$1" in
     N=${2:-3}
     echo "[floor_dock] 반복 도킹 ${N}회 (마지막은 도킹 상태로 종료)"
     ros2 run ddago_control floor_dock_repeat_client --ros-args \
-      -p count:="$N" -p wall_gap_m:=0.03 -p post_advance_m:=0.30 -p pause_s:=2.0
+      -p count:="$N" -p wall_gap_m:=0.03 -p post_advance_m:=0.05 -p pause_s:=2.0
     ;;
   *)
     echo "사용법: floor_dock.sh {server|dry|goal|repeat [N]}"

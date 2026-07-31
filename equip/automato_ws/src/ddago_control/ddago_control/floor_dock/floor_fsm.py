@@ -23,11 +23,17 @@ SEARCH_TIMEOUT = SEARCH_REVS * 2 * math.pi / SEARCH_W
 LOST_TIMEOUT = 1.0                # 놓친 뒤 SEARCH 복귀까지 [s]
 # ── 접근 / 중심선 정렬 ──
 V_APPROACH = 0.05                 # 접근 전진 속도 [m/s]
+V_DECEL_ZONE = 0.05               # STAGED 목표 앞 이 거리부터 감속 [m] (오버슛 방지)
+V_STAGE_MIN_FRAC = 0.3            # 감속 하한(V_APPROACH 대비, 너무 느리면 못 감)
 D_STAGE = 0.20                    # 스테이징 거리(사각형 중심→base) [m]
 LATERAL_OFFSET = 0.005            # 정렬 목표 횡 오프셋 [m] (+왼쪽)
 BEARING_TOL = math.radians(3.0)   # 정면(FACE) 허용오차 [rad]
 YAW_TOL = math.radians(5.0)       # 수직(중심선) 허용오차 [rad]
 YAW_RELIABLE_D = 0.24             # yaw 신뢰 최소 거리 [m] (근접 FACE 완화 근거)
+# 거리(측정) 신뢰 창 [m] — 이 창에서만 중심선 계획. 노드가 로봇별 floor_dock_cal(dw)로 덮는다.
+#  창 밖: d<MIN 너무 가까움(직진 후진), d>MAX 너무 멂(접근). 기본은 하위호환(하한=yaw신뢰, 상한=무제한).
+D_RELIABLE_MIN = 0.24
+D_RELIABLE_MAX = 10.0
 FACE_TIMEOUT = 6.0                # FACE 정렬 실패 판정 [s]
 K_BEARING = 1.0                   # bearing → 각속도 게인
 W_MAX = 0.5                       # 최대 각속도 [rad/s]
@@ -71,6 +77,7 @@ _TUNABLE = (
     'DYNAMIC_REVERSE', 'REV_MIN', 'REV_MAX', 'REVERSE_DIST', 'V_APPROACH', 'V_REVERSE',
     'SEARCH_W', 'TURN_W', 'FACE_TIMEOUT', 'STAGE_SETTLE_SEC', 'CL_VERIFY_D',
     'CL_MAX_REPLANS', 'CL_TARGET_D', 'POST_DOCK_HOLD_SEC', 'V_ADVANCE',
+    'D_RELIABLE_MIN', 'D_RELIABLE_MAX',
 )
 
 
@@ -116,10 +123,19 @@ def square_geometry(center, heading):
     N = _ang_norm(face_dir + math.pi)
     gx = Cx + CL_TARGET_D * math.cos(N)   # 중심선 기동 목표 = 신뢰거리(ALIGN 이 D_STAGE 까지 접근)
     gy = Cy + CL_TARGET_D * math.sin(N)
-    th1 = math.atan2(gy, gx)
     dist = math.hypot(gx, gy)
-    th2 = _ang_norm(face_dir - th1)
-    return d, bearing, yaw, (th1, dist, th2), gx, gy
+    # DRIVE 방향 자동선택: 전진(G 향해) vs 후진(뒤를 G로) 중 회전량 작은 쪽.
+    #  G가 뒤(근접 d<CL_TARGET_D)면 전진안은 th1≈±180°(왕복)라, 후진안이 회전 0 → 헛턴 제거.
+    #  dist 부호로 방향 전달: dist>0 전진, dist<0 후진(마커는 계속 정면 → 검출 유지).
+    th1_f = math.atan2(gy, gx)                 # 전진: G 향해 회전
+    th2_f = _ang_norm(face_dir - th1_f)
+    th1_b = _ang_norm(th1_f + math.pi)         # 후진: 뒤를 G 로
+    th2_b = _ang_norm(face_dir - th1_b)
+    if abs(th1_b) + abs(th2_b) < abs(th1_f) + abs(th2_f):
+        th1, th2, drive = th1_b, th2_b, -1.0
+    else:
+        th1, th2, drive = th1_f, th2_f, 1.0
+    return d, bearing, yaw, (th1, drive * dist, th2), gx, gy
 
 
 def docking_values(center, heading):
@@ -176,6 +192,7 @@ class DockFsm:
         self.post_advance_m = 0.0     # >0 이면 REVERSE 완료 후 HOLD→전진(반복 테스트용) → DONE
         self.hold_start = None        # HOLD(도킹완료 정지) 시작시각
         self.adv_xy0 = None
+        self.adv_target = 0.0         # ADVANCE 목표 이동거리 = rev_dist + margin(창 안 착지, HOLD서 계산)
         self.obstacle_ahead = False   # 노드가 라이다로 세팅. ADVANCE 중 True면 조기 완료(정지)
         self.obstacle_behind = False  # 노드가 세팅. PLAN 후진 중 True면 후진 중지 → ALIGN 폴백
         self.reverse_odom_used = None  # REVERSE 완료 시: odom 실거리(True)/시간폴백(False)
@@ -263,6 +280,11 @@ class DockFsm:
             if now - self.hold_start >= POST_DOCK_HOLD_SEC:
                 self.state = "ADVANCE"
                 self.adv_xy0 = None
+                # ADVANCE 거리 = 후진(rev_dist) 되돌리기 + margin → 재획득 d ≈ D_STAGE + margin.
+                #  창을 안 넘게 margin 상한 클램프(≤ D_RELIABLE_MAX−D_STAGE). rev_dist 무관하게 창 안 착지
+                #  → 다음 회차가 신뢰창 밖(데이터 없음)에서 시작해 복구 못 하는 문제 방지.
+                margin = min(self.post_advance_m, max(0.0, D_RELIABLE_MAX - D_STAGE))
+                self.adv_target = self.rev_dist + margin
             return 0.0, 0.0
 
         if self.state == "ADVANCE":              # 도킹 후 전진(반복용). odom 실거리, 없으면 생략
@@ -272,8 +294,8 @@ class DockFsm:
                 self.state = "DONE"
                 return 0.0, 0.0
             trav = math.hypot(odom_xy[0] - self.adv_xy0[0], odom_xy[1] - self.adv_xy0[1])
-            # 목표 도달 or 전방 장애물(노드가 obstacle_ahead 세팅) → 조기 정지·완료(ABORT 아님, 다음 진행)
-            if trav >= self.post_advance_m or self.obstacle_ahead:
+            # 목표(adv_target=rev_dist+margin) 도달 or 전방 장애물 → 조기 정지·완료(ABORT 아님, 다음 진행)
+            if trav >= self.adv_target or self.obstacle_ahead:
                 if self.obstacle_ahead:
                     self._warn('ADVANCE 중 전방 장애물 — %.0fmm 전진 후 정지·완료' % (trav * 1000))
                 self.state = "DONE"
@@ -304,9 +326,9 @@ class DockFsm:
                 if self.cl_plan_since is None:
                     self.cl_plan_since = now
                     self.cl_plan_xy0 = odom_xy
-                # 신뢰거리(d≥YAW_RELIABLE_D)서 좋은 프레임일 때만 계획
+                # 신뢰 창(D_RELIABLE_MIN≤d≤D_RELIABLE_MAX)서 좋은 프레임일 때만 계획
                 if not (found and plan is not None and n >= n_plan
-                        and d >= YAW_RELIABLE_D):
+                        and D_RELIABLE_MIN <= d <= D_RELIABLE_MAX):
                     backed = 0.0
                     if odom_xy is not None and self.cl_plan_xy0 is not None:
                         backed = math.hypot(odom_xy[0] - self.cl_plan_xy0[0],
@@ -340,7 +362,11 @@ class DockFsm:
                         self._warn('중심선 계획 불가(%s) — ALIGN 접근 폴백' % why)
                         self.state = "ALIGN"       # 계획 실패 → 접근 폴백(cl_done=False)
                         return 0.0, 0.0
-                    # (B) 신뢰거리까지 직진 후진만(회전 제거) — 근접 검출을 동시 회전이 깨뜨리지 않게.
+                    # 너무 멂(d>MAX): 창 밖은 거리 데이터 부정확 → 접근은 backed 한계 안에서만(폭주 방지).
+                    #  근본 대책은 ADVANCE 가 창을 안 넘게 하는 것(반복 도킹, adv_target 참조).
+                    if d > D_RELIABLE_MAX and odom_xy is not None:
+                        return V_APPROACH, _clamp(-K_BEARING * bearing, W_MAX)
+                    # (B) 너무 가까움(d<MIN)엔 직진 후진만(회전 제거) — 근접 검출을 동시 회전이 깨뜨리지 않게.
                     if d < D_STAGE + CL_PLAN_BACKUP_MAX and odom_xy is not None:
                         return -V_APPROACH, 0.0
                     return 0.0, 0.0
@@ -373,17 +399,23 @@ class DockFsm:
                     return 0.0, 0.0
                 return 0.0, _clamp(K_TURN * err, TURN_W)
             if self.cl_phase == "DRIVE":
+                target = abs(self.cl_dist)          # cl_dist 부호 = 방향(음수 후진)
                 if odom_xy is not None and self.cl_xy0 is not None:
                     trav = math.hypot(odom_xy[0] - self.cl_xy0[0],
                                       odom_xy[1] - self.cl_xy0[1])
-                    done = trav >= self.cl_dist
+                    done = trav >= target
                 else:
-                    done = now - self.cl_drive_start >= self.cl_dist / V_APPROACH
+                    done = now - self.cl_drive_start >= target / V_APPROACH
                 if done:
                     self.cl_phase = "TURN2"
                     return 0.0, 0.0
+                # 후진 DRIVE(cl_dist<0)면 후방 블라인드 → 라이다 후방 장애물 시 정지·ALIGN 폴백.
+                if self.cl_dist < 0 and self.obstacle_behind:
+                    self._warn('후진 DRIVE 중 후방 장애물(라이다) — 정지·ALIGN 폴백')
+                    self.state = "ALIGN"
+                    return 0.0, 0.0
                 w = _clamp(-K_HEADING * _ang_norm(odom_yaw - self.hold_yaw), W_MAX)
-                return V_APPROACH, w
+                return math.copysign(V_APPROACH, self.cl_dist), w
             if self.cl_phase == "TURN2":
                 err = _ang_norm(self.cl_odom0 + self.cl_th1 + self.cl_th2 - odom_yaw)
                 if abs(err) < TURN_TOL:
@@ -466,7 +498,9 @@ class DockFsm:
                 self.state = "FACE"
                 self.face_start = now
                 return 0.0, w_align
-            return V_APPROACH, w_align
+            # 목표(D_STAGE=신뢰창 하한+5mm) 근처면 감속 → 신뢰창(H 검출 한계) 아래로 오버슛 방지.
+            v = V_APPROACH * max(V_STAGE_MIN_FRAC, min(1.0, (d - D_STAGE) / V_DECEL_ZONE))
+            return v, w_align
 
         if self.state == "FACE":
             # FACE 는 v=0(제자리) → d 는 이미 staging 거리. 후진용 d 를 미리 모아둔다

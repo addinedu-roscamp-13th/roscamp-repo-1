@@ -142,6 +142,9 @@ class FloorDockServer(Node):
         self.declare_parameter('robot_id', 'dg_01')
         self.declare_parameter('floor_calib_file',
                                '/home/pinky/floor_dock_ws/floor_calib.npz')
+        # 로봇별 실측 보정(dw offset + 신뢰창). 없으면 offset 0·창 기본(하위호환).
+        self.declare_parameter('floor_dock_cal_file',
+                               '/home/pinky/floor_dock_ws/floor_dock_cal.json')
         self.declare_parameter('camera_width', 1280)
         self.declare_parameter('camera_height', 720)
         self.declare_parameter('odom_topic', 'odom')
@@ -198,6 +201,12 @@ class FloorDockServer(Node):
             self.get_logger().set_level(LoggingSeverity.DEBUG)
         self._crossbar_to_wall = float(self.get_parameter('crossbar_to_wall').value)
 
+        # 로봇별 실측 보정(dw offset + 신뢰창 [dw]). 파일 없으면 offset 0·창 None(기본).
+        self._dw_offset = 0.0
+        self._dw_rel_min = None
+        self._dw_rel_max = None
+        self._load_dock_cal(self.get_parameter('floor_dock_cal_file').value)
+
         # FSM 기본 튜닝을 파라미터로 덮어쓴다(goal 이 다시 덮을 수 있다).
         self._apply_fsm_params()
 
@@ -227,6 +236,7 @@ class FloorDockServer(Node):
         self._odom_yaw = None
         self._odom_xy = None
         self._busy = threading.Lock()
+        self._shutting_down = False   # Ctrl+C 시 goal 루프가 cmd_vel 을 계속 덮지 않게 즉시 탈출
 
         odom = self.get_parameter('odom_topic').value
         self.create_subscription(Odometry, odom, self._on_odom, 10,
@@ -288,8 +298,23 @@ class FloorDockServer(Node):
     def _apply_fsm_params(self, wall_gap=None, lateral=None):
         """노드 파라미터(+goal 오버라이드)를 floor_fsm 모듈 상수로 반영."""
         g = self.get_parameter
+        d_stage = float(g('d_stage').value)
+        cl_target = float(fsm_mod.CL_TARGET_D)          # 기본 0.26(cal 없으면 유지)
+        # 신뢰창(cal)이 있으면 로봇별로 파생: CL_TARGET_D=창 중간(양 경계=근접클리핑/거리부정확 에서 가장 멂),
+        #  STAGED=창 하한+5mm(기동목표보다 2cm 가깝게). 창 밖서 측정/기동하는 것을 원천 방지.
+        if self._dw_rel_min is not None and self._dw_rel_max is not None:
+            rmin = float(self._dw_rel_min) - self._crossbar_to_wall
+            rmax = float(self._dw_rel_max) - self._crossbar_to_wall
+            cl_target = 0.5 * (rmin + rmax)             # 기동/VERIFY = 신뢰창 중간
+            d_stage = min(max(d_stage, rmin + 0.005), cl_target - 0.02)
+            self.get_logger().info(
+                'STAGED d=%.3f(dw%.3f) / CL_TARGET_D=%.3f(dw%.3f) — 신뢰창[dw %.3f,%.3f] 파생'
+                % (d_stage, d_stage + self._crossbar_to_wall,
+                   cl_target, cl_target + self._crossbar_to_wall,
+                   self._dw_rel_min, self._dw_rel_max))
         fsm_mod.configure(
-            D_STAGE=float(g('d_stage').value),
+            D_STAGE=d_stage,
+            CL_TARGET_D=cl_target,
             WALL_GAP_TARGET=(wall_gap if wall_gap else float(g('wall_gap_target').value)),
             REVERSE_K=float(g('reverse_k').value),
             CROSSBAR_TO_WALL=float(g('crossbar_to_wall').value),
@@ -300,6 +325,35 @@ class FloorDockServer(Node):
             CL_VERIFY_D=float(g('cl_verify_d').value),
             CL_MAX_REPLANS=int(g('cl_max_replans').value),
             POST_DOCK_HOLD_SEC=float(g('post_dock_hold_sec').value))
+        # 로봇별 신뢰창(dw)을 d 도메인으로 변환해 FSM 계획 게이팅에 반영(있을 때만).
+        if self._dw_rel_min is not None and self._dw_rel_max is not None:
+            fsm_mod.configure(
+                D_RELIABLE_MIN=float(self._dw_rel_min) - self._crossbar_to_wall,
+                D_RELIABLE_MAX=float(self._dw_rel_max) - self._crossbar_to_wall)
+
+    def _load_dock_cal(self, path):
+        """로봇별 floor_dock_cal.json 로드: dw_offset(실측−측정) + dw 신뢰창.
+        d_corr = d_meas + dw_offset (dw=d+상수라 offset 은 d/dw 동일). 파일 없으면 무시."""
+        import json
+        try:
+            with open(path) as f:
+                c = json.load(f)
+            self._dw_offset = float(c.get('dw_offset', 0.0))
+            self._dw_rel_min = (float(c['dw_reliable_min'])
+                                if 'dw_reliable_min' in c else None)
+            self._dw_rel_max = (float(c['dw_reliable_max'])
+                                if 'dw_reliable_max' in c else None)
+            self.get_logger().info(
+                '도킹 보정 로드: %s | dw_offset=%+.3f 신뢰창 dw[%s, %s]'
+                % (path, self._dw_offset,
+                   ('%.3f' % self._dw_rel_min) if self._dw_rel_min is not None else '-',
+                   ('%.3f' % self._dw_rel_max) if self._dw_rel_max is not None else '-'))
+        except FileNotFoundError:
+            self.get_logger().warn(
+                '⚠️ 도킹 보정 파일 없음(%s) — dw_offset 0·신뢰창 기본값 사용. '
+                '이 로봇 실측 보정 미적용(정확도/STAGED 위치 로봇별 조정 안 됨).' % path)
+        except Exception as e:   # noqa: BLE001
+            self.get_logger().warn('도킹 보정 로드 실패(%s): %s — 기본 사용' % (path, e))
 
     def _load_calib(self, path):
         """floor_calib.npz(바닥 평면 + 내장 mtx/dist) 로드. 실패하면 goal 거절."""
@@ -543,7 +597,7 @@ class FloorDockServer(Node):
         gate_cnt = adv_cnt = plan_cnt = 0    # 라이다 디바운스(연속 프레임 카운터)
         fresh_t = time.monotonic()
         try:
-            while rclpy.ok():
+            while rclpy.ok() and not self._shutting_down:
                 t0 = time.monotonic()
                 if goal_handle.is_cancel_requested:
                     self._stop()
@@ -576,6 +630,7 @@ class FloorDockServer(Node):
                 if det is not None:
                     center, heading, size, contour = det
                     d, bearing, yaw = fsm_mod.docking_values(center, heading)
+                    d += self._dw_offset          # 로봇별 실측 보정(dw=d+상수라 offset 동일)
                     th1, dist_pl, th2, _gx, _gy = fsm_mod.centerline_plan(center, heading)
                     plan, found = (th1, dist_pl, th2), True
 
@@ -772,6 +827,7 @@ class FloorDockServer(Node):
             center, heading, size, contour = det
             cv2.polylines(vis, [contour.astype(int)], True, (0, 180, 0), 2)
             d, bearing, yaw = fsm_mod.docking_values(center, heading)
+            d += self._dw_offset          # 로봇별 실측 보정(IDLE 표시도 보정 dw)
             _put(vis, '[h%.0f] d=%.3f dw=%.3f(wall) b=%+.1f y=%+.1f'
                  % (size * 100, d, d + self._crossbar_to_wall,
                     math.degrees(bearing), math.degrees(yaw)), (10, 26), (0, 220, 0))
@@ -876,7 +932,13 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node._stop()
+        # goal 실행 스레드가 cmd_vel 을 계속 발행 중일 수 있다(별도 콜백 스레드).
+        #  ① 종료 플래그로 goal 루프를 즉시 빠지게 하고 ② 0속도를 반복 발행해 마지막 명령을
+        #     확실히 0 으로(bringup 에 cmd_vel 워치독이 없어, 안 그러면 로봇이 계속 감).
+        node._shutting_down = True
+        for _ in range(8):
+            node._stop()
+            time.sleep(0.05)
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
