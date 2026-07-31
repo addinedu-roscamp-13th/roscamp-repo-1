@@ -19,8 +19,14 @@ import signal
 import requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-WEB = "http://127.0.0.1:7000"
-CTRL = "http://127.0.0.1:7001"
+# 포트를 고정하면 실연동 시험(7000)이 떠 있을 때 그걸 덮어쓰거나 충돌한다.
+# 2026-07-31 통신시험 중에 실제로 걸렸다 — 안전모드 가드가 막아줘서 사고는 안 났다.
+# 기본값은 그대로 두고(팀원 사용법 안 바뀜), 환경변수로 비켜갈 수 있게 한다.
+#   예: SELFTEST_WEB_PORT=7200 SELFTEST_CTRL_PORT=7201 python3 selftest_chain.py
+WEB_PORT = os.environ.get("SELFTEST_WEB_PORT", "7000")
+CTRL_PORT = os.environ.get("SELFTEST_CTRL_PORT", "7001")
+WEB = "http://127.0.0.1:%s" % WEB_PORT
+CTRL = "http://127.0.0.1:%s" % CTRL_PORT
 PASS, FAIL = [], []
 
 
@@ -42,9 +48,9 @@ def wait_up(url, tries=40):
 
 def main():
     # 이 하네스가 띄우는 서버는 항상 텔레그램 차단으로 강제한다 — 호출자가 깜빡해도 오발송이 없게.
-    env_web = dict(os.environ, PORT="7000", CONTROL_SERVICE_URL=CTRL,
+    env_web = dict(os.environ, PORT=WEB_PORT, CONTROL_SERVICE_URL=CTRL,
                    INGEST_TOKEN="automato-live-2026", TELEGRAM_DISABLED="1")
-    env_ctrl = dict(os.environ, PORT="7001", WEB_SERVICE_URL=WEB)
+    env_ctrl = dict(os.environ, PORT=CTRL_PORT, WEB_SERVICE_URL=WEB)
     logs = open(os.path.join(HERE, "selftest_servers.log"), "w")
     web = subprocess.Popen([sys.executable, "app.py"], cwd=HERE, env=env_web, stdout=logs, stderr=logs)
     ctrl = subprocess.Popen([sys.executable, "mock_control_service.py"], cwd=HERE, env=env_ctrl, stdout=logs, stderr=logs)
@@ -63,7 +69,7 @@ def main():
             print("   (이 하네스는 서버를 TELEGRAM_DISABLED=1 로 띄우므로, 여기 걸렸다면 그게 안 먹은 것이다)")
             print("=" * 66)
             sys.exit(2)
-        print("서버 기동 완료 (Web:7000, Control:7001) · 텔레그램 안전모드 확인\n", flush=True)
+        print("서버 기동 완료 (Web:%s, Control:%s) · 텔레그램 안전모드 확인\n" % (WEB_PORT, CTRL_PORT), flush=True)
 
         # ---------- 링크 1: Farm Admin App ↔ Automato Web Service ----------
         print("[링크 1] Farm Admin App ↔ Automato Web Service", flush=True)
@@ -175,7 +181,7 @@ def main():
         print("\n[링크 3+] WebSocket 실시간 채널 (/ws/farm-admin)", flush=True)
         try:
             import simple_websocket
-            ws = simple_websocket.Client("ws://127.0.0.1:7000/ws/farm-admin")
+            ws = simple_websocket.Client("ws://127.0.0.1:%s/ws/farm-admin" % WEB_PORT)
             requests.post(WEB + "/internal/v1/detections/notify", json={
                 "task_id": 55555, "waypoint_id": 1, "robot_id": "dg_02",
                 "ripe_percent": 33, "unripe_percent": 60, "rotten_percent": 7, "disease_percent": 0,
