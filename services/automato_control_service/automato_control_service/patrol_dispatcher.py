@@ -257,7 +257,11 @@ class PatrolDispatcher:
            촬영하지 않는다(훅 없는 평범한 주행). 지정이 없거나 이미 그 노드면 생략한다.
         """
         # ① 언도킹: [current] 한 노드만 하달(촬영 없음). 좌표·yaw 는 undock_step 이 정한다.
-        if not self.runner.undock_step(client, task_id, current):
+        # 하트비트를 넘기는 이유: 이 자리는 위에서 이미 예약했는데, 언도킹이 15초를 넘기면
+        # 갱신이 없어 TTL 만료로 회수된다(도킹에 넘기는 것과 같은 이유).
+        if not self.runner.undock_step(
+                client, task_id, current,
+                heartbeat=(engine, [engine.node_slot(current)], robot_id)):
             self._log.warn(f"언도킹 하달 실패 task={task_id} 노드 {current}")
             return "aborted", current
         self._log.info(f"언도킹 완료 task={task_id} → 노드 {current}")
@@ -303,8 +307,15 @@ class PatrolDispatcher:
         지금 도달 가능하면 갇힌 게 아니다(문서 22(a): 다른 지점으로 스킵). 전부 도달 불가면
         갇힌 것이므로 T_block(BLOCK_GIVEUP_SEC) 동안 재시도하며 통로가 풀리길 기다린다
         (문서 22(b)). 그래도 못 나가면 True → 호출부(run_patrol)가 22-1 복귀로 넘어간다.
+
+        서 있는 자리는 폴링마다 하트비트를 갱신한다. 여기서 기다리는 동안에는 주행
+        하트비트(_dispatch_segment)가 안 도는데, T_block(60초)이 RESERVATION_TTL_SEC
+        (15초)의 네 배라 갱신이 없으면 **반드시** 자리가 죽은 예약으로 회수된다. 하필
+        통로가 붐벼 막힌 상황이라, 그 순간 '이 지점 비었다'고 남에게 알리는 꼴이 된다
+        (자원 양보 대기 RouteRunner._reserve_with_wait 와 같은 처리).
         """
         deadline = time.monotonic() + BLOCK_GIVEUP_SEC
+        standing_slot = engine.node_slot(current)
         while True:
             if self._escapable(engine, robot_id, current, targets, visited):
                 return False
@@ -313,6 +324,7 @@ class PatrolDispatcher:
                     f"{robot_id} 위치 {current} 에서 남은 순찰 지점 전부 도달 불가 · "
                     f"T_block({BLOCK_GIVEUP_SEC}s) 초과 → 막힘 확정(22-1 복귀)")
                 return True
+            engine.heartbeat(standing_slot, robot_id)   # 서 있는 자리 TTL 방어
             time.sleep(RESERVE_POLL_SEC)
 
     def _escapable(self, engine, robot_id, current, targets, visited):

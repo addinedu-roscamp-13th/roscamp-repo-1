@@ -143,7 +143,7 @@ class RouteRunner:
         return {"corridors": sorted(corridors), "nodes": sorted(nodes)}
 
     # ---------------------------- 언도킹(도킹 탈출) ---------------------------- #
-    def undock_step(self, client, task_id, wp) -> bool:
+    def undock_step(self, client, task_id, wp, heartbeat=None) -> bool:
         """도킹된 로봇을 진입 노드 '그 자리'로 한 칸 하달해 정면으로 빼낸다.
 
         순찰(충전소 출발)·수확(충전소·수확지·예냉실 출발)이 함께 쓴다. 로봇은 도킹으로
@@ -164,6 +164,12 @@ class RouteRunner:
         도킹을 마친 로봇은 정확히 그 반대를 본다(CHARGE_01 실측 대조: 진입 노드
         1.45 → 반대 -1.69 vs 실제 도킹 자세 -1.75, 차이 3.4°). 이러면 탈출거리가
         10cm 를 넘든 안 넘든 회전량이 0 에 가깝다.
+
+        heartbeat=(engine, [cid...], robot_id): 결과 대기 중 쥔 자리 예약을 갱신한다.
+        이동거리는 20cm 남짓이지만 Goal 수락·계획·recovery 를 합치면 RESERVATION_TTL_SEC
+        (15초)를 넘길 수 있고, 그러면 '로봇이 지금 물리적으로 붙어 있는 자리'가 죽은
+        예약으로 회수돼 남이 들어온다. 도킹(docking.dock)에 하트비트를 넘기는 것과
+        같은 이유다 — 언도킹은 그 짝인데 빠져 있었다.
 
         반환: True 성공(도착 보고 0) / False 실패 — 호출부가 중단 여부를 정한다.
         """
@@ -187,7 +193,8 @@ class RouteRunner:
             f"언도킹 하달 task={task_id} 노드 {wp} "
             f"yaw={'미지정' if yaw is None else f'{yaw:.2f}'}")
         code, _last = self._dispatch_segment(
-            client, task_id, hadal, cap_ids, yaw_override=yaw)
+            client, task_id, hadal, cap_ids, heartbeat=heartbeat,
+            yaw_override=yaw)
         return code == 0
 
     # ---------------------------- 주행 본체 ---------------------------- #
