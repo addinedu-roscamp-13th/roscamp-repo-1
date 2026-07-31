@@ -98,10 +98,10 @@ def main():
         check("완료 patrol_completed", any(x["event"] == "patrol_completed" for x in mine))
         time.sleep(6)  # 로봇 대기복귀 반영
 
-        print("\n[E1-specific] 직접 선택 dg_01 → ACCEPTED → 컨트롤 도달", flush=True)
-        s, j = api("POST", "/api/v1/patrol/requests", {"robot_selection": "specific", "robot_id": "dg_01"})
+        print("\n[E1-manual] 직접 선택 dg_01 → ACCEPTED → 컨트롤 도달", flush=True)
+        s, j = api("POST", "/api/v1/patrol/requests", {"robot_selection": "manual", "robot_id": "dg_01"})
         tid2 = j.get("task_id")
-        check("specific ACCEPTED", s == 200 and j.get("status") == "ACCEPTED", "task_id=%s" % tid2)
+        check("manual ACCEPTED", s == 200 and j.get("status") == "ACCEPTED", "task_id=%s" % tid2)
         time.sleep(2)
         check("★ 컨트롤(농장)이 명령 수신", ("task_id=%s" % tid2) in farm_log())
 
@@ -113,7 +113,7 @@ def main():
         time.sleep(6)
 
         print("\n[E1-거절] 배터리부족 로봇 지정 dg_03 → 409 ROBOT_NOT_AVAILABLE", flush=True)
-        s, j = api("POST", "/api/v1/patrol/requests", {"robot_selection": "specific", "robot_id": "dg_03"})
+        s, j = api("POST", "/api/v1/patrol/requests", {"robot_selection": "manual", "robot_id": "dg_03"})
         check("dg_03 지정 409", s == 409 and j.get("reason") == "ROBOT_NOT_AVAILABLE", "reason=%s" % j.get("reason"))
 
         api("POST", "/api/v1/patrol/reset")
