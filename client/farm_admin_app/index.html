@@ -894,10 +894,38 @@ function robotStateBadge(r){
   if(r.available)            return {t:'대기 중 · 배정 가능', bg:'#eafaef', fg:'#1d8a3e', dot:'🟢'};
   return {t:(r.nav_status||'상태 미상'), bg:'#eef0f1', fg:'#5f6469', dot:'⚪'};
 }
+/* ══ 로봇별 신선도 추적 ══
+   ACS 는 로봇별 age 를 안 실어준다(payload 에 stamp 도 없다). 그래서 여기서 직접 잰다:
+   배터리·좌표·nav_status 가 **마지막으로 바뀐 시각**을 로봇마다 기억한다.
+
+   이걸로 ROBOT_OFFLINE 의 원인을 화면에서 가를 수 있다:
+     ① 값이 계속 바뀌는데 OFFLINE  → 데이터는 살아서 오는 중. ACS 의 age 계산이 틀린 것.
+        age = ACS노트북_시각 − 로봇이_찍은_header.stamp 이므로(telemetry_ws.py:78),
+        두 기계의 **시계가 3초 이상 어긋나면** 신선한 데이터도 영구히 OFFLINE 이 된다.
+     ② 값이 굳었는데 OFFLINE       → 로봇이 정말로 발행을 멈춘 것. 전원·노드·네트워크 문제.
+   ①과 ②는 화면상 똑같이 'ROBOT_OFFLINE' 이라 구분이 안 됐다(2026-07-31 실제로 헤맸다). */
+window._robotSeen = window._robotSeen || {};
+function trackRobotFreshness(robots){
+  var now=Date.now();
+  (robots||[]).forEach(function(r){
+    var pos=r.position||{};
+    // 값이 실제로 달라졌는지만 본다. 같은 값이 계속 오면 '안 바뀐 것'으로 친다.
+    var key=[r.battery_percent, pos.x, pos.y, pos.yaw, r.nav_status, r.task_type].join('|');
+    var e=window._robotSeen[r.robot_id];
+    if(!e || e.key!==key) window._robotSeen[r.robot_id]={key:key, at:now};
+  });
+}
+function robotQuietSec(rid){
+  var e=window._robotSeen[rid];
+  return e ? Math.round((Date.now()-e.at)/1000) : null;
+}
 async function loadFleetLive(){
   var el=document.getElementById('fleetLive'); if(!el){ window._fleetRunning=false; return; }
   try{ const d=await (await fetch('/api/v1/telemetry?t='+Date.now())).json();
-    window._lastRobots=d.robots||[]; window._lastConn=!!d.connected; renderFleet();
+    window._lastRobots=d.robots||[]; window._lastConn=!!d.connected;
+    window._streamAge=d.age_sec;              // WS 프레임이 마지막으로 온 지 몇 초 (스트림 전체)
+    trackRobotFreshness(window._lastRobots);  // 로봇별 '값이 마지막으로 바뀐 시각'
+    renderFleet();
   }catch(e){}
   setTimeout(loadFleetLive, 2000);
 }
@@ -913,7 +941,22 @@ function renderFleet(){
        지우는 대신 흐리게 하고 '마지막 수신' 이라고 붙인다. QT 가 3초 기준으로 하는 것과 같은 취지다. */
     var stale=(r.unavailable_reason==='ROBOT_OFFLINE');
     var dim=stale?'opacity:.55;':'';
-    var staleTag=stale?'<span style="font-size:11px;color:var(--muted);font-weight:600;margin-left:4px">· 마지막 수신</span>':'';
+    /* OFFLINE 원인 가르기 — 값이 계속 바뀌면 데이터는 오는 중이므로 시계 문제,
+       값이 굳었으면 로봇이 진짜 멈춘 것. 둘 다 화면엔 'ROBOT_OFFLINE' 으로만 떠서 헤맸었다. */
+    var quiet=robotQuietSec(r.robot_id);
+    var live=(quiet!==null && quiet<=6);      // 6초 안에 값이 바뀜 = 살아서 오는 중
+    var staleTag='';
+    if(stale){
+      staleTag = live
+        ? '<span style="font-size:11px;color:var(--warn);font-weight:700;margin-left:4px">· 데이터는 수신 중</span>'
+        : '<span style="font-size:11px;color:var(--muted);font-weight:600;margin-left:4px">· 마지막 수신 '+(quiet===null?'?':quiet+'초 전')+'</span>';
+    }
+    // 시계 어긋남이 의심되면 카드 아래에 한 줄로 짚어준다(원인 추적 시간을 아끼려고).
+    var diag = (stale && live)
+      ? '<div style="font-size:11.5px;color:var(--warn);margin-top:5px;line-height:1.45">'
+        +'⏱ 값은 계속 갱신되는데 오프라인 판정입니다 — <b>로봇·ACS 시계 확인</b>'
+        +'<span style="color:var(--muted)"> (ACS 는 로봇이 찍은 시각 기준 3초로 판정)</span></div>'
+      : '';
     var bc=r.battery_percent>50?'#1d8a3e':(r.battery_percent>=20?'#e8912d':'#e0483a');
     var sel=(window._reqPick===r.robot_id);
     return '<div '+(manual?'onclick="selectRobot(\''+r.robot_id+'\')" ':'')+'style="flex:1;min-width:140px;border:1.5px solid '+(sel?'var(--leaf)':'var(--line)')+';border-left:4px solid '+s.fg+';border-radius:10px;padding:10px 12px;background:'+(sel?'#eafaef':'#fff')+';'+(manual?'cursor:pointer;':'')+'">'
@@ -921,7 +964,8 @@ function renderFleet(){
       +'<span style="font-size:12px;font-weight:700;padding:3px 9px;border-radius:20px;background:'+s.bg+';color:'+s.fg+'">'+s.t+'</span></div>'
       +'<div style="font-size:13px;color:var(--muted);margin-top:6px">현재 작업: <b style="color:var(--ink)">'+(r.task_type?(TASK_LABEL[r.task_type]||r.task_type):'없음')+'</b>'+(sel?' <span style="color:var(--leaf-d);font-weight:700">· 선택됨</span>':'')+'</div>'
       +'<div style="font-size:13px;margin-top:3px;display:flex;align-items:center;gap:6px;'+dim+'">배터리 '+bat(r.battery_percent)+'%'+staleTag
-        +'<span style="flex:1;max-width:80px;height:6px;background:#eef2f0;border-radius:4px"><span style="display:block;width:'+Math.max(0,Math.min(100,r.battery_percent))+'%;height:100%;border-radius:4px;background:'+bc+'"></span></span></div></div>';
+        +'<span style="flex:1;max-width:80px;height:6px;background:#eef2f0;border-radius:4px"><span style="display:block;width:'+Math.max(0,Math.min(100,r.battery_percent))+'%;height:100%;border-radius:4px;background:'+bc+'"></span></span></div>'
+      +diag+'</div>';
   }
   var harvestR=robots.filter(function(r){return ROLE[r.robot_id]!=='순찰·운반';});   // 수확 = 왼쪽 절반
   var patrolR=robots.filter(function(r){return ROLE[r.robot_id]==='순찰·운반';});     // 순찰 = 오른쪽 절반
