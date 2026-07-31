@@ -41,7 +41,9 @@ def wait_up(url, tries=40):
 
 
 def main():
-    env_web = dict(os.environ, PORT="7000", CONTROL_SERVICE_URL=CTRL, INGEST_TOKEN="automato-live-2026")
+    # 이 하네스가 띄우는 서버는 항상 텔레그램 차단으로 강제한다 — 호출자가 깜빡해도 오발송이 없게.
+    env_web = dict(os.environ, PORT="7000", CONTROL_SERVICE_URL=CTRL,
+                   INGEST_TOKEN="automato-live-2026", TELEGRAM_DISABLED="1")
     env_ctrl = dict(os.environ, PORT="7001", WEB_SERVICE_URL=WEB)
     logs = open(os.path.join(HERE, "selftest_servers.log"), "w")
     web = subprocess.Popen([sys.executable, "app.py"], cwd=HERE, env=env_web, stdout=logs, stderr=logs)
@@ -49,7 +51,19 @@ def main():
     try:
         assert wait_up(WEB + "/api/v1/patrol/events"), "Web Service 안 뜸"
         assert wait_up(CTRL + "/healthz"), "Control(mock) 안 뜸"
-        print("서버 기동 완료 (Web:7000, Control:7001)\n", flush=True)
+
+        # 안전장치 — 이 테스트는 병해충·완료·실패 콜백을 수십 건 쏜다. 텔레그램이 살아 있으면
+        # 전부 실제 봇으로 나간다(2026-07-29 에 전수검증을 켠 채 돌려 142건 오발송).
+        # validate_all.py 와 같은 기준으로 여기서도 막는다.
+        cfg = requests.get(WEB + "/api/v1/_config", timeout=5).json()
+        if not cfg.get("telegram_disabled"):
+            print("=" * 66)
+            print("🛑 실행 거부 — 서버가 텔레그램 안전모드가 아닙니다.")
+            print("   이대로 돌리면 실제 봇으로 알림이 수십 건 발송됩니다.")
+            print("   (이 하네스는 서버를 TELEGRAM_DISABLED=1 로 띄우므로, 여기 걸렸다면 그게 안 먹은 것이다)")
+            print("=" * 66)
+            sys.exit(2)
+        print("서버 기동 완료 (Web:7000, Control:7001) · 텔레그램 안전모드 확인\n", flush=True)
 
         # ---------- 링크 1: Farm Admin App ↔ Automato Web Service ----------
         print("[링크 1] Farm Admin App ↔ Automato Web Service", flush=True)
@@ -206,7 +220,7 @@ def main():
         # 여기서는 운영 기본값(dg_03)으로 별도 프로세스를 띄워 역할이 실제로 강제되는지 본다.
         print("\n[역할 분담] 순찰=dg_03 · 수확=dg_01(HARVEST_01)/dg_02(HARVEST_02)", flush=True)
         env_role = dict(os.environ, PORT="7010", CONTROL_SERVICE_URL=CTRL,
-                        INGEST_TOKEN="automato-live-2026")     # PATROL_ROBOT_IDS 기본값(dg_03) 사용
+                        INGEST_TOKEN="automato-live-2026", TELEGRAM_DISABLED="1")  # PATROL_ROBOT_IDS 기본값(dg_03)
         role = subprocess.Popen([sys.executable, "app.py"], cwd=HERE, env=env_role,
                                 stdout=logs, stderr=logs)
         W2 = "http://127.0.0.1:7010"
