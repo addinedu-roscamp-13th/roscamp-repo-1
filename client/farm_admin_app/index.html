@@ -906,13 +906,21 @@ function renderFleet(){
   var robots=window._lastRobots||[], manual=(window._reqMode==='manual');
   function cardHTML(r){
     var s=robotStateBadge(r);
+    /* [C-1] ACS 는 끊긴 로봇도 배열에서 빼지 않고 **마지막 수신값**을 계속 보낸다
+       (시나리오1 E0: "텔레메트리가 끊긴 로봇도 배열에서 빼지 않는다. 마지막 값을 그대로 넣는다").
+       그래서 ROBOT_OFFLINE 인데도 배터리·좌표가 멀쩡한 숫자로 보인다 — 30분 전 값일 수 있다.
+       숫자를 지우면 '연결 끊김'과 '값이 원래 없음'을 구분할 수 없으니(배열에서 빼지 말라는 규격과 같은 이유),
+       지우는 대신 흐리게 하고 '마지막 수신' 이라고 붙인다. QT 가 3초 기준으로 하는 것과 같은 취지다. */
+    var stale=(r.unavailable_reason==='ROBOT_OFFLINE');
+    var dim=stale?'opacity:.55;':'';
+    var staleTag=stale?'<span style="font-size:11px;color:var(--muted);font-weight:600;margin-left:4px">· 마지막 수신</span>':'';
     var bc=r.battery_percent>50?'#1d8a3e':(r.battery_percent>=20?'#e8912d':'#e0483a');
     var sel=(window._reqPick===r.robot_id);
     return '<div '+(manual?'onclick="selectRobot(\''+r.robot_id+'\')" ':'')+'style="flex:1;min-width:140px;border:1.5px solid '+(sel?'var(--leaf)':'var(--line)')+';border-left:4px solid '+s.fg+';border-radius:10px;padding:10px 12px;background:'+(sel?'#eafaef':'#fff')+';'+(manual?'cursor:pointer;':'')+'">'
       +'<div style="display:flex;justify-content:space-between;align-items:center;gap:6px"><span style="font-weight:700;font-size:15px">'+r.robot_id+'<span style="font-weight:400;font-size:11px;color:var(--muted);margin-left:5px">'+(ROLE[r.robot_id]||'')+'</span></span>'
       +'<span style="font-size:12px;font-weight:700;padding:3px 9px;border-radius:20px;background:'+s.bg+';color:'+s.fg+'">'+s.t+'</span></div>'
       +'<div style="font-size:13px;color:var(--muted);margin-top:6px">현재 작업: <b style="color:var(--ink)">'+(r.task_type?(TASK_LABEL[r.task_type]||r.task_type):'없음')+'</b>'+(sel?' <span style="color:var(--leaf-d);font-weight:700">· 선택됨</span>':'')+'</div>'
-      +'<div style="font-size:13px;margin-top:3px;display:flex;align-items:center;gap:6px">배터리 '+bat(r.battery_percent)+'%'
+      +'<div style="font-size:13px;margin-top:3px;display:flex;align-items:center;gap:6px;'+dim+'">배터리 '+bat(r.battery_percent)+'%'+staleTag
         +'<span style="flex:1;max-width:80px;height:6px;background:#eef2f0;border-radius:4px"><span style="display:block;width:'+Math.max(0,Math.min(100,r.battery_percent))+'%;height:100%;border-radius:4px;background:'+bc+'"></span></span></div></div>';
   }
   var harvestR=robots.filter(function(r){return ROLE[r.robot_id]!=='순찰·운반';});   // 수확 = 왼쪽 절반
@@ -1620,6 +1628,7 @@ function buildFarmScene(){
     fetch('/api/telemetry?t='+Date.now()).then(function(r){return r.json();}).then(function(d){
       // robot_id 로 매칭한다. 인덱스로 맞추면 ACS가 일부 로봇만 보고할 때(dg_03만 온라인)
       // 엉뚱한 로봇 자리에 위치가 들어간다. 데모 응답(DG1..)은 dg_01.. 로 맞춰 읽는다.
+      window._acsMode=(d.source==='acs');   // 실연동 판정 — 유령 로봇 억제에 쓴다
       var m={}; (d.robots||[]).forEach(function(r,i){
         var id=String(r.robot_id||'').toLowerCase().replace(/^dg(\d)$/,'dg_0$1');
         m[id||('dg_0'+(i+1))]={pos:r.position||null, online:(r.online!==false)};
@@ -1638,7 +1647,12 @@ function buildFarmScene(){
       var ent=window._fleetPos&&window._fleetPos['dg_0'+(k+1)];
       var fp=ent&&ent.pos;
       // 안 켜진 로봇은 지도에서 숨긴다 — 있지도 않은 로봇이 순찰하는 것처럼 보이면 안 된다
-      pk.visible=!ent||ent.online!==false;
+      // 실연동(source=acs)에서는 **보고된 로봇만** 그린다.
+      //   !ent(텔레메트리에 아예 없음)를 visible=true 로 치면, 위치가 없으니 아래 else 로 빠져
+      //   데모 순찰 애니메이션을 돈다 → 켜지지도 않은 로봇이 지도를 유유히 돌아다닌다.
+      //   ACS 는 끊긴 로봇도 배열에 남기지만(시나리오1 E0 규격), 로봇을 아예 빼는 순간 이게 터진다.
+      pk.visible = window._acsMode ? !!(ent && ent.online!==false && fp && fp.live)
+                                   : (!ent || ent.online!==false);
       if(!pk.visible)return;
       if(fp&&fp.live){  // 실제 로봇 실시간 위치(정규화 -1~1)만 반영
         var tx=fp.nx*F.HX, tz=fp.nz*F.HZ;
@@ -2130,6 +2144,33 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
       +(h.failed?(' · ⚠️ 실패 <b>'+num(h.failed,0)+'</b>개'):'')
       +(h.remaining!=null?(' · 이번 라운드 남은 '+num(h.remaining,0)+'개'):'')+'</div></div>';
   };
+  /* ══ 이벤트 → 대시보드 갱신 ══
+     주기는 **1Hz**. 근거는 텔레메트리 발행 주기 스펙(DdagiTelemetry 1Hz)이고,
+     보연님 ACS 의 WS 도 실측 1Hz(seq 가 초당 1 증가)다.
+     ⚠ 예전 주석에 "시나리오1 STEP 3-A 가 1.2초를 요구" 라고 썼는데 **오독이었다**.
+        그 1.2초는 내가 쓴 테스트 가이드(시나리오1_라이브_버튼테스트.md)의 관찰 안내 문구로,
+        목업이 웨이포인트를 sleep(1.0) 간격으로 뱉는 걸 눈대중으로 적은 것이다. 규격이 아니다.
+
+     [고치기 전 문제] loadHeat() 호출 지점이 세 곳뿐이었다 —
+       ① 대시보드 진입  ② 순찰 요청 1.3초 뒤  ③ 데모 초기화 버튼
+     순찰은 웨이포인트 4개를 도는 데 5초 넘게 걸리는데 ②가 1.3초에 딱 한 번 불린다.
+     그래서 WP0 의 중간값(예: 익음 50%)을 찍고 그대로 굳었다. 최종값(병해충 7%)은 영영 안 뜬다.
+     '갱신이 안 되는' 게 아니라 '틀린 중간값을 확정값처럼 보여주는' 쪽이라 더 나쁘다. */
+  var _dashT=0, _dashPending=null;
+  function dashRefresh(why){
+    var now=Date.now(), MIN=1000;
+    var run=function(){
+      _dashT=Date.now(); _dashPending=null;
+      try{ if(typeof loadHeat==='function') loadHeat(); }catch(_){}       // 히트맵 + 작물 상태 + 요약행
+      // 수확 실적은 순찰 중에는 변하지 않는다 — 완료 계열에서만 다시 읽는다.
+      // 수확 실적도 같은 1Hz 로 맞춘다. 처음엔 '매초 변할 값이 아니다' 라며 8초를 뒀는데,
+      // 주기가 화면마다 다르면 "이 숫자는 언제 갱신되나" 를 매번 따져야 한다.
+      // /api/harvest/stats 는 로컬 JSON 한 번 읽는 정도라 1Hz 로 올려도 부담이 없다.
+      try{ if(typeof loadHarvestStats==='function') loadHarvestStats(); }catch(_){}
+    };
+    if(now-_dashT>=MIN){ run(); }
+    else if(!_dashPending){ _dashPending=setTimeout(run, MIN-(now-_dashT)); }
+  }
   function handle(e){
     if(e.event==='patrol_progress'){
       var wasLive=!!window._patrolLive;
@@ -2137,6 +2178,7 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
         ripe:e.ripe_percent,unripe:e.unripe_percent,rotten:e.rotten_percent,disease:e.disease_percent};
       window.renderPatrolLive();
       if(!wasLive){ try{loadPatrol();}catch(_){} }   // 순찰 시작 → 순찰 화면(양 탭) 즉시 '요청 불가'로
+      dashRefresh('patrol_progress');                // 검출 올 때마다 히트맵·작물 % 반영
     } else if(e.event==='disease_alert'){
       var msg='병해충 발견 · '+val(e.robot_id,'로봇')+' · WP'+val(e.waypoint_id)+' · '+num(e.disease_percent)+'%';
       // image_path 는 ACS 가 준 값이다. 속성값에 그대로 넣으면 따옴표를 닫고 onload= 를 주입할 수 있어
@@ -2156,6 +2198,7 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
       notify('🐛 병해충 발견', msg, true);
       try{toast(msg);}catch(_){}
     } else if(e.event==='patrol_completed'){
+      dashRefresh('patrol_completed');
       var s=e.summary||{};
       // 스펙 E2-10: status(COMPLETED/COMPLETED_PARTIAL) + unvisited_waypoint_ids 로 문구 분기
       var partial=(e.status==='COMPLETED_PARTIAL');
@@ -2178,7 +2221,9 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
         remaining:e.remaining_in_round};
       window.renderHarvestLive();
       if(!wasH){ try{loadHarvest();}catch(_){} }    // 수확 시작 → 요청 화면 '요청 불가'로
+      dashRefresh('harvest_progress');
     } else if(e.event==='harvest_completed'){
+      dashRefresh('harvest_completed');   // ⚠ 이 줄을 '별도 분기'로 앞에 두면 아래 처리가 통째로 죽는다
       // [시나리오2 E6-3] exit_reason 별 문구 3종 (스펙 표 그대로)
       var HX={
         DEPLETED:{t:'수확 완료',u:false},
@@ -2290,6 +2335,26 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
     connectWS();
     setTimeout(function(){ if(!wsOk) startPolling(); },2500);   // WS 안 뜨는 환경(pythonanywhere)은 폴링
   });
+
+  /* ══ 대시보드 1Hz 동기화 ══ (⚠ 규격 외 — 우리 보강)
+     컨플루언스 시나리오 1·2 규격도, 팀원 구현(ACS patrol_notify/harvest_notify)도
+     **이벤트 기반**이다: patrol_progress 는 waypoint 마다, harvest_progress 는 토마토 1개마다.
+     주기 타이머로 도는 코드는 팀 어디에도 없다(1Hz 는 텔레메트리 계열 전용).
+     그런데도 여기에 1Hz 폴링을 두는 이유는 하나다 — 이벤트가 유실되면 화면이 그대로 멎고,
+     농장주가 F5 를 눌러야 하는 상태로 되돌아가기 때문이다(2026-07-31 실제로 겪음).
+     이벤트가 1차, 이 타이머는 안전망이다. 규격을 대체하는 게 아니다.
+     이벤트 기반(dashRefresh)만 두면 이벤트가 한 건이라도 유실될 때 화면이 그대로 멎는다.
+     농장주가 F5 를 눌러야 하는 상황이 다시 생기므로, 주기 타이머를 안전망으로 같이 둔다.
+       - 텔레메트리·로봇위치는 이미 1Hz 로 돌고 있어 여기서는 히트맵/작물만 맞춘다.
+       - dashRefresh 안의 1초 쓰로틀이 이벤트發·타이머發 중복을 하나로 묶는다.
+       - 대시보드(#farmHeat)가 화면에서 사라지면 스스로 해제한다. */
+  (function dashSyncLoop(){
+    if(window._dashSync) clearInterval(window._dashSync);
+    window._dashSync=setInterval(function(){
+      if(!document.getElementById('farmHeat')) return;   // 다른 화면이면 쉰다(해제는 아님 — 돌아올 수 있다)
+      dashRefresh('tick');
+    },1000);
+  })();
 })();
 </script>
 
