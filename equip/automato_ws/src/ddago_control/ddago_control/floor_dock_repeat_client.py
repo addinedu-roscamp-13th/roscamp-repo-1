@@ -3,25 +3,32 @@
 
 FloorDock 액션(단일 도킹)을 **고정 횟수 순차** 전송한다(1회 완료 → 다음).
 floor_pose.py 의 '자동 반복'을 서버 밖(클라이언트)에서 재현 — 서버는 단일 도킹
-의미를 유지한다. 도킹 사이 '벽에서 후퇴'는 **서버 파라미터 post_advance_m** 이
-담당하므로(예: 0.30), 다음 회차 SEARCH 가 마커를 다시 본다.
+의미를 유지한다.
+
+'벽에서 후퇴'(다음 회차가 마커를 다시 보게)는 **클라이언트가 회차별로 서버
+파라미터 `post_advance_m` 을 설정**해서 제어한다:
+  * i < count  → post_advance_m = `post_advance_m`(기본 0.05)  (후퇴 후 다음 도킹)
+  * 마지막/단발 → post_advance_m = 0  (**후퇴 없이 도킹 상태로 종료**)
+  ※ post_advance_m 은 '고정 후퇴거리'가 아니라 **STAGED 복귀(rev_dist) 뒤 여유(margin)**.
+    ADVANCE 실제거리 = rev_dist + margin → 재획득 d ≈ D_STAGE + margin (신뢰창 안).
+    신뢰창을 넘으면 데이터가 없어 복구 불가라, margin 은 창 far 끝까지로 클램프된다.
 
 한 회차라도 실패(거절/ABORT/미검출)하면 **즉시 중단하고 요약을 출력**한다.
 
-실행 예 (서버가 post_advance_m:=0.30 로 떠 있어야 반복 의미 있음):
-  # 서버(로봇): 후퇴 켜고 기동
-  ros2 launch ddago_control ddago_floor_dock.launch.py post_advance_m:=0.30
-  # 클라이언트: 5회 왕복
+실행 예 (서버 launch 는 post_advance_m 불필요 — 클라이언트가 회차별로 덮어씀):
+  ros2 launch ddago_control ddago_floor_dock.launch.py robot_id:=dg_03
   ros2 run ddago_control floor_dock_repeat_client --ros-args \\
-    -p count:=5 -p wall_gap_m:=0.03 -p pause_s:=2.0
+    -p count:=5 -p wall_gap_m:=0.03 -p post_advance_m:=0.05 -p pause_s:=2.0
 
 파라미터:
-  count(int=5)          반복 횟수
+  count(int=5)          반복 횟수 (1이면 단발 → 후퇴 없이 도킹 종료)
   wall_gap_m(float=0)   목표 후면~벽 [m] (0=서버 기본)
   lateral_offset_m(0)   횡 오프셋 [m] (0=서버 기본)
+  post_advance_m(0.05)  STAGED 복귀 후 여유 margin [m] (실제 ADVANCE=rev_dist+margin, 창 클램프)
   task_point_id('TEST') goal 라벨
   pause_s(float=2.0)    회차 사이 대기 [s]
   action_name('/ddago/floor_dock')
+  server_node('ddago_floor_dock_server')  파라미터 설정 대상
   stop_on_fail(bool=True)  실패 시 즉시 중단
 """
 import time
@@ -29,6 +36,8 @@ import time
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.parameter_client import AsyncParameterClient
 
 from automato_interfaces.action import FloorDock
 
@@ -43,6 +52,10 @@ class FloorDockRepeatClient(Node):
         self.declare_parameter('pause_s', 2.0)
         self.declare_parameter('action_name', '/ddago/floor_dock')
         self.declare_parameter('stop_on_fail', True)
+        # 회차 사이 후퇴[m]. 클라이언트가 서버 파라미터를 회차별로 설정한다:
+        #  i<count → 이 값(다음 마커 보려 후퇴), 마지막/단발 → 0(도킹 상태로 종료).
+        self.declare_parameter('post_advance_m', 0.05)
+        self.declare_parameter('server_node', 'ddago_floor_dock_server')
 
         g = self.get_parameter
         self.count = int(g('count').value)
@@ -51,9 +64,20 @@ class FloorDockRepeatClient(Node):
         self.point_id = str(g('task_point_id').value)
         self.pause_s = float(g('pause_s').value)
         self.stop_on_fail = bool(g('stop_on_fail').value)
+        self.post_advance = float(g('post_advance_m').value)
         self._action_name = str(g('action_name').value)
         self._client = ActionClient(self, FloorDock, self._action_name)
+        self._pcli = AsyncParameterClient(self, str(g('server_node').value))
         self._last_phase = None
+
+    def _set_server_advance(self, val):
+        """서버의 post_advance_m 을 val 로 설정(회차별). 실패해도 진행(경고만)."""
+        if not self._pcli.wait_for_services(timeout_sec=3.0):
+            self.get_logger().warn('서버 파라미터 서비스 없음 — post_advance 설정 생략')
+            return
+        fut = self._pcli.set_parameters(
+            [Parameter('post_advance_m', Parameter.Type.DOUBLE, float(val))])
+        rclpy.spin_until_future_complete(self, fut)
 
     # --- 피드백: phase 바뀔 때만 한 줄 ---
     def _on_feedback(self, msg):
@@ -96,7 +120,11 @@ class FloorDockRepeatClient(Node):
 
         gaps, ok_n = [], 0
         for i in range(1, self.count + 1):
-            self.get_logger().info('── [%d/%d] 도킹 goal 전송 ──' % (i, self.count))
+            # 마지막(=단발 포함) 회차는 후퇴 없이 도킹 상태로 종료 → 서버 post_advance=0
+            adv = self.post_advance if i < self.count else 0.0
+            self._set_server_advance(adv)
+            self.get_logger().info('── [%d/%d] 도킹 goal 전송 (post_advance=%.2fm) ──'
+                                   % (i, self.count, adv))
             ok, res = self._send_one(i)
             if res is not None:
                 gap_mm = res.final_wall_gap_m * 1000.0
