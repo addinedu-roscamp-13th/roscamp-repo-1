@@ -55,6 +55,28 @@ cp <받은 파일>/tomato_4cls_v8.pt ~/roscamp-repo-1/equip/automato_ws/src/dg_a
 
 ### 2) Pi 에서 팔 브리지 (수동 — 자동 실행 아님)
 
+Pi 에서 도는 `arm_server.py` 는 **이 저장소의 파일**이다
+(`ddagi_harvest/arm_server.py`). Pi 에는 ROS2 도 이 워크스페이스도 없으므로
+colcon 이 배포해 주지 않는다 — **파일 하나를 직접 복사한다.**
+
+```bash
+# 배포 (저장소 → Pi). 코드를 고쳤으면 다시 한다.
+scp ddagi_harvest/arm_server.py jetcobot@$ARM_IP:~/kdh_ws/m1_arm_basics/
+
+# 같은 것이 도는지 확인 — 두 해시가 같아야 한다
+md5sum ddagi_harvest/arm_server.py
+ssh jetcobot@$ARM_IP 'md5sum ~/kdh_ws/m1_arm_basics/arm_server.py'
+```
+
+`pymycobot` 외에는 표준 라이브러리만 쓰므로 **이 파일 하나면 된다.** Pi 에 같이
+있는 `arm_util.py` · `10_teach_replay.py` 등은 초기 실습 스크립트라 브리지와 무관하다.
+
+> ⚠ **버전이 어긋나도 아무 신호가 없다.** 저장소 쪽만 고치면 Pi 는 옛 사본을 계속
+> 돌리고, 증상은 엉뚱한 곳(파지 실패·타임아웃)에서 나온다. 브리지를 고쳤으면
+> 배포와 해시 확인을 같이 한다.
+
+띄우기:
+
 ```bash
 ssh jetcobot@$ARM_IP
 cd ~/kdh_ws/m1_arm_basics && ~/venv/automato/bin/python3 arm_server.py
