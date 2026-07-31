@@ -1,0 +1,49 @@
+##
+## Ddagi 팔 브리지 (arm_server.py) — Pi 부팅 시 자동 실행
+##
+## 노트북의 NetworkArm 이 붙는 TCP 9010 서버. 지금까지는 SSH 로 손수 띄웠는데,
+## 전원 재인가·공유기 재부팅 때마다 죽어서 그때마다 다시 띄워야 했다. 증상이
+## '팔이 응답 없음' 으로 나와 원인을 팔·네트워크·도메인에서 찾게 된다.
+##
+## 설치는 README 의 "Pi 팔 브리지" 절 참고. 요약:
+##   sudo cp arm-server.service /etc/systemd/system/
+##   sudo systemctl daemon-reload && sudo systemctl enable --now arm-server
+##
+[Unit]
+Description=Ddagi 팔 브리지 (arm_server.py, TCP 9010)
+After=network.target
+
+# 팔이 안 꽂혀 있으면 arm_server 는 시리얼 열기에 실패하고 즉시 죽는다. systemd 기본값
+# (10초에 5회 실패하면 영구 포기)이면 부팅 시 팔이 늦게 인식되는 것만으로 서비스가 죽은
+# 채 남는다. 0 = 재시도 횟수 제한 없음 — 팔을 꽂는 순간 알아서 붙는다.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=jetcobot
+Group=jetcobot
+WorkingDirectory=/home/jetcobot/kdh_ws/m1_arm_basics
+
+# EnvironmentFile= 은 **줄 순서와 무관하게** Environment= 를 덮어쓴다(실측: 두 순서
+# 모두 파일 값이 이겼다). 그래서 아래 값은 기본값이고, 로봇별 차이는 유닛을 고치지 말고
+# /etc/default/arm-server 에 적으면 된다. 같은 키를 Environment= 로 여러 줄 적으면
+# 덮어쓰지 않고 각각 누적된다.
+#
+# PYTHONUNBUFFERED — 없으면 stdout 이 tty 가 아니라서 파이썬이 버퍼링하고, journal 에
+#   로그가 한참 뒤에야(또는 죽을 때까지 안) 나온다. 디버깅이 불가능해진다.
+# ARM_PORT — /dev/ttyUSB0 대신 udev(99-jetcobot.rules)가 만드는 고정 심볼릭 링크를
+#   쓴다. USB 시리얼이 하나 더 꽂히면 ttyUSB0 번호가 밀릴 수 있다.
+Environment=PYTHONUNBUFFERED=1
+Environment=ARM_PORT=/dev/ttyJETCOBOT
+EnvironmentFile=-/etc/default/arm-server
+
+ExecStart=/home/jetcobot/venv/automato/bin/python3 \
+          /home/jetcobot/kdh_ws/m1_arm_basics/arm_server.py
+
+# 시리얼이 끊기거나 예외로 죽어도 되살린다. 5초는 팔 USB 재인식을 기다릴 만한 간격.
+Restart=always
+RestartSec=5
+SyslogIdentifier=arm-server
+
+[Install]
+WantedBy=multi-user.target

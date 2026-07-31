@@ -75,7 +75,50 @@ ssh jetcobot@$ARM_IP 'md5sum ~/kdh_ws/m1_arm_basics/arm_server.py'
 > 돌리고, 증상은 엉뚱한 곳(파지 실패·타임아웃)에서 나온다. 브리지를 고쳤으면
 > 배포와 해시 확인을 같이 한다.
 
-띄우기:
+#### 자동 실행 (systemd — 로봇마다 한 번만)
+
+브리지는 전원 재인가·공유기 재부팅 때마다 죽는다. 증상이 '팔이 응답 없음' 으로 나와
+원인을 팔·네트워크·도메인에서 찾게 되므로, **부팅 시 자동으로 뜨게 해 둔다.**
+
+```bash
+scp deploy/arm-server.service jetcobot@$ARM_IP:/tmp/
+ssh jetcobot@$ARM_IP
+```
+
+Pi 에서 (sudo 암호를 물어본다):
+
+```bash
+pkill -f arm_server.py                       # 손으로 띄운 게 있으면 먼저 정리
+sudo cp /tmp/arm-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now arm-server
+systemctl status arm-server --no-pager
+```
+
+`active (running)` 이면 끝. 이제 재부팅해도 알아서 뜬다.
+
+```bash
+journalctl -u arm-server -f          # 로그 (노트북 연결·에러가 여기 찍힌다)
+sudo systemctl restart arm-server    # 팔이 이상할 때 브리지만 재시작
+sudo systemctl stop arm-server       # 손으로 띄워 실험할 때는 먼저 멈춘다
+```
+
+> 서비스가 도는 채로 `arm_server.py` 를 또 띄우면 포트 9010 이 이미 잡혀 있어
+> `Address already in use` 로 죽는다. 손으로 띄울 일이 있으면 `stop` 을 먼저 한다.
+
+유닛이 하는 일 중 눈여겨볼 것:
+
+| 설정 | 왜 |
+|---|---|
+| `StartLimitIntervalSec=0` | 기본값(10초에 5회 실패 → 영구 포기)이면 부팅 시 팔 인식이 늦은 것만으로 죽은 채 남는다 |
+| `Restart=always` / `RestartSec=5` | 팔을 꽂는 순간 알아서 붙는다 |
+| `ARM_PORT=/dev/ttyJETCOBOT` | udev(`99-jetcobot.rules`)가 만드는 고정 링크. USB 시리얼이 하나 더 꽂히면 `ttyUSB0` 번호가 밀린다 |
+| `PYTHONUNBUFFERED=1` | 없으면 파이썬이 버퍼링해 journal 에 로그가 안 나온다 |
+
+로봇마다 시리얼 포트가 다르면 유닛을 고치지 말고 `/etc/default/arm-server` 에 적는다
+(`ARM_PORT=...`, `ARM_SERVER_PORT=...`). 그 파일이 유닛 값을 덮어쓴다.
+
+#### 손으로 띄우기 (서비스를 안 걸었을 때)
 
 ```bash
 ssh jetcobot@$ARM_IP
