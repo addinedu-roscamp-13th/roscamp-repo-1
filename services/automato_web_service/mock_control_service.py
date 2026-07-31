@@ -149,6 +149,24 @@ def _reject_bad_selection(sel):
     return None
 
 
+# 실 ACS 는 병해충 알림에 사진 실물을 base64 로 동봉한다(detection_service.build_alert_payload, PR #84).
+# 모의도 같이 보내야 '사진이 실제로 뜨는지' 를 여기서 검증할 수 있다.
+# 로봇 카메라가 없으므로 검출 프레임을 흉내낸 작은 JPEG 를 매번 생성한다.
+def _fake_detection_jpeg(wp, robot_id, pct):
+    try:
+        from PIL import Image, ImageDraw
+        import io
+        im = Image.new("RGB", (320, 240), (34, 72, 40))
+        d = ImageDraw.Draw(im)
+        d.ellipse([70, 60, 250, 175], fill=(178, 46, 32))          # 병든 열매
+        d.text((14, 205), "MOCK detection  WP%s  %s  disease %s%%" % (wp, robot_id, pct),
+               fill=(255, 255, 255))
+        buf = io.BytesIO(); im.save(buf, "JPEG", quality=85)
+        return buf.getvalue()
+    except Exception:                       # Pillow 없으면 최소 JPEG 헤더만
+        return b"\xff\xd8\xff\xe0" + b"\x00" * 256 + b"\xff\xd9"
+
+
 @app.post("/internal/v1/tasks/patrol")
 def tasks_patrol():
     data = request.get_json(force=True, silent=True) or {}
@@ -318,11 +336,15 @@ def _simulate_patrol(task_id, robot_id):
             "rotten_percent": p["rotten"], "disease_percent": p["disease"], "detected_at": now})
         log("  ▶ Web: notify wp%s disease=%s%%" % (wp, p["disease"]) + ("  → 병해충 알림 발동" if p["disease"] >= 5 else "  (5%미만 스킵)"))
         if p["disease"] >= 5:                            # E3 트리거는 ACS가 판단
+            import base64 as _b64
+            _img = _fake_detection_jpeg(wp, robot_id, p["disease"])
             _post("/internal/v1/alerts/disease", {
                 "task_id": task_id, "waypoint_id": wp, "robot_id": robot_id,
                 "disease_percent": p["disease"],
                 "image_path": "%s/wp%s_%s.jpg" % (now[:10], wp, robot_id),
+                "image_data": _b64.b64encode(_img).decode("ascii"),   # 실 ACS 와 동일(PR #84)
                 "detected_at": now})
+            log("  → 병해충 알림 WP%s %s%% · 사진 %d bytes 동봉" % (wp, p["disease"], len(_img)))
     _post("/internal/v1/patrol/completed", {
         "task_id": task_id, "robot_id": robot_id,
         "status": "COMPLETED", "unvisited_waypoint_ids": [],    # 스펙 E2-9-1
