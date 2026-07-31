@@ -55,6 +55,71 @@ cp <받은 파일>/tomato_4cls_v8.pt ~/roscamp-repo-1/equip/automato_ws/src/dg_a
 
 ### 2) Pi 에서 팔 브리지 (수동 — 자동 실행 아님)
 
+Pi 에서 도는 `arm_server.py` 는 **이 저장소의 파일**이다
+(`ddagi_harvest/arm_server.py`). Pi 에는 ROS2 도 이 워크스페이스도 없으므로
+colcon 이 배포해 주지 않는다 — **파일 하나를 직접 복사한다.**
+
+```bash
+# 배포 (저장소 → Pi). 코드를 고쳤으면 다시 한다.
+scp ddagi_harvest/arm_server.py jetcobot@$ARM_IP:~/kdh_ws/m1_arm_basics/
+
+# 같은 것이 도는지 확인 — 두 해시가 같아야 한다
+md5sum ddagi_harvest/arm_server.py
+ssh jetcobot@$ARM_IP 'md5sum ~/kdh_ws/m1_arm_basics/arm_server.py'
+```
+
+`pymycobot` 외에는 표준 라이브러리만 쓰므로 **이 파일 하나면 된다.** Pi 에 같이
+있는 `arm_util.py` · `10_teach_replay.py` 등은 초기 실습 스크립트라 브리지와 무관하다.
+
+> ⚠ **버전이 어긋나도 아무 신호가 없다.** 저장소 쪽만 고치면 Pi 는 옛 사본을 계속
+> 돌리고, 증상은 엉뚱한 곳(파지 실패·타임아웃)에서 나온다. 브리지를 고쳤으면
+> 배포와 해시 확인을 같이 한다.
+
+#### 자동 실행 (systemd — 로봇마다 한 번만)
+
+브리지는 전원 재인가·공유기 재부팅 때마다 죽는다. 증상이 '팔이 응답 없음' 으로 나와
+원인을 팔·네트워크·도메인에서 찾게 되므로, **부팅 시 자동으로 뜨게 해 둔다.**
+
+```bash
+scp deploy/arm-server.service jetcobot@$ARM_IP:/tmp/
+ssh jetcobot@$ARM_IP
+```
+
+Pi 에서 (sudo 암호를 물어본다):
+
+```bash
+pkill -f arm_server.py                       # 손으로 띄운 게 있으면 먼저 정리
+sudo cp /tmp/arm-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now arm-server
+systemctl status arm-server --no-pager
+```
+
+`active (running)` 이면 끝. 이제 재부팅해도 알아서 뜬다.
+
+```bash
+journalctl -u arm-server -f          # 로그 (노트북 연결·에러가 여기 찍힌다)
+sudo systemctl restart arm-server    # 팔이 이상할 때 브리지만 재시작
+sudo systemctl stop arm-server       # 손으로 띄워 실험할 때는 먼저 멈춘다
+```
+
+> 서비스가 도는 채로 `arm_server.py` 를 또 띄우면 포트 9010 이 이미 잡혀 있어
+> `Address already in use` 로 죽는다. 손으로 띄울 일이 있으면 `stop` 을 먼저 한다.
+
+유닛이 하는 일 중 눈여겨볼 것:
+
+| 설정 | 왜 |
+|---|---|
+| `StartLimitIntervalSec=0` | 기본값(10초에 5회 실패 → 영구 포기)이면 부팅 시 팔 인식이 늦은 것만으로 죽은 채 남는다 |
+| `Restart=always` / `RestartSec=5` | 팔을 꽂는 순간 알아서 붙는다 |
+| `ARM_PORT=/dev/ttyJETCOBOT` | udev(`99-jetcobot.rules`)가 만드는 고정 링크. USB 시리얼이 하나 더 꽂히면 `ttyUSB0` 번호가 밀린다 |
+| `PYTHONUNBUFFERED=1` | 없으면 파이썬이 버퍼링해 journal 에 로그가 안 나온다 |
+
+로봇마다 시리얼 포트가 다르면 유닛을 고치지 말고 `/etc/default/arm-server` 에 적는다
+(`ARM_PORT=...`, `ARM_SERVER_PORT=...`). 그 파일이 유닛 값을 덮어쓴다.
+
+#### 손으로 띄우기 (서비스를 안 걸었을 때)
+
 ```bash
 ssh jetcobot@$ARM_IP
 cd ~/kdh_ws/m1_arm_basics && ~/venv/automato/bin/python3 arm_server.py
