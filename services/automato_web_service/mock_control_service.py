@@ -137,12 +137,26 @@ def available():
     return jsonify({"requested_at": _now(), "min_battery_percent": MIN_BAT_PATROL, "robots": out})
 
 
+# 실 ACS 는 robot_selection 을 pydantic Literal["auto","manual"] 로 받아 그 밖의 값이면 422 다
+# (patrol_api.PatrolRequest / harvest_api.HarvestRequest). 모의도 똑같이 거절해야
+# 'specific' 같은 스펙 밖 값이 여기서만 통과하고 실연동에서 터지는 일을 막는다.
+def _reject_bad_selection(sel):
+    if sel not in ("auto", "manual"):
+        log("  → 거절: robot_selection=%r 은 스펙 밖(auto|manual)" % sel)
+        return jsonify({"detail": [{"loc": ["body", "robot_selection"],
+                                    "msg": "Input should be 'auto' or 'manual'",
+                                    "type": "literal_error"}]}), 422
+    return None
+
+
 @app.post("/internal/v1/tasks/patrol")
 def tasks_patrol():
     data = request.get_json(force=True, silent=True) or {}
     sel = data.get("robot_selection", "auto")
     rid_req = data.get("robot_id")
     log("◀ Web: POST tasks/patrol  robot_selection=%s robot_id=%s" % (sel, rid_req))
+    _bad = _reject_bad_selection(sel)
+    if _bad: return _bad
     with _LOCK:
         avail = [r for r in _ROBOTS.values() if r.get("role") == "patrol" and _avail(r)[0]]
         if not avail:
@@ -244,6 +258,8 @@ def tasks_harvest():
     rid_req = data.get("robot_id")
     loc = data.get("harvest_location") or "HARVEST_01"
     log("◀ Web: POST tasks/harvest  robot_selection=%s robot_id=%s location=%s" % (sel, rid_req, loc))
+    _bad = _reject_bad_selection(sel)
+    if _bad: return _bad
     with _LOCK:
         # E1-3-1 : 로봇팔 1대 = 동시 수확 1건 → 진행 중이면 409 HARVEST_IN_PROGRESS
         if any(r["status"] == "HARVESTING" for r in _ROBOTS.values()):

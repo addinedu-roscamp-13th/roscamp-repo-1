@@ -202,6 +202,46 @@ def _telemetry_fresh():
     age = (time.time() - _TELEMETRY["recv_at"]) if _TELEMETRY["recv_at"] else None
     return (age is not None) and (age <= ROBOT_OFFLINE_SEC)
 
+
+# ACS 는 robot_selection 을 pydantic Literal["auto","manual"] 로 받는다
+# (patrol_api.PatrolRequest · harvest_api.HarvestRequest). 그 밖의 값이면 422 로 튕긴다.
+# 그런데 예전 클라이언트·테스트 스크립트는 'specific' 을 쓴다 — 모의 ACS 는 검증을 안 해서
+# 통과했지만 보연님 실 ACS 에서는 전부 실패한다. 중계 전에 여기서 스펙 값으로 맞춘다.
+_SELECTION_ALIAS = {"specific": "manual", "manual": "manual", "auto": "auto"}
+
+_FAIL_MSG = {   # ACS FAIL_REASONS enum → 관리자가 읽을 문장
+    "BLOCKED":              "통로가 막혀 이동하지 못했습니다.",
+    "BLOCKED_UNRECOVERABLE": "통로 막힘을 스스로 풀지 못했습니다. 현장 확인이 필요합니다.",
+    "DOCK_FAILED":          "도킹에 실패했습니다.",
+    "BATTERY_DEPLETED":     "배터리가 소진되어 작업을 중단했습니다.",
+    "HARDWARE_ERROR":       "하드웨어 오류로 작업을 중단했습니다.",
+}
+
+def _task_failed_message(d):
+    """작업 실패 사유를 사람이 읽을 문장으로. 교착이면 어느 통로에서 누구에게 막혔는지 덧붙인다."""
+    base = _FAIL_MSG.get(d.get("reason"), "작업이 실패했습니다(%s)." % d.get("reason"))
+    bits = []
+    if d.get("blocked_corridor") is not None:
+        bits.append("통로 %s" % d["blocked_corridor"])
+    if d.get("blocked_by_robot_id"):
+        bits.append("%s 이(가) 점유" % d["blocked_by_robot_id"])
+    if d.get("waited_sec") is not None:
+        bits.append("%s초 대기" % d["waited_sec"])
+    return base + (" (" + " · ".join(bits) + ")" if bits else "")
+
+
+def _normalize_selection(data):
+    """(정규화된 body, robot_selection) 반환. robot_id 가 있으면 manual 로 본다."""
+    d = dict(data or {})
+    raw = str(d.get("robot_selection", "auto") or "auto").strip().lower()
+    sel = _SELECTION_ALIAS.get(raw)
+    if sel is None:                       # 모르는 값 → robot_id 유무로 판단(요청을 버리지 않는다)
+        sel = "manual" if d.get("robot_id") else "auto"
+    if raw != sel:
+        wlog("  ↳ robot_selection '%s' → '%s' 로 보정(ACS 스펙: auto|manual)" % (raw, sel))
+    d["robot_selection"] = sel
+    return d, sel
+
 # ============================================================================
 #  자체 함대 (ACS 없이 라이브 단독 구동용) — CONTROL_SERVICE_URL 없으면 Web이 ACS 대역 겸함.
 #  값·역할·임계값을 mock_control_service._ROBOTS 와 동일하게 유지 → localhost(mock)와
@@ -1206,7 +1246,7 @@ def patrol_request():
     """순찰 요청. {robot_selection: auto|manual, robot_id?, mode?}
        Control 연동 시 /internal/v1/tasks/patrol 로 중계. 아니면 로컬 데모. (E1-2/3)"""
     data = body()
-    sel = data.get("robot_selection", "auto")
+    data, sel = _normalize_selection(data)
     if _control_on():
         try:
             wlog("▶ App 요청: 순찰 요청(robot_selection=%s robot_id=%s) → ACS 중계 POST /internal/v1/tasks/patrol"
@@ -1315,6 +1355,7 @@ def internal_detections_notify():
     _push_event({"event": "patrol_progress",
                  "task_id": d.get("task_id"), "waypoint_id": d.get("waypoint_id"),
                  "robot_id": d.get("robot_id"),
+                 "detection_id": d.get("detection_id"),   # DB 검출 행 id (저장 실패 시 null)
                  "ripe_percent": d.get("ripe_percent"), "unripe_percent": d.get("unripe_percent"),
                  "rotten_percent": d.get("rotten_percent"), "disease_percent": d.get("disease_percent"),
                  "detected_at": d.get("detected_at")})
@@ -1430,13 +1471,28 @@ def internal_alerts_task_failed():
        reason  : BLOCKED / BLOCKED_UNRECOVERABLE / DOCK_FAILED / BATTERY_DEPLETED / HARDWARE_ERROR
        recovery_action : RETURN_TO_CHARGER / NONE"""
     d = body()
-    wlog("◀ ACS 콜백: 작업 실패 task_id=%s robot=%s reason=%s → App task_failed 푸시 + 텔레그램" % (
-        d.get("task_id"), d.get("robot_id"), d.get("reason")))
+    _blk = ""
+    if d.get("blocked_corridor") is not None or d.get("blocked_by_robot_id") is not None:
+        _blk = " [교착 통로=%s 막은로봇=%s 대기=%ss]" % (
+            d.get("blocked_corridor"), d.get("blocked_by_robot_id"), d.get("waited_sec"))
+    wlog("◀ ACS 콜백: 작업 실패 task_id=%s robot=%s reason=%s%s → App task_failed 푸시 + 텔레그램" % (
+        d.get("task_id"), d.get("robot_id"), d.get("reason"), _blk))
+    # 교착(BLOCKED) 진단 필드를 그대로 실어 보낸다. ACS 는 이 4개를 항상 보내는데
+    # (막힘이 아니면 null) 구버전은 읽지 않아, '왜 막혔는지·누가 막았는지' 가 화면에서
+    # 통째로 사라졌다. 반대로 ACS 가 보내지도 않는 message 를 읽고 있었다.
     ev = _push_event({"event": "task_failed",
                       "task_id": d.get("task_id"), "robot_id": d.get("robot_id"),
                       "task_type": d.get("task_type"), "reason": d.get("reason"),
+                      "blocked_corridor": d.get("blocked_corridor"),
+                      "blocked_by_robot_id": d.get("blocked_by_robot_id"),
+                      "robot_position": d.get("robot_position"),
+                      "waited_sec": d.get("waited_sec"),
                       "recovery_action": d.get("recovery_action"),
-                      "message": d.get("message"), "failed_at": d.get("failed_at")})
+                      # message 는 App 계약의 필수 필드인데 ACS 는 보내지 않는다
+                      # (build_task_failed_payload 에 없음). reason 으로 사람이 읽을 문장을
+                      # 여기서 만든다. ACS 가 나중에 보내주면 그 값을 우선한다.
+                      "message": d.get("message") or _task_failed_message(d),
+                      "failed_at": d.get("failed_at")})
     _schedule_telegram_fallback(ev)   # App 열려있으면 App 발송(스펙), 닫혀있으면 서버 대신 발송
     return jsonify({"success": True})
 
@@ -1989,7 +2045,7 @@ def harvest_request():
     """수확 요청. {robot_selection: auto|manual, robot_id?}
        Control 연동 시 /internal/v1/tasks/harvest 로 중계(대시보드=요청 일치). 아니면 로컬 데모."""
     data = body()
-    sel = data.get("robot_selection", "auto")
+    data, sel = _normalize_selection(data)     # 'specific' 등 → ACS 스펙(auto|manual)
     rid_req = data.get("robot_id")
     loc = data.get("harvest_location")
 

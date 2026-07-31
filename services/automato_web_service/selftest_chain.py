@@ -80,8 +80,8 @@ def main():
         check("E1 available: 순찰 후보는 dg_03 만 · 대기중이면 가능",
               ids0 == ["dg_03"] and rb("dg_03").get("available") is True, "ids=%s" % ids0)
         ctrl_reset()
-        rs = requests.post(WEB + "/api/v1/patrol/requests", json={"robot_selection": "specific", "robot_id": "dg_03"}, timeout=5).json()
-        check("E1 직접선택(specific dg_03) → ACCEPTED", rs.get("status") == "ACCEPTED" and rs.get("assigned_robot_id") == "dg_03",
+        rs = requests.post(WEB + "/api/v1/patrol/requests", json={"robot_selection": "manual", "robot_id": "dg_03"}, timeout=5).json()
+        check("E1 직접선택(manual dg_03) → ACCEPTED", rs.get("status") == "ACCEPTED" and rs.get("assigned_robot_id") == "dg_03",
               "robot=%s" % rs.get("assigned_robot_id"))
         # 순찰 중인 로봇을 다시 지정 → ACS 판단(ROBOT_BUSY)이 그대로 내려와야 한다
         busy = requests.get(WEB + "/api/v1/robots/patrol/available", timeout=5).json().get("robots", [])
@@ -90,7 +90,7 @@ def main():
               bz.get("available") is False and bz.get("unavailable_reason") == "ROBOT_BUSY",
               "dg_03.reason=%s" % bz.get("unavailable_reason"))
         ctrl_reset()
-        rna = requests.post(WEB + "/api/v1/patrol/requests", json={"robot_selection": "specific", "robot_id": "dg_01"}, timeout=5)
+        rna = requests.post(WEB + "/api/v1/patrol/requests", json={"robot_selection": "manual", "robot_id": "dg_01"}, timeout=5)
         jna = rna.json()
         check("E1 거절: 순찰 자격 없는 로봇(dg_01=수확전용) 지정 → 409",
               rna.status_code == 409, "%s %s" % (rna.status_code, jna.get("reason")))
