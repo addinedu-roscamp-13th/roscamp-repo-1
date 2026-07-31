@@ -162,7 +162,9 @@ class HarvestDispatcher:
             # 로봇은 지금 충전기에 '물리적으로 붙어' 있다(반사테이프 도킹). 그대로 다음
             # 목표를 하달하면 좁은 충전 공간에서 회전부터 시작해 충전 단자를 긁는다.
             # 먼저 진입 노드로 한 스텝 빼내 정면으로 나오게 한다(순찰 _lead_in ①과 동일).
-            if not self.runner.undock_step(clients["nav"], task_id, current):
+            if not self.runner.undock_step(
+                    clients["nav"], task_id, current,
+                    heartbeat=(engine, [start_slot], robot_id)):
                 self._log.warning(
                     f"[HARVEST] E2 언도킹 실패 task={task_id} {robot_id} "
                     f"노드 {current} → FAILED (충전기에서 빠져나오지 못했다)")
@@ -245,7 +247,9 @@ class HarvestDispatcher:
             # WALL_GAP_TARGET). 여기서 바로 예냉실 쪽으로 돌면 후면 코너가 벽을 긁는다.
             # 자리(entry_slot)는 수확 내내 쥐고 있었으므로 새로 예약하지 않는다.
             # 실적(batch_id)은 이미 저장했다 — 여기서 실패해도 딴 개수는 남는다.
-            if not self.runner.undock_step(clients["nav"], task_id, current):
+            if not self.runner.undock_step(
+                    clients["nav"], task_id, current,
+                    heartbeat=(engine, [entry_slot], robot_id)):
                 self._log.warning(
                     f"[HARVEST] E5 언도킹 실패 task={task_id} {robot_id} "
                     f"노드 {current} → FAILED (수확지에서 빠져나오지 못했다. "

@@ -642,7 +642,9 @@ class AutomatoControlNode(Node):
         # 못 빠져나왔는데 복귀 주행을 하달하면 그 자리에서 회전한다(벽까지 3cm).
         if undock_from is not None:
             if not self._dispatcher.runner.undock_step(
-                    nav_client, task_id, undock_from):
+                    nav_client, task_id, undock_from,
+                    heartbeat=(engine, [engine.node_slot(undock_from)],
+                               robot_id)):
                 self.get_logger().warn(
                     f"복귀 언도킹 실패 task={task_id} {robot_id} 노드 {undock_from} "
                     f"→ 현장 정지(22-2)")
