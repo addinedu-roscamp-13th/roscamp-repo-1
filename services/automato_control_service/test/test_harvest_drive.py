@@ -384,6 +384,47 @@ def test_언도킹은_도킹을_마친_방향으로_하달한다(fast_timing):
         f"언도킹 방향이 도킹 자세(±π)가 아니다: {undock_yaw} (0.0 이면 폴백이 나간 것)"
 
 
+def _arrival_yaw(nav, wp):
+    """wp 에 도착하는 하달을 찾아 그 마지막 노드의 목표 방향을 돌려준다."""
+    for wps, yaws in zip(nav.dispatched, nav.yaws):
+        if wps and wps[-1] == wp:
+            return yaws[-1]
+    return None
+
+
+def test_수확지_도착은_진입노드_DB_yaw로_선다(fast_timing):
+    """H 마커 도킹은 **정면 카메라**라 도착 방향이 틀어지면 마커가 화각 밖으로 나간다.
+
+    기본 규칙(진행 방향)에 맡기면 '오던 방향'으로 서는데, 실제 그래프에서 wp1→wp20 은
+    DB yaw 와 78° 어긋난다. 라이다(360°)를 쓰는 충전소 도킹보다 훨씬 치명적이다.
+    """
+    engine, disp, _log, nav, dock, harv = _make()
+    disp.runner.wp_meta[4] = {**disp.runner.wp_meta[4], "yaw": -1.711}
+
+    disp.run_harvest(1, "dg_01", HARVEST_POINT, engine,
+                     _clients(nav, dock, harv), start_wp=15)
+
+    yaw = _arrival_yaw(nav, 4)
+    assert yaw is not None, f"수확지(4)에 도착하는 하달이 없다: {nav.dispatched}"
+    assert yaw == pytest.approx(-1.711), (
+        f"수확지 도착 yaw 가 DB 값이 아니다: {yaw} "
+        f"(진행 방향 폴백이면 ±π 가 나온다)")
+
+
+def test_예냉실_도착은_진입노드_DB_yaw로_선다(fast_timing):
+    """예냉실은 들어오는 길이 하나뿐이라 진행 방향에 맡기면 **매번** 162.8° 어긋난다."""
+    engine, disp, _log, nav, dock, harv = _make()
+    disp.runner.wp_meta[12] = {**disp.runner.wp_meta[12], "yaw": 1.512}
+
+    _e5(disp, engine, _clients(nav, dock, harv))
+
+    yaw = _arrival_yaw(nav, 12)
+    assert yaw is not None, f"예냉실(12)에 도착하는 하달이 없다: {nav.dispatched}"
+    assert yaw == pytest.approx(1.512), (
+        f"예냉실 도착 yaw 가 DB 값이 아니다: {yaw} "
+        f"(진행 방향 폴백이면 0.0 이 나온다)")
+
+
 def test_언도킹이_실패하면_주행하지_않고_FAILED(fast_timing):
     """충전기에서 못 빠져나왔는데 다음 목표를 하달하면 그 자리에서 회전한다."""
     engine, disp, log, _nav, dock, harv = _make()

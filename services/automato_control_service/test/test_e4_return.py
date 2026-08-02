@@ -118,6 +118,7 @@ class FakeNavClient:
         self.robot = robot            # {"wp": 현재 노드}
         self.code = code
         self.dispatched = []          # [(wp_ids, capture_flags), ...]
+        self.dispatched_yaws = []     # [[yaw, ...], ...] 하달마다 노드별 목표 방향
 
     def wait_for_server(self, timeout_sec=None):
         return True
@@ -126,6 +127,7 @@ class FakeNavClient:
         wps = [w.waypoint_id for w in goal.waypoints]
         caps = [bool(w.capture) for w in goal.waypoints]
         self.dispatched.append((wps, caps))
+        self.dispatched_yaws.append([float(w.yaw) for w in goal.waypoints])
         result_future = Future()
 
         def drive():
@@ -278,6 +280,68 @@ def test_drive_to_point_arrives_without_capture(fast):
     assert client.dispatched, "복귀 주행이 아무것도 하달하지 않았다"
     for _wps, caps in client.dispatched:
         assert not any(caps), f"복귀 중 촬영 플래그가 켜졌다: {client.dispatched}"
+
+
+def test_return_drive_final_node_uses_db_yaw(fast):
+    """복귀 주행의 **마지막 노드**는 진입 노드의 DB yaw 로 선다(도킹 진입 자세).
+
+    이걸 안 하면 도착 방향이 '오던 방향'이 돼, 어느 쪽에서 접근하느냐로 자세가 90°
+    가까이 달라진다(실측: wp15→wp24 는 176.6°, wp16→wp24 는 81.7°, DB 값은 87.3°).
+    마커를 비스듬히 보면 코너 한 면이 짧게 읽혀 검출에서 탈락 → 도킹이 '마커 없음'
+    으로 실패한다(2026-08-02 통합 실패의 원인 A).
+    """
+    engine, disp = _make()
+    disp.wp_meta[22] = {**disp.wp_meta[22], "yaw": 1.523}   # 충전소를 정면으로 보는 방향
+    client = FakeNavClient({"wp": 4})
+    outcome, pos = disp.drive_to_point(1, "dg_01", 4, 22, engine, client)
+
+    assert (outcome, pos) == ("arrived", 22)
+    last_wps = client.dispatched[-1][0]
+    last_yaws = client.dispatched_yaws[-1]
+    assert last_wps[-1] == 22, "마지막 하달의 끝 노드가 충전소 진입 노드가 아니다"
+    assert last_yaws[-1] == pytest.approx(1.523), (
+        f"진입 노드 도착 yaw 가 DB 값이 아니다: {last_yaws[-1]}")
+
+
+def test_return_drive_middle_nodes_keep_travel_yaw(fast):
+    """중간 노드는 진행 방향 그대로 — 전 구간에 같은 방향을 걸면 두리번거린다.
+
+    노드가 x 축 위에 동쪽으로 늘어서 있어 통과 노드의 진행 방향은 0.0(동쪽)이다.
+    마지막 노드만 DB yaw(1.523)여야 하고 나머지는 0.0 이어야 한다.
+    """
+    engine, disp = _make()
+    disp.wp_meta[22] = {**disp.wp_meta[22], "yaw": 1.523}
+    client = FakeNavClient({"wp": 4})
+    disp.drive_to_point(1, "dg_01", 4, 22, engine, client)
+
+    for wps, yaws in zip([d[0] for d in client.dispatched], client.dispatched_yaws):
+        for wid, yaw in zip(wps, yaws):
+            if wid == 22:
+                continue                       # 진입 노드만 예외
+            assert yaw == pytest.approx(0.0), (
+                f"통과 노드 {wid} 의 방향이 진행 방향(0.0)이 아니다: {yaw}")
+
+
+def test_patrol_drive_not_affected_by_final_yaw(fast):
+    """순찰 주행은 이 변경의 영향을 받지 않는다(final_yaw 를 안 넘긴다).
+
+    순찰 지점 9·4 는 촬영 지점이라 DB yaw(π)로, 통과 노드는 진행 방향으로 선다.
+    복귀 전용 인자가 순찰 경로에 새지 않는지 지킨다.
+    """
+    engine, disp = _make()
+    client = FakeNavClient({"wp": 15})
+    status, _unvisited, _last = disp.run_patrol(
+        1, "dg_01", [{"waypoint_id": 9}, {"waypoint_id": 4}],
+        engine, client, start_wp=15)
+
+    assert status == "COMPLETED"
+    seen = {}
+    for wps, yaws in zip([d[0] for d in client.dispatched], client.dispatched_yaws):
+        for wid, yaw in zip(wps, yaws):
+            seen[wid] = yaw
+    for wid in (9, 4):
+        assert seen[wid] == pytest.approx(math.pi), (
+            f"촬영 지점 {wid} 의 방향이 DB yaw(π)가 아니다: {seen[wid]}")
 
 
 def test_dock_success(fast):

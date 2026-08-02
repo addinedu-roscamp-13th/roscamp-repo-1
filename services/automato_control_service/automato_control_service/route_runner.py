@@ -142,6 +142,29 @@ class RouteRunner:
         corridors, nodes = self._split_blocked(engine, self._blacklist_active())
         return {"corridors": sorted(corridors), "nodes": sorted(nodes)}
 
+    # ---------------------------- 도킹 진입 방향 ---------------------------- #
+    def entry_yaw(self, wp, task_id=None):
+        """도킹 진입 노드의 DB yaw(rad). 없으면 None.
+
+        진입 노드의 yaw_coord 는 '충전소/마커 쪽으로 들어가는 방향'이다. 도킹 직전 주행이
+        이 값으로 서야 마커가 정면에 온다 — 기본 규칙(진행 방향)에 맡기면 어느 쪽에서
+        오느냐로 자세가 크게 달라진다(실측 오차: 충전소 89°, 수확지 78°, 예냉실 163°).
+        특히 H 마커 도킹은 **정면 카메라**라 방향이 틀어지면 마커가 화각 밖으로 나가
+        아예 보이지 않는다(라이다는 360° 라 그나마 보이기는 한다).
+
+        값이 없으면 방향을 지어내지 않고 None 을 준다 — 0.0 으로 채우면 정동쪽을 보고
+        서는 사고가 된다(undock_step 의 폴백 주석과 같은 이유).
+        """
+        yaw = (self.wp_meta.get(wp) or {}).get("yaw")
+        if yaw is None:
+            self._log.warn(
+                f"도킹 진입 노드 {wp} 에 yaw 가 없다"
+                f"{'' if task_id is None else f' task={task_id}'} — 도착 방향 지정 없이 "
+                f"주행한다(마커를 비스듬히 봐 도킹이 실패할 수 있음, "
+                f"waypoints.yaw_coord 확인)")
+            return None
+        return float(yaw)
+
     # ---------------------------- 언도킹(도킹 탈출) ---------------------------- #
     def undock_step(self, client, task_id, wp, heartbeat=None) -> bool:
         """도킹된 로봇을 진입 노드 '그 자리'로 한 칸 하달해 정면으로 빼낸다.
@@ -199,7 +222,7 @@ class RouteRunner:
 
     # ---------------------------- 주행 본체 ---------------------------- #
     def drive(self, engine, client, task_id, robot_id, current, target,
-              hooks=None):
+              hooks=None, final_yaw=None):
         """current→target 까지 '세그먼트 + 룩어헤드'로 이동. 반환: (outcome, 도달한 노드).
 
         상태 2개로 움직인다:
@@ -210,6 +233,9 @@ class RouteRunner:
         outcome: 'arrived'(목표 도달) | 'skipped'(우회 불가로 포기) | 'aborted'(중단).
 
         hooks: DriveHooks. None 이면 기본(촬영 없는 평범한 주행).
+        final_yaw: target 에 도착할 때의 방향(rad). **목표에 닿는 마지막 세그먼트의 마지막
+                   노드에만** 실린다(reached 판정 재사용) — 중간 세그먼트는 평소대로다.
+                   복귀 주행이 도킹 진입 노드의 DB yaw 를 넘긴다(_dispatch_segment 참고).
         """
         hooks = hooks or DriveHooks()
         attempt_block = set()   # 이번 target 시도에서 회피할 통로(예약실패/막힘 누적)
@@ -297,7 +323,9 @@ class RouteRunner:
                 code, last_wp = self._dispatch_segment(
                     client, task_id, hadal, cap_ids,
                     heartbeat=(engine, held, robot_id), on_tick=on_tick,
-                    on_feedback=on_feedback)
+                    on_feedback=on_feedback,
+                    # 목표에 닿는 세그먼트에서만 도착 방향을 지정한다(reached 재사용).
+                    final_yaw=final_yaw if reached else None)
                 # 하달 결과를 호출자에게 알린다(순찰: 촬영 끝난 지점을 방문 완료로 마킹).
                 hooks.on_segment_done(hadal, cap_ids, cap_parents, last_wp, code)
                 # 이후 진행도 계산은 그래프 노드 기준이므로 그래프 밖 id 를 되돌린다.
@@ -600,7 +628,8 @@ class RouteRunner:
 
     def _dispatch_segment(self, client, task_id, waypoint_ids,
                           capture_ids, heartbeat=None, on_tick=None,
-                          on_feedback=None, yaw_override=None):
+                          on_feedback=None, yaw_override=None,
+                          final_yaw=None):
         """확보된 세그먼트(연속 waypoint 목록)를 Navigate Goal(Waypoint[] 배열)로 한 번에 하달.
 
         waypoint_ids: [세그먼트 첫 노드 ... 끝 노드] — 예약을 확보한 통로들을 지나는 경로에
@@ -618,6 +647,14 @@ class RouteRunner:
                      언도킹처럼 **노드가 하나뿐이라 진행 방향을 계산할 수 없는** 하달에서
                      쓴다 — 그 경우 기본 규칙은 0.0(정동쪽)으로 폴백하는데, 그 값에는
                      의미가 없어 도킹 자리에서 엉뚱하게 도는 원인이 된다(undock_step 참고).
+        final_yaw: **배열의 마지막 노드에만** 적용할 도착 방향(rad). yaw_override 와 달리
+                     중간 통과 노드는 건드리지 않아 '진행 방향' 규칙이 그대로 살아 있다
+                     (전 노드에 같은 방향을 걸면 로봇이 가는 내내 그쪽을 보려고 두리번거린다).
+                     도킹 진입 노드로 가는 복귀 주행이 쓴다 — 진입 노드의 DB yaw 는
+                     '마커를 정면으로 보는 방향'인데, 기본 규칙(진행 방향)은 그걸 무시하고
+                     '오던 방향'으로 세운다. 어느 쪽에서 오느냐로 도착 자세가 90° 가까이
+                     달라져(wp15→wp24 실측 176.6° vs DB 87.3°), 마커를 비스듬히 보게 되면
+                     코너 한 면이 짧게 읽혀 검출에서 탈락한다 → 도킹이 '마커 없음'으로 실패.
         반환: (result_code, last_waypoint_id). result_code 0 성공/1 실패·막힘/2 중단.
         """
         # 좌표를 먼저 모은다 — 통과 노드 yaw 를 '진행 방향(다음 노드 쪽)'으로 잡으려면
@@ -635,6 +672,10 @@ class RouteRunner:
                 # 호출부가 방향을 지정했다(언도킹). 촬영 판정보다 우선한다 — 이 하달은
                 # 애초에 촬영이 없고, 목적이 '고개를 돌리지 않고 빠져나오기' 이다.
                 yaw = float(yaw_override)
+            elif final_yaw is not None and i == len(waypoint_ids) - 1:
+                # 마지막 노드(= 도킹 진입 노드): 마커를 정면으로 봐야 도킹이 시작된다.
+                # 중간 노드는 아래 진행 방향 규칙 그대로라 두리번거림이 생기지 않는다.
+                yaw = float(final_yaw)
             elif is_capture:
                 # 촬영 지점: 베드를 봐야 사진이 나온다 → DB 에 지정된 방향 그대로.
                 yaw = float(m.get("yaw") or 0.0)
