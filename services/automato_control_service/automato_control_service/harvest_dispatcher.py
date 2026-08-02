@@ -172,8 +172,11 @@ class HarvestDispatcher:
 
             # 훅을 안 넘긴다 = DriveHooks 기본값(촬영·짝·방문 마킹 없는 평범한 주행).
             # 순찰과 같은 예약 규칙으로 움직이므로 두 로봇이 통로를 놓고 경합해도 안전하다.
+            # final_yaw: 수확지는 H 마커 도킹(정면 카메라)이라 도착 방향이 틀어지면 마커가
+            # 화각 밖으로 나가 아예 안 보인다. 진행 방향에 맡기면 wp1→wp20 에서 78° 어긋난다.
             outcome, current = self.runner.drive(
-                engine, clients["nav"], task_id, robot_id, current, target)
+                engine, clients["nav"], task_id, robot_id, current, target,
+                final_yaw=self.runner.entry_yaw(target, task_id))
             if outcome != "arrived":
                 # skipped = 블랙리스트·점유로 우회로가 없어 포기 / aborted = 로봇이 중단 보고.
                 self._log.warning(
@@ -258,8 +261,12 @@ class HarvestDispatcher:
 
             # 수확지 → 예냉실. 여기도 훅 없이 부른다(촬영·짝 없는 평범한 주행).
             # 수확지 자리는 drive 가 출발하며 이어받아 반납한다.
+            # final_yaw: 예냉실도 H 마커 도킹이다. 들어오는 길이 wp17 하나뿐이라 진행
+            # 방향에 맡기면 **매번** 162.8° 어긋난다 — 마커를 등지고 서서 도킹이 시작조차
+            # 못 한다(수확지 78°보다 심하다).
             outcome, current = self.runner.drive(
-                engine, clients["nav"], task_id, robot_id, current, precool_wp)
+                engine, clients["nav"], task_id, robot_id, current, precool_wp,
+                final_yaw=self.runner.entry_yaw(precool_wp, task_id))
             if outcome != "arrived":
                 self._log.warning(
                     f"[HARVEST] E5 예냉실 이송 실패({outcome}) task={task_id} "

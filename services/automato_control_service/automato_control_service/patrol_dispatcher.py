@@ -357,6 +357,13 @@ class PatrolDispatcher:
         선다'만 한다. 속은 순찰과 똑같은 RouteRunner.drive 라 복귀 주행도 통로를 예약하며
         움직인다 — 복귀라고 예약 없이 달리면 그게 다른 로봇의 새 막힘 원인이 된다.
 
+        **도착 방향은 target 의 DB yaw 로 고정한다.** 도킹 진입 노드의 yaw_coord 는
+        '마커를 정면으로 보는 방향'인데, 주행 기본 규칙은 통과 노드를 '진행 방향'으로
+        세운다(_travel_yaw). 그러면 어느 쪽에서 오느냐로 도착 자세가 크게 달라져
+        (wp15→wp24 는 176.6°, wp16→wp24 는 81.7°, DB 값은 87.3°) 마커를 비스듬히
+        보게 되고, 코너 한 면이 짧게 읽혀 검출에서 탈락한다 → 도킹이 '마커 없음'으로
+        실패한다. 언도킹(undock_step)에는 같은 방어가 이미 있었고 그 짝이 빠져 있었다.
+
         반환: (outcome, 도달한 노드).
           'arrived' 목표(충전소 진입 노드) 도달 → 다음은 도킹.
           'skipped' 우회로도 없어 못 감 → 호출부가 22-2(현장 정지)로 넘긴다.
@@ -366,13 +373,17 @@ class PatrolDispatcher:
             self._log.warn(
                 f"{robot_id} Navigate 서버 미기동 → 복귀 주행 불가 task={task_id}")
             return "aborted", current
+        # 도착 방향(마지막 노드에만 적용). 없으면 None → 기존 규칙(진행 방향)에 맡긴다.
+        final_yaw = self.runner.entry_yaw(target, task_id)
         self._log.info(
-            f"복귀 주행 시작 task={task_id} {robot_id} {current}→{target}(충전소)")
+            f"복귀 주행 시작 task={task_id} {robot_id} {current}→{target}(충전소) "
+            f"도착 yaw={'미지정' if final_yaw is None else f'{final_yaw:.2f}'}")
         # 훅을 안 넘긴다 = DriveHooks 기본값(촬영·짝·방문 마킹 없는 평범한 주행).
         # 예전에는 _navigate(capture=False) 로 순찰 로직을 '껐'지만, 지금은 그 로직이
         # 애초에 drive 밖(_PatrolHooks)에 있어 안 넘기면 그만이다.
         return self.runner.drive(
-            engine, client, task_id, robot_id, current, target)
+            engine, client, task_id, robot_id, current, target,
+            final_yaw=final_yaw)
 
     # ---------------------------- 촬영 판정(방향 게이트, RP-EX) ---------------------------- #
     def _build_segment_goal(self, seg_wps, visited, seg_start):
