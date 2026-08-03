@@ -312,7 +312,7 @@ class NavigateServer(Node):
                 f'주행 시작 task={task_id} [{idx + 1}/{len(wps)}] '
                 f'waypoint={int(wp.waypoint_id)} '
                 f'({wp.x:.2f},{wp.y:.2f}) yaw={wp.yaw:.2f} '
-                f'{"촬영" if wp.capture else "통과"}')
+                f'{"촬영" if wp.capture else ("정렬" if wp.hold_yaw else "통과")}')
             code = self._drive_to(goal_handle, wp)
             if code != 0:
                 self.get_logger().warn(
@@ -321,15 +321,22 @@ class NavigateServer(Node):
                     f'(마지막 도달 노드={last_wp})')
                 break
 
-            # 촬영 지점만 정밀 조준한다. 통과 지점은 다음 waypoint 로 출발할 때
-            # 어차피 다시 도므로(_drive_to 의 출발 정렬), 여기서 맞춰 봐야 회전이
-            # 두 번이 된다. 현장에서 스텝당 회전 2회 → 1회로 줄인 것이 이 규칙이다.
+            # 촬영 지점과 hold_yaw 지점만 정밀 조준한다. 그냥 통과하는 지점은 다음
+            # waypoint 로 출발할 때 어차피 다시 도므로(_drive_to 의 출발 정렬), 여기서
+            # 맞춰 봐야 회전이 두 번이 된다. 현장에서 스텝당 회전 2회 → 1회로 줄인 것이
+            # 이 규칙이고, 그래서 기본은 '고쳐 서지 않기' 다.
+            #
+            # hold_yaw 는 그 규칙의 유일한 예외다(ACS 가 도킹 진입 노드에만 켠다).
+            # 도킹은 마커를 정면에서 봐야 시작되는데, 여기서 조준하지 않으면 어느 쪽에서
+            # 왔느냐로 자세가 90° 가까이 틀어져(실측 wp15→wp24 176.6° vs DB 87.3°)
+            # 마커를 비스듬히 보고 '마커 없음'으로 실패한다. 이 지점은 그 자리에서 곧장
+            # 도킹으로 넘어가므로 '다음 출발 때 어차피 돈다'는 전제가 성립하지 않는다.
             #
             # 도착 보고보다 **먼저** 조준한다. ACS 는 도착 보고를 받으면 지나온 통로
             # 예약을 반납하는데(patrol_dispatcher._passed_resources), 조준은 최대
             # 12cm 뒤로 물러날 수 있어 방금 반납한 통로로 되돌아갈 여지가 있다.
             # 늦어지는 것은 2~4초뿐이다.
-            if wp.capture:
+            if wp.capture or wp.hold_yaw:
                 self._refine(wp)
 
             # 여기서부터 "도착 확정". 이 순서를 지켜야 last_wp 와 피드백이 어긋나지 않는다.
@@ -678,7 +685,10 @@ class NavigateServer(Node):
             self._nudge_ang(err)
 
     def _refine(self, wp):
-        """촬영 지점에서 목표 좌표·yaw 로 좁힌다. 보정 전/후 오차를 로그로 남긴다.
+        """촬영·정렬(hold_yaw) 지점에서 목표 좌표·yaw 로 좁힌다. 보정 전/후 오차를 로그로.
+
+        도킹 진입 노드(hold_yaw)에도 그대로 쓴다 — 마커를 정면에서 보려면 방향뿐 아니라
+        위치도 맞아야 하고, Nav2 는 허용오차(약 5cm) 안이면 도착으로 치고 멈추기 때문이다.
 
         회전 → 전후진 → 회전 순서다. 전후진하면 방향이 조금 틀어지므로 회전으로 끝낸다.
         횡(lat) 오차는 차동구동(옆으로 못 감)이라 고칠 수 없다 — 재서 로그로만 남긴다.

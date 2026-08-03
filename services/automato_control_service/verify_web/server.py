@@ -19,8 +19,16 @@
 실행:
   cd <리포 루트>
   source /opt/ros/jazzy/setup.bash
-  source install/setup.bash          # PYTHONPATH 에 automato_control_service 등록
+  source equip/automato_ws/install/setup.bash                    # automato_interfaces
+  source services/automato_control_service/install/setup.bash    # ACS 패키지
   python3 services/automato_control_service/verify_web/server.py
+
+  ⚠️ 워크스페이스는 두 개다(equip/automato_ws, services/automato_control_service).
+  각자의 디렉터리에서 colcon build 하고, 위 순서대로 둘 다 source 한다.
+  **리포 루트의 install/ 을 source 하면 안 된다** — 리포 루트는 워크스페이스가 아니라
+  거기서 colcon build 하면 안 되는데, 예전에 그렇게 만들어진 낡은 트리가 남아 있으면
+  최신 코드 대신 그것이 잡힌다(실제로 도킹 yaw 수정 #89·#90 이 빠진 코드로 검증된 적이
+  있다). 루트에 build/ install/ log/ 가 보이면 지워도 되는 찌꺼기다.
 """
 import asyncio
 import contextlib

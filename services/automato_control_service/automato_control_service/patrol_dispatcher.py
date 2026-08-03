@@ -336,8 +336,10 @@ class PatrolDispatcher:
         """
         # 블랙리스트·자원 분류는 주행 엔진(RouteRunner)이 소유한다 — 순찰·수확이 공유하는
         # 상태라, 여기서 따로 들면 '막혔다'는 판정이 두 벌이 된다.
+        # 회피 목록은 '이 로봇이 피해야 할 것'만 본다(전역 막힘 + 내 양보). 남이 양보한
+        # 사정까지 끌어오면, 갈 수 있는데도 '갇혔다'고 오판해 순찰을 접고 복귀해 버린다.
         blocked = (engine.reserved_corridors(exclude_robot=robot_id)
-                   | self.runner._blacklist_active())
+                   | self.runner._blacklist_active(robot_id))
         corridors, nodes = self.runner._split_blocked(engine, blocked)
         for t in targets:
             if t in visited:
