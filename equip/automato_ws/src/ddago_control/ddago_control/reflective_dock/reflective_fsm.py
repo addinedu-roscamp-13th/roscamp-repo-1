@@ -56,6 +56,16 @@ DMAX_MARGIN = 0.03  # 거리가 시작값보다 이만큼 늘면 방향 이상 �
 # ── 공통 ──
 WATCHDOG_SEC = 0.5  # 호출부가 마커 pose 신선도 판정에 쓰는 기준(참고용 기본값)
 MAX_SEC = 60.0      # 도킹 전체 제한시간
+# APPROACH 에 들어온 뒤 '쓸 만한 관측'을 한 번도 못 받은 채 이만큼 지나면 포기한다.
+# 아래 두 판정(마커 상실·β 과대)은 원래 last_good_t 만 기준으로 삼았는데, 그 값은
+# 좋은 관측을 한 번 받아야 세워진다. 그래서 **처음부터 계속 나쁜 값만 오면** 판정이
+# 영영 성립하지 않아 MAX_SEC(60초)를 통째로 정지 상태로 흘려보냈다
+# (2026-08-03 실사고: 마커를 10Hz 로 멀쩡히 보면서 48초를 로그 한 줄 없이 날림).
+APPROACH_STALL_SEC = 3.0
+# |β| 가 이보다 크면 '오검출'이 아니라 **로봇이 마커를 등지지 않았다**는 뜻이다.
+# 후진 도킹이라 마커는 라이다 정면(β≈0)에 와야 하는데, 180° 근처면 마주 보고 있는 것
+# = 사전정렬(SNAP~TURN2)이 헤딩을 반대로 잡은 것이다. 원인이 아주 다르므로 갈라 남긴다.
+FLIP_BETA_DEG = 135.0
 
 # ── Result.result_code (ReflectiveDock.action 주석과 일치) ──
 RC_OK = 0
@@ -69,7 +79,7 @@ _TUNABLE = (
     'SNAP_FRAMES', 'KW', 'KV', 'TURN_TOL_DEG', 'DRIVE_TOL_M', 'MIN_MOVE_M',
     'MAX_MOVE_M', 'WMAX', 'WMIN', 'VMAX', 'VMIN', 'KDIST', 'KBETA', 'KE',
     'SIGN_E', 'MAX_BETA_DEG', 'WCAP', 'SWITCH_M', 'CREEP_V', 'CREEP_MAX',
-    'DMAX_MARGIN', 'MAX_SEC',
+    'DMAX_MARGIN', 'MAX_SEC', 'APPROACH_STALL_SEC', 'FLIP_BETA_DEG',
 )
 
 
@@ -111,6 +121,9 @@ class ReflectiveDockFsm:
         # 후진용
         self.d0 = None
         self.last_good_t = None
+        # APPROACH 에 처음 들어온 시각. 좋은 관측을 아직 한 번도 못 받았을 때
+        # (last_good_t is None) 상실·β과대 판정의 기준으로 쓴다.
+        self.approach_t0 = None
         self.creep_origin = None
         self.creep_dist = 0.0
 
@@ -242,10 +255,19 @@ class ReflectiveDockFsm:
 
     # ---- APPROACH~CREEP (후진) --------------------------------------- #
     def _approach(self, pose, odom, now):
+        if self.approach_t0 is None:
+            self.approach_t0 = now
+
         if pose is None:
             # 한 번이라도 좋은 값을 본 뒤에만 상실 판정(TURN2 직후 재획득 유예).
-            if self.last_good_t is not None and (now - self.last_good_t) > 0.7:
-                return self._finish('마커 상실 — 정지', RC_MARKER_NOT_FOUND)
+            if self.last_good_t is not None:
+                if (now - self.last_good_t) > 0.7:
+                    return self._finish('마커 상실 — 정지', RC_MARKER_NOT_FOUND)
+            elif (now - self.approach_t0) > APPROACH_STALL_SEC:
+                # 좋은 관측이 처음부터 없었다 → 위 판정이 성립하지 않는 경우.
+                return self._finish(
+                    '후진 시작 후 %.1f초간 마커를 못 봄 — 정지' % APPROACH_STALL_SEC,
+                    RC_MARKER_NOT_FOUND)
             return (0.0, 0.0)
 
         x, y, yaw = pose
@@ -255,8 +277,18 @@ class ReflectiveDockFsm:
         tilt = abs(((math.degrees(yaw) - 180.0 + 180.0) % 360.0) - 180.0)
 
         if abs(beta) > math.radians(MAX_BETA_DEG):  # 스퓨리어스 차단
-            if self.last_good_t is not None and (now - self.last_good_t) > 1.0:
-                return self._finish('마커 이상(β 과대) — 정지', RC_MARKER_NOT_FOUND)
+            # 뒤집힘(마주 봄)과 오검출은 원인이 달라 결과코드·문구를 가른다.
+            flipped = abs(beta) > math.radians(FLIP_BETA_DEG)
+            why = ('사전정렬 뒤집힘(로봇이 마커를 마주 봄)' if flipped
+                   else '마커 오검출')
+            msg = 'β=%.0f° 과대 — %s → 정지' % (math.degrees(beta), why)
+            code = RC_ALIGN_FAILED if flipped else RC_MARKER_NOT_FOUND
+            if self.last_good_t is not None:
+                if (now - self.last_good_t) > 1.0:
+                    return self._finish(msg, code)
+            elif (now - self.approach_t0) > APPROACH_STALL_SEC:
+                # 좋은 관측이 처음부터 없었다 → 위 판정이 성립하지 않는 경우.
+                return self._finish(msg, code)
             return (0.0, 0.0)
 
         self.last_good_t = now

@@ -193,3 +193,35 @@ def test_ttl_does_not_expire_while_docking(det):
 
     det._expire_lock(now + 20 * 0.1 + ttl + 0.1)   # 그 뒤 시야에서 사라지면
     assert det.lock is None
+
+
+# ------------------------------------------------- 도킹 시작 알림 리셋 --- #
+def test_dock_start_resets_lock(det):
+    """도킹 시작 알림을 받으면 찜해 둔 목표를 버린다.
+
+    TTL(시간 기반)만으로는 부족했다 — 복귀 주행 도중 잡은 lock 이 도킹 시작까지
+    살아남을 수 있고, 움직이며 본 마커라 옆 충전소이거나 법선이 뒤집혀 있을 수 있다.
+    (2026-08-03 실사고: 도킹 7초 전, 초속 5cm 로 회전 중에 정지 게이트가 폴백으로
+     뚫려 lock 이 잡혔고, 그 값으로 사전정렬이 뒤집혔다.)
+    도킹 시작은 **로봇이 확실히 멈춘 시점**이라 여기서 버리면 제대로 다시 잡는다.
+    """
+    det.odom = (0.0, 0.0, 0.0)
+    _acquire(det, _marker(-0.30, 0.0))
+    assert det.lock is not None
+
+    det.on_lock_reset(None)
+    assert det.lock is None
+    # 딸린 상태도 함께 비워야 한다 — 하나라도 남으면 다음 획득이 옛 값에 끌려간다.
+    assert det.last_target_t is None
+    assert det.acq_world is None and det.acq_count == 0
+    assert det.acq_block_t is None
+
+    # 버린 뒤에는 멈춘 자리에서 새로 잡을 수 있다.
+    _acquire(det, _marker(-0.30, 0.0))
+    assert det.lock is not None
+
+
+def test_dock_start_reset_is_safe_without_lock(det):
+    """lock 이 없을 때 알림이 와도 예외 없이 넘어간다(도킹을 막지 않는다)."""
+    det.on_lock_reset(None)
+    assert det.lock is None
