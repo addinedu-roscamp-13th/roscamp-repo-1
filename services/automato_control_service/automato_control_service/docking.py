@@ -19,6 +19,7 @@
    TTL(RESERVATION_TTL_SEC, 기본 15초)이 만료되는데, 그걸 막는 하트비트만 대신 쳐 준다
    (heartbeat 인자). 무엇을 쥐고 언제 놓을지는 호출부(오케스트레이션)가 정한다.
 """
+import math
 import threading
 import time
 
@@ -116,15 +117,19 @@ def dock(log, task_id, robot_id, task_point_id, method, dock_client,
         log.info(
             f"도킹 시도 {attempt}/{DOCK_RETRY_MAX} task={task_id} {robot_id} "
             f"@ {task_point_id} ({method})")
-        code, msg = _send_dock_goal(log, dock_client, goal, task_id, heartbeat)
+        code, msg, metrics = _send_dock_goal(log, dock_client, goal, task_id, heartbeat)
         last_code, last_msg = code, msg
+        # 오차 요약은 성공·실패 양쪽에 붙인다. 실패(특히 code=2 정차 오차 초과)일 때야말로
+        # 어느 축이 나빴는지가 진단의 전부다.
+        detail = f" | {metrics}" if metrics else ""
         if code == 0:
             log.info(
-                f"도킹 성공 task={task_id} {robot_id} @ {task_point_id} ({method})")
+                f"도킹 성공 task={task_id} {robot_id} @ {task_point_id} ({method})"
+                f"{detail}")
             return True, 0, msg
         log.warn(
             f"도킹 실패(code={code}) task={task_id} "
-            f"시도 {attempt}/{DOCK_RETRY_MAX}: {msg}")
+            f"시도 {attempt}/{DOCK_RETRY_MAX}: {msg}{detail}")
     return False, last_code, last_msg
 
 
@@ -164,8 +169,55 @@ def _build_goal(method, task_id, task_point_id, marker):
     return goal
 
 
+# 오차 축 중 좌우(final_lateral_m)·스큐(final_yaw_error)는 세 액션이 이름을 공유하지만,
+# 거리 축만 이름과 의미가 갈린다. 맞는 것 하나를 찾아 그 라벨로 표시한다.
+_DIST_FIELDS = (
+    ("final_wall_gap_m", "벽간격"),     # FloorDock      — 후면~벽
+    ("final_gap_m", "마커간격"),        # ReflectiveDock — 뒤끝~마커
+    ("final_error_m", "위치오차"),      # Dock(charuco)  — 목표 대비 총 오차
+)
+
+
+def _format_metrics(res):
+    """도킹 Result 의 오차 축을 사람이 읽는 한 줄로. 남길 게 없으면 None.
+
+    로봇 쪽 노드는 이 값을 로그로 남기지 않는다 — ACS 가 안 찍으면 **어디에도 안 남는다**.
+    도킹 정확도(특히 좌우 이탈)는 한 회차만 봐선 편향인지 산포인지 못 가리므로 회차를
+    모을 수 있게 성공·실패 양쪽에 찍는다.
+
+    표시 전용이라 어떤 예외도 도킹을 막지 않게 통째로 감싼다(액션 정의가 바뀌어 필드가
+    사라져도 도킹은 그대로 돌아야 한다).
+    """
+    try:
+        parts = []
+        for field, label in _DIST_FIELDS:
+            val = getattr(res, field, None)
+            if val is not None:
+                parts.append(f"{label} {float(val) * 100:+.1f}cm")
+                break
+        lateral = getattr(res, "final_lateral_m", None)
+        skew = getattr(res, "final_yaw_error", None)
+        if lateral is None or skew is None:
+            pass                      # 두 축이 없는 타입 — 거리 축만 남긴다
+        elif float(lateral) == 0.0 and float(skew) == 0.0:
+            # 로봇은 마커를 한 번도 못 봤거나 각이 신뢰 밖(|b|>90)이면 이 두 축을 아예
+            # 안 채운다(0.0 그대로). '+0.0cm' 로 찍으면 '완벽 정렬' 과 구분이 안 돼
+            # 실패 회차를 오독하게 되므로 미측정임을 명시한다. 실제 계산값(d·sin σ)이
+            # 둘 다 정확히 0.0 으로 떨어지는 일은 사실상 없어 오탐 걱정은 없다.
+            parts.append("좌우·스큐 미측정")
+        else:
+            parts.append(f"중심선이탈 {float(lateral) * 100:+.1f}cm")
+            parts.append(f"스큐 {math.degrees(float(skew)):+.1f}°")
+        return " / ".join(parts) if parts else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _send_dock_goal(log, dock_client, goal, task_id, heartbeat):
-    """Dock Goal 을 한 번 하달하고 결과를 기다린다. 반환: (result_code, message).
+    """Dock Goal 을 한 번 하달하고 결과를 기다린다. 반환: (result_code, message, metrics).
+
+    metrics 는 오차 요약 문자열(없으면 None) — 로그 표시 전용이라 재시도 판정에는 쓰지
+    않는다. 결과를 못 받은 경로(거부·타임아웃)에는 당연히 없다.
 
     Goal 거부/수락 타임아웃은 (1, ...) 로 취급한다 — 마커 미검출(1)과 같은 '재시도
     가능' 등급으로 묶어 상위 재시도 루프가 다시 시도하게 한다.
@@ -190,7 +242,7 @@ def _send_dock_goal(log, dock_client, goal, task_id, heartbeat):
         GOAL_ACCEPT_TIMEOUT_SEC)
     if goal_handle is None or not goal_handle.accepted:
         log.warn(f"Dock Goal 거부/수락 타임아웃 task={task_id}")
-        return 1, "Dock Goal 거부/수락 타임아웃"
+        return 1, "Dock Goal 거부/수락 타임아웃", None
     return _await_dock_result(log, goal_handle.get_result_async(), heartbeat)
 
 
@@ -198,10 +250,11 @@ def _await_dock_result(log, result_future, heartbeat):
     """도킹 결과 대기. 대기 중 HEARTBEAT_SEC 마다 쥔 자리 예약을 갱신한다.
 
     주행(RouteRunner._await_result)과 달리 룩어헤드가 없고 타임아웃이
-    DOCK_RESULT_TIMEOUT_SEC 다. Dock Result 는 (result_code, message) 만 꺼낸다 —
-    오차 축(final_*)은 로봇이 판정·기록하는 값이라 ACS 의 재시도 판정에는 result_code 로
-    충분하다.
-    반환: (result_code, message). 타임아웃/파싱 실패는 (1, ...).
+    DOCK_RESULT_TIMEOUT_SEC 다. **재시도 판정에는 result_code 만** 쓴다 — 오차 축(final_*)
+    이 얼마든 성공은 성공이고, 어느 축이 나빴는지로 재시도를 가르지 않는다.
+    다만 그 오차를 버리면 도킹 정확도가 아무 데도 안 남아(로봇도 안 찍는다) 튜닝할
+    근거가 사라지므로, 판정에는 안 쓰되 로그용으로 함께 꺼낸다.
+    반환: (result_code, message, metrics). 타임아웃/파싱 실패는 (1, ..., None).
     """
     done = threading.Event()
     result_future.add_done_callback(lambda _f: done.set())
@@ -213,9 +266,9 @@ def _await_dock_result(log, result_future, heartbeat):
                 engine.heartbeat(cid, robot_id)
         if time.monotonic() >= deadline:
             log.warn("도킹 결과 대기 타임아웃 → 실패 취급")
-            return 1, "도킹 결과 대기 타임아웃"
+            return 1, "도킹 결과 대기 타임아웃", None
     try:
         res = result_future.result().result
-        return int(res.result_code), str(res.message)
+        return int(res.result_code), str(res.message), _format_metrics(res)
     except Exception:  # noqa: BLE001
-        return 1, "도킹 결과 파싱 실패"
+        return 1, "도킹 결과 파싱 실패", None
