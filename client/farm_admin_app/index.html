@@ -810,7 +810,7 @@ async function loadFarmMini(){
     if(el)el.innerHTML='<div style="display:flex;gap:12px;flex-wrap:wrap">'+col('📝 할 일',g.todo,'#8a9295')+col('🔨 진행 중',g.doing,'#e8912d')+col('✅ 완료',g.done,'#1d8a3e')+'</div>';
   }catch(e){}
 }
-const PATROL_REASON={ROBOT_OFFLINE:'📡 오프라인(응답 없음)',IMMOBILIZED:'🛑 갇힘/정지 — 관리자 개입 필요',CHARGING:'⚡ 충전 중',BATTERY_TOO_LOW:'🔋 배터리 부족',ROBOT_BUSY:'🚧 작업 중',ALREADY_PATROLLING:'🚓 이미 순찰 중(최대 1대)',NO_AVAILABLE_ROBOT:'가능한 로봇 없음'};
+const PATROL_REASON={ROBOT_OFFLINE:'📡 오프라인(응답 없음)',IMMOBILIZED:'⚙ 점검 중',CHARGING:'⚡ 충전 중',BATTERY_TOO_LOW:'🔋 배터리 부족',ROBOT_BUSY:'🚧 작업 중',ALREADY_PATROLLING:'🚓 이미 순찰 중(최대 1대)',NO_AVAILABLE_ROBOT:'가능한 로봇 없음'};
 const WORK_LABEL={PATROLLING:'🚓 순찰 중',HARVESTING:'🍅 수확 중',RESERVED:'📅 예약 작업 중',CHARGING:'⚡ 충전 중',IDLE:'🟢 대기 중'};
 function busyLabel(r){ return (r.unavailable_reason==='ROBOT_BUSY')?(WORK_LABEL[r.status]||'🚧 작업 중'):null; }  // 작업 중이면 무슨 작업인지
 // E0-5 task_type (PATROL/HARVEST/TRANSFER/null) — 받은 값 그대로 라벨링
@@ -826,10 +826,14 @@ function renderAlertBanner(){
   var robots=window._lastRobots||[], crop=window._heatCrop||null;
   var urgent=[], warn=[];
   // 오프라인은 경보로 올리지 않는다 — 로봇 전원을 아직 안 켠 상태에서도 계속 울려
-  //   정작 봐야 할 병해충·갇힘 경보가 묻힌다. 오프라인 여부는 로봇 카드에서 이미 보인다.
+  //   정작 봐야 할 병해충 경보가 묻힌다. 오프라인 여부는 로봇 카드에서 이미 보인다.
+  // ⚠ IMMOBILIZED(현장 정지)는 경보로 올리지 않는다.
+  //   해제 경로(POST /api/v1/robots/{id}/recover)를 구현 범위에서 뺐기 때문에,
+  //   '개입 필요' 라고 띄워도 농장주가 앱에서 할 수 있는 일이 없다.
+  //   해제는 DB 를 직접 고쳐야 하고 그건 관리자(개발자) 몫이다.
+  //   할 수 없는 일을 시키는 빨간 배너는 진짜 경보(병해충)를 묻히게 만든다.
   robots.forEach(function(r){ var u=r.unavailable_reason;
-    if(u==='IMMOBILIZED') urgent.push(r.robot_id+' 갇힘(개입 필요)');
-    else if(u==='BATTERY_TOO_LOW') warn.push(r.robot_id+' 배터리 부족');
+    if(u==='BATTERY_TOO_LOW') warn.push(r.robot_id+' 배터리 부족');
   });
   if(crop){ var tot=(crop.ripe||0)+(crop.unripe||0)+(crop.pest||0)+(crop.rot||0)||1;
     var pest=(crop.pest||0)/tot*100, rot=(crop.rot||0)/tot*100;
@@ -885,7 +889,8 @@ function startFleetLive(){ if(window._fleetRunning) return; window._fleetRunning
 function robotStateBadge(r){
   var u=r.unavailable_reason;
   if(u==='ROBOT_OFFLINE')    return {t:'오프라인',       bg:'#eef0f1', fg:'#5f6469', dot:'⚫'};
-  if(u==='IMMOBILIZED')      return {t:'갇힘 · 개입 필요', bg:'#fbeaea', fg:'#b0392b', dot:'🛑'};
+  // 배정은 여전히 안 된다(ACS 가 거절한다) — 그 사실만 담백하게 알린다.
+  if(u==='IMMOBILIZED')      return {t:'점검 중',          bg:'#eef0f1', fg:'#5f6469', dot:'⚙'};
   if(u==='CHARGING')         return {t:'충전 중',        bg:'#fdf3e0', fg:'#b8791a', dot:'⚡'};
   if(u==='BATTERY_TOO_LOW')  return {t:'배터리 부족',     bg:'#fdeee4', fg:'#c2661f', dot:'🔋'};
   if(r.task_type==='PATROL') return {t:'순찰 중',        bg:'#e6f0fb', fg:'#2f6fd0', dot:'🚓'};
@@ -994,7 +999,7 @@ async function requestPatrol(){
 }
 async function patrolReset(){await fetch('/api/v1/patrol/reset',{method:'POST'});loadPatrol();loadHeat();}
 /* ===== 수확 요청 (로봇팔 필요 · 순찰과 동일 UX) ===== */
-const HARVEST_REASON={ROBOT_OFFLINE:'📡 오프라인(응답 없음)',IMMOBILIZED:'🛑 갇힘/정지 — 관리자 개입 필요',CHARGING:'⚡ 충전 중',NO_ARM:'🦾 로봇팔 없음(수확 불가)',BATTERY_TOO_LOW:'🔋 배터리 부족',ROBOT_BUSY:'🚧 작업 중',ALREADY_HARVESTING:'🍅 이미 수확 중(최대 1대)',HARVEST_IN_PROGRESS:'🍅 수확 진행 중 — 끝나야 요청 가능(전역 1건)',INVALID_HARVEST_LOCATION:'📍 수확 위치가 올바르지 않음',NO_AVAILABLE_ROBOT:'가능한 로봇 없음'};
+const HARVEST_REASON={ROBOT_OFFLINE:'📡 오프라인(응답 없음)',IMMOBILIZED:'⚙ 점검 중',CHARGING:'⚡ 충전 중',NO_ARM:'🦾 로봇팔 없음(수확 불가)',BATTERY_TOO_LOW:'🔋 배터리 부족',ROBOT_BUSY:'🚧 작업 중',ALREADY_HARVESTING:'🍅 이미 수확 중(최대 1대)',HARVEST_IN_PROGRESS:'🍅 수확 진행 중 — 끝나야 요청 가능(전역 1건)',INVALID_HARVEST_LOCATION:'📍 수확 위치가 올바르지 않음',NO_AVAILABLE_ROBOT:'가능한 로봇 없음'};
 let harvestPick='auto', harvestSelId=null;
 // [시나리오2 E1] 수확 위치 — task_points.task_point_id (HARVEST_01 / HARVEST_02 만 가능)
 const HARVEST_LOCS=[{id:'HARVEST_01',name:'🍅 수확구역 1'},{id:'HARVEST_02',name:'🍅 수확구역 2'}];
@@ -1089,12 +1094,13 @@ async function loadHeat(){
     const d=await(await fetch('/api/heatmap?t='+Date.now())).json();
     // awaiting_patrol = 실연동인데 아직 순찰 검출이 없음 → 이전 값도 비운다(시드가 남지 않게)
     window._heatAwaiting=!!d.awaiting_patrol;
-    if(d.awaiting_patrol){ window._heatDens=null; window._heatCrop=null; }
+    if(d.awaiting_patrol){ window._heatDens=null; window._heatCrop=null; window._heatByWp=null; }
     else{
       // 밀집도는 ACS 검출 콜백의 '웨이포인트별 익음 비율' 로 만든다.
       // pillars 를 직접 보내주는 서비스가 없어서(AI 는 웨이포인트 단위로만 낸다),
       // 각 웨이포인트를 가장 가까운 베드에 묶고 그 평균을 그 베드의 밀집도로 쓴다.
       // → 익음이 많은 베드는 진하게, 적은 베드는 옅게 자동으로 칠해진다.
+      window._heatByWp=d.by_waypoint||null;      // 촬영점별 원본 — 열지도는 이걸로 그린다
       var dens=bedDensityFromWaypoints(d.by_waypoint);
       if(dens) window._heatDens=dens;
       else if(Array.isArray(d.pillars)) window._heatDens=d.pillars;   // 누가 pillars 를 보내주면 그걸 우선
@@ -1584,19 +1590,14 @@ function buildFarmScene(){
     var lb=farmLabelSprite(THREE,'⚡ DG'+(i+1),'rgba(20,60,110,.94)'); lb.scale.set(1.5,0.5,1); lb.position.set(s.x,1.0,s.z); scene.add(lb);
   });
   // (D435 카메라는 각 Pinky 우측에 부착 — makePinky)
-  // ===== 실측 waypoint 마커 + 통로(corridor) =====
-  // 순찰점끼리 직선으로 잇지 않는다 — 실제 로봇은 통로(links)를 따라가므로, 촬영 순서대로
-  // 직선을 그으면 베드를 관통하는 없는 길이 생긴다. 순서는 라벨의 (n) 으로만 표시한다.
+  /* 웨이포인트·통로선은 **화면에 그리지 않는다.**
+     농장주에게 필요한 건 '로봇이 어디 있나' 지 '내부 경로 그래프' 가 아니다.
+     노드 21개 + 링크 23개를 다 그리면 지도가 온통 초록 링과 라벨로 덮여 로봇이 묻힌다.
+     좌표(F.waypoints / F.links)는 그대로 둔다 — 히트맵 좌표 변환·순찰 시뮬레이션에 계속 쓴다.
+     로봇 위치는 텔레메트리로 실시간 표시된다(그건 유지). */
   var patrolWps=F.waypoints.filter(function(w){return w.ord;})
                            .sort(function(a,b){return a.ord-b.ord;});
-  F.waypoints.forEach(function(w){
-    var dock=!!w.gate, col=dock?0x2f7fd6:0x1f9d55, dotc=dock?0x5aa9f0:0x14c46a;
-    var ring=new THREE.Mesh(new THREE.TorusGeometry(0.34,0.06,8,22),new THREE.MeshLambertMaterial({color:col})); ring.rotation.x=Math.PI/2; ring.position.set(w.x,0.06,w.z); scene.add(ring);
-    var dot=new THREE.Mesh(new THREE.CylinderGeometry(0.12,0.12,0.05,12),new THREE.MeshLambertMaterial({color:dotc})); dot.position.set(w.x,0.06,w.z); scene.add(dot);
-    var txt='WP'+w.id+(w.ord?' ('+w.ord+')':'')+(dock?' · '+w.gate:'');
-    var lb=farmLabelSprite(THREE,txt,dock?'rgba(30,90,180,.94)':'rgba(20,120,70,.92)'); lb.scale.set(dock?1.9:1.35,0.46,1); lb.position.set(w.x,0.98,w.z); scene.add(lb);
-  });
-  (F.links||[]).forEach(function(lk){ var a=F.waypoints.find(function(w){return w.id===lk[0];}), b=F.waypoints.find(function(w){return w.id===lk[1];}); if(a&&b){ var ln=new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(a.x,0.12,a.z),new THREE.Vector3(b.x,0.12,b.z)]),new THREE.LineDashedMaterial({color:0x1f9d55,dashSize:0.4,gapSize:0.28})); ln.computeLineDistances(); scene.add(ln); } });
+
   // ===== Pinky 3대 (dg_01/02/03) =====
   function makePinky(col){
     var g=new THREE.Group();
@@ -1669,6 +1670,8 @@ function buildFarmScene(){
   }
   animate();
   window.addEventListener('resize',function(){ if(!document.getElementById('farm3d'))return; var w=host.clientWidth,h=host.clientHeight; camera.aspect=w/h;camera.updateProjectionMatrix();renderer.setSize(w,h);});
+  // 히트맵 캔버스도 카드 폭에 다시 맞춘다(창 크기가 바뀌면 카드 폭이 달라진다)
+  window.addEventListener('resize',function(){ try{ if(document.getElementById('farmHeat')) drawFarmHeat(); }catch(e){} });
 }
 var battTimer=null;
 function startBattTimer(){if(battTimer)clearInterval(battTimer);battTimer=setInterval(function(){if(document.getElementById('battBox'))loadBatt();else{clearInterval(battTimer);battTimer=null;}},1000);}
@@ -1710,8 +1713,10 @@ function renderFarm(v){
     <div class="grid g2" style="margin-bottom:6px;align-items:stretch">
       <div class="card" style="padding:12px 16px;display:flex;flex-direction:column">
         <div style="margin-bottom:8px"><h3 style="margin:0">완숙 밀집 히트맵</h3></div>
-        <div style="border-radius:12px;overflow:hidden;border:1px solid var(--line);background:#eef2f5;height:308px;display:flex;align-items:center;justify-content:center">
-          <canvas id="farmHeat" width="300" height="360" style="width:306px;height:368px;transform:rotate(90deg);border-radius:8px"></canvas>
+        <!-- 높이만 고정하고 폭은 카드에 맡긴다. 캔버스 크기는 fitHeatCanvas() 가 잡는다.
+             300×360 으로 박아두면 넓은 카드에서 양옆이 크게 남는다. -->
+        <div style="border-radius:12px;overflow:hidden;border:1px solid var(--line);background:#eef2f5;height:360px;display:flex;align-items:center;justify-content:center">
+          <canvas id="farmHeat" width="300" height="360" style="transform:rotate(90deg);border-radius:8px"></canvas>
         </div>
         <div id="harvestBar">${reqBar('harvest')}</div>
       </div>
@@ -1787,8 +1792,26 @@ function heatCells(){
   return out;
 }
 /* 3D 맵과 동일 배치를 위에서 본 2D 평면 히트맵 */
+/* 캔버스를 카드 폭에 맞춘다.
+   CSS 90° 회전 때문에 화면 가로 = 캔버스 세로, 화면 세로 = 캔버스 가로가 된다.
+   그래서 canvas.height ← 컨테이너 가로, canvas.width ← 컨테이너 세로 로 넣는다.
+   고정 크기로 두면 넓은 카드에서 양옆이 크게 남는다.
+   덤으로 비율도 정확해진다 — 그리기(sx/sy)가 VX:VZ(≈0.45)로 늘리는데
+   고정값 300:360=0.83 은 가로로 크게 늘어난 상태였다. */
+function fitHeatCanvas(){
+  var cv=document.getElementById('farmHeat'); if(!cv)return false;
+  var box=cv.parentElement; if(!box)return false;
+  var bw=Math.round(box.clientWidth), bh=Math.round(box.clientHeight);
+  if(bw<40||bh<40) return false;
+  var w=bh, h=bw;                                   // 회전 보정
+  if(cv.width===w && cv.height===h) return false;   // 안 바뀌었으면 다시 안 그린다
+  cv.width=w; cv.height=h;
+  cv.style.width=w+'px'; cv.style.height=h+'px';
+  return true;
+}
 function drawFarmHeat(){
   var cv=document.getElementById('farmHeat'); if(!cv)return;
+  fitHeatCanvas();
   var F=FARM, g=cv.getContext('2d'), CW=cv.width, CH=cv.height, pad=22;
   function T(t,x,y){ g.save(); g.translate(x,y); g.rotate(-Math.PI/2); g.fillText(t,0,0); g.restore(); }   // CSS 90° 회전 상쇄 → 라벨 똑바로
   // 보이는 범위는 맵(±HX/±HZ)보다 조금 넓게 잡는다 — 로봇팔·덩굴·하단 벽이 맵 경계 바깥에
@@ -1820,44 +1843,41 @@ function drawFarmHeat(){
   // 밀집 히트(재배 베드 주변, 부드러운 열지도 빨강→주황→노랑→연두)
   // 순찰 검출이 아직 없으면(_heatAwaiting) 열지도를 아예 그리지 않는다 — 시드 밀집도를
   // 칠해두면 스캔한 적도 없는 구역이 '완숙 밀집'으로 보인다.
-  var dens=window._heatDens;
-  // 열지도는 밭 안쪽으로 잘라낸다 — 구버전은 반경 배수가 커서(3.0) 벽 밖으로 번져
-  // 패널 배경까지 물들었고, 그게 '난잡함' 의 큰 부분이었다.
+  /* ══ 열지도 = 촬영점 단위 ══
+     로봇은 순찰 촬영점(ord 가 붙은 노드)에서만 사진을 찍는다. 지금 10곳이고,
+     통로를 사이에 두고 쌍을 이룬다: 12·9 / 13·10 / 14·11 / 5·6 / 1·2.
+     그러니 색도 **촬영점마다 따로** 나와야 한다 — 12번이 익었고 9번이 안 익었으면
+     두 곳의 색이 달라야 한다.
+
+     구버전은 촬영값을 '가장 가까운 베드' 로 묶어 평균낸 뒤 베드 하나당 큰 타원 하나를
+     칠했다(3덩어리). 그러면 한 지점만 익어도 베드 전체가 물들고 쌍끼리의 차이가 사라진다.
+     실제로 본 곳만, 본 만큼 칠한다. */
+  var byWp=window._heatByWp;
   g.save();
   g.beginPath(); g.rect(sx(-F.HX),sy(-F.HZ),sw(F.HX*2),sh(F.HZ*2)); g.clip();
-  F.pillars.forEach(dens?function(p,i){
-    var d=dens[i];
-    if(typeof d!=='number') return;             // 그 베드는 아직 촬영 안 됨 → 안 칠한다
-    var lenX=p.face==='x'?p.w:p.d, lenZ=p.face==='x'?p.d:p.w;
-    var rx=sw(lenX)*0.85, ry=sh(lenZ)*0.62;      // 베드를 감싸는 정도의 헤일로
-    var cx=sx(p.x), cy=sy(p.z), R=Math.max(rx,ry);
-    g.save(); g.translate(cx,cy);
-    var grd=g.createRadialGradient(0,0,2,0,0,R);
-    grd.addColorStop(0,'rgba(214,28,20,'+(0.9*d)+')');
-    grd.addColorStop(0.3,'rgba(236,96,36,'+(0.64*d)+')');
-    grd.addColorStop(0.58,'rgba(250,190,55,'+(0.42*d)+')');
-    grd.addColorStop(0.8,'rgba(180,214,90,'+(0.2*d)+')');
-    grd.addColorStop(1,'rgba(150,205,110,0)');
-    g.fillStyle=grd; g.beginPath(); g.ellipse(0,0,rx,ry,0,0,7); g.fill(); g.restore();
-  }:function(){});
-  g.restore();                                   // 클립 해제 — 로봇팔은 맵 바깥이라 잘리면 안 된다
-  // 로봇팔 위(맵 바깥) 방울토마토 덩굴의 밀집.
-  // ⚠ 구버전은 d=0.92 하드코딩이라 검출 데이터가 없어도 빨갛게 칠했다(데모 잔재).
-  //   실제 검출값이 있을 때만, 베드 밀집도의 평균으로 그린다.
-  var known=(dens||[]).filter(function(v){return typeof v==='number';});
-  if(known.length){
-    var davg=known.reduce(function(s,v){return s+v;},0)/known.length;   // 촬영된 베드만 평균
-    F.arms.forEach(function(a){
-      var cx=sx(a.x), cy=sy(a.z), rx=Math.max(26,sw(1.6)), ry=15;
-      g.save(); g.translate(cx,cy);
-      var grd=g.createRadialGradient(0,0,2,0,0,Math.max(rx,ry));
-      grd.addColorStop(0,'rgba(214,28,20,'+(0.85*davg)+')');
-      grd.addColorStop(0.4,'rgba(236,96,36,'+(0.55*davg)+')');
-      grd.addColorStop(0.72,'rgba(250,190,55,'+(0.32*davg)+')');
-      grd.addColorStop(1,'rgba(150,205,110,0)');
+  if(byWp){
+    Object.keys(byWp).forEach(function(id){
+      var w=F.waypoints.find(function(v){return String(v.id)===String(id);});
+      var rec=byWp[id];
+      if(!w||!rec||typeof rec.ripe!=='number') return;      // 안 찍힌 곳은 건너뛴다
+      var d=Math.max(0,Math.min(1,rec.ripe/100));
+      if(d<=0) return;
+      var rx=sw(1.55), ry=sh(1.55), R=Math.max(rx,ry);
+      g.save(); g.translate(sx(w.x),sy(w.z));
+      var grd=g.createRadialGradient(0,0,2,0,0,R);
+      grd.addColorStop(0,   'rgba(214,28,20,'+(0.90*d)+')');
+      grd.addColorStop(0.30,'rgba(236,96,36,'+(0.64*d)+')');
+      grd.addColorStop(0.58,'rgba(250,190,55,'+(0.42*d)+')');
+      grd.addColorStop(0.80,'rgba(180,214,90,'+(0.20*d)+')');
+      grd.addColorStop(1,   'rgba(150,205,110,0)');
       g.fillStyle=grd; g.beginPath(); g.ellipse(0,0,rx,ry,0,0,7); g.fill(); g.restore();
     });
   }
+  g.restore();
+  // ⚠ 로봇팔(수확대) 자리에는 열지도를 **칠하지 않는다.**
+  //   dg_03 은 순찰 웨이포인트만 돈다. 로봇팔 줄은 맵 경계 바깥이라 카메라가 본 적이 없다.
+  //   관측한 적 없는 구역을 관측한 것처럼 보여주면 안 된다(2026-08-03 지적).
+
   // 외벽 — 위·좌·우는 통짜, 아래쪽은 F.wallBars 로 따로 그린다(가운데가 뚫려 있으므로
   // strokeRect 로 사각형을 닫아버리면 개방부가 벽으로 메워져 보인다).
   g.strokeStyle=C.line; g.lineWidth=3; g.lineCap='butt';
@@ -1872,20 +1892,9 @@ function drawFarmHeat(){
     g.fillStyle=C.fill; g.fillRect(x,y,sw(lenX),sh(lenZ));
     g.strokeStyle=C.line; g.lineWidth=1.5; g.strokeRect(x,y,sw(lenX),sh(lenZ));
   });
-  // 통로(corridor) = 로봇이 실제로 다니는 길. 순찰점끼리 직선으로 잇지 않는다(없는 길이 생긴다).
-  g.strokeStyle=C.soft; g.lineWidth=1.5; g.setLineDash([4,4]);
-  (F.links||[]).forEach(function(lk){
-    var a=F.waypoints.find(function(w){return w.id===lk[0];}), b=F.waypoints.find(function(w){return w.id===lk[1];});
-    if(a&&b){ g.beginPath(); g.moveTo(sx(a.x),sy(a.z)); g.lineTo(sx(b.x),sy(b.z)); g.stroke(); }
-  });
-  g.setLineDash([]);
-  // waypoint 마커 — 시설 진입은 무채색 파랑 한 톤, 순찰점은 진회색, 경유점은 옅은 회색.
-  g.textAlign='center'; g.textBaseline='middle';
-  F.waypoints.forEach(function(w){ var X=sx(w.x),Y=sy(w.z);
-    g.fillStyle=w.gate?C.fac:(w.ord?C.nodeOn:C.node);
-    g.beginPath(); g.arc(X,Y,6.5,0,7); g.fill();
-    g.fillStyle='#fff'; g.font='bold 8.5px sans-serif'; T(w.id,X,Y);
-    if(w.ord){ var o=offUpRight(X,Y,11); g.fillStyle=C.txt; g.font='bold 8.5px sans-serif'; T('('+w.ord+')',o[0],o[1]); } });
+  // 웨이포인트 마커·통로선은 그리지 않는다(3D 와 같은 이유 — 위 주석 참고).
+  // 히트맵은 촬영점 위치에 색으로만 나타난다. 번호와 링크선이 겹치면 그 색이 안 읽힌다.
+
   // ★ 하단 외벽 — 두 토막. 가운데 42cm 는 뚫려 있다(로봇팔 2대 사이 = 수확물 인수 공간).
   g.strokeStyle=C.line; g.lineWidth=3;
   (F.wallBars||[]).forEach(function(wb){ var wy=sy(wb.z);
@@ -2178,7 +2187,9 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
         ripe:e.ripe_percent,unripe:e.unripe_percent,rotten:e.rotten_percent,disease:e.disease_percent};
       window.renderPatrolLive();
       if(!wasLive){ try{loadPatrol();}catch(_){} }   // 순찰 시작 → 순찰 화면(양 탭) 즉시 '요청 불가'로
-      dashRefresh('patrol_progress');                // 검출 올 때마다 히트맵·작물 % 반영
+      // ⚠ 검출마다 화면을 바꾸지 않는다. 순찰 도중 숫자가 계속 흔들리면
+      //   농장주가 어느 값을 믿어야 할지 알 수 없다(2026-08-03 결정).
+      //   서버도 pending 에만 쌓고 patrol_completed 에서 평균을 확정한다.
     } else if(e.event==='disease_alert'){
       var msg='병해충 발견 · '+val(e.robot_id,'로봇')+' · WP'+val(e.waypoint_id)+' · '+num(e.disease_percent)+'%';
       // image_path 는 ACS 가 준 값이다. 속성값에 그대로 넣으면 따옴표를 닫고 onload= 를 주입할 수 있어
@@ -2221,7 +2232,7 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
         remaining:e.remaining_in_round};
       window.renderHarvestLive();
       if(!wasH){ try{loadHarvest();}catch(_){} }    // 수확 시작 → 요청 화면 '요청 불가'로
-      dashRefresh('harvest_progress');
+
     } else if(e.event==='harvest_completed'){
       dashRefresh('harvest_completed');   // ⚠ 이 줄을 '별도 분기'로 앞에 두면 아래 처리가 통째로 죽는다
       // [시나리오2 E6-3] exit_reason 별 문구 3종 (스펙 표 그대로)

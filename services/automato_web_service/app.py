@@ -1359,7 +1359,7 @@ def internal_detections_notify():
                  "ripe_percent": d.get("ripe_percent"), "unripe_percent": d.get("unripe_percent"),
                  "rotten_percent": d.get("rotten_percent"), "disease_percent": d.get("disease_percent"),
                  "detected_at": d.get("detected_at")})
-    _apply_detection_to_heat(d)      # '작물 상태' 카드에 반영 (구버전은 받고 버렸다)
+    _apply_detection_to_heat(d)      # 누적 버퍼에만 쌓는다 — 화면 반영은 순찰 완료 시
     return jsonify({"success": True})
 
 
@@ -1369,6 +1369,7 @@ def internal_patrol_completed():
     d = body()
     wlog("◀ ACS 콜백: 순찰 완료 task_id=%s robot=%s → App patrol_completed 푸시 + 텔레그램" % (
         d.get("task_id"), d.get("robot_id")))
+    _commit_heat_on_patrol_completed(d)   # 방문 웨이포인트 평균을 확정 → 이제야 화면이 바뀐다
     ev = _push_event({"event": "patrol_completed", "task_id": d.get("task_id"),
                       "robot_id": d.get("robot_id"),
                       "status": d.get("status", "COMPLETED"),                      # 스펙 E2-9-1/10
@@ -1775,7 +1776,7 @@ def post_harvest_stats():
 HEAT_FILE = os.path.join(BASE, "heat.json")
 HEAT_DEFAULT = {"pillars": [0.95, 0.90, 0.72],                 # 기둥(재배 베드) 3곳 밀집도 0~1
                 "crop": {"ripe": 342, "unripe": 588, "pest": 47, "rot": 23},
-                "patrol_count": 0, "updated_at": None}
+                "patrol_count": 0, "updated_at": None, "pending": {}}
 
 
 def load_heat():
@@ -1795,12 +1796,20 @@ def save_heat(d):
 
 
 def _apply_detection_to_heat(d):
-    """E2-9 검출 콜백(ACS→Web)의 작물 비율을 '작물 상태' 카드에 반영한다.
+    """E2-9 검출 콜백(ACS→Web)을 **누적 버퍼**에 쌓는다. 화면에는 아직 반영하지 않는다.
 
-       콜백은 퍼센트(ripe/unripe/rotten/disease)로 오고 heat.json 은 개수로 저장한다.
-       화면은 개수의 합으로 비율을 다시 계산하므로, 1000 스케일 개수로 환산하면
-       화면 비율 = 콜백 퍼센트가 그대로 된다.
-       ⚠ 값이 하나도 없는 콜백이면 아무것도 덮어쓰지 않는다(0% 로 지워버리지 않도록)."""
+       [왜 즉시 반영하지 않나]
+       구버전은 crop[name] = 이번 웨이포인트 값 으로 **덮어썼다.** 그래서
+       WP1 → WP2 로 넘어가면 WP1 결과가 사라지고 WP2 값만 남았다. 순찰이 끝나면
+       마지막 웨이포인트 하나의 값이 '농장 전체 작물 상태' 로 표시됐다.
+       올바른 값은 **방문한 웨이포인트 전체의 평균**이다.
+
+       [왜 완료 시점에 커밋하나]
+       순찰 도중에 숫자가 계속 흔들리면 농장주가 어느 값을 믿어야 할지 알 수 없다.
+       그래서 도는 동안은 pending 에만 쌓고, patrol_completed 에서 한 번에 평균을 내
+       crop/by_waypoint 로 커밋한다. 그 전까지 화면은 **직전 순찰 결과**를 그대로 유지한다.
+
+       task_id 가 바뀌면 새 순찰이므로 버퍼를 비운다(이전 순찰 값이 섞이지 않게)."""
     keys = (("ripe", "ripe_percent"), ("unripe", "unripe_percent"),
             ("rot", "rotten_percent"), ("pest", "disease_percent"))
     pcts = {}
@@ -1811,25 +1820,53 @@ def _apply_detection_to_heat(d):
     if not pcts:
         return
     wp = d.get("waypoint_id")
+    if wp is None:
+        return
+    task_id = d.get("task_id")
     with LOCK:
         h = load_heat()
-        crop = dict(h.get("crop", HEAT_DEFAULT["crop"]))
-        for name, v in pcts.items():
-            crop[name] = int(round(v * 10))          # % → 1000 스케일 개수
-        h["crop"] = crop
-        # 웨이포인트별 익음 비율도 남긴다. 밀집 히트맵은 '어디가 많은가' 를 보여줘야 하므로
-        # 전체 비율 하나로는 못 그린다. 화면(FARM 지오메트리를 아는 쪽)이 이 값을 베드별로
-        # 묶어 밀집도를 만든다. pillars 를 보내주는 서비스가 따로 없어서 이 경로가 유일하다.
-        if wp is not None and isinstance(d.get("ripe_percent"), (int, float)):
-            byw = dict(h.get("by_waypoint") or {})
-            byw[str(wp)] = {"ripe": float(d["ripe_percent"]),
-                            "at": time.strftime("%m/%d %H:%M:%S")}
-            h["by_waypoint"] = byw
+        pend = h.get("pending") or {}
+        if pend.get("task_id") != task_id:            # 새 순찰 → 버퍼 초기화
+            pend = {"task_id": task_id, "waypoints": {}}
+        wps = dict(pend.get("waypoints") or {})
+        wps[str(wp)] = {"ripe": pcts.get("ripe", 0.0), "unripe": pcts.get("unripe", 0.0),
+                        "rot": pcts.get("rot", 0.0), "pest": pcts.get("pest", 0.0),
+                        "at": time.strftime("%m/%d %H:%M:%S")}
+        pend["waypoints"] = wps
+        h["pending"] = pend
+        save_heat(h)
+
+
+def _commit_heat_on_patrol_completed(d):
+    """순찰 완료 → 누적 버퍼를 **방문 웨이포인트 평균**으로 확정해 화면에 반영한다.
+
+       평균은 방문한 지점 수로 나눈다(안 간 곳은 계산에 안 들어간다).
+       버퍼가 비어 있으면(검출 콜백이 하나도 안 왔으면) 화면을 건드리지 않는다 —
+       0% 로 지워버리면 직전 순찰 결과까지 잃는다."""
+    with LOCK:
+        h = load_heat()
+        pend = h.get("pending") or {}
+        wps = pend.get("waypoints") or {}
+        if not wps:
+            return
+        n = len(wps)
+        avg = {}
+        for name in ("ripe", "unripe", "rot", "pest"):
+            avg[name] = sum(float(v.get(name) or 0.0) for v in wps.values()) / n
+        # heat.json 은 개수로 저장하고 화면이 합으로 비율을 다시 낸다.
+        # 1000 스케일로 넣으면 화면 비율 = 평균 퍼센트가 그대로 된다.
+        h["crop"] = {name: int(round(v * 10)) for name, v in avg.items()}
+        # 밀집 히트맵용 — 방문한 웨이포인트의 익음 비율만 남긴다(안 간 곳은 없음 그대로).
+        h["by_waypoint"] = {k: {"ripe": float(v.get("ripe") or 0.0), "at": v.get("at")}
+                            for k, v in wps.items()}
         h["patrol_count"] = h.get("patrol_count", 0) + 1
         h["updated_at"] = time.strftime("%m/%d %H:%M")
         h["source"] = "acs"
+        h["pending"] = {}
         save_heat(h)
-    wlog("  ↳ 작물 상태 갱신(ACS 검출 WP%s): %s" % (wp, ", ".join("%s %.1f%%" % (k, v) for k, v in pcts.items())))
+        wlog("   작물 상태 확정: 웨이포인트 %d곳 평균 → 익음 %.1f%% 병해충 %.1f%%"
+             % (n, avg["ripe"], avg["pest"]))
+
 
 
 def _evolve_heat():
