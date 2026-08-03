@@ -188,6 +188,10 @@
   .mb-tabs>div span:first-child{font-size:16px}
   .mb-tabs>div.on{color:var(--sc-accentT);font-weight:700}
   .mb-segwrap{display:flex;justify-content:center;gap:8px;padding:14px 0 4px;flex-wrap:wrap}
+  /* 372px 폭이라 데스크톱 배너 글자(15.5px)는 넘친다 */
+  .mb-scroll #alertBanner>div{font-size:12.5px !important;padding:11px 13px !important;border-radius:14px !important}
+  .mb-card .sc-maplegend{flex-wrap:wrap;gap:8px;font-size:10.5px}
+  .mb-card .sc-legend{gap:5px}
   /* 실제 폰(좁은 화면)에서는 베젤을 벗긴다 — README: "실제 구현엔 베젤 불필요".
      데스크톱에서 '모바일 미리보기' 로 볼 때만 폰처럼 보이면 된다. */
   @media(max-width:520px){
@@ -1398,9 +1402,13 @@ function mbGo(tab){
   // 탭이 바뀌면 DOM 이 통째로 새로 그려진다 → 화면을 채우는 렌더를 전부 다시 태운다.
   // (이걸 빠뜨리면 '불러오는 중…' 과 '--:--' 에서 멈춘다)
   try{ renderMbTop(); }catch(e){}                 // 상단 시계·연결·배터리·병해충 pill
+  try{ renderAlertBanner(); }catch(e){}           // 경고 배너(탭마다 다시 채운다)
   try{ renderFleet(); }catch(e){}                 // 액션 카드 + 로봇 상태
   try{ renderCropCard(); }catch(e){}              // 작물 상태(이미 받아둔 값으로 즉시)
+  try{ renderHeatSummary(); }catch(e){}           // 히트맵 요약행(베드 1/2/3)
+  try{ renderRobotPosList(); }catch(e){}          // 3D 아래 로봇 위치행
   try{ renderMbWeekly(); }catch(e){}              // 수확 실적
+  try{ if(document.getElementById('farmHeat')) drawFarmHeat(); }catch(e){}
   try{ startFleetLive(); }catch(e){}
   try{ if(document.getElementById('farm3d')) initFarm3D(); }catch(e){}
   try{ if(document.getElementById('farmHeat')) loadHeat(); }catch(e){}
@@ -1423,7 +1431,11 @@ function mbTitle(){
 function mbHeatCard(){
   return '<div class="mb-card">'
     +'<div class="mb-ch"><div class="mb-ct">완숙 밀집 히트맵</div>'
-    +'<div class="mono" style="font-size:10.5px;color:var(--sc-mut)" id="heatSub">스캔 대기</div></div>'
+    // 데스크톱과 같은 LOW—HIGH 범례. 색이 뭘 뜻하는지 없으면 히트맵을 읽을 수 없다.
+    +'<div class="sc-legend" style="gap:5px">'
+      +'<span class="sc-legend-t">LOW</span><span class="sc-legend-bar" style="width:44px"></span>'
+      +'<span class="sc-legend-t">HIGH</span></div></div>'
+    +'<div class="mono" style="font-size:10.5px;color:var(--sc-mut);margin:-6px 0 10px" id="heatSub">스캔 대기</div>'
     +'<div class="sc-inner" style="height:250px;display:flex;align-items:center;justify-content:center;padding:0;overflow:hidden">'
     +'<canvas id="farmHeat" width="356" height="660" style="transform:rotate(90deg);border-radius:10px"></canvas></div>'
     +'<div id="heatSummary" class="sc-rows" style="margin-top:10px"></div></div>';
@@ -1435,7 +1447,12 @@ function mb3dCard(){
     +'<div style="position:relative;height:186px;border-radius:15px;overflow:hidden;background:var(--sc-inner2)">'
       +'<div id="farm3d" style="width:100%;height:186px;touch-action:none;cursor:grab"></div>'
       +'<div id="farm3dLoad" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--sc-mut2);font-size:12.5px;font-weight:600">3D 지도 불러오는 중…</div></div>'
-    +'<div id="robotPosList" class="mb-rows" style="margin-top:12px"></div></div>';
+    // 데스크톱과 같은 범례 — 점 색이 뭘 뜻하는지 알아야 로봇을 구분한다.
+    +'<div class="sc-maplegend" style="margin-top:10px;font-size:10.5px">'
+      +'<span><i class="d" style="background:var(--sc-lime)"></i>수확 로봇</span>'
+      +'<span><i class="d" style="background:var(--sc-blueT)"></i>순찰 · 운반</span>'
+      +'<span><i class="s"></i>도킹 스테이션</span></div>'
+    +'<div id="robotPosList" class="mb-rows" style="margin-top:10px"></div></div>';
 }
 function mbWeeklyCard(){
   return '<div class="mb-card" id="mbWeekly">수확 실적 불러오는 중…</div>';
@@ -1506,6 +1523,9 @@ function mobileDashHTML(){
       +'<div id="mbPill"></div></div>'
     +'<div class="mb-scroll">'
       +'<div id="reqScreen" style="display:none"></div>'
+      // 경고 배너 — 데스크톱에는 있는데 모바일엔 없었다. 상단 pill 은 병해충만 보여주므로
+      // 썩음·배터리 부족 같은 다른 경보가 모바일에서만 안 보이는 상태였다.
+      +'<div id="alertBanner" style="margin-bottom:2px"></div>'
       +'<div id="dashBody" style="display:flex;flex-direction:column;gap:14px">'
         +mobileTabBody()
       +'</div>'
