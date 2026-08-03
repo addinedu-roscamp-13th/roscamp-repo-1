@@ -736,22 +736,25 @@ class NavigateServer(Node):
           ① 너무 작으면(min) 안 한다 — 괜히 움직이지 않는다.
           ② 너무 크면(max) 안 한다 — 그 정도면 경로·좌표 쪽 문제라 미는 게 위험하다.
           ③ 주변이 좁으면(clear) 안 한다 — 회전하다 벽에 닿는 것이 오차보다 나쁘다.
+
+        실제로 움직였으면 True, 한 가지 이유로든 건너뛰었으면 False 를 돌려준다.
+        호출부가 이 값을 봐야 하는 이유는 _refine 쪽 주석에 적었다.
         """
         if not bool(self.get_parameter('refine_lateral').value):
-            return
+            return False
         e = self._error(target)
         if e is None:
-            return
+            return False
         lat = e[1]
         lo = float(self.get_parameter('refine_lat_min_m').value)
         hi = float(self.get_parameter('refine_lat_max_m').value)
         if abs(lat) < lo:
-            return
+            return False
         if abs(lat) > hi:
             self.get_logger().warn(
                 f'waypoint={wid} 옆 오차 {lat * 100:+.1f}cm 가 한계 '
                 f'{hi * 100:.0f}cm 초과 → 횡보정 생략. 좌표·경로 점검 필요')
-            return
+            return False
         need = float(self.get_parameter('refine_lat_clear_m').value)
         clear = self._scan_clearance()
         if clear is not None and clear < need:
@@ -759,7 +762,7 @@ class NavigateServer(Node):
                 f'waypoint={wid} 옆 오차 {lat * 100:+.1f}cm 이나 주변 여유 '
                 f'{clear * 100:.0f}cm < {need * 100:.0f}cm → 횡보정 생략'
                 f'(여기서 돌면 닿는다)')
-            return
+            return False
         # lat 이 +면 목표가 왼쪽에 있다 → 왼쪽(+90°)으로 돌아 그만큼 전진한 뒤 되돌아온다.
         turn = math.pi / 2.0 if lat > 0 else -math.pi / 2.0
         self.get_logger().info(
@@ -768,6 +771,7 @@ class NavigateServer(Node):
         self._nudge_ang(turn)
         self._nudge_lin(abs(lat))
         self._nudge_ang(-turn)
+        return True
 
     def _refine(self, wp):
         """촬영·정렬(hold_yaw) 지점에서 목표 좌표·yaw 로 좁힌다. 보정 전/후 오차를 로그로.
@@ -814,11 +818,19 @@ class NavigateServer(Node):
             self._nudge_ang(e[2])
 
         # 앞뒤·방향을 맞춘 뒤에 옆을 잡는다(순서가 중요하다 — 방향이 틀어진 상태에서
-        # 옆으로 옮기면 '옆'의 기준 자체가 어긋난다). 꺼져 있으면 즉시 반환한다.
-        self._lateral_fix(target, wid)
-        e = self._error(target)      # 횡보정의 회전 2회 뒤 방향을 다시 여민다
-        if e is not None and abs(e[2]) > self._tol_ang:
-            self._nudge_ang(e[2])
+        # 옆으로 옮기면 '옆'의 기준 자체가 어긋난다).
+        #
+        # 마무리 회전은 **횡보정을 실제로 했을 때만** 한다. 조건 없이 돌리면 바로 위
+        # 회전이 목표를 지나쳐 멈춘 것(_nudge_ang 은 지나치면 되돌리지 않고 멈춘다)을
+        # 곧바로 반대로 되돌리게 되고, 그 되돌림이 또 지나쳐 좌우 헌팅이 된다.
+        # _nudge_ang 의 헌팅 방지는 '한 번의 호출 안'에서만 성립하므로, 호출을 하나
+        # 더 붙이는 순간 무력해진다.
+        # (2026-08-03 현장: wp5 에서 제자리 미세 진동 → 벽 쪽으로 밀려 서서 wp6 로
+        #  가는 경로가 안 나옴 → 구간 종료로 wp6 촬영까지 통째로 건너뛰었다.)
+        if self._lateral_fix(target, wid):
+            e = self._error(target)  # 횡보정의 회전 2회 뒤 방향을 다시 여민다
+            if e is not None and abs(e[2]) > self._tol_ang:
+                self._nudge_ang(e[2])
 
         self.get_logger().info(f'waypoint={wid} 도착 {_fmt_err(before)}')
         self.get_logger().info(f'waypoint={wid} 보정 {_fmt_err(self._error(target))}')
