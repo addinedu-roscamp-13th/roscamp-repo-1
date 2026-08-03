@@ -113,3 +113,42 @@ def test_runs_when_scan_missing(srv):
     _set(srv, lat=+0.04, clear=None)
     srv._lateral_fix((0.0, 0.0, 0.0), wid=24)
     assert [m[0] for m in srv._moves] == ['ang', 'lin', 'ang']
+
+
+def test_reports_whether_it_moved(srv):
+    """수행했으면 True, 건너뛰었으면 False 를 돌려준다 — 호출부가 이걸 본다."""
+    _set(srv, lat=+0.04)
+    assert srv._lateral_fix((0.0, 0.0, 0.0), wid=24) is True
+    _set(srv, lat=+0.01)                                  # 임계 미만 → 생략
+    assert srv._lateral_fix((0.0, 0.0, 0.0), wid=24) is False
+    srv.set_parameters([Parameter('refine_lateral', value=False)])
+    _set(srv, lat=+0.04)
+    assert srv._lateral_fix((0.0, 0.0, 0.0), wid=24) is False
+
+
+def test_disabled_refine_adds_no_extra_rotation(srv):
+    """★ 회귀: 횡보정이 꺼져 있으면 _refine 의 회전 횟수가 도입 전과 같아야 한다.
+
+    2026-08-03 현장 사고. 횡보정을 넣으면서 _refine 끝에 마무리 회전을 조건 없이
+    붙였더니, 꺼져 있는데도 회전이 1회 늘었다. _nudge_ang 은 목표를 지나치면
+    되돌리지 않고 멈추는데(그게 헌팅 방지책이다) 그 방지는 **한 번의 호출 안**에서만
+    성립한다 → 호출을 하나 더 붙이자 지나친 만큼을 반대로 되돌리는 코드가 되어
+    wp5 에서 좌우 미세 진동이 났고, 벽 쪽으로 밀려 서면서 다음 지점(wp6)으로 가는
+    경로가 안 나와 촬영까지 통째로 건너뛰었다.
+
+    '동작은 종전과 같다'를 주석이 아니라 테스트로 지킨다.
+    """
+    srv.set_parameters([Parameter('refine_lateral', value=False)])
+
+    class _WP:                       # _refine 이 보는 필드만 갖춘 가짜 waypoint
+        waypoint_id, x, y, yaw = 5, 0.66, -0.018, 3.11
+
+    # 방향이 늘 tolerance 밖으로 남아 있는 상태 = 오버슈트가 반복되는 최악 조건.
+    srv._error = lambda _t: (0.0, 0.0, math.radians(3.0))
+    srv._scan_clearance = lambda: 1.0
+    srv._refine(_WP())
+
+    rounds = srv._refine_rounds
+    # for 루프에서 회전 rounds 회 + 전후진 0 회(fwd 오차 0) + 루프 뒤 마무리 회전 1 회.
+    # 횡보정이 꺼져 있으므로 그 뒤로는 아무것도 더 돌지 않는다.
+    assert [m[0] for m in srv._moves] == ['ang'] * (rounds + 1)
