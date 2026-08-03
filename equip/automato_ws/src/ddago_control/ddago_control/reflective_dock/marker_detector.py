@@ -274,6 +274,11 @@ def _far_end(segment, vx, vy):
     return (e1.x, e1.y) if d1 > d0 else (e0.x, e0.y)
 
 
+def _norm_ang(a):
+    """각도를 -pi ~ pi 로 접는다(두 방향의 차이를 재려면 접어야 한다)."""
+    return math.atan2(math.sin(a), math.cos(a))
+
+
 def compute_pose(marker):
     """S11: 마커의 위치(원점)와 바라보는 방향(yaw)을 계산.
 
@@ -281,6 +286,18 @@ def compute_pose(marker):
     - yaw:  두 면이 벌어진 반대쪽 법선 = 재귀반사 면이 로봇을 향하는 방향.
             로봇은 이 축을 따라 진입(후진)한다.
     반환: dict(x, y, yaw_rad, id=None) / 계산불가면 None
+
+    ⚠️ 마지막의 방향 검증이 왜 필요한가 (2026-08-03 실측):
+      두 면 방향의 합으로 바깥쪽을 정하는 계산은 **정면에서 볼 때만 안정적**이다.
+      비스듬히 보면 한 면이 짧게 잘려 보이고, 그러면 꼭짓점(두 직선의 교점)이
+      반대편에 잡혀 두 면 방향이 함께 뒤집힌다 → yaw 가 정확히 180° 반대가 된다.
+      실측: 마커 정면 축에서 6.6cm 옆에 선 상태에서 도킹하니, 로봇이 마커를 등지는
+      대신 **마주 본 채** 후진 단계에 들어갔다(β=-179°).
+      바로잡는 근거는 기하가 아니라 물리다 — 반사테이프는 충전소 벽에 붙어 있고
+      라이다는 그 앞 공간에 있다. **라이다가 벽 속으로 들어갈 수는 없으므로**
+      법선은 반드시 라이다(원점) 쪽을 향한다. 반대면 뒤집힌 것이다.
+      원인이 무엇이든(면 잘림·꼭짓점 오판) 결과가 불가능하면 되돌리는 방식이라,
+      검출 파이프라인 앞단을 건드리지 않고도 뒤집힘을 막는다.
     """
     la = fit_line(marker["face_a"])
     lb = fit_line(marker["face_b"])
@@ -295,6 +312,10 @@ def compute_pose(marker):
     # 두 면 방향의 합 = 코너가 '벌어지는(안쪽)' 방향. 바깥(로봇쪽) = 그 반대.
     facing = (-(ua[0] + ub[0]), -(ua[1] + ub[1]))
     yaw = math.atan2(facing[1], facing[0])
+    # 라이다는 원점이므로 '마커 → 로봇' 은 곧 꼭짓점의 반대 방향이다.
+    to_robot = math.atan2(-vy, -vx)
+    if abs(_norm_ang(yaw - to_robot)) > math.pi / 2.0:
+        yaw = _norm_ang(yaw + math.pi)
     return {"x": vx, "y": vy, "yaw_rad": yaw, "id": None}
 
 

@@ -92,6 +92,66 @@ def test_approach_lost_marker():
     assert fsm.result_code == R.RC_MARKER_NOT_FOUND
 
 
+def test_approach_flipped_marker_stops_instead_of_hanging():
+    """마커가 등 뒤가 아니라 정면에 있으면(β≈180°) 매달리지 않고 이유를 달고 끝난다.
+
+    2026-08-03 실사고 재현. 사전정렬이 헤딩을 반대로 잡아 로봇이 마커를 마주 본 채
+    후진 단계에 들어갔다. β 가 계속 과대라 '좋은 관측'이 한 번도 없었고, 상실·과대
+    판정이 last_good_t(=None) 기준이라 성립하지 않아 마커를 10Hz 로 멀쩡히 보면서
+    48초를 정지 상태로 흘려보냈다(로그 한 줄 없이).
+    """
+    fsm = _fsm()
+    fsm.state = 'APPROACH'
+    bad = (-0.436, -0.005, math.pi)             # 실측값: 마커가 라이다 뒤 = 로봇 정면
+    v, w = fsm.step(bad, (0.0, 0.0, 0.0), now=100.0)
+    assert not fsm.done and (v, w) == (0.0, 0.0)      # 첫 틱은 유예
+    fsm.step(bad, (0.0, 0.0, 0.0), now=100.0 + R.APPROACH_STALL_SEC + 0.1)
+    assert fsm.done
+    assert fsm.result_code == R.RC_ALIGN_FAILED       # 오검출이 아니라 정렬 뒤집힘
+    assert '뒤집힘' in fsm.note
+
+
+def test_approach_stalls_out_when_marker_never_seen():
+    """후진 단계에서 마커를 한 번도 못 받아도 전체 제한시간 전에 끝난다.
+
+    위 뒤집힘과 같은 뿌리다 — last_good_t 가 None 이면 상실 판정이 성립하지 않았다.
+    """
+    fsm = _fsm()
+    fsm.state = 'APPROACH'
+    fsm.step(None, (0.0, 0.0, 0.0), now=10.0)
+    assert not fsm.done
+    fsm.step(None, (0.0, 0.0, 0.0), now=10.0 + R.APPROACH_STALL_SEC + 0.1)
+    assert fsm.done
+    assert fsm.result_code == R.RC_MARKER_NOT_FOUND
+
+
+def test_approach_spurious_beta_is_not_flip():
+    """β 가 어중간하게 큰 것(60~135°)은 뒤집힘이 아니라 오검출로 분류한다."""
+    fsm = _fsm()
+    fsm.state = 'APPROACH'
+    ang = math.radians(90.0)
+    bad = (0.30 * math.cos(ang), 0.30 * math.sin(ang), math.pi)   # β=90°
+    fsm.step(bad, (0.0, 0.0, 0.0), now=5.0)
+    fsm.step(bad, (0.0, 0.0, 0.0), now=5.0 + R.APPROACH_STALL_SEC + 0.1)
+    assert fsm.done
+    assert fsm.result_code == R.RC_MARKER_NOT_FOUND
+    assert '오검출' in fsm.note
+
+
+def test_approach_normal_beta_keeps_driving():
+    """정상 관측(β≈0)은 유예시간이 지나도 끝나지 않고 후진을 이어간다(회귀 방지).
+
+    타임아웃을 넣으면서 멀쩡한 도킹까지 끊어버리지 않는지 지킨다.
+    """
+    fsm = _fsm()
+    fsm.state = 'APPROACH'
+    good = (0.40, 0.0, math.pi)                 # 정면, SWITCH_M(0.18)보다 멀다
+    fsm.step(good, (0.0, 0.0, 0.0), now=1.0)
+    v, _w = fsm.step(good, (0.0, 0.0, 0.0), now=1.0 + R.APPROACH_STALL_SEC + 5.0)
+    assert not fsm.done
+    assert v < 0.0                              # 후진 중
+
+
 # ------------------------------------------------------ 후진(CREEP) --- #
 def test_creep_finishes_on_odom_distance():
     """CREEP 는 odom 실이동거리로 끝난다(시간 아님) → 성공·gap=stop_gap."""

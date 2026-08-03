@@ -35,7 +35,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Int64
+from std_msgs.msg import Empty, Int64
 
 from automato_interfaces.action import ReflectiveDock
 
@@ -80,6 +80,15 @@ class ReflectiveDockServer(Node):
         self.declare_parameter('watchdog_sec', float(fsm_mod.WATCHDOG_SEC))
         self.declare_parameter('dry_run', False)
         self.declare_parameter('debug', False)
+        # 도킹 시작 시 검출기의 목표 lock 을 버리게 할지. 끄면 옛 동작(검출기가 순찰
+        # 중에 잡아 둔 lock 을 그대로 씀)으로 되돌아간다 — 문제 생겼을 때의 탈출구다.
+        self.declare_parameter('reset_lock_on_start', True)
+        # 리셋 알림 뒤 검출기가 새 프레임으로 다시 잡을 시간. SNAP 이 평균낼 프레임에
+        # 옛 lock 기준 값이 섞이지 않게 한 박자 쉰다(라이다 10Hz → 3프레임분).
+        self.declare_parameter('reset_lock_settle_sec', 0.3)
+        # 속도 명령이 0 인 채 이만큼 지나면 지금 어느 단계인지 경고를 한 번 남긴다.
+        # FSM 이 어떤 이유로 멈춰 있어도 로그로 드러나게 하는 안전망이다.
+        self.declare_parameter('stall_warn_sec', 3.0)
 
         self._robot_id = self.get_parameter('robot_id').value
         self._dry_run = bool(self.get_parameter('dry_run').value)
@@ -109,6 +118,10 @@ class ReflectiveDockServer(Node):
             Int64, '/ddago/current_task',
             QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        # 도킹 시작 알림 → detector_node 가 목표 lock 을 버린다(_run 첫머리 참고).
+        self._lock_reset_pub = self.create_publisher(
+            Empty, '/ddago/dock_lock_reset',
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
 
         self._server = ActionServer(
             self, ReflectiveDock, '/ddago/reflective_dock',
@@ -192,6 +205,21 @@ class ReflectiveDockServer(Node):
         task_msg.data = int(goal.task_id)
         self._task_pub.publish(task_msg)
 
+        # 찜해 둔 목표를 버리게 한다. 검출기는 순찰 내내 켜져 있어서 **주행 중에도**
+        # lock 을 잡을 수 있는데(정지 게이트가 폴백으로 뚫리는 경우), 움직이며 본 마커는
+        # 옆 충전소이거나 법선이 뒤집혀 있을 수 있다. 지금은 복귀 주행이 끝나 로봇이
+        # 멈춰 있으므로, 여기서 버리고 다시 잡게 하면 게이트가 제대로 작동한다.
+        # (2026-08-03 실사고: 도킹 7초 전, 초속 5cm 로 회전 중에 잡은 lock 으로 사전정렬이
+        #  뒤집혀 로봇이 마커를 마주 본 채 후진 단계에 들어갔다.)
+        if bool(self.get_parameter('reset_lock_on_start').value):
+            self._lock_reset_pub.publish(Empty())
+            settle = float(self.get_parameter('reset_lock_settle_sec').value)
+            if settle > 0.0:
+                time.sleep(settle)
+
+        stall_warn = float(self.get_parameter('stall_warn_sec').value)
+        stall_t0 = None          # 속도 0 이 시작된 시각
+        stall_warned = False     # 같은 정지 구간에서 경고는 한 번만
         fb = ReflectiveDock.Feedback()
         last_fb = 0.0
         prev_state = None
@@ -218,6 +246,23 @@ class ReflectiveDockServer(Node):
                          if fsm.state in ('TURN1', 'TURN2') and fsm.snap_move else '')
                 log.info('[reflective_dock] → %s%s' % (fsm.state, extra))
                 prev_state = fsm.state
+                stall_t0, stall_warned = None, False   # 단계가 바뀌면 정지 감시 초기화
+
+            # 정지 감시 — 바퀴가 안 도는 채로 시간만 가는 상황을 로그로 드러낸다.
+            # 상태 전이가 없으면 위 로그도 안 나오므로, 이게 없으면 '아무 일도 안 일어나는
+            # 것처럼 보이는 구간'이 통째로 깜깜해진다(실사고 때 48초가 그랬다).
+            if abs(v) < 1e-6 and abs(w) < 1e-6:
+                if stall_t0 is None:
+                    stall_t0 = now
+                elif not stall_warned and (now - stall_t0) >= stall_warn:
+                    log.warn('[reflective_dock] %s 에서 %.1f초째 정지 명령만 나간다 '
+                             '(마커=%s 거리=%s) — 진행이 막혔는지 확인'
+                             % (fsm.state, now - stall_t0,
+                                '보임' if fsm.marker_detected else '없음',
+                                '%.2fm' % fsm.last_d if fsm.last_d else '-'))
+                    stall_warned = True
+            else:
+                stall_t0, stall_warned = None, False
 
             if now - last_fb >= 0.2:
                 fb.phase = fsm.state

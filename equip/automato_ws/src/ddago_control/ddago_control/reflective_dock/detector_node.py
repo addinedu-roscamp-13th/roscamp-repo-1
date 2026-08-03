@@ -22,6 +22,7 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import PoseStamped, Point
 from nav_msgs.msg import Odometry
+from std_msgs.msg import Empty
 from visualization_msgs.msg import Marker, MarkerArray
 
 from .marker_detector import run_pipeline
@@ -102,7 +103,24 @@ class MarkerDetector(Node):
         self.acq_block_t = None     # 정지 게이트가 획득을 막기 시작한 시각(폴백 기준)
         self.acq_fallback_warned = False
 
+        # 도킹 서버가 "지금부터 붙는다"고 알리면 찜해 둔 목표를 버린다.
+        # lock 은 주행 중에도 잡힐 수 있고(정지 게이트가 폴백으로 뚫리는 경우),
+        # 그렇게 잡은 값은 옆 충전소이거나 법선이 뒤집혀 있을 수 있다. 도킹을 시작하는
+        # 시점에는 주행이 끝나 로봇이 멈춰 있으므로, 그때 다시 잡으면 게이트가 제대로
+        # 작동한다. lock_ttl_sec(시간 기반 해제)과 달리 **확실한 시점**에 푸는 창구다.
+        self.create_subscription(
+            Empty, "/ddago/dock_lock_reset", self.on_lock_reset, 10)
+
         self.get_logger().info("marker_detector 시작. /scan·/odom 구독 중...")
+
+    def on_lock_reset(self, _msg):
+        """도킹 시작 알림 → 목표 lock 을 버린다(다음 검출에서 멈춘 채로 다시 잡는다)."""
+        if self.lock is None:
+            self.get_logger().info("도킹 시작 알림 — 찜해 둔 목표 없음(그대로 진행)")
+            return
+        self._clear_lock()
+        self.get_logger().info(
+            "도킹 시작 알림 → 목표 lock 해제(멈춘 상태에서 다시 획득한다)")
 
     def _cfg(self):
         return {k: self.get_parameter(k).value for k in CFG}
@@ -271,6 +289,14 @@ class MarkerDetector(Node):
             f"목표 lock 해제: {now - self.last_target_t:.1f}초 동안 목표를 못 봄 "
             f"(주행 중 등) → 다음 검출 때 다시 획득한다"
         )
+        self._clear_lock()
+
+    def _clear_lock(self):
+        """lock 과 그에 딸린 상태를 한 벌로 되돌린다(시간 만료·도킹 시작 알림 공용).
+
+        하나라도 빠뜨리면 조용한 버그가 된다 — 예전에 last_target_t 를 안 세워
+        '기준 시각 None' 이 되는 바람에 TTL 이 영영 안 걸린 적이 있다.
+        """
         self.lock = None
         self.last_pub_world = None
         self.skip_count = 0
