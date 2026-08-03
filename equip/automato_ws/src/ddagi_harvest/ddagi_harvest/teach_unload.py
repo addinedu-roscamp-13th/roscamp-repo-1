@@ -66,6 +66,7 @@ from ddagi_harvest.arm_backend import NetworkArm      # noqa: E402
 # 싱크 주입(log.set_sink)을 타야 한다. 나머지 CLI 함수(do_teach/do_check/...)는 터미널
 # 전용이라 print 로 둔다.
 from ddagi_harvest.log import log, warn                # noqa: E402
+from ddagi_harvest import pick as pk                    # noqa: E402  관측자세 상수
 
 # ⚠ 패키지 안(__file__ 기준)에 두면 안 된다. 그러면 티칭은 src 에 쓰이는데 액션 서버는
 # **install 공간**에서 읽어(colcon 이 모듈을 복사하므로) 파일을 못 찾는다 — 실측:
@@ -103,6 +104,11 @@ FIRST_MOVE_WARN_DEG = 25  # 어느 관절이든 이만큼 넘게 벌어지면 �
 SETTLE = 0.4              # 스텝 후 정착 대기(s)
 GRIPPER_SPEED = 60
 WAIT_SEC = 3.0            # 'w' 스텝 기본 대기 (Unload.action 의 shake_delay_sec)
+
+# 하역을 마치면 관측 자세로 돌아간다. 다음 수확이 '어디서 출발할지 아는' 상태로
+# 시작해야 첫 이동이 예측 가능하다(수확 첫 이동은 관측자세 기준으로 맞춰져 있다).
+# 실측 거리: 하역 마지막 자세 → 관측 J5 145.2° — 관측→WP1(160°, 3.95초)과 같은 급.
+RETURN_OBSERVE_SPEED = 30
 
 # ---- 털기 ------------------------------------------------------------------ #
 # 손목 관절 하나를 ±진폭으로 왕복시킨다. 좌표로 흔들면 왕복마다 IK 해가 달라져
@@ -634,12 +640,15 @@ def do_shaketest(arm) -> None:
 
 def replay(arm, steps, *, speed: int = SPEED, shake_cfg: dict | None = None,
            wait_sec: float = WAIT_SEC, on_phase=None, should_cancel=None,
-           grip_threshold: int = 6) -> dict:
+           grip_threshold: int = 6, return_observe: bool = True) -> dict:
     """티칭 경로를 재생한다. **프롬프트·입력이 없어** 액션 서버에서도 그대로 쓴다.
 
     harvest.harvest() 와 같은 방식으로 ROS 의존을 들이지 않고 콜백만 받는다:
       on_phase(phase, step_no, total) -> None   Unload.action 의 Feedback 발행에 쓴다
       should_cancel() -> bool                   스텝 경계에서만 검사한다
+
+    return_observe : 성공했을 때 관측 자세로 복귀할지(기본 켬). 하역 경로만 따로
+                     확인할 때 끈다.
 
     반환 {"result_code", "message", "phase"} — Unload.action 의 result_code 규약대로
     0 성공 / 1 손잡이 파지 실패 / 2 중단.
@@ -704,6 +713,18 @@ def replay(arm, steps, *, speed: int = SPEED, shake_cfg: dict | None = None,
             time.sleep(wait_sec)
         elif act == "shake":
             do_shake(arm, angles, shake_cfg)
+
+    # ⚠ 성공 반환 **직전** 이라는 이 위치가 곧 복귀 조건이다 — 파지 실패(1)·취소(2)는
+    #   위에서 이미 return 했으므로 여기 닿는 것은 성공뿐이다. 위로 끌어올리면 취소에도
+    #   팔이 움직이는데, 그때는 바구니를 든 채일 수 있어 움직이면 안 된다.
+    if return_observe:
+        emit("RETURN", total)          # 이동 전에 알린다 — DG 워치독(15초) 대비
+        log(f"  관측 자세로 복귀 (속도 {RETURN_OBSERVE_SPEED})")
+        try:
+            arm.move_angles(pk.OBSERVE_ANGLES, RETURN_OBSERVE_SPEED)
+        except Exception as exc:
+            # 하역 자체는 이미 끝났다 — 복귀 실패로 결과를 뒤집지 않는다.
+            warn(f"  관측 자세 복귀 실패: {exc} (하역은 완료됨)")
 
     return bail(0, f"하역 완료 ({total}스텝)")
 
