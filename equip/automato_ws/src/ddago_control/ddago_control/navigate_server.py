@@ -103,7 +103,9 @@ from rclpy.qos import (
     DurabilityPolicy,
     QoSProfile,
     ReliabilityPolicy,
+    qos_profile_sensor_data,
 )
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Int64
 from tf2_ros import Buffer, TransformListener
 
@@ -192,6 +194,18 @@ class NavigateServer(Node):
         self.declare_parameter('refine_tol_ang_deg', 1.0)
         self.declare_parameter('refine_max_fix_lin_m', pm.MAX_FIX_LIN)
         self.declare_parameter('min_travel_m', pm.MIN_TRAVEL)
+        # --- 횡(lat) 보정 ---
+        # 차동구동이라 옆으로 못 가므로 '돌아서 → 가서 → 되돌아' 3단계로 없앤다.
+        # 좁은 곳에서 90° 를 두 번 도는 동작이라 기본은 꺼 둔다(파라미터로 켠다).
+        # 매번 파라미터를 다시 읽으므로 ros2 param set 으로 주행 중에도 토글된다.
+        self.declare_parameter('refine_lateral', False)
+        self.declare_parameter('refine_lat_min_m', 0.02)    # 이보다 작으면 안 건드림
+        self.declare_parameter('refine_lat_max_m', 0.08)    # 이보다 크면 손대지 않음
+        # 회전에 필요한 주변 여유. 로봇 대각 반경(약 8.5cm)에 마진을 얹은 값이다.
+        # 실측: 충전소 진입 노드 wp24 24cm·wp23 20cm 는 넉넉하지만 wp22 는 8cm 라
+        # 여기서 돌면 벽에 닿는다 → 그런 자리는 건너뛰고 로그만 남긴다.
+        self.declare_parameter('refine_lat_clear_m', 0.12)
+        self.declare_parameter('scan_topic', '/scan')
 
         self._precision = bool(self.get_parameter('precision_enable').value)
         self._global_frame = self.get_parameter('global_frame_id').value
@@ -210,6 +224,15 @@ class NavigateServer(Node):
         # 서버 실행(블로킹) 중에도 Nav2 콜백이 처리되도록 모든 통신을
         # ReentrantCallbackGroup 에 넣는다(main 의 MultiThreadedExecutor 와 짝).
         self._cb = ReentrantCallbackGroup()
+
+        # 횡보정 전에 '지금 돌아도 되나'를 보려고 라이다를 받아 둔다.
+        # 맵이 아니라 실측을 보는 이유: 맵에 없는 물건(사람·상자)이 놓여 있을 수 있고,
+        # 회전은 그 자리에서 즉시 일어나기 때문이다.
+        self._scan_lock = threading.Lock()
+        self._scan_min = None       # 가장 가까운 점까지 거리 [m]
+        self.create_subscription(
+            LaserScan, self.get_parameter('scan_topic').value,
+            self._on_scan, qos_profile_sensor_data, callback_group=self._cb)
 
         # --- 상태 ---
         self._nav_client = None     # Nav2 NavigateToPose 클라이언트 (지연 생성)
@@ -684,6 +707,68 @@ class NavigateServer(Node):
                     f'waypoint={waypoint_id} 출발정렬 {math.degrees(err):+.1f}°')
             self._nudge_ang(err)
 
+    # 로봇 자신(라이다 마운트·섀시)이 잡히는 거리. 이보다 가까운 점은 장애물이
+    # 아니므로 여유 판정에서 뺀다(실측: 로봇 구조물이 4~7cm 에 항상 잡힌다).
+    SCAN_SELF_M = 0.08
+
+    def _on_scan(self, msg):
+        """가장 가까운 라이다 점까지 거리만 갱신한다(횡보정 여유 판정용)."""
+        vals = [r for r in msg.ranges
+                if math.isfinite(r) and r > self.SCAN_SELF_M]
+        with self._scan_lock:
+            self._scan_min = min(vals) if vals else None
+
+    def _scan_clearance(self):
+        """지금 주변에서 가장 가까운 장애물까지 [m]. 스캔이 없으면 None."""
+        with self._scan_lock:
+            return self._scan_min
+
+    def _lateral_fix(self, target, wid):
+        """옆(lat) 오차를 '돌아서 → 가서 → 되돌아' 3단계로 없앤다.
+
+        왜 이게 따로 필요한가 — 로봇은 자동차처럼 **옆으로 못 간다**. 그래서 기존
+        정밀 조준은 앞뒤(fwd)와 방향(yaw)만 고치고 옆 오차는 재서 로그로만 남겼다.
+        그런데 그 옆 오차가 실제로 세 가지를 동시에 망가뜨리고 있었다:
+          · 카메라가 옆 90° 를 보므로 그대로 피사체 거리 오차가 된다(실측 wp5 +5cm).
+          · 좁은 통로에서 벽에 붙어 Nav2 가 경로를 못 낸다(실측 wp6 벽까지 9cm).
+          · 도킹 진입 자세가 틀어진다(실측 wp24 lat 4.1cm → 충전소 여유는 1.5cm).
+        회전 2회가 붙는 동작이라 기본은 꺼져 있고, 아래 세 가지로 스스로를 막는다:
+          ① 너무 작으면(min) 안 한다 — 괜히 움직이지 않는다.
+          ② 너무 크면(max) 안 한다 — 그 정도면 경로·좌표 쪽 문제라 미는 게 위험하다.
+          ③ 주변이 좁으면(clear) 안 한다 — 회전하다 벽에 닿는 것이 오차보다 나쁘다.
+        """
+        if not bool(self.get_parameter('refine_lateral').value):
+            return
+        e = self._error(target)
+        if e is None:
+            return
+        lat = e[1]
+        lo = float(self.get_parameter('refine_lat_min_m').value)
+        hi = float(self.get_parameter('refine_lat_max_m').value)
+        if abs(lat) < lo:
+            return
+        if abs(lat) > hi:
+            self.get_logger().warn(
+                f'waypoint={wid} 옆 오차 {lat * 100:+.1f}cm 가 한계 '
+                f'{hi * 100:.0f}cm 초과 → 횡보정 생략. 좌표·경로 점검 필요')
+            return
+        need = float(self.get_parameter('refine_lat_clear_m').value)
+        clear = self._scan_clearance()
+        if clear is not None and clear < need:
+            self.get_logger().warn(
+                f'waypoint={wid} 옆 오차 {lat * 100:+.1f}cm 이나 주변 여유 '
+                f'{clear * 100:.0f}cm < {need * 100:.0f}cm → 횡보정 생략'
+                f'(여기서 돌면 닿는다)')
+            return
+        # lat 이 +면 목표가 왼쪽에 있다 → 왼쪽(+90°)으로 돌아 그만큼 전진한 뒤 되돌아온다.
+        turn = math.pi / 2.0 if lat > 0 else -math.pi / 2.0
+        self.get_logger().info(
+            f'waypoint={wid} 횡보정 {lat * 100:+.1f}cm '
+            f'(여유 {"미상" if clear is None else f"{clear * 100:.0f}cm"})')
+        self._nudge_ang(turn)
+        self._nudge_lin(abs(lat))
+        self._nudge_ang(-turn)
+
     def _refine(self, wp):
         """촬영·정렬(hold_yaw) 지점에서 목표 좌표·yaw 로 좁힌다. 보정 전/후 오차를 로그로.
 
@@ -725,6 +810,13 @@ class NavigateServer(Node):
                 self._nudge_lin(e[0])
 
         e = self._error(target)      # 전후진 뒤 틀어진 방향 마무리
+        if e is not None and abs(e[2]) > self._tol_ang:
+            self._nudge_ang(e[2])
+
+        # 앞뒤·방향을 맞춘 뒤에 옆을 잡는다(순서가 중요하다 — 방향이 틀어진 상태에서
+        # 옆으로 옮기면 '옆'의 기준 자체가 어긋난다). 꺼져 있으면 즉시 반환한다.
+        self._lateral_fix(target, wid)
+        e = self._error(target)      # 횡보정의 회전 2회 뒤 방향을 다시 여민다
         if e is not None and abs(e[2]) > self._tol_ang:
             self._nudge_ang(e[2])
 
