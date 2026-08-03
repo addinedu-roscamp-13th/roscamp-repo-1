@@ -1380,6 +1380,121 @@ function desktopDashHTML(){ return `    <!-- ══ Syncult 핸드오프 데스�
    그래서 CSS 로 접는 대신 마크업을 따로 만든다. 대신 데이터는 데스크톱과 같은 소스
    (_lastRobots / _hstats / _heatCrop / _heatMeta)만 읽어 두 화면이 어긋나지 않게 한다.
    폰 베젤은 데스크톱에서 '모바일 미리보기' 로 볼 때만 씌운다(실제 폰에서는 CSS 로 벗긴다). */
+/* ══ 모바일 하단 탭 ══
+   ⚠ 핸드오프(dc.html)의 탭바는 **그림만** 있다 — onClick 이 하나도 없고 README 에도
+     "누르면 무엇이 나온다" 가 없다. 즉 동작은 우리가 정해야 한다.
+     처음엔 기존 데스크톱 화면(f_batt/f_work/f_report)에 연결했는데,
+     이름과 내용이 안 맞았고(지도→배터리, 리포트→수확요청) 무엇보다
+     그 화면들은 폰 틀·탭바가 없어서 한 번 나가면 돌아올 수가 없었다.
+   → 폰 밖으로 나가지 않는다. **스크롤 영역의 내용만** 갈아끼운다. */
+window._mbTab = window._mbTab || 'status';
+function mbGo(tab){
+  if(window._mbTab===tab) return;
+  window._mbTab=tab;
+  window._reqOpen=null; window._reqDone=null;      // 탭 이동 시 열린 오버레이는 닫는다
+  var el=document.getElementById('farmView');
+  if(el) el.innerHTML=mobileDashHTML();
+  // 캔버스·3D 는 탭마다 있고 없고가 달라서, 새로 그려진 DOM 기준으로 다시 붙인다.
+  // 탭이 바뀌면 DOM 이 통째로 새로 그려진다 → 화면을 채우는 렌더를 전부 다시 태운다.
+  // (이걸 빠뜨리면 '불러오는 중…' 과 '--:--' 에서 멈춘다)
+  try{ renderMbTop(); }catch(e){}                 // 상단 시계·연결·배터리·병해충 pill
+  try{ renderFleet(); }catch(e){}                 // 액션 카드 + 로봇 상태
+  try{ renderCropCard(); }catch(e){}              // 작물 상태(이미 받아둔 값으로 즉시)
+  try{ renderMbWeekly(); }catch(e){}              // 수확 실적
+  try{ startFleetLive(); }catch(e){}
+  try{ if(document.getElementById('farm3d')) initFarm3D(); }catch(e){}
+  try{ if(document.getElementById('farmHeat')) loadHeat(); }catch(e){}
+  try{ loadHarvestStats(); }catch(e){}
+}
+function mbTabBar(){
+  var T=[['status','◈','현황'],['map','◎','지도'],['work','▤','작업'],['report','◇','리포트']];
+  return '<div class="mb-tabs">'+T.map(function(x){
+    var on=(window._mbTab===x[0]);
+    return '<div class="'+(on?'on':'')+'" onclick="mbGo(\''+x[0]+'\')">'
+      +'<span>'+x[1]+'</span><span>'+x[2]+'</span></div>';
+  }).join('')+'</div>';
+}
+/* 탭별 제목 — 상단 바가 화면을 따라간다(어디 있는지 알 수 있게) */
+function mbTitle(){
+  return {status:'오늘의 현황', map:'농장 지도', work:'작업', report:'리포트'}[window._mbTab]||'오늘의 현황';
+}
+
+/* ── 탭별 카드 조각 (같은 렌더 함수를 재사용한다 — 화면마다 따로 만들면 한쪽만 고치는 사고가 난다) ── */
+function mbHeatCard(){
+  return '<div class="mb-card">'
+    +'<div class="mb-ch"><div class="mb-ct">완숙 밀집 히트맵</div>'
+    +'<div class="mono" style="font-size:10.5px;color:var(--sc-mut)" id="heatSub">스캔 대기</div></div>'
+    +'<div class="sc-inner" style="height:250px;display:flex;align-items:center;justify-content:center;padding:0;overflow:hidden">'
+    +'<canvas id="farmHeat" width="356" height="660" style="transform:rotate(90deg);border-radius:10px"></canvas></div>'
+    +'<div id="heatSummary" class="sc-rows" style="margin-top:10px"></div></div>';
+}
+function mb3dCard(){
+  return '<div class="mb-card">'
+    +'<div class="mb-ch"><div class="mb-ct">로봇 위치 · 3D 지도</div>'
+    +'<div class="mono" style="font-size:11px;color:var(--sc-mut)">A동 '+nodeCount()+'노드</div></div>'
+    +'<div style="position:relative;height:186px;border-radius:15px;overflow:hidden;background:var(--sc-inner2)">'
+      +'<div id="farm3d" style="width:100%;height:186px;touch-action:none;cursor:grab"></div>'
+      +'<div id="farm3dLoad" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--sc-mut2);font-size:12.5px;font-weight:600">3D 지도 불러오는 중…</div></div>'
+    +'<div id="robotPosList" class="mb-rows" style="margin-top:12px"></div></div>';
+}
+function mbWeeklyCard(){
+  return '<div class="mb-card" id="mbWeekly">수확 실적 불러오는 중…</div>';
+}
+/* 리포트 탭의 수확 실적. 데스크톱 weeklyChartHTML 은 폭이 넓어 412px 에서 깨진다 →
+   모바일은 '오늘/누적' 숫자 두 개 + 7일 막대만 컴팩트하게. */
+function renderMbWeekly(){
+  var el=document.getElementById('mbWeekly'); if(!el)return;
+  var hs=window._hstats;
+  if(!hs||!hs.week){ el.innerHTML='<div class="mb-ct">수확 실적</div>'
+    +'<div style="font-size:12px;color:var(--sc-mut2);margin-top:8px">아직 수확 기록이 없습니다.</div>'; return; }
+  var wk=hs.week, mx=Math.max.apply(null,wk.map(function(w){return w.kg;}).concat([0.001]));
+  var tot=wk.reduce(function(s,w){return s+w.kg;},0);
+  var bars=wk.map(function(w,i){
+    var last=(i===wk.length-1), h=Math.max(3,Math.round(w.kg/mx*54));
+    var d=new Date(w.date+'T00:00:00');
+    return '<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">'
+      +'<span class="mono" style="font-size:9.5px;color:var(--sc-mut)">'+(w.kg||0)+'</span>'
+      +'<span style="width:100%;height:'+h+'px;border-radius:5px;background:'
+      +(last?'var(--sc-lime)':'var(--sc-track2)')+'"></span>'
+      +'<span class="mono" style="font-size:9px;color:'+(last?'var(--sc-accentT)':'var(--sc-mut)')+'">'
+      +(d.getMonth()+1)+'/'+d.getDate()+'</span></div>';
+  }).join('');
+  el.innerHTML='<div class="mb-ch"><div class="mb-ct">수확 실적</div>'
+    +'<div class="mono" style="font-size:10.5px;color:var(--sc-mut)">최근 7일</div></div>'
+    +'<div style="display:flex;gap:10px;margin-bottom:12px">'
+      +'<div style="flex:1;background:var(--sc-inner);border-radius:13px;padding:11px 13px">'
+        +'<div style="font-size:11px;color:var(--sc-mut)">오늘</div>'
+        +'<div class="mono" style="font-size:19px;font-weight:800;margin-top:2px">'+(hs.today_kg||0)+'<small style="font-size:11px"> kg</small></div></div>'
+      +'<div style="flex:1;background:var(--sc-inner);border-radius:13px;padding:11px 13px">'
+        +'<div style="font-size:11px;color:var(--sc-mut)">7일 누적</div>'
+        +'<div class="mono" style="font-size:19px;font-weight:800;margin-top:2px">'+tot.toFixed(1)+'<small style="font-size:11px"> kg</small></div></div></div>'
+    +'<div style="display:flex;gap:5px;align-items:flex-end">'+bars+'</div>';
+}
+
+function mobileTabBody(){
+  var tab=window._mbTab;
+  if(tab==='map'){
+    // 지도 — 이름 그대로 지도만. 3D(로봇 위치) + 2D(완숙 밀집) 둘 다 지도다.
+    return mb3dCard()+mbHeatCard();
+  }
+  if(tab==='work'){
+    // 작업 — 무엇을 시킬지(액션) + 누가 할 수 있는지(로봇 상태).
+    return '<div id="fleetLive" class="mb-grid2">불러오는 중…</div>'
+         + '<div class="mb-card" id="fleetStatus">로봇 상태 불러오는 중…</div>';
+  }
+  if(tab==='report'){
+    // 리포트 — 결과. 작물 상태 + 수확 실적.
+    // 개선안이 대시보드에서 뺀 주간 수확량을 여기서 되살린다(첫 화면은 그대로 두고).
+    return '<div class="mb-card" id="cropCardBox">감지 상태 불러오는 중…</div>'
+         + mbWeeklyCard();
+  }
+  // 현황(기본) — 첫 화면. 사용자가 "완벽하다" 고 한 구성이라 손대지 않는다.
+  return '<div id="fleetLive" class="mb-grid2">불러오는 중…</div>'
+       + '<div class="mb-card" id="fleetStatus">로봇 상태 불러오는 중…</div>'
+       + '<div class="mb-card" id="cropCardBox">감지 상태 불러오는 중…</div>'
+       + mbHeatCard() + mb3dCard();
+}
+
 function mobileDashHTML(){
   return ''
   +'<div class="mb-stage"><div class="mb-phone"><div class="mb-screen">'
@@ -1387,36 +1502,15 @@ function mobileDashHTML(){
       +'<span style="display:flex;gap:6px"><span id="mbNet">ACS</span><span id="mbBat">--</span></span></div>'
     +'<div class="mb-top">'
       +'<div><div style="font-size:12px;color:var(--sc-mut);font-weight:600">A동 · 방울토마토</div>'
-      +'<div style="font-size:20px;font-weight:800;letter-spacing:-.5px;margin-top:2px">오늘의 현황</div></div>'
+      +'<div style="font-size:20px;font-weight:800;letter-spacing:-.5px;margin-top:2px">'+mbTitle()+'</div></div>'
       +'<div id="mbPill"></div></div>'
     +'<div class="mb-scroll">'
       +'<div id="reqScreen" style="display:none"></div>'
       +'<div id="dashBody" style="display:flex;flex-direction:column;gap:14px">'
-        +'<div id="fleetLive" class="mb-grid2">불러오는 중…</div>'
-        +'<div class="mb-card" id="fleetStatus">로봇 상태 불러오는 중…</div>'
-        +'<div class="mb-card" id="cropCardBox">감지 상태 불러오는 중…</div>'
-        // 핸드오프 모바일에는 히트맵이 없지만, 우리 실제 기능이라 같은 카드 문법으로 넣는다.
-        +'<div class="mb-card">'
-          +'<div class="mb-ch"><div class="mb-ct">완숙 밀집 히트맵</div>'
-          +'<div class="mono" style="font-size:10.5px;color:var(--sc-mut)" id="heatSub">스캔 대기</div></div>'
-          +'<div class="sc-inner" style="height:250px;display:flex;align-items:center;justify-content:center;padding:0">'
-          +'<canvas id="farmHeat" width="356" height="660" style="width:356px;height:660px;transform:rotate(90deg) scale(.52);border-radius:10px"></canvas></div>'
-          +'<div id="heatSummary" class="sc-rows" style="margin-top:10px"></div></div>'
-        +'<div class="mb-card">'
-          +'<div class="mb-ch"><div class="mb-ct">로봇 위치 · 3D 지도</div>'
-          +'<div class="mono" style="font-size:11px;color:var(--sc-mut)">A동 '+nodeCount()+'노드</div></div>'
-          +'<div style="position:relative;height:186px;border-radius:15px;overflow:hidden;background:var(--sc-inner2)">'
-            +'<div id="farm3d" style="width:100%;height:186px;touch-action:none;cursor:grab"></div>'
-            +'<div id="farm3dLoad" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--sc-mut2);font-size:12.5px;font-weight:600">3D 지도 불러오는 중…</div></div>'
-          +'<div id="robotPosList" class="mb-rows" style="margin-top:12px"></div></div>'
+        +mobileTabBody()
       +'</div>'
     +'</div>'
-    +'<div class="mb-tabs">'
-      +'<div class="on"><span>◈</span><span>현황</span></div>'
-      +'<div onclick="farmGo(\'f_batt\')"><span>◎</span><span>지도</span></div>'
-      +'<div onclick="farmGo(\'f_work\')"><span>▤</span><span>작업</span></div>'
-      +'<div onclick="farmGo(\'f_report\')"><span>◇</span><span>리포트</span></div>'
-    +'</div>'
+    +mbTabBar()
   +'</div></div></div>'
   +'<div class="mb-segwrap" id="dcSeg"></div>';
 }
@@ -2190,6 +2284,7 @@ function renderHarvestSummary(){
 async function loadHarvestStats(){
   try{ var r=await fetch('/api/harvest/stats?t='+Date.now()); var j=await r.json(); if(j&&j.week) window._hstats=j; }catch(e){}
   renderHarvestSummary();
+  try{ renderMbWeekly(); }catch(e){}
 }
 function startHarvestStatsTimer(){   // 배터리처럼 주기 폴링 → 서버 반영 + 실패해도 계속 재시도
   if(window._hstatsTimer)clearInterval(window._hstatsTimer);
