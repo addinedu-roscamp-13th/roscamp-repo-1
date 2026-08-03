@@ -995,10 +995,9 @@ function renderAlertBanner(){
     if(u==='BATTERY_TOO_LOW') warn.push(r.robot_id+' 배터리 부족');
   });
   if(crop){ var tot=(crop.ripe||0)+(crop.unripe||0)+(crop.pest||0)+(crop.rot||0)||1;
-    var pest=(crop.pest||0)/tot*100, rot=(crop.rot||0)/tot*100;
+    // 병충해 = disease + rot (AI 가 둘을 구분 못 해 rot 은 항상 0 이지만, 값이 오면 합산한다)
+    var pest=((crop.pest||0)+(crop.rot||0))/tot*100;
     if(pest>=5) urgent.push('병해충 '+pest.toFixed(1)+'% — 방제 시급');
-    else if(pest>0) warn.push('병해충 '+pest.toFixed(1)+'% 관찰');
-    if(rot>=5) warn.push('썩음 '+rot.toFixed(1)+'%');
   }
   // flex-wrap 이 없으면 412px 모바일에서 '방제 시 / 급' 처럼 어절 중간이 잘린다.
   var pad='border-radius:12px;padding:13px 18px;font-size:15.5px;font-weight:800;display:flex;align-items:center;gap:9px;flex-wrap:wrap;';
@@ -1373,8 +1372,11 @@ function desktopDashHTML(){ return `    <!-- ══ Syncult 핸드오프 데스�
       </div>
 
       <!-- 1-4. 로봇 상태 + 작물 상태 -->
-      <!-- 1-4. 작물 상태 (전폭) — 로봇 상태는 1-2 행으로 올라갔다 -->
-      <div class="card sc-card" id="cropCardBox" style="margin-bottom:16px">감지 상태 불러오는 중…</div>
+      <!-- 1-4. 작물 상태 + 최근 알림 -->
+      <div class="dc-row2">
+        <div class="card sc-card" id="cropCardBox">감지 상태 불러오는 중…</div>
+        <div class="card sc-card" id="alertLog">알림 없음</div>
+      </div>
     </div>`;
 }
 
@@ -1408,6 +1410,7 @@ function mbGo(tab){
   try{ renderHeatSummary(); }catch(e){}           // 히트맵 요약행(베드 1/2/3)
   try{ renderRobotPosList(); }catch(e){}          // 3D 아래 로봇 위치행
   try{ renderMbWeekly(); }catch(e){}              // 수확 실적
+  try{ renderAlertLog(); }catch(e){}              // 최근 알림
   try{ if(document.getElementById('farmHeat')) drawFarmHeat(); }catch(e){}
   try{ startFleetLive(); }catch(e){}
   try{ if(document.getElementById('farm3d')) initFarm3D(); }catch(e){}
@@ -1503,6 +1506,7 @@ function mobileTabBody(){
     // 리포트 — 결과. 작물 상태 + 수확 실적.
     // 개선안이 대시보드에서 뺀 주간 수확량을 여기서 되살린다(첫 화면은 그대로 두고).
     return '<div class="mb-card" id="cropCardBox">감지 상태 불러오는 중…</div>'
+         + '<div class="mb-card" id="alertLog">알림 없음</div>'
          + mbWeeklyCard();
   }
   // 현황(기본) — 첫 화면. 사용자가 "완벽하다" 고 한 구성이라 손대지 않는다.
@@ -1599,6 +1603,7 @@ function renderFleet(){
   try{renderAlertBanner();}catch(e){}
   try{renderRobotPosList();}catch(e){}
   try{renderFleetStatus();}catch(e){}
+  try{renderAlertLog();}catch(e){}
   try{renderDcHead();}catch(e){}
 }
 
@@ -1759,6 +1764,35 @@ function fleetStatusCardHTML(robots){
     : '<div style="font-size:12.5px;color:var(--sc-mut2);padding:14px 0;text-align:center">연결된 로봇이 없습니다</div>';
   return '<div class="card" style="min-height:172px;border-radius:22px;padding:18px 20px">'+head+body+'</div>';
 }
+/* 최근 알림 카드 — 병해충 사진과 순찰 완료가 새로고침 후에도 남는다. */
+window.renderAlertLog=function(){
+  var el=document.getElementById('alertLog'); if(!el)return;
+  var arr=(window.getAlertLog&&window.getAlertLog())||[];
+  var head='<div class="sc-head"><div><h3 class="sc-title">최근 알림</h3>'
+    +'<div class="sc-sub">'+(arr.length?(arr.length+'건'):'아직 없음')+'</div></div>'
+    +(arr.length?'<span onclick="clearAlertLog()" style="font-size:11.5px;color:var(--sc-mut3);cursor:pointer;'
+      +'padding:5px 10px;border:1px solid var(--sc-bd2);border-radius:9px">지우기</span>':'')+'</div>';
+  if(!arr.length){ el.innerHTML=head
+    +'<div style="font-size:12.5px;color:var(--sc-mut2);padding:16px 0;text-align:center">'
+    +'순찰 완료·병해충 알림이 여기에 쌓입니다.</div>'; return; }
+  el.innerHTML=head+'<div class="sc-rows">'+arr.map(function(a){
+    var dis=(a.kind==='disease');
+    var when='';
+    try{ var d=new Date(a.at); when=('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2); }catch(e){}
+    return '<div style="display:flex;align-items:center;gap:11px;padding:11px 13px;border-radius:13px;'
+      +'background:'+(dis?'rgba(255,107,90,.09)':'var(--sc-inner)')+';'
+      +'border:1px solid '+(dis?'rgba(255,107,90,.26)':'var(--sc-bd)')+'">'
+      +(a.img?'<img src="'+a.img+'" onerror="this.style.display=\'none\'" '
+        +'style="width:46px;height:46px;border-radius:10px;object-fit:cover;flex:none;cursor:pointer" '
+        +'onclick="window.open(this.src,\'_blank\')">'
+       :'<span style="width:46px;height:46px;border-radius:10px;flex:none;display:flex;align-items:center;'
+        +'justify-content:center;font-size:19px;background:var(--sc-card3)">'+(dis?'🐛':'✅')+'</span>')
+      +'<div style="flex:1;min-width:0">'
+        +'<div style="font-size:13px;font-weight:700;color:'+(dis?'var(--sc-redT)':'var(--sc-fg)')+'">'+a.title+'</div>'
+        +'<div style="font-size:11.5px;color:var(--sc-mut2);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+a.body+'</div></div>'
+      +'<span class="mono" style="font-size:11px;color:var(--sc-mut);flex:none">'+when+'</span></div>';
+  }).join('')+'</div>';
+};
 function renderFleetStatus(){
   var el=document.getElementById('fleetStatus'); if(!el)return;
   var robots=(window._lastRobots||[]).slice().sort(function(a,b){
@@ -2060,17 +2094,21 @@ function renderCropCard(){
         : '<div class="sc-head"><div><h3 class="sc-title">작물 상태</h3><div class="sc-sub">순찰 스캔 대기 중</div></div></div>')
       +'<div class="sc-inner" style="text-align:center;padding:28px 18px">'
       +'<div style="font-size:14px;font-weight:700;color:var(--sc-mut5)">🚜 아직 순찰 검출 결과가 없습니다</div>'
-      +'<div style="font-size:12px;color:var(--sc-mut2);margin-top:6px">순찰이 완료되면 익음·안익음·병해충·썩음 비율이 채워집니다.</div></div>';
+      +'<div style="font-size:12px;color:var(--sc-mut2);margin-top:6px">순찰이 완료되면 익음·안익음·병해충 비율이 채워집니다.</div></div>';
     try{renderHeatSummary();}catch(e){}
     return;
   }
   var cr=window._heatCrop;
   // Syncult 핸드오프 1-4 '작물 상태': 채움색은 고정 액센트(라임/레드/앰버/브라운),
   // 값 텍스트는 라이트 배경 대비를 위해 어두운 토큰(--sc-redT 등)을 쓴다.
+  /* 썩음 칸은 없앴다. AI 모델이 부패와 병해충을 안정적으로 구분하지 못해
+     DG AI Service 가 rotten 을 disease_percent 에 합쳐서 보내고 rotten_percent 는 항상 0 이다
+     (컨플루언스 시나리오1 첫 문단). 실기에서도 썩음이 계속 0.0% 로만 떴다.
+     0 으로 고정된 칸을 띄우면 '썩은 게 하나도 없다' 는 잘못된 확신을 준다 →
+     병충해 = disease + rot 로 합쳐 3칸으로 보여준다. */
   var C=[['익음','수확 대상',cr.ripe||0,'var(--sc-ripe)','var(--sc-redT)','rgba(255,107,90,.08)'],
          ['안익음','관찰',    cr.unripe||0,'var(--sc-lime)','var(--sc-accentT)','rgba(201,242,77,.08)'],
-         ['병충해','방제 필요',cr.pest||0,'var(--sc-pest)','var(--sc-amberTx)','rgba(242,179,61,.08)'],
-         ['썩음','제거 필요',  cr.rot||0,'var(--sc-rot)','var(--sc-brownT)','rgba(138,106,74,.14)']];
+         ['병충해','방제 필요',(cr.pest||0)+(cr.rot||0),'var(--sc-pest)','var(--sc-amberTx)','rgba(242,179,61,.08)']];
   var tot=C.reduce(function(s,c){return s+c[2];},0)||1;
   var bar=C.map(function(c){return '<i style="width:'+(c[2]/tot*100)+'%;background:'+c[3]+'"></i>';}).join('');
   var tiles=C.map(function(c){ var pct=(c[2]/tot*100).toFixed(1);
@@ -2415,6 +2453,14 @@ var FARM={
     {id:11,x: 4.48,z: -1.06, ord:6 },
     {id:12,x:-3.63,z:  2.53, ord:10},
     {id:13,x: 0.27,z:  1.69, ord:11},
+    /* 양방향 촬영 지점의 짝 (시나리오1 E2 20-1). 로봇 카메라는 한쪽에 고정이라
+       통로 양쪽을 다 찍으려면 같은 자리에서 방향만 돌려 한 번 더 찍는다: 10↔18, 13↔19.
+       ACS 는 이 번호로 검출을 보내는데 FARM 에 없어서 **그려지지 않고 버려졌다**
+       (2026-08-03 실기: 18·19 유실 → 베드2·3 에 원이 하나씩 비었다).
+       좌표는 대표 노드와 같은 자리지만, 히트맵에서 겹치면 한 점으로 보이므로
+       각자 '바라보는 베드' 쪽으로 밀어 둔다 — 10은 베드3, 짝 18은 베드2 쪽. */
+    {id:18,x:-1.07,z: -1.52, ord:13, pair:10},
+    {id:19,x: 1.87,z:  1.69, ord:14, pair:13},
     {id:14,x: 4.50,z:  1.80, ord:5 },
     {id:15,x:-3.20,z:  7.20           },
     {id:16,x: 0.41,z:  5.78           },
@@ -3142,6 +3188,28 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
       }
     }catch(e){}
   }
+  /* ══ 최근 알림 기록 ══
+     배너·토스트·브라우저 알림은 전부 **휘발성**이다. 닫거나 새로고침하면 사라져서,
+     "순찰 끝났다는 알림이 안 왔다" 처럼 보인다(2026-08-03 실기 지적).
+     병해충 사진도 배너가 사라지면 다시 볼 방법이 없었다.
+     → localStorage 에 최근 20건을 남기고 대시보드 카드로 보여준다. */
+  function pushAlertLog(rec){
+    try{
+      var k='automato_alerts';
+      var arr=JSON.parse(localStorage.getItem(k)||'[]');
+      if(rec.seq && arr.some(function(a){return a.seq===rec.seq;})) return;   // 중복 방지
+      arr.unshift(rec); arr=arr.slice(0,20);
+      localStorage.setItem(k,JSON.stringify(arr));
+      window.renderAlertLog&&window.renderAlertLog();
+    }catch(e){}
+  }
+  window.getAlertLog=function(){
+    try{ return JSON.parse(localStorage.getItem('automato_alerts')||'[]'); }catch(e){ return []; }
+  };
+  window.clearAlertLog=function(){
+    try{ localStorage.removeItem('automato_alerts'); window.renderAlertLog&&window.renderAlertLog(); }catch(e){}
+  };
+  window._pushAlertLog=pushAlertLog;
   function banner(html){
     var b=document.getElementById('diseaseBanner');
     if(!b){ b=document.createElement('div'); b.id='diseaseBanner';
@@ -3161,7 +3229,7 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
     if(!p){ el.innerHTML='<div style="color:var(--muted);font-size:14px">🚓 진행 중인 순찰이 없습니다</div>'; return; }
     el.innerHTML='<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center">'
       +'<div style="font-weight:800;font-size:15px">🚓 순찰 진행 중 · '+val(p.robot_id,'')+' · WP'+val(p.waypoint_id)+'</div>'
-      +'<div style="font-size:14px;color:var(--muted)">🍅 익음 '+num(p.ripe)+'% · 🟢 안익음 '+num(p.unripe)+'% · 🟠 썩음 '+num(p.rotten)+'% · 🐛 병해충 '+num(p.disease)+'%</div></div>';
+      +'<div style="font-size:14px;color:var(--muted)">🍅 익음 '+num(p.ripe)+'% · 🟢 안익음 '+num(p.unripe)+'% · 🐛 병해충 '+num((p.disease||0)+(p.rotten||0))+'%</div></div>';
   };
   // [시나리오2 E4] 수확 진행 실시간 표시 — 순찰(renderPatrolLive)과 같은 자리에 붙는다
   window.renderHarvestLive=function(){
@@ -3200,6 +3268,9 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
       );
       notify('🐛 병해충 발견', msg, true);
       try{toast(msg);}catch(_){}
+      pushAlertLog({seq:e.seq, kind:'disease', at:e.detected_at||new Date().toISOString(),
+                    title:'병해충 발견', body:msg, pct:e.disease_percent,
+                    img:e.image_path?('/detections/'+encodeURI(String(e.image_path))):null});
     } else if(e.event==='patrol_completed'){
       // 히트맵·작물 상태는 **여기서만** 바뀐다. 서버가 patrol_completed 에서
       // 방문 웨이포인트 평균을 확정하므로, 그 직후 한 번 읽으면 된다.
@@ -3216,6 +3287,8 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
       var uvtxt=partial&&uv.length?(' — '+uv.map(function(x){return esc(x)+'번';}).join(', ')+'. 통로 막힘으로 도달하지 못했습니다.'):'';
       var m='✅ '+head+uvtxt+' · '+(e.robot_id||'')+' (익음 '+(s.ripe_percent||0)+'% · 병해충 '+(s.disease_percent||0)+'%)';
       notify(partial?'⚠️ 순찰 완료 (일부 미방문)':'✅ 순찰 완료', m, partial);
+      pushAlertLog({seq:e.seq, kind:'patrol', at:e.completed_at||new Date().toISOString(),
+                    title:partial?'순찰 완료 (일부 미방문)':'순찰 완료', body:m});
       try{toast(m);}catch(_){}
       window._patrolLive=null; window.renderPatrolLive();
       try{loadPatrol();}catch(_){}   // 순찰 완료 → 순찰 화면 다시 '배정 가능'으로
@@ -3325,7 +3398,12 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
     try{
       var proto=location.protocol==='https:'?'wss:':'ws:';
       var ws=new WebSocket(proto+'//'+location.host+'/ws/farm-admin');
-      ws.onopen=function(){ wsOk=true; };
+      /* ⚠ 재접속하면 끊겨 있던 동안의 이벤트를 **다시 받아야 한다.**
+         WS 는 과거 이벤트를 되돌려주지 않으므로, 붙자마자 since=_evSeq 로 한 번 긁는다.
+         2026-08-03 실기: 순찰(17:50~17:55) 도중 WS 가 끊겼다 17:57 에 재접속했는데,
+         그 사이 patrol_completed 와 disease_alert 2건이 통째로 유실돼
+         완료 알림도 병해충 사진도 화면에 안 떴다(텔레그램은 서버가 보내서 정상 도착). */
+      ws.onopen=function(){ wsOk=true; catchUp(); };
       ws.onmessage=function(m){ wsOk=true; try{ dispatch(JSON.parse(m.data)); }catch(_){} };
       ws.onclose=function(){ wsOk=false; startPolling(); setTimeout(connectWS,5000); };
       ws.onerror=function(){ wsOk=false; };
@@ -3335,6 +3413,19 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
   async function prime(){
     try{ var j=await (await fetch('/api/v1/patrol/events?since=0')).json(); window._evSeq=j.last_seq||0; }catch(e){}
   }
+  /* 놓친 이벤트 따라잡기. prime() 과 다르다 —
+     prime 은 '첫 로드라 과거는 재생하지 않는다', catchUp 은 '끊긴 동안 것만 마저 받는다'. */
+  var _catching=false;
+  async function catchUp(){
+    if(_catching) return; _catching=true;
+    try{
+      var j=await (await fetch('/api/v1/patrol/events?since='+(window._evSeq||0))).json();
+      (j.events||[]).forEach(dispatch);
+    }catch(e){}
+    _catching=false;
+  }
+  // 탭을 다시 보게 됐을 때도 따라잡는다(백그라운드 탭은 타이머가 늦춰진다)
+  document.addEventListener('visibilitychange',function(){ if(!document.hidden) catchUp(); });
   prime().then(function(){
     connectWS();
     setTimeout(function(){ if(!wsOk) startPolling(); },2500);   // WS 안 뜨는 환경(pythonanywhere)은 폴링
