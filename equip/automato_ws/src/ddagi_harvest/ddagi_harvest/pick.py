@@ -425,11 +425,13 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
       30초(harvest_feedback_timeout_sec)다. 열매 단위로만 Feedback 을 쏘면
       **정상 수확 중에 취소당한다**(실측: 마지막 Feedback 후 30.5초에 취소).
       단계 경계에서 쏘므로 팔이 실제로 멎으면 여전히 신호가 끊긴다 —
-      워치독의 '멎음 감지' 는 그대로 살아 있다.
+      워치독의 '멎음 감지' 는 그대로 살아 있다. 그래서 아래 _step 위치를 옮기거나
+      타이머 하트비트로 바꾸면 안 된다 — 멎은 팔도 살아 있다고 보고하게 된다.
     """
     def _step(name: str) -> None:
         if on_step is not None:
             on_step(name)
+
     # 접근 자세 결정: 위치별 티칭 모델(taught_approaches 보간)이 있으면 그걸로 — 끝
     # 토마토는 바깥에서 접근하는 등 위치마다 다른 자세가 필요. 시연 없으면 고정 오프셋 폴백.
     plan = (approach_model.plan(target_xyz, zone_fn=lambda b: zone_of(b[1]))

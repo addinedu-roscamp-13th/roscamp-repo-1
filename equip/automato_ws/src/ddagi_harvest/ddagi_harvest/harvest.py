@@ -226,13 +226,8 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
             break
 
         for idx, t in enumerate(batch):
-            progress(len(batch) - idx)       # 이번 라운드 잔여 개수
-            # 파지 1회가 실측 ~40초인데 DG 수확 워치독은 30초다. 열매 단위로만
-            # 알리면 **정상 수확 중에 취소당한다**(실측: 마지막 Feedback 후 30.5초에
-            # CANCELED). 그래서 파지 내부 단계에서도 알린다. 단계 경계라 팔이 실제로
-            # 멎으면 신호도 끊긴다 — 워치독의 '멎음 감지' 는 그대로 살아 있다.
-            def _tick(_name, _remain=len(batch) - idx):
-                progress(_remain)
+            remaining = len(batch) - idx     # 이번 라운드 잔여 개수
+            progress(remaining)
             if attempts >= max_attempts:
                 break
             if should_cancel is not None and should_cancel():
@@ -263,7 +258,11 @@ def harvest(arm: ArmBackend, detector: TomatoDetector,
                 try:
                     # pick 은 그리퍼가 물었을 때만 True + 바구니 투하. 최종 수확 판정은
                     # 이 파지여부 + 재검출 '사라짐'을 함께 본다(줄기 건드려 떨군 것 배제).
-                    grabbed = pk.pick(arm, target, t["grade"], on_step=_tick)
+                    # on_step: 파지 1회가 ~40초라 열매 단위로만 알리면 DG 워치독(30초)에
+                    # 정상 수확 중에 취소당한다. 잔여 개수는 그대로 두고 파지 내부 단계
+                    # 경계마다 다시 흘린다 — 근거는 pick() docstring 참고.
+                    grabbed = pk.pick(arm, target, t["grade"],
+                                      on_step=lambda _name: progress(remaining))
                 except RuntimeError as e:
                     # 진입 불가(standoff 확보 실패) — 즉시 포기하되 **영구 제외는 안 한다**.
                     # 다음 배치에는 옆 열매가 빠져 도달성이 달라질 수 있어 재시도 가치가
