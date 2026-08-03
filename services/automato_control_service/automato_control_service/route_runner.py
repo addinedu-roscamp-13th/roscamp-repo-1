@@ -32,6 +32,7 @@ from automato_control_service.patrol_config import (
     BLOCK_TTL_SEC,
     GOAL_ACCEPT_TIMEOUT_SEC,
     HEARTBEAT_SEC,
+    MIN_BLOCK_ELAPSED_SEC,
     RESERVE_POLL_SEC,
     RESERVE_WAIT_SEC,
     SEGMENT_TIMEOUT_SEC,
@@ -116,30 +117,56 @@ class RouteRunner:
         # waypoint_id -> {"x","y","yaw","capture"}; 그래프 로드 시 노드가 채운다.
         # 순찰의 짝(pair)까지 전부 들어온다 — 짝을 하달하려면 그 좌표와 yaw 가 필요하다.
         self.wp_meta = {}
-        # 막힘/양보로 잠시 회피할 통로: corridor_id -> 만료 monotonic 시각
+        # 잠시 회피할 자원: corridor_id -> (만료 monotonic 시각, 소유 로봇 | None).
+        # 소유 로봇이 None 이면 '모두가 피해야 할 진짜 막힘', 값이 있으면 '그 로봇만의
+        # 사정(남이 쓰는 중이라 양보)'이다. 아래 _blacklist_add 주석 참고.
         self._blacklist = {}
         self._bl_lock = threading.Lock()
 
     # ---------------------------- 블랙리스트(시간 기반) ---------------------------- #
-    def _blacklist_add(self, corridor_id) -> None:
-        with self._bl_lock:
-            self._blacklist[corridor_id] = time.monotonic() + BLOCK_TTL_SEC
+    def _blacklist_add(self, corridor_id, robot_id=None) -> None:
+        """회피 목록에 올린다. robot_id 를 주면 **그 로봇에게만** 보이는 회피가 된다.
 
-    def _blacklist_active(self) -> set:
+        한 바구니에 성격이 다른 둘이 들어오기 때문에 구분이 필요하다:
+          · robot_id=None : 진짜 막힘(주행이 실패했다) — 물리적 장애물이므로 모두가 피해야
+            한다. 전역으로 공유한다.
+          · robot_id=지정 : 양보(통로·자리를 남이 쥐고 있어 비켜 줬다) — 이건 **그 로봇의
+            사정**일 뿐 길이 사라진 게 아니다. 전역으로 퍼뜨리면 아무 상관 없는 로봇까지
+            그 지점을 목표로 삼지 못해 '경로 없음 → 건너뜀'이 연쇄한다.
+            (실측: dg_02 가 지점 9 에 서 있어 dg_03 이 양보했을 뿐인데, 무관한 dg_01 의
+             9 행 3건이 전부 차단됐다.)
+        """
+        with self._bl_lock:
+            self._blacklist[corridor_id] = (
+                time.monotonic() + BLOCK_TTL_SEC, robot_id)
+
+    def _blacklist_active(self, robot_id=None) -> set:
+        """지금 회피해야 할 자원. robot_id 를 주면 '전역 막힘 + 그 로봇 몫'만 돌려준다.
+
+        robot_id 를 안 주면 전역 막힘만 본다 — 남의 양보 사정에 끌려다니지 않기 위함이다.
+        """
         now = time.monotonic()
         with self._bl_lock:
-            for cid in [c for c, exp in self._blacklist.items() if exp <= now]:
+            for cid in [c for c, (exp, _) in self._blacklist.items() if exp <= now]:
                 del self._blacklist[cid]
-            return set(self._blacklist.keys())
+            return {cid for cid, (_, owner) in self._blacklist.items()
+                    if owner is None or owner == robot_id}
 
     def blacklist_view(self, engine) -> dict:
         """회피 중인 목록을 통로/지점으로 갈라서 돌려준다(관측 도구용).
 
         _blacklist 는 통로 id(양수)와 자리 id(음수)를 한 바구니에 담는다. 화면이 이걸
         그대로 받으면 음수를 통로 번호로 오해해 엉뚱한 선을 칠한다.
+        여기서는 소유자를 가리지 않고 **전부** 보여준다 — 화면은 '지금 회피 중인 것'을
+        그대로 비추는 관측 창구이지, 경로 계산의 입력이 아니기 때문이다.
         반환: {"corridors": [id...], "nodes": [노드id...]}
         """
-        corridors, nodes = self._split_blocked(engine, self._blacklist_active())
+        now = time.monotonic()
+        with self._bl_lock:
+            for cid in [c for c, (exp, _) in self._blacklist.items() if exp <= now]:
+                del self._blacklist[cid]
+            active = set(self._blacklist.keys())
+        corridors, nodes = self._split_blocked(engine, active)
         return {"corridors": sorted(corridors), "nodes": sorted(nodes)}
 
     # ---------------------------- 도킹 진입 방향 ---------------------------- #
@@ -240,6 +267,9 @@ class RouteRunner:
         hooks = hooks or DriveHooks()
         attempt_block = set()   # 이번 target 시도에서 회피할 통로(예약실패/막힘 누적)
         held = []               # 지금 예약(점유)한 자원들 — dispatch 하트비트에 live 로 넘김
+        # 통로별 '너무 빨리 온 실패'를 이미 한 번 봐줬는지. 통신 사고로 온 가짜 실패에
+        # 지도를 지우지 않으려는 장치이자, 그 관용이 무한 재시도가 되지 않게 하는 제동이다.
+        quick_fail = set()
         seg = None              # 다음에 하달할 세그먼트 (룩어헤드가 미리 채웠을 수 있음)
         # 출발 전에 '지금 서 있는 자리'부터 확보한다. 앞 구간에서 넘겨받았으면 내 것이라
         # 즉시 성공(멱등), 첫 구간이면 여기서 처음 잡는다. 이게 없으면 이동 중이
@@ -255,7 +285,8 @@ class RouteRunner:
             while current != target:
                 # 1) 하달할 세그먼트 확보(룩어헤드가 미리 잡아놨으면 그걸 사용).
                 if seg is None:
-                    route = self._plan_route(engine, current, target, attempt_block)
+                    route = self._plan_route(
+                        engine, current, target, attempt_block, robot_id)
                     if route is None:
                         self._log.warn(
                             f"경로 없음 task={task_id} {current}→{target} → 건너뜀")
@@ -320,12 +351,16 @@ class RouteRunner:
                     f"통로={seg_cids} 촬영={sorted(cap_ids)}")
 
                 # 3) 세그먼트 배열 하달. 하트비트엔 live held 를 넘겨 룩어헤드분도 함께 유지.
+                # 하달~응답 시간을 재 둔다 — 실패가 왔을 때 그게 '진짜 막힘'인지
+                # '통신 사고'인지 가르는 유일하게 믿을 만한 단서다(아래 4) 참고).
+                dispatched_at = time.monotonic()
                 code, last_wp = self._dispatch_segment(
                     client, task_id, hadal, cap_ids,
                     heartbeat=(engine, held, robot_id), on_tick=on_tick,
                     on_feedback=on_feedback,
                     # 목표에 닿는 세그먼트에서만 도착 방향을 지정한다(reached 재사용).
                     final_yaw=final_yaw if reached else None)
+                elapsed = time.monotonic() - dispatched_at
                 # 하달 결과를 호출자에게 알린다(순찰: 촬영 끝난 지점을 방문 완료로 마킹).
                 hooks.on_segment_done(hadal, cap_ids, cap_parents, last_wp, code)
                 # 이후 진행도 계산은 그래프 노드 기준이므로 그래프 밖 id 를 되돌린다.
@@ -336,15 +371,29 @@ class RouteRunner:
                 if code == 2:
                     self._log.warn(f"중단 보고 task={task_id} → 주행 실패")
                     return "aborted", current
-                if code == 1:                       # 진짜 막힘 → 우회
+                if code == 1:                       # 막힘(또는 통신 사고) → 우회/재시도
                     current, blocked_cid, standing = self._segment_progress(
                         current, seg_wps, seg_cids, last_wp)
                     if blocked_cid is not None:
-                        self._log.warn(
-                            f"세그먼트 막힘 task={task_id} 통로 {blocked_cid} "
-                            f"(로봇 위치 {current}) → 블랙리스트 후 우회")
-                        self._blacklist_add(blocked_cid)
-                        attempt_block.add(blocked_cid)
+                        # 하달하자마자 온 실패는 막힘의 증거가 될 수 없다 — 로봇이 그
+                        # 통로를 시도해 볼 시간조차 없었다. 이걸 믿고 블랙리스트에 넣으면
+                        # 멀쩡한 통로가 지도에서 지워지고 '경로 없음'이 연쇄한다.
+                        # 통로당 한 번만 봐주고(무한 재시도 방지) 그대로 재계획한다.
+                        if (elapsed < MIN_BLOCK_ELAPSED_SEC
+                                and blocked_cid not in quick_fail):
+                            quick_fail.add(blocked_cid)
+                            self._log.warn(
+                                f"세그먼트 실패가 너무 빠름 task={task_id} 통로 "
+                                f"{blocked_cid} ({elapsed:.1f}초 < "
+                                f"{MIN_BLOCK_ELAPSED_SEC:.0f}초, 로봇 위치 {current}) "
+                                f"→ 막힘으로 보지 않고 1회 재시도. 하달이 로봇에 닿는지 "
+                                f"확인할 것(중계 노드가 둘이면 이 증상이 난다)")
+                        else:
+                            self._log.warn(
+                                f"세그먼트 막힘 task={task_id} 통로 {blocked_cid} "
+                                f"(로봇 위치 {current}) → 블랙리스트 후 우회")
+                            self._blacklist_add(blocked_cid)
+                            attempt_block.add(blocked_cid)
                     self._release_except(engine, robot_id, held, {standing}, current)
                     continue
                 # code == 0: 세그먼트 끝 도착.
@@ -474,10 +523,25 @@ class RouteRunner:
         nodes = {engine.node_of_slot(i) for i in ids if engine.is_node_slot(i)}
         return corridors, nodes
 
-    def _plan_route(self, engine, current, target, attempt_block):
-        """current→target 경로. 인접하면 직행, 막히면 Dijkstra 우회. 없으면 None."""
+    def _plan_route(self, engine, current, target, attempt_block, robot_id=None):
+        """current→target 경로. 인접하면 직행, 막히면 Dijkstra 우회. 없으면 None.
+
+        robot_id: 회피 목록에서 '이 로봇이 피해야 할 것'만 골라내는 기준. 안 주면 전역
+        막힘만 본다(_blacklist_active 참고).
+        """
         blocked, blocked_nodes = self._split_blocked(
-            engine, set(attempt_block) | self._blacklist_active())
+            engine, set(attempt_block) | self._blacklist_active(robot_id))
+        # 목표 자리가 회피 목록에 있다는 이유로 목표 자체를 포기하지는 않는다.
+        # 자리 회피는 '지금 남이 서 있다'는 순간의 사정이고, 도착할 즈음엔 비어 있을 수
+        # 있다. 정말 안 비면 _acquire_segment 가 그 자리를 기다렸다 양보한다 — 판단은
+        # 거기서 하면 되고, 여기서 미리 잘라내면 갈 수 있는 목표까지 '경로 없음'이 된다.
+        # (실측: 지점 9 를 '지나가는' 경로는 멀쩡히 찾으면서 9 를 '목표로' 삼는 것만
+        #  원천 차단됐다. 순찰점은 대부분 갈림길이 없어 이 경로를 그대로 탄다.)
+        # 단 attempt_block 은 그대로 둔다 — 이번 시도에서 방금 못 간 자리로 곧장
+        # 되돌아가면 무한 왕복이 된다.
+        _, attempt_nodes = self._split_blocked(engine, set(attempt_block))
+        if target not in attempt_nodes:
+            blocked_nodes.discard(target)
         direct = engine.corridor_between(current, target)
         # 직행도 '도착 지점이 막혔는지'를 같이 본다 — 통로가 비어도 그 자리에 남이 서
         # 있으면 갈 수 없다. 이 검사를 빠뜨리면 우회 등록해 둔 지점으로 곧장 되돌아간다.
@@ -544,7 +608,8 @@ class RouteRunner:
         first_wp, first_cid = hops[0]
         first_slot = engine.node_slot(first_wp)
         if not self._reserve_with_wait(engine, first_cid, robot_id, held):
-            self._blacklist_add(first_cid)
+            # 양보는 '이 로봇의 사정'이다 — 전역으로 퍼뜨리면 남의 경로까지 끊는다.
+            self._blacklist_add(first_cid, robot_id)
             attempt_block.add(first_cid)
             return None
         # 통로를 잡은 뒤 자리를 기다리는 동안, 방금 잡은 통로도 하트비트 대상에 넣는다.
@@ -556,7 +621,8 @@ class RouteRunner:
             self._log.warn(
                 f"지점 {first_wp} 자리 점유 중(로봇 {engine.holder_of(first_slot)}) "
                 f"→ 통로 {first_cid} 반납 후 그 지점을 피해 우회")
-            self._blacklist_add(first_slot)
+            # 자리 점유도 마찬가지로 이 로봇만의 사정이다(위 통로 양보와 같은 이유).
+            self._blacklist_add(first_slot, robot_id)
             attempt_block.add(first_slot)
             return None
         seg_wps = [first_wp]
@@ -581,7 +647,7 @@ class RouteRunner:
         """
         if node == target:
             return None                     # 이미 목표 → 미리 잡을 것 없음
-        route = self._plan_route(engine, node, target, attempt_block)
+        route = self._plan_route(engine, node, target, attempt_block, robot_id)
         if route is None:
             return None
         seg_wps = []
@@ -668,6 +734,9 @@ class RouteRunner:
         for i, wid in enumerate(waypoint_ids):
             m = self.wp_meta.get(wid, {})
             is_capture = bool(wid in capture_ids)
+            # 도착해서 이 yaw 로 '정확히' 돌아서야 하는가. 촬영 지점은 capture 플래그가
+            # 이미 그 일을 시키므로(로봇이 찍기 전에 조준한다) 여기서는 안 켠다.
+            hold_yaw = False
             if yaw_override is not None:
                 # 호출부가 방향을 지정했다(언도킹). 촬영 판정보다 우선한다 — 이 하달은
                 # 애초에 촬영이 없고, 목적이 '고개를 돌리지 않고 빠져나오기' 이다.
@@ -676,6 +745,11 @@ class RouteRunner:
                 # 마지막 노드(= 도킹 진입 노드): 마커를 정면으로 봐야 도킹이 시작된다.
                 # 중간 노드는 아래 진행 방향 규칙 그대로라 두리번거림이 생기지 않는다.
                 yaw = float(final_yaw)
+                # 방향을 실어 보내는 것만으로는 부족하다 — 로봇은 통과 지점의 yaw 를
+                # '가는 방향'으로 덮어쓰고 도착 후에도 고쳐 서지 않는다(촬영 지점만
+                # 조준한다). 이 플래그가 그 예외를 만든다. 없으면 오던 방향 그대로
+                # 서서 마커를 비스듬히 보고 도킹이 실패한다.
+                hold_yaw = True
             elif is_capture:
                 # 촬영 지점: 베드를 봐야 사진이 나온다 → DB 에 지정된 방향 그대로.
                 yaw = float(m.get("yaw") or 0.0)
@@ -690,6 +764,7 @@ class RouteRunner:
                 y=coords[i][1],
                 yaw=yaw,
                 capture=is_capture,
+                hold_yaw=hold_yaw,
             ))
         goal = Navigate.Goal()
         goal.task_id = int(task_id)
