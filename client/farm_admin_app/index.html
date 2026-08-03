@@ -2781,11 +2781,19 @@ function drawFarmHeat(){
   g.moveTo(L,TP); g.lineTo(L,BT); g.lineTo(R,BT); g.lineTo(R,TP);   // 좌·아래(화면기준)·우
   g.stroke();
   // 재배 베드 — 히트가 이 위에 얹히므로 테두리는 얇은 무채색. (구버전 빨강 테두리는 히트 빨강과 겹쳐 보였다)
-  F.pillars.forEach(function(p){
+  F.pillars.forEach(function(p,i){
     var lenX=p.face==='x'?p.w:p.d, lenZ=p.face==='x'?p.d:p.w;
     var x=sx(p.x)-sw(lenX)/2, y=sy(p.z)-sh(lenZ)/2;
     g.fillStyle=C.fill; g.fillRect(x,y,sw(lenX),sh(lenZ));
     g.strokeStyle=C.line; g.lineWidth=1.5; g.strokeRect(x,y,sw(lenX),sh(lenZ));
+    // 베드 이름을 베드 위에 직접 얹는다. 아래 요약행이 '베드 1/2/3' 으로 나오는데
+    // 지도에 이름이 없으면 그게 어느 덩어리인지 알 수 없다(열지도는 촬영점 단위라 더 헷갈린다).
+    // 히트 색과 경쟁하지 않게 무채색 한 톤, 굵기만 살짝.
+    g.save();
+    g.fillStyle=C.txt; g.font='bold 12px sans-serif';
+    g.textAlign='center'; g.textBaseline='middle';
+    T('베드 '+(i+1), sx(p.x), sy(p.z));
+    g.restore();
   });
   // 통로(corridor) = 로봇이 실제로 다니는 길. 순찰점끼리 직선으로 잇지 않는다(없는 길이 생긴다).
   g.strokeStyle=C.soft; g.lineWidth=1.5; g.setLineDash([4,4]);
