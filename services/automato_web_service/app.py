@@ -1896,7 +1896,11 @@ def _apply_detection_to_heat(d):
         h["pending"] = pend
         # ── 히트맵은 즉시 반영 ── (작물 % 인 h["crop"] 은 건드리지 않는다)
         byw = dict(h.get("by_waypoint") or {})
-        byw[str(wp)] = {"ripe": pcts.get("ripe", 0.0), "at": now}
+        # 익음만이 아니라 네 항목을 다 남긴다. 화면이 '그 지점에서 무엇이 가장 많았나'로
+        # 색을 고르기 때문이다(익음/안익음/병충해 3색). 익음만 있으면 병해충 100%인
+        # 지점이 '익음 0' 으로만 보여서 안전한 색으로 칠해진다.
+        byw[str(wp)] = {"ripe": pcts.get("ripe", 0.0), "unripe": pcts.get("unripe", 0.0),
+                        "rot": pcts.get("rot", 0.0), "pest": pcts.get("pest", 0.0), "at": now}
         h["by_waypoint"] = byw
         h["source"] = "acs"
         h["updated_at"] = time.strftime("%m/%d %H:%M")
@@ -1955,7 +1959,9 @@ def _commit_heat_on_patrol_completed(d):
         # 히트맵은 이미 실시간으로 채워져 있다. 혹시 중간에 놓친 지점이 있으면 여기서 메운다.
         byw = dict(h.get("by_waypoint") or {})
         for k, v in wps.items():
-            byw[k] = {"ripe": float(v.get("ripe") or 0.0), "at": v.get("at")}
+            byw[k] = {"ripe": float(v.get("ripe") or 0.0), "unripe": float(v.get("unripe") or 0.0),
+                      "rot": float(v.get("rot") or 0.0), "pest": float(v.get("pest") or 0.0),
+                      "at": v.get("at")}
         h["by_waypoint"] = byw
         h["patrol_count"] = h.get("patrol_count", 0) + 1
         h["updated_at"] = time.strftime("%m/%d %H:%M")
