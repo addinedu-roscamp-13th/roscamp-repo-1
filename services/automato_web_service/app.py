@@ -1796,20 +1796,24 @@ def save_heat(d):
 
 
 def _apply_detection_to_heat(d):
-    """E2-9 검출 콜백(ACS→Web)을 **누적 버퍼**에 쌓는다. 화면에는 아직 반영하지 않는다.
+    """E2-9 검출 콜백(ACS→Web)을 두 갈래로 처리한다.
 
-       [왜 즉시 반영하지 않나]
-       구버전은 crop[name] = 이번 웨이포인트 값 으로 **덮어썼다.** 그래서
-       WP1 → WP2 로 넘어가면 WP1 결과가 사라지고 WP2 값만 남았다. 순찰이 끝나면
-       마지막 웨이포인트 하나의 값이 '농장 전체 작물 상태' 로 표시됐다.
-       올바른 값은 **방문한 웨이포인트 전체의 평균**이다.
+       [히트맵] by_waypoint 에 **즉시** 기록한다 → 찍는 대로 지도에 점이 하나씩 늘어난다.
+                앞서 찍은 점은 그대로 남는다(누적). 이게 '실시간 누적' 이다.
+       [작물 %] pending 버퍼에만 쌓고 화면에는 반영하지 않는다.
+                순찰이 **완전히 끝나야** 방문한 지점 전체의 평균으로 확정한다.
 
-       [왜 완료 시점에 커밋하나]
-       순찰 도중에 숫자가 계속 흔들리면 농장주가 어느 값을 믿어야 할지 알 수 없다.
-       그래서 도는 동안은 pending 에만 쌓고, patrol_completed 에서 한 번에 평균을 내
-       crop/by_waypoint 로 커밋한다. 그 전까지 화면은 **직전 순찰 결과**를 그대로 유지한다.
+       [왜 나눴나]
+       지도는 '어디까지 훑었나' 를 보여주는 것이라 진행 중에도 늘어나야 쓸모가 있다.
+       반면 작물 % 는 농장 전체를 대표하는 수치라, 절반만 돈 상태의 평균을 보여주면
+       그게 최종값인 줄 알고 판단하게 된다.
 
-       task_id 가 바뀌면 새 순찰이므로 버퍼를 비운다(이전 순찰 값이 섞이지 않게)."""
+       [ACS 는 기억하지 않는다]
+       보연님 ACS 의 notify 는 '지금 이 지점' 스냅샷만 보낸다
+       (detection_service.py: "zone_cumulative 는 없음(제거됨)").
+       그래서 누적은 전적으로 이쪽 몫이다. heat.json 에 쓰므로 서버를 재시작해도 남는다.
+
+       task_id 가 바뀌면 새 순찰이므로 지도와 버퍼를 함께 비운다."""
     keys = (("ripe", "ripe_percent"), ("unripe", "unripe_percent"),
             ("rot", "rotten_percent"), ("pest", "disease_percent"))
     pcts = {}
@@ -1823,22 +1827,37 @@ def _apply_detection_to_heat(d):
     if wp is None:
         return
     task_id = d.get("task_id")
+    now = time.strftime("%m/%d %H:%M:%S")
     with LOCK:
         h = load_heat()
         pend = h.get("pending") or {}
-        if pend.get("task_id") != task_id:            # 새 순찰 → 버퍼 초기화
+        new_patrol = (pend.get("task_id") != task_id)
+        if new_patrol:                                  # 새 순찰 → 지도·버퍼 함께 초기화
             pend = {"task_id": task_id, "waypoints": {}}
+            h["by_waypoint"] = {}
+            # 작물 % 도 다시 감춘다. 안 그러면 히트맵은 새 순찰인데 옆의 숫자만
+            # 직전 순찰 값이라 짝이 안 맞는다 — 어제 헷갈린 지점이 정확히 이것이다.
+            h["crop_ready"] = False
         wps = dict(pend.get("waypoints") or {})
         wps[str(wp)] = {"ripe": pcts.get("ripe", 0.0), "unripe": pcts.get("unripe", 0.0),
-                        "rot": pcts.get("rot", 0.0), "pest": pcts.get("pest", 0.0),
-                        "at": time.strftime("%m/%d %H:%M:%S")}
+                        "rot": pcts.get("rot", 0.0), "pest": pcts.get("pest", 0.0), "at": now}
         pend["waypoints"] = wps
         h["pending"] = pend
+        # ── 히트맵은 즉시 반영 ── (작물 % 인 h["crop"] 은 건드리지 않는다)
+        byw = dict(h.get("by_waypoint") or {})
+        byw[str(wp)] = {"ripe": pcts.get("ripe", 0.0), "at": now}
+        h["by_waypoint"] = byw
+        h["source"] = "acs"
+        h["updated_at"] = time.strftime("%m/%d %H:%M")
         save_heat(h)
 
 
 def _commit_heat_on_patrol_completed(d):
-    """순찰 완료 → 누적 버퍼를 **방문 웨이포인트 평균**으로 확정해 화면에 반영한다.
+    """순찰 완료 → 버퍼를 **방문 웨이포인트 평균**으로 확정해 작물 % 를 채운다.
+
+       히트맵(by_waypoint)은 순찰 도중에 이미 실시간으로 채워져 있다. 여기서 하는 일은
+       **작물 상태 % 를 확정하는 것 하나뿐**이다 — 절반만 돈 평균이 최종값처럼 보이면
+       안 되므로 완료 시점까지 미뤄둔 것이다.
 
        평균은 방문한 지점 수로 나눈다(안 간 곳은 계산에 안 들어간다).
        버퍼가 비어 있으면(검출 콜백이 하나도 안 왔으면) 화면을 건드리지 않는다 —
@@ -1856,13 +1875,18 @@ def _commit_heat_on_patrol_completed(d):
         # heat.json 은 개수로 저장하고 화면이 합으로 비율을 다시 낸다.
         # 1000 스케일로 넣으면 화면 비율 = 평균 퍼센트가 그대로 된다.
         h["crop"] = {name: int(round(v * 10)) for name, v in avg.items()}
-        # 밀집 히트맵용 — 방문한 웨이포인트의 익음 비율만 남긴다(안 간 곳은 없음 그대로).
-        h["by_waypoint"] = {k: {"ripe": float(v.get("ripe") or 0.0), "at": v.get("at")}
-                            for k, v in wps.items()}
+        h["crop_ready"] = True          # 이제야 작물 % 를 화면에 내보내도 된다
+        # 히트맵은 이미 실시간으로 채워져 있다. 혹시 중간에 놓친 지점이 있으면 여기서 메운다.
+        byw = dict(h.get("by_waypoint") or {})
+        for k, v in wps.items():
+            byw[k] = {"ripe": float(v.get("ripe") or 0.0), "at": v.get("at")}
+        h["by_waypoint"] = byw
         h["patrol_count"] = h.get("patrol_count", 0) + 1
         h["updated_at"] = time.strftime("%m/%d %H:%M")
         h["source"] = "acs"
-        h["pending"] = {}
+        # task_id 는 남겨둔다 — 완료 직후 늦게 도착한 검출이 '새 순찰' 로 오인돼
+        # 방금 그린 히트맵을 지워버리는 것을 막는다.
+        h["pending"] = {"task_id": pend.get("task_id"), "waypoints": {}}
         save_heat(h)
         wlog("   작물 상태 확정: 웨이포인트 %d곳 평균 → 익음 %.1f%% 병해충 %.1f%%"
              % (n, avg["ripe"], avg["pest"]))
@@ -1904,6 +1928,14 @@ def get_heatmap():
         return jsonify({"pillars": None, "crop": None, "patrol_count": 0,
                         "updated_at": None, "awaiting_patrol": True, "by_waypoint": {},
                         "note": "아직 순찰 검출 결과가 없습니다. 순찰이 완료되면 채워집니다."})
+    if ACS_MODE and not d.get("crop_ready"):
+        # 히트맵은 찍는 대로 내보내되, 작물 % 는 순찰이 **완료돼야** 준다.
+        # 여기서 감추지 않으면 시드값(익음34.2%/병해충4.7%)이 첫 검출과 함께 새어나가
+        # 순찰 도중에 가짜 '병해충 4.7%' 경보가 뜬다.
+        d = dict(d)
+        d["crop"] = None
+        d["crop_pending"] = True
+        d["note"] = "순찰 진행 중입니다. 작물 비율은 순찰이 완료되면 표시됩니다."
     return jsonify(d)
 
 

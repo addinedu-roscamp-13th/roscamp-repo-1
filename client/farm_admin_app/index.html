@@ -1981,7 +1981,7 @@ async function harvestReset(){await fetch('/api/v1/patrol/reset',{method:'POST'}
 window._heatDens=window._heatDens||null; window._heatByWp=window._heatByWp||null; window._heatCrop=window._heatCrop||null; window._heatMeta=window._heatMeta||null;
 /* 웨이포인트별 익음 비율 → 베드별 밀집도(0~1).
    AI 는 순찰 지점(웨이포인트) 단위로만 검출 비율을 낸다. 히트맵은 '어느 베드가 많은가' 를
-   보여줘야 하므로, 각 순찰점을 가장 가까운 베드에 묶고 그 평균을 그 베드의 밀집도로 쓴다.
+   보여줘야 하므로, 각 순찰점을 그 점이 촬영하는 베드(waypoints 의 bed)에 묶고 평균을 낸다.
    촬영한 지점이 하나도 없는 베드는 null 로 남겨 그 베드만 안 칠한다(없는 데이터를 0 으로
    칠하면 '검사했고 익은 게 없다' 로 읽힌다). */
 function bedDensityFromWaypoints(byWp){
@@ -1992,13 +1992,15 @@ function bedDensityFromWaypoints(byWp){
     var w=FARM.waypoints.find(function(v){return String(v.id)===String(id);});
     var r=byWp[id]&&byWp[id].ripe;
     if(!w||typeof r!=='number') return;
-    var best=-1,bd=Infinity;
-    FARM.pillars.forEach(function(p,i){                 // 베드 사각형까지의 최단거리
-      var lenX=p.face==='x'?p.w:p.d, lenZ=p.face==='x'?p.d:p.w;
-      var dx=Math.max(Math.abs(w.x-p.x)-lenX/2,0), dz=Math.max(Math.abs(w.z-p.z)-lenZ/2,0);
-      var dist=Math.hypot(dx,dz); if(dist<bd){bd=dist;best=i;}
-    });
-    if(best>=0){ beds[best].sum+=r; beds[best].n++; }
+    /* 소속 베드는 waypoints 의 bed 필드로 **못박아** 둔다. 예전엔 '가장 가까운 베드'
+       로 추정했는데 두 가지가 깨졌다.
+         ① 짝 노드(10↔18, 13↔19)는 같은 자리에서 방향만 돌려 반대쪽 베드를 찍는다.
+            물리적으로 같은 좌표라 거리로는 원리상 구분이 불가능하다.
+         ② 베드를 조금만 옮겨도 소속이 바뀌어 4/4/4 가 3/5 로 깨졌다
+            (2026-08-04 통로 균등화 때 실제로 13번이 넘어갔다).
+       어느 베드를 향해 찍는지는 측정으로 정해진 사실이지 좌표에서 유추할 것이 아니다. */
+    var b=w.bed;
+    if(typeof b==='number' && beds[b]){ beds[b].sum+=r; beds[b].n++; }
   });
   if(!beds.some(function(b){return b.n;})) return null;
   return beds.map(function(b){ return b.n?Math.max(0,Math.min(1,(b.sum/b.n)/100)):null; });
@@ -2020,6 +2022,10 @@ async function loadHeat(){
       else if(Array.isArray(d.pillars)) window._heatDens=d.pillars;   // 누가 pillars 를 보내주면 그걸 우선
       if(d.crop) window._heatCrop=d.crop;
     }
+    /* 히트맵은 찍는 대로 늘어나고, 작물 % 는 순찰이 끝나야 나온다.
+       crop_pending = 검출은 들어오는 중인데 아직 완료 신호(patrol_completed)가 안 왔다는 뜻. */
+    window._heatPending=!!d.crop_pending;
+    window._heatShot=Object.keys(d.by_waypoint||{}).length;   // 지금까지 찍은 지점 수
     window._heatMeta={count:d.patrol_count,at:d.updated_at};
   }catch(e){}
   if(document.getElementById('farmHeat')) drawFarmHeat();     // 밀집 히트맵 다시 그림(서버 밀집도)
@@ -2036,7 +2042,9 @@ function renderHeatSummary(){
   var el=document.getElementById('heatSummary');
   var sub=document.getElementById('heatSub');
   if(sub){ var m=window._heatMeta;
-    sub.textContent=(m&&m.at)?(m.at+' 순찰 스캔 기준 · 베드 3열'):'순찰 스캔 대기 중'; }
+    sub.textContent=window._heatPending
+      ? ('순찰 중 · '+(window._heatShot||0)+'/12 구역 촬영 완료')
+      : ((m&&m.at)?(m.at+' 순찰 스캔 기준 · 베드 3열'):'순찰 스캔 대기 중'); }
   if(!el)return;
   var dens=window._heatDens, crop=window._heatCrop;
   if(!dens&&!crop){ el.innerHTML=''; return; }
@@ -2098,12 +2106,22 @@ function renderRobotPosList(){
 function renderCropCard(){
   var box=document.getElementById('cropCardBox'); if(!box)return;
   if(!window._heatCrop){   // 아직 순찰 검출 없음 — 시드값을 실측처럼 보여주지 않는다
+    /* 두 가지 상태를 구분해 보여준다.
+       진행 중  : 히트맵에는 점이 찍히고 있는데 순찰이 아직 안 끝난 상태.
+                 여기서 절반만 돈 평균을 내보이면 그게 최종값인 줄 알고 판단하게 되므로 미룬다.
+       대기     : 순찰을 아예 시작한 적 없음. */
+    var run=!!window._heatPending, shot=window._heatShot||0;
     box.innerHTML=(window._view==='mobile'
         ? '<div class="mb-ct" style="margin-bottom:10px">작물 상태 · 순찰 확인</div>'
-        : '<div class="sc-head"><div><h3 class="sc-title">작물 상태</h3><div class="sc-sub">순찰 스캔 대기 중</div></div></div>')
+        : '<div class="sc-head"><div><h3 class="sc-title">작물 상태</h3><div class="sc-sub">'
+          +(run?('순찰 중 · '+shot+'/12 구역'):'순찰 스캔 대기 중')+'</div></div></div>')
       +'<div class="sc-inner" style="text-align:center;padding:28px 18px">'
-      +'<div style="font-size:14px;font-weight:700;color:var(--sc-mut5)">🚜 아직 순찰 검출 결과가 없습니다</div>'
-      +'<div style="font-size:12px;color:var(--sc-mut2);margin-top:6px">순찰이 완료되면 익음·안익음·병해충 비율이 채워집니다.</div></div>';
+      +(run
+        ? '<div style="font-size:14px;font-weight:700;color:var(--sc-mut5)">🛰️ 순찰 중 — '+shot+'/12 구역 촬영 완료</div>'
+          +'<div style="font-size:12px;color:var(--sc-mut2);margin-top:6px">촬영된 구역은 위 히트맵에 바로 표시됩니다. 비율은 순찰이 끝나면 전체 평균으로 확정됩니다.</div>'
+        : '<div style="font-size:14px;font-weight:700;color:var(--sc-mut5)">🚜 아직 순찰 검출 결과가 없습니다</div>'
+          +'<div style="font-size:12px;color:var(--sc-mut2);margin-top:6px">순찰이 완료되면 익음·안익음·병해충 비율이 채워집니다.</div>')
+      +'</div>';
     try{renderHeatSummary();}catch(e){}
     return;
   }
@@ -2421,8 +2439,20 @@ var FARM={
     //   노드 5·6 열(z≈-4.6) 사이 띠가 5.30 뿐이라 2.80/중심 -7.35 로 잡아 앞뒤 주행 여유를
     //   +0.60 / +0.62 로 맞췄다. (PGM 점유는 z -7.31~-6.09 로 더 얇지만 그대로 쓰면 막대가 된다)
     {x:-2.33, z:-7.35, w:2.80, d:7.67, face:'z'},
-    {x:-1.53, z: 0.57, w:2.10, d:7.32, face:'x'},  // 세로 베드 (노드열 사이)
-    {x: 2.47, z: 0.57, w:1.90, d:7.32, face:'x'}   // 세로 베드
+    /* 세로 베드 2개. **세 통로 폭이 똑같아지도록** 잡았다 (이건수 지시 2026-08-04).
+       예전 값(-1.53/2.47, 폭 2.10/1.90)은 통로가 3.92 / 2.00 / 3.08 로 제각각이라
+       가운데만 좁아 보였다. 지금은 3.20 / 3.20 / 3.20.
+         좌벽 -6.50 │ 3.20 │ 베드2 -3.30~-1.51 │ 3.20 │ 베드3 1.68~3.30 │ 3.20 │ 우벽 6.50
+
+       [왜 폭도 줄였나 — 균등 간격과 주행 여유의 맞바꿈]
+       통로가 균등하면 3g + 베드폭합 = 13.00 이 강제된다. 즉 베드를 두껍게 할수록 통로가
+       좁아지고, 왼쪽 통로의 촬영점(WP12 x=-3.63)에 선 Pinky(폭 0.95)가 베드2를 파고든다.
+         g=3.00(폭 그대로) → 0.35 파고듦   g=3.20(폭 15%↓) → 0.15   g=3.35(폭 26%↓) → 0
+       0.15 는 로봇 폭 0.95 중 일부라 화면에서 거의 드러나지 않고, 베드도 26%까지 얇아지지
+       않아 빈약해 보이지 않는다. 그 절충점이 아래 값이다.
+       (map_layout.py 가 "구조물은 배치·비율만 참고, 노드·통로만 진짜"라 명시 → 폭 조정 허용) */
+    {x:-2.41, z: 0.57, w:1.79, d:7.32, face:'x'},  // 세로 베드 (노드열 사이)
+    {x: 2.49, z: 0.57, w:1.62, d:7.32, face:'x'}   // 세로 베드
   ],
   // ★ 하단 벽 = 맵 아래쪽 '외벽'. 가운데가 뚫려 있다
   //   (PGM rows 61~63: 열 0~11 벽 / 열 12~25 개방 42cm / 열 26~38 벽).
@@ -2451,26 +2481,26 @@ var FARM={
   stations:[{x:-4.29,z:12.03},{x:-1.69,z:12.03},{x:0.21,z:12.03}],  // 충전 1~3 (노드 22·23·24)
   // 실측 노드 21개. ord = 순찰 촬영 순서(없으면 경유점/시설 진입). gate 는 시설 라벨.
   waypoints:[
-    {id:1, x:-3.42,z: -9.99, ord:8 },
-    {id:2, x:-0.68,z: -9.99, ord:7 },
+    {id:1, bed:0, x:-3.42,z: -9.99, ord:8 },
+    {id:2, bed:0, x:-0.68,z: -9.99, ord:7 },
     {id:3, x: 4.09,z: -9.82           },
-    {id:5, x:-2.98,z: -4.69, ord:1 },
-    {id:6, x: 0.03,z: -4.55, ord:2 },
+    {id:5, bed:0, x:-2.98,z: -4.69, ord:1 },
+    {id:6, bed:0, x: 0.03,z: -4.55, ord:2 },
     {id:8, x: 3.94,z: -4.51           },
-    {id:9, x:-3.78,z: -0.47, ord:9 },
-    {id:10,x: 0.53,z: -1.52, ord:12},
-    {id:11,x: 4.48,z: -1.06, ord:6 },
-    {id:12,x:-3.63,z:  2.53, ord:10},
-    {id:13,x: 0.27,z:  1.69, ord:11},
+    {id:9, bed:1, x:-3.78,z: -0.47, ord:9 },
+    {id:10,bed:2, x: 0.53,z: -1.52, ord:12, hx: 1.30},
+    {id:11,bed:2, x: 4.48,z: -1.06, ord:6 },
+    {id:12,bed:1, x:-3.63,z:  2.53, ord:10},
+    {id:13,bed:1, x: 0.27,z:  1.69, ord:11, hx:-0.66},
     /* 양방향 촬영 지점의 짝 (시나리오1 E2 20-1). 로봇 카메라는 한쪽에 고정이라
        통로 양쪽을 다 찍으려면 같은 자리에서 방향만 돌려 한 번 더 찍는다: 10↔18, 13↔19.
        ACS 는 이 번호로 검출을 보내는데 FARM 에 없어서 **그려지지 않고 버려졌다**
        (2026-08-03 실기: 18·19 유실 → 베드2·3 에 원이 하나씩 비었다).
        좌표는 대표 노드와 같은 자리지만, 히트맵에서 겹치면 한 점으로 보이므로
        각자 '바라보는 베드' 쪽으로 밀어 둔다 — 10은 베드3, 짝 18은 베드2 쪽. */
-    {id:18,x:-1.07,z: -1.52, ord:13, pair:10},
-    {id:19,x: 1.87,z:  1.69, ord:14, pair:13},
-    {id:14,x: 4.50,z:  1.80, ord:5 },
+    {id:18,bed:1, x:-1.07,z: -1.52, ord:13, pair:10, hx:-0.40},
+    {id:19,bed:2, x: 1.87,z:  1.69, ord:14, pair:13, hx: 1.20},
+    {id:14,bed:2, x: 4.50,z:  1.80, ord:5 },
     {id:15,x:-3.20,z:  7.20           },
     {id:16,x: 0.41,z:  5.78           },
     {id:17,x: 4.17,z:  6.36           },
@@ -2792,15 +2822,15 @@ function renderFarm(v){
     try{startFleetLive();}catch(e){}
     try{initFarm3D();}catch(e){}
     try{loadHeat();}catch(e){}
-    // 히트맵 자동 갱신. 예전엔 '대시보드 진입' 과 '순찰 요청 1.3초 뒤' 에만 불렀다.
-    // 서버가 순찰 완료 시점에만 crop/by_waypoint 를 확정하므로, 이 폴링이 돌아도
-    // 순찰 도중에는 화면 값이 바뀌지 않는다. patrol_completed 이벤트가 유실돼도
-    // 5초 안에 결과를 주워오는 **안전망** 역할이다.
+    /* 히트맵 자동 갱신. 서버가 검출 1건마다 by_waypoint 를 즉시 채우므로
+       이 폴링이 곧 '실시간 누적' 을 화면에 옮기는 통로다. 한 지점 촬영에 수 초가
+       걸리니 2초면 찍는 즉시 뜨는 것처럼 보인다.
+       (작물 % 는 서버가 순찰 완료 전까지 내주지 않으므로 이 폴링으로도 안 바뀐다.) */
     if(window._heatTimer)clearInterval(window._heatTimer);
     window._heatTimer=setInterval(function(){
       if(!document.getElementById('farmHeat')){clearInterval(window._heatTimer);window._heatTimer=null;return;}
       try{loadHeat();}catch(e){}
-    },5000);
+    },2000);
     try{loadHarvestStats();}catch(e){}
   }
   if(v==='f_work') el.innerHTML=`
@@ -2927,7 +2957,12 @@ function drawFarmHeat(){
       if(d<=0) return;
       // 반경은 '카메라가 한 지점에서 보는 정도'. 베드를 통째로 덮지 않게 작게 잡는다.
       var rx=sw(1.55), ry=sh(1.55), R=Math.max(rx,ry);
-      g.save(); g.translate(sx(w.x),sy(w.z));
+      /* hx = 그릴 x. 짝 노드(10↔18, 13↔19)는 같은 자리에서 방향만 돌려 통로 양쪽을
+         찍으므로 실좌표가 같다 — 그대로 그리면 두 원이 겹쳐 한 점으로 보인다.
+         그래서 각자 '바라보는 베드' 쪽으로 밀어 그린다. 실좌표 x 는 손대지 않는다
+         (로봇 위치 변환에 계속 쓰이므로). */
+      var wx=(typeof w.hx==='number')?w.hx:w.x;
+      g.save(); g.translate(sx(wx),sy(w.z));
       var grd=g.createRadialGradient(0,0,2,0,0,R);
       grd.addColorStop(0,   'rgba(214,28,20,'+(0.90*d)+')');
       grd.addColorStop(0.30,'rgba(236,96,36,'+(0.64*d)+')');
