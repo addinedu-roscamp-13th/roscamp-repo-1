@@ -2490,23 +2490,27 @@ var FARM={
      간격 1.90(박스폭 1.82 → 틈 0.08)으로 붙이고, 세 칸의 노드 오차를 0.35 로 균등하게 나눴다.
      ※ 더 왼쪽 벽(x=-6.50)까지 밀지 않은 이유: 그만큼 노드에서 멀어져서 방금 고친
        '로봇이 칸 밖에 서 보이는' 문제가 그대로 되살아난다. 벽까지는 1.50 남긴다. */
-  /* DG 충전 스테이션 3개 = **주차 슬롯**. z 는 슬롯 중심, d 는 깊이, dock 은 실제 도킹점.
+  /* DG 충전 스테이션 3개 — **왼쪽 위 벽 모서리에 붙여, 같은 간격으로** (이건수 결정 2026-08-04).
+       z = 11.91 → 박스 바깥 끝 12.88, 벽(13.00) 안쪽으로 0.12 — 경계선을 넘지 않게
+       x = -5.47 / -3.57 / -1.67 → DG1 이 위쪽 벽(-6.50) 안쪽 0.12, 칸 사이 틈 0.08 로 균일
 
-     [왜 '칸' 이 아니라 '슬롯' 인가 — 벽 밀착과 주차 정확도를 동시에 만족시키는 방법]
-     로봇의 3D 위치는 _map_to_norm 으로 변환한 **실측 좌표**로 찍힌다(도킹 노드 22·23·24,
-     z = 6.80 / 7.56 / 7.45). 그런데 박스를 작게 그리면 둘 중 하나만 된다:
-       · 박스를 벽(z=13)에 붙이면 → 로봇이 칸 밖(5m 앞)에 서 보인다  ← 원래 버그
-       · 박스를 도킹점에 맞추면  → 벽에서 5.5m 떠서 허공에 뜬 것처럼 보인다
-     실제 주차 구역은 '벽의 충전기부터 안쪽으로 뻗은 슬롯' 이다. 그렇게 그리면
-     바깥 끝은 벽에 닿고 도킹점은 슬롯 안에 들어와 **둘 다 만족한다.**
-     슬롯이 z 6.25~12.90 을 덮으므로 로봇이 이 구간 어디서 멈춰도 칸 안이다
-     (정확한 정차 좌표를 아직 실측하지 못했는데, 슬롯이라 그 불확실성도 흡수한다).
+     [로봇은 이 칸 '앞' 에 서 보인다 — 알고 그렇게 둔 것]
+     로봇 위치는 _map_to_norm 으로 변환한 실측 좌표라 언제나 진짜다. 반면 도킹 노드
+     (22·23·24)는 z = 6.80 / 7.56 / 7.45 로 이 박스보다 4.5~5.2 안쪽이다. 그래서 실제로
+     주차를 마쳐도 화면에서는 칸 앞에 서 있는 것처럼 보인다.
 
-     [x 는 균등·밀착] 실측 노드 간격이 2.60 / 1.90 이라 DG1 만 떨어져 보였다.
-     간격 1.90(슬롯폭 1.82 → 틈 0.08)으로 붙이고 노드 오차를 0.35 로 균등 분배했다. */
-  stations:[{x:-3.94,z:9.57,d:6.65,dock:6.80},
-            {x:-2.04,z:9.57,d:6.65,dock:7.56},
-            {x:-0.14,z:9.57,d:6.65,dock:7.45}],   // 충전 1~3 (노드 22·23·24)
+     이 어긋남을 없애려 박스를 도킹 노드로 내려도 봤고(벽에서 5.5 떠서 허공에 뜬 것처럼
+     보였다), 벽부터 노드까지 깊이 6.65 슬롯으로 늘려도 봤다(로봇이 그 구간 어디에 서든
+     주차한 것처럼 보여 화면이 거짓말을 한다). 둘 다 되돌리고 **배치는 벽 기준으로,
+     로봇은 실좌표 그대로** 두기로 했다 — 최소한 로봇 위치는 절대 왜곡하지 않는다.
+
+     ⚠ 정확히 맞추려면 dg_03 을 충전소에 보내 도킹 완료 시점의 map_position 을 실측해
+     그 자리에 박스를 놓으면 된다. 그 전까지는 이 어긋남을 알고 감수하는 것이다.
+
+     [참고] 그려진 경계(z ±13)는 온실 벽이 아니라 PGM 맵 범위다. 실측 노드 전체가
+     z -10.19~7.56 에 들어가므로 +z 쪽 5.44 는 노드가 없는 빈 맵(온실 바깥 여백)이다.
+     시설이 '허공에 뜬 것처럼' 보이던 근본 원인이 이것이다. 예냉실도 마찬가지다. */
+  stations:[{x:-5.47,z:11.91},{x:-3.57,z:11.91},{x:-1.67,z:11.91}],   // 충전 1~3 (노드 22·23·24)
   // 실측 노드 21개. ord = 순찰 촬영 순서(없으면 경유점/시설 진입). gate 는 시설 라벨.
   waypoints:[
     {id:1, bed:0, x:-3.42,z: -9.99, ord:8 , hx:-4.25, hz:-9.30},
@@ -2727,13 +2731,9 @@ function buildFarmScene(){
   })(F.cold);
   // DG 충전 스테이션 3개 (좌하단)
   F.stations.forEach(function(s,i){
-    // 슬롯 바닥 — 벽에서 안쪽으로 뻗는다
-    var sp=box(1.82,0.12,s.d||1.95,s.x,0.06,s.z,new THREE.MeshLambertMaterial({color:CO.fac})); sp.castShadow=false;
-    // 도킹 링은 **실제 정차 지점**에. 로봇이 여기 서면 링 안에 들어온다.
-    var ring=new THREE.Mesh(new THREE.TorusGeometry(0.8,0.055,10,26),new THREE.MeshLambertMaterial({color:0xa9d2ef})); ring.rotation.x=Math.PI/2; ring.position.set(s.x,0.16,s.dock); scene.add(ring);
-    // 충전기 본체는 슬롯의 벽쪽 끝에
-    var chg=box(1.5,0.55,0.34,s.x,0.28,s.z+(s.d||1.95)/2-0.22,new THREE.MeshLambertMaterial({color:CO.fac})); chg.castShadow=false;
-    var lb=farmLabelSprite(THREE,'⚡ dg_0'+(i+1),'rgba(38,104,160,.95)'); lb.scale.set(1.5,0.5,1); lb.position.set(s.x,1.0,s.dock); scene.add(lb);
+    var sp=box(1.82,0.12,1.95,s.x,0.06,s.z,new THREE.MeshLambertMaterial({color:CO.fac})); sp.castShadow=false;
+    var ring=new THREE.Mesh(new THREE.TorusGeometry(0.8,0.055,10,26),new THREE.MeshLambertMaterial({color:0xa9d2ef})); ring.rotation.x=Math.PI/2; ring.position.set(s.x,0.16,s.z); scene.add(ring);
+    var lb=farmLabelSprite(THREE,'⚡ dg_0'+(i+1),'rgba(38,104,160,.95)'); lb.scale.set(1.5,0.5,1); lb.position.set(s.x,1.0,s.z); scene.add(lb);
   });
   // (D435 카메라는 각 Pinky 우측에 부착 — makePinky)
   // waypoint 마커·통로선은 그리지 않는다(2026-07-31). 관리자 화면이 보여줄 것은
@@ -3076,11 +3076,7 @@ function drawFarmHeat(){
   // 예냉실 · 충전소 — 수확대와 같은 규칙
   var c=F.cold; facBox(sx(c.x),sy(c.z),sw(c.w),sh(c.d),'예냉실',10);
   F.stations.forEach(function(s,i){
-    // 슬롯 전체를 그린다 — 바깥 끝이 벽에 닿고 도킹점이 안에 들어온다.
-    facBox(sx(s.x),sy(s.z),Math.max(24,sw(1.82)),Math.max(17,sh(s.d||1.95)),'DG'+(i+1),9);
-    // 실제 정차 지점(도킹 노드)에 작은 표식 — 슬롯 어디에 서는지 알 수 있게
-    g.save(); g.strokeStyle='rgba(56,132,196,.55)'; g.lineWidth=1.4;
-    g.beginPath(); g.arc(sx(s.x),sy(s.dock),Math.max(5,sw(0.42)),0,7); g.stroke(); g.restore();
+    facBox(sx(s.x),sy(s.z),Math.max(24,sw(1.82)),Math.max(17,sh(1.95)),'DG'+(i+1),9);
   });
 }
 function sliderRow(lab,val,pct){return `<div class="pr" style="margin-bottom:16px"><div class="top"><span>${lab}</span><b>${val}</b></div>
