@@ -1697,7 +1697,16 @@ try{
   document.documentElement.setAttribute('data-theme',window._theme);
   document.documentElement.setAttribute('data-view',window._view);
 }catch(e){}
-function nodeCount(){ try{ return (FARM&&FARM.waypoints)?FARM.waypoints.length:21; }catch(e){ return 21; } }
+/* 농장의 '지점' 수. 짝 노드(pair)는 빼고 센다.
+   18·19 는 새 장소가 아니라 10·13 과 **같은 자리에서 방향만 바꿔 한 번 더 찍는** 것이다
+   (시나리오1 E2 20-1: x·y 가 같고 yaw 만 반대, corridors 에도 넣지 않는다).
+   배열 길이를 그대로 쓰면 21곳인 농장이 23곳으로 보인다. */
+function nodeCount(){
+  try{
+    if(!FARM||!FARM.waypoints) return 21;
+    return FARM.waypoints.filter(function(w){ return !w.pair; }).length;
+  }catch(e){ return 21; }
+}
 function renderDcHead(){
   // ⚠ 세그먼트를 먼저 그린다. 예전엔 dcHeadSub 가 없으면(=모바일) 바로 return 해서
   //   모바일에 테마/뷰 토글이 아예 안 붙었고, 한 번 모바일로 가면 데스크톱으로
