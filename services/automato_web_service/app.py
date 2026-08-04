@@ -2040,6 +2040,13 @@ def harvest_available():
                 continue
             reason = r.get("unavailable_reason")
             bat = r.get("battery_percent")
+            # ⚠ '팔이 있는지 모른다' 와 '팔이 없는 게 확실하다' 는 다르다.
+            #   PATROL_ROBOT_IDS 에 있는 로봇은 순찰 전용으로 확정된 것이므로
+            #   여기서 '수확 가능' 으로 내보내면 안 된다.
+            #   2026-08-04: dg_03 만 연결된 상태에서 수확 가용 1대로 나왔다 —
+            #   눌렀으면 팔도 없는 로봇에 수확을 배정하려다 ACS 가 거절했을 것이다.
+            if reason is None and r.get("robot_id") in PATROL_ROBOT_IDS:
+                reason = "NO_ARM"
             if reason is None and isinstance(bat, (int, float)) and bat < MIN_BAT_HARVEST:
                 reason = "BATTERY_TOO_LOW"           # 위 분기와 같은 기준 — 여기만 빠져 있었다
             rr = {"robot_id": r.get("robot_id"), "status": r.get("nav_status") or "IDLE",
