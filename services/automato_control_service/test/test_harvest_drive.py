@@ -309,6 +309,12 @@ def fast_timing(monkeypatch):
     monkeypatch.setattr(rr, "HEARTBEAT_SEC", 0.02)
     monkeypatch.setattr(docking, "HEARTBEAT_SEC", 0.02)
     monkeypatch.setattr(hd, "HEARTBEAT_SEC", 0.02)   # 수확 결과 대기
+    # 길이 영영 막힌 것을 확인하는 테스트가 실제로 30초를 기다리지 않게 한다.
+    # (drive_retry 는 이 값을 호출 시점에 읽으므로 여기서 바꾸면 먹는다)
+    monkeypatch.setattr(rr, "DRIVE_RETRY_SEC", 0.3)
+    monkeypatch.setattr(rr, "YIELD_TTL_SEC", 0.05)   # 재시도 간격(양보 회피 만료)
+    monkeypatch.setattr(hd, "PRECOOL_WAIT_SEC", 0.3)  # 예냉실 자리 대기
+    monkeypatch.setattr(hd, "RESERVE_POLL_SEC", 0.02)
 
 
 def _make(nav=None, dock=None, harvest=None):

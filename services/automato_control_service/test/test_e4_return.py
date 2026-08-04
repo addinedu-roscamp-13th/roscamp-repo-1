@@ -200,6 +200,8 @@ def fast(monkeypatch):
     monkeypatch.setattr(docking, "HEARTBEAT_SEC", 0.02)  # 도킹 결과 대기 하트비트
     monkeypatch.setattr(pd, "RESERVE_POLL_SEC", 0.02)    # 막힘 재시도 간격(_stranded)
     monkeypatch.setattr(pd, "BLOCK_GIVEUP_SEC", 0.15)    # T_block
+    monkeypatch.setattr(rr, "DRIVE_RETRY_SEC", 0.15)     # 복귀 주행 포기 전 재시도
+    monkeypatch.setattr(rr, "YIELD_TTL_SEC", 0.05)       # 그 재시도 간격
 
 
 def _make(ttl=60.0):

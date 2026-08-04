@@ -46,6 +46,8 @@ from automato_control_service.patrol_config import (
     HARVEST_MAX_CAPACITY,
     HARVEST_RESULT_TIMEOUT_SEC,
     HEARTBEAT_SEC,
+    PRECOOL_WAIT_SEC,
+    RESERVE_POLL_SEC,
     SERVER_WAIT_SEC,
     UNLOAD_RESULT_TIMEOUT_SEC,
     UNLOAD_SHAKE_DELAY_SEC,
@@ -174,7 +176,10 @@ class HarvestDispatcher:
             # 순찰과 같은 예약 규칙으로 움직이므로 두 로봇이 통로를 놓고 경합해도 안전하다.
             # final_yaw: 수확지는 H 마커 도킹(정면 카메라)이라 도착 방향이 틀어지면 마커가
             # 화각 밖으로 나가 아예 안 보인다. 진행 방향에 맡기면 wp1→wp20 에서 78° 어긋난다.
-            outcome, current = self.runner.drive(
+            # drive_retry: 충전소는 출구가 wp15 하나뿐인 막다른 길이고 그 wp15 에 충전소
+            # 셋이 모두 붙어 있다 — 여러 대가 같이 출발하면 여기서 반드시 만난다. 한 번
+            # 포기로 끝내면 출발도 못 하고 task 가 죽으므로(실측 3.5초) 잠깐 기다렸다 간다.
+            outcome, current = self.runner.drive_retry(
                 engine, clients["nav"], task_id, robot_id, current, target,
                 final_yaw=self.runner.entry_yaw(target, task_id))
             if outcome != "arrived":
@@ -243,37 +248,64 @@ class HarvestDispatcher:
                     f"(수확 실적 batch_id={batch_id} 은 저장됨)")
                 return STATUS_FAILED, None, None
 
+            # 출발하기 전에 **예냉실 자리부터 맡는다.** 지금 로봇은 수확지에 도킹해 있고,
+            # 수확지는 자기만 쓰는 막다른 길이라 여기서 기다리면 아무의 길도 막지 않는다.
+            # 반대로 '가서 확인'하면 예냉실 관문(wp17)에 서게 되는데, 그 자리가 바로 안에
+            # 있는 로봇의 유일한 퇴로다 → 서로 기다리는 교착이 된다(실측으로 확인).
+            # 여기서부터 precool_slot 은 이 로봇 것이다 — 못 가게 되면 반드시 돌려놔야 한다.
+            precool_slot = engine.node_slot(precool_wp)
+            if not self._await_precool_slot(
+                    engine, robot_id, task_id, precool_slot, precool_label,
+                    entry_slot):
+                self._log.warning(
+                    f"[HARVEST] E5 예냉실({precool_label}) 자리를 "
+                    f"{PRECOOL_WAIT_SEC:.0f}초 안에 얻지 못했다 task={task_id} "
+                    f"{robot_id} → FAILED (수확 실적 batch_id={batch_id} 은 저장됨)")
+                return STATUS_FAILED, None, None
+
             self._log.info(
                 f"[HARVEST] E5 예냉실 이송 시작 task={task_id} {robot_id} "
-                f"{current} → {precool_wp}({precool_label})")
-            # 수확지 언도킹 — 로봇은 H 마커 도킹으로 후면이 벽에서 3cm 다(floor_fsm 의
-            # WALL_GAP_TARGET). 여기서 바로 예냉실 쪽으로 돌면 후면 코너가 벽을 긁는다.
-            # 자리(entry_slot)는 수확 내내 쥐고 있었으므로 새로 예약하지 않는다.
-            # 실적(batch_id)은 이미 저장했다 — 여기서 실패해도 딴 개수는 남는다.
-            if not self.runner.undock_step(
+                f"{current} → {precool_wp}({precool_label}) — 자리 확보 완료")
+            # 이동하는 동안 맡아 둔 자리를 살려 둔다(hold_slot). 없으면 7홉을 가는 사이
+            # TTL(15초)이 지나 회수되고, 애써 맡아 둔 자리를 남에게 빼앗긴다.
+            # 언도킹도 이 블록 안이다 — 그 15초 남짓도 갱신이 끊기면 안 된다.
+            with self.runner.hold_slot(engine, precool_slot, robot_id):
+                # 수확지 언도킹 — 로봇은 H 마커 도킹으로 후면이 벽에서 3cm 다(floor_fsm 의
+                # WALL_GAP_TARGET). 여기서 바로 예냉실 쪽으로 돌면 후면 코너가 벽을 긁는다.
+                # 자리(entry_slot)는 수확 내내 쥐고 있었으므로 새로 예약하지 않는다.
+                # 실적(batch_id)은 이미 저장했다 — 여기서 실패해도 딴 개수는 남는다.
+                undocked = self.runner.undock_step(
                     clients["nav"], task_id, current,
-                    heartbeat=(engine, [entry_slot], robot_id)):
+                    heartbeat=(engine, [entry_slot], robot_id))
+                # 수확지 → 예냉실. 여기도 훅 없이 부른다(촬영·짝 없는 평범한 주행).
+                # 수확지 자리는 drive 가 출발하며 이어받아 반납한다.
+                # final_yaw: 예냉실도 H 마커 도킹이다. 들어오는 길이 wp17 하나뿐이라 진행
+                # 방향에 맡기면 **매번** 162.8° 어긋난다 — 마커를 등지고 서서 도킹이
+                # 시작조차 못 한다(수확지 78°보다 심하다).
+                # drive_retry: 자리는 맡아 뒀어도 가는 길목은 남과 겹친다(8-11-14-17 구간을
+                # 두 수확 로봇이 공유). 잠깐 막혔다고 토마토를 실은 채 포기하지 않는다.
+                outcome, current = (
+                    self.runner.drive_retry(
+                        engine, clients["nav"], task_id, robot_id, current,
+                        precool_wp,
+                        final_yaw=self.runner.entry_yaw(precool_wp, task_id))
+                    if undocked else ("aborted", current))
+            if not undocked:
+                engine.release(precool_slot, robot_id)   # 맡아 둔 자리를 돌려준다
                 self._log.warning(
                     f"[HARVEST] E5 언도킹 실패 task={task_id} {robot_id} "
                     f"노드 {current} → FAILED (수확지에서 빠져나오지 못했다. "
                     f"수확 실적 batch_id={batch_id} 은 저장됨)")
                 return STATUS_FAILED, None, None
-
-            # 수확지 → 예냉실. 여기도 훅 없이 부른다(촬영·짝 없는 평범한 주행).
-            # 수확지 자리는 drive 가 출발하며 이어받아 반납한다.
-            # final_yaw: 예냉실도 H 마커 도킹이다. 들어오는 길이 wp17 하나뿐이라 진행
-            # 방향에 맡기면 **매번** 162.8° 어긋난다 — 마커를 등지고 서서 도킹이 시작조차
-            # 못 한다(수확지 78°보다 심하다).
-            outcome, current = self.runner.drive(
-                engine, clients["nav"], task_id, robot_id, current, precool_wp,
-                final_yaw=self.runner.entry_yaw(precool_wp, task_id))
             if outcome != "arrived":
+                # 못 갔으면 맡아 둔 자리를 반드시 놓는다. 안 놓으면 아무도 쓰지 않는
+                # 예냉실이 영영 점유된 채로 남아 다음 수확까지 막는다.
+                engine.release(precool_slot, robot_id)
                 self._log.warning(
                     f"[HARVEST] E5 예냉실 이송 실패({outcome}) task={task_id} "
-                    f"로봇 위치 {current} → FAILED")
+                    f"로봇 위치 {current} → FAILED (맡아 둔 예냉실 자리 반납)")
                 return STATUS_FAILED, None, None
 
-            precool_slot = engine.node_slot(current)
             precool_method = docking.method_for(precool_label)   # PRECOOL_* → floor
             success, code, msg = docking.dock(
                 self._log, task_id, robot_id, precool_label, precool_method,
@@ -328,6 +360,40 @@ class HarvestDispatcher:
                 engine.release(engine.node_slot(current), robot_id)
                 self._log.info(
                     f"[HARVEST] task={task_id} 지점 {current} 자리 반납")
+
+    def _await_precool_slot(self, engine, robot_id, task_id, precool_slot,
+                            label, standing_slot) -> bool:
+        """예냉실 자리를 확보할 때까지 수확지에 도킹한 채로 기다린다. 성공하면 True.
+
+        '확인'이 아니라 '예약'인 것이 요점이다. 두 로봇이 비슷한 시각에 수확을 마치면
+        확인만으로는 둘 다 '비었다'를 보고 동시에 출발한다 — 확인한 순간엔 사실이었어도
+        도착할 때는 아니다. 자리를 잡아 두면 한 대만 출발하고 나머지는 여기서 기다린다.
+
+        기다리는 장소가 수확지(자기가 도킹한 막다른 길)라는 점이 핵심이다. 남이 지나갈
+        일이 없어 이 대기는 누구의 길도 막지 않는다. 반대로 예냉실 앞(wp17)까지 가서
+        기다리면 그 자리가 안에 있는 로봇의 유일한 퇴로라 서로 묶인다.
+
+        재시도 주기는 다른 자원 대기와 같은 RESERVE_POLL_SEC(0.5초)다 — 예약 시도는
+        락 한 번이라 비용이 사실상 없고, 자리가 비면 0.5초 안에 출발한다.
+        """
+        deadline = time.monotonic() + PRECOOL_WAIT_SEC
+        announced = False
+        while True:
+            if engine.try_reserve(precool_slot, robot_id):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            if not announced:
+                # 대기에 '들어갈 때' 한 번만 알린다(0.5초마다 찍으면 로그가 묻힌다).
+                self._log.info(
+                    f"[HARVEST] E5 예냉실({label}) 사용 중"
+                    f"(로봇 {engine.holder_of(precool_slot)}) → 수확지에서 대기 "
+                    f"task={task_id} {robot_id} (최대 {PRECOOL_WAIT_SEC:.0f}초)")
+                announced = True
+            # 기다리는 동안 내가 도킹해 있는 수확지 자리를 놓치면 안 된다 — 여기서
+            # 하트비트가 끊기면 TTL(15초)에 회수돼 남이 내 도킹 자리로 들어온다.
+            engine.heartbeat(standing_slot, robot_id)
+            time.sleep(RESERVE_POLL_SEC)
 
     def _save_batch(self, save_batch, task_id, harvested):
         """수확 실적을 콜백으로 저장하고 batch_id 를 돌려준다. 실패해도 None 만 낸다.
