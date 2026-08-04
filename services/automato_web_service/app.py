@@ -1389,6 +1389,66 @@ def internal_patrol_completed():
     return jsonify({"success": True})
 
 
+def _ensure_local_detection_image(d):
+    """웹앱이 볼 수 있게 **실제 촬영본을 로컬에 확보**한다. 저장 성공 시 True.
+
+       [왜 필요한가]
+       텔레그램은 image_data(base64) 나 image_url 을 그대로 첨부할 수 있어서 로봇이 찍은
+       실물 사진이 잘 갔다. 그런데 웹앱은 `/detections/<image_path>` 라는 **로컬 파일 하나만**
+       본다(index.html). ACS 가 URL 만 주면 웹앱 쪽에는 그 파일이 없어서 사진이 안 뜨거나,
+       예전 시험 때 남은 **목업 파일이 대신 보인다.**
+       (2026-08-04 이건수 지적: "텔레그램에는 실제 찍은 사진을 잘만 보내더만")
+
+       그래서 image_data 가 없으면 ACS 에서 한 번 내려받아 같은 경로에 저장한다.
+       → 웹앱·텔레그램이 **같은 실물 사진**을 보게 된다.
+       덤으로 촬영본이 로컬에 영구 보존된다(증거 보관 원칙)."""
+    path = d.get("image_path")
+    lp = _safe_detection_path(path)
+    if not lp:
+        if path:
+            wlog("⚠ image_path 가 detections 폴더를 벗어나 저장을 건너뜀: %r" % (path,))
+        return False
+    try:
+        os.makedirs(os.path.dirname(lp), exist_ok=True)
+    except Exception:
+        return False
+
+    # ① ACS 가 사진 본문을 같이 실어준 경우 — 그대로 저장(가장 확실)
+    if d.get("image_data"):
+        try:
+            with open(lp, "wb") as f:
+                f.write(base64.b64decode(d["image_data"]))
+            wlog("   📷 실촬영본 저장(base64) → %s" % path)
+            return True
+        except Exception as e:                                   # noqa: BLE001
+            wlog("   ⚠ base64 사진 저장 실패: %s" % e)
+
+    # ② URL 만 온 경우 — 내려받아 저장. 이게 없으면 웹앱에만 사진이 안 뜬다.
+    url = d.get("image_url")
+    if not url and path and ACS_IMAGE_BASE_URL:
+        url = ACS_IMAGE_BASE_URL + "/" + str(path).lstrip("/")
+    if url and _rq:
+        try:
+            r = _rq.get(url, timeout=10)
+            ok = (r.status_code == 200 and r.content
+                  and r.headers.get("Content-Type", "").startswith("image"))
+            if ok:
+                with open(lp, "wb") as f:
+                    f.write(r.content)
+                wlog("   📷 실촬영본 내려받아 저장 → %s (%d bytes)" % (path, len(r.content)))
+                return True
+            wlog("   ⚠ 사진 내려받기 실패 HTTP %s %s" % (r.status_code, url))
+        except Exception as e:                                   # noqa: BLE001
+            wlog("   ⚠ 사진 내려받기 오류: %s" % e)
+
+    # ③ 둘 다 없으면 로컬에 실물이 없다. 예전 목업이 남아 있으면 그게 보이므로 경고를 남긴다.
+    if os.path.exists(lp):
+        wlog("   ⚠ ACS 가 사진을 안 보냈다. 같은 경로에 **예전 파일**이 있어 그게 표시된다: %s" % path)
+    else:
+        wlog("   ⚠ ACS 가 사진을 안 보냈고 로컬에도 없다 → 웹앱은 사진 없이 표시: %s" % path)
+    return False
+
+
 @app.post("/internal/v1/alerts/disease")
 def internal_alerts_disease():
     """E3-1: ACS가 disease_percent>=5 확인 후 알림 전달 → App 으로 disease_alert 푸시(사진경로 포함)."""
@@ -1402,17 +1462,8 @@ def internal_alerts_disease():
     # ACS가 로봇 카메라 실제 이미지를 image_data(base64)로 실어주면 파일로 저장 → 웹앱/알림이 /detections 로 표시
     ev_disease["image_url"] = d.get("image_url")
     ev_disease["image_data"] = d.get("image_data")
-    if d.get("image_data") and d.get("image_path"):
-        try:
-            lp = _safe_detection_path(d.get("image_path"))
-            if lp:
-                os.makedirs(os.path.dirname(lp), exist_ok=True)
-                with open(lp, "wb") as f:
-                    f.write(base64.b64decode(d["image_data"]))
-            else:
-                wlog("⚠ image_path 가 detections 폴더를 벗어나 저장을 건너뜀: %r" % (d.get("image_path"),))
-        except Exception:
-            pass
+    # 웹앱은 로컬 파일만 보므로 실촬영본을 여기서 확보한다(base64 저장 또는 ACS 에서 내려받기).
+    ev_disease["image_ready"] = _ensure_local_detection_image(d)
     _schedule_telegram_fallback(ev_disease)   # App 열려있으면 App 발송(스펙), 닫혀있으면 서버 대신 발송
     return jsonify({"success": True})
 

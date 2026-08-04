@@ -1791,7 +1791,11 @@ window.renderAlertLog=function(){
     return '<div style="display:flex;align-items:center;gap:11px;padding:11px 13px;border-radius:13px;'
       +'background:'+(dis?'rgba(255,107,90,.09)':'var(--sc-inner)')+';'
       +'border:1px solid '+(dis?'rgba(255,107,90,.26)':'var(--sc-bd)')+'">'
-      +(a.img?'<img src="'+a.img+'" onerror="this.style.display=\'none\'" '
+      /* 로컬에 실촬영본이 없으면 ACS 원본(imgAlt)으로 한 번 더 시도한 뒤 숨긴다.
+         목업이 아니라 로봇이 실제로 찍은 사진을 보여주기 위한 폴백. */
+      +(a.img?'<img src="'+a.img+'" onerror="'
+        +(a.imgAlt?('this.onerror=null;this.src=\''+a.imgAlt+'\'')
+                  :'this.style.display=\'none\'')+'" '
         +'style="width:46px;height:46px;border-radius:10px;object-fit:cover;flex:none;cursor:pointer" '
         +'onclick="window.open(this.src,\'_blank\')">'
        :'<span style="width:46px;height:46px;border-radius:10px;flex:none;display:flex;align-items:center;'
@@ -3335,9 +3339,20 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
       if(!wasLive){ try{loadPatrol();}catch(_){} }   // 순찰 시작 → 순찰 화면(양 탭) 즉시 '요청 불가'로
     } else if(e.event==='disease_alert'){
       var msg='병해충 발견 · '+val(e.robot_id,'로봇')+' · WP'+val(e.waypoint_id)+' · '+num(e.disease_percent)+'%';
-      // image_path 는 ACS 가 준 값이다. 속성값에 그대로 넣으면 따옴표를 닫고 onload= 를 주입할 수 있어
-      // encodeURI + esc 로 이중 처리한다(2026-07-29 감사 지적).
-      var thumb=e.image_path?('<img src="/detections/'+esc(encodeURI(String(e.image_path)))+'" onerror="this.parentNode.innerHTML=\'🐛\'" style="width:100%;height:100%;object-fit:cover">'):'🐛';
+      /* 사진은 **로봇이 실제로 찍은 것**이어야 한다. 서버가 disease_alert 를 받을 때
+         image_data(base64) 를 저장하거나 ACS 에서 내려받아 /detections/<image_path> 에
+         실촬영본을 확보한다(_ensure_local_detection_image).
+         그래도 로컬에 없으면 ACS 원본 URL 로 한 번 더 시도한 뒤 아이콘으로 떨어진다 —
+         예전 시험 때 남은 목업 파일이 대신 보이던 문제를 여기서 끊는다
+         (2026-08-04 이건수: "텔레그램에는 실제 찍은 사진을 잘만 보내더만").
+
+         image_path·image_url 은 ACS 가 준 값이다. 속성값에 그대로 넣으면 따옴표를 닫고
+         onload= 를 주입할 수 있어 encodeURI + esc 로 이중 처리한다(2026-07-29 감사 지적). */
+      var _src=e.image_path?('/detections/'+esc(encodeURI(String(e.image_path)))):'';
+      var _alt=e.image_url?esc(encodeURI(String(e.image_url))):'';
+      var _fb=_alt?('this.onerror=null;this.src=\''+_alt+'\'')
+                  :'this.parentNode.innerHTML=\'🐛\'';
+      var thumb=(_src||_alt)?('<img src="'+(_src||_alt)+'" onerror="'+_fb+'" style="width:100%;height:100%;object-fit:cover">'):'🐛';
       banner(
         '<div style="background:linear-gradient(180deg,#e5462f,#c0392b);color:#fff;border-radius:16px;padding:15px 16px;display:flex;gap:14px;align-items:center;animation:dzIn .3s ease, dzGlow 1.9s ease-in-out infinite">'
         +'<div style="width:56px;height:56px;flex:none;border-radius:12px;overflow:hidden;background:rgba(255,255,255,.2);display:flex;align-items:center;justify-content:center;font-size:30px">'+thumb+'</div>'
@@ -3353,7 +3368,8 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
       try{toast(msg);}catch(_){}
       pushAlertLog({seq:e.seq, kind:'disease', at:e.detected_at||new Date().toISOString(),
                     title:'병해충 발견', body:msg, pct:e.disease_percent,
-                    img:e.image_path?('/detections/'+encodeURI(String(e.image_path))):null});
+                    img:e.image_path?('/detections/'+encodeURI(String(e.image_path))):(e.image_url||null),
+                    imgAlt:e.image_url||null});   // 로컬 실패 시 ACS 원본으로 대체
     } else if(e.event==='patrol_completed'){
       // 히트맵·작물 상태는 **여기서만** 바뀐다. 서버가 patrol_completed 에서
       // 방문 웨이포인트 평균을 확정하므로, 그 직후 한 번 읽으면 된다.
