@@ -1,0 +1,6 @@
+[Web] ◀ ACS 콜백: 검출현황 WP5 (익음43/안익음57/썩음0/병해충0%) → App patrol_progress 푸시
+[Web] ◀ ACS 콜백: 검출현황 WP6 (익음39/안익음61/썩음0/병해충0%) → App patrol_progress 푸시
+[Web] ◀ ACS 콜백: 검출현황 WP13 (익음46/안익음0/썩음0/병해충54%) → App patrol_progress 푸시
+[Web] ◀ ACS 콜백: 병해충 알림 WP13 54% (≥5) → App disease_alert 푸시 + 텔레그램
+[Web] ◀ ACS 콜백: 병해충 알림 WP10 38% (≥5) → App disease_alert 푸시 + 텔레그램
+[Web] ◀ ACS 콜백: 검출현황 WP10 (익음54/안익음8/썩음0/병해충38%) → App patrol_progress 푸시
