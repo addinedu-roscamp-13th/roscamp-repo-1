@@ -7,9 +7,13 @@
   /docking_marker_pose  (PoseStamped)  : 검출된 마커의 위치·방향
 발행. 단계별 개수는 로그(DEBUG).
 
-⚠️ 로그는 **상태가 바뀔 때만** INFO 로 남긴다(채택 시작 / lock 밖 / 후보 없음).
-   라이다가 10Hz 라 매 프레임 INFO 를 찍으면 초당 10줄이 쏟아져 같은 런치로 뜬 다른
-   노드(카메라·텔레메트리·도킹 서버)의 로그를 덮어버린다. 매 프레임 값은 DEBUG 로 간다.
+⚠️ 로그는 **도킹 구간에서, 상태가 바뀔 때만** INFO 로 남긴다.
+   ① 매 프레임 값은 DEBUG — 라이다가 10Hz 라 매 프레임 INFO 면 초당 10줄이 쏟아진다.
+   ② 상태 전이(채택 시작 / lock 밖 / 후보 없음)조차도 순찰 주행 중엔 쉴 새 없이
+      뒤집혀(스치는 반사물 + lock 획득·TTL만료 반복) 결국 로그를 덮는다. 그래서
+      도킹 시작 알림(/ddago/dock_lock_reset)을 받은 뒤 verbose_sec 동안만 INFO 로
+      열고, 그 밖에는 DEBUG 로 내린다(지우는 게 아니라 낮추는 것 — 진단이 필요하면
+      --log-level debug 로 전부 다시 보인다).
 
 실행:  python3 detector_node.py
 """
@@ -87,6 +91,15 @@ class MarkerDetector(Node):
         # 폴백: 이만큼 기다려도 '정지'가 안 나오면 경고 후 그냥 획득한다. 속도 추정이
         # 이상해 영영 정지로 안 보이는 경우에도 도킹이 통째로 막히지 않게 하는 탈출구다.
         self.declare_parameter("lock_acquire_wait_sec", 3.0)
+        # 로그 창: 도킹 시작 알림을 받은 뒤 이 시간 동안만 검출 로그를 INFO 로 낸다.
+        # 이 노드는 bringup 과 함께 순찰 내내 떠 있는데, 주행 중에는 스치는 반사물 탓에
+        # '후보 없음↔채택↔lock 밖' 이 계속 뒤집히고 lock 획득·TTL만료도 반복돼,
+        # 상태 전이만 찍어도 초당 여러 줄이 나와 다른 노드 로그를 덮는다.
+        # 도킹 시작 알림이 오는 시점이 곧 '도킹 직전'이라 그때부터 창을 연다.
+        # 0 이하 = 항상 INFO(옛 동작). ⚠️ 도킹 서버의 reset_lock_on_start 를 false 로
+        # 끄면 알림 자체가 오지 않아 영영 조용해지니, 그때는 이 값을 0 으로 두어야 한다.
+        # 기본 180초 = 도킹 한 번을 넉넉히 덮는 시간(실측 도킹은 1분 안쪽).
+        self.declare_parameter("verbose_sec", 180.0)
         self.create_subscription(Odometry, "/odom", self.on_odom, 10)
         self.odom = None   # (X, Y, yaw) 로봇 pose(odom 프레임)
         self.lock = None   # (ox, oy) 목표 마커의 odom 좌표(고정)
@@ -102,6 +115,7 @@ class MarkerDetector(Node):
         self.vel_ref_t = None       # 그 기준을 잡은 시각
         self.acq_block_t = None     # 정지 게이트가 획득을 막기 시작한 시각(폴백 기준)
         self.acq_fallback_warned = False
+        self.verbose_until = None   # 이 시각(monotonic)까지 검출 로그를 INFO 로 낸다
 
         # 도킹 서버가 "지금부터 붙는다"고 알리면 찜해 둔 목표를 버린다.
         # lock 은 주행 중에도 잡힐 수 있고(정지 게이트가 폴백으로 뚫리는 경우),
@@ -111,10 +125,44 @@ class MarkerDetector(Node):
         self.create_subscription(
             Empty, "/ddago/dock_lock_reset", self.on_lock_reset, 10)
 
-        self.get_logger().info("marker_detector 시작. /scan·/odom 구독 중...")
+        vsec = float(self.get_parameter("verbose_sec").value)
+        self.get_logger().info(
+            "marker_detector 시작. /scan·/odom 구독 중... " + (
+                f"검출 로그는 도킹 시작 후 {vsec:.0f}초 동안만 INFO"
+                "(평소엔 DEBUG — --log-level debug 로 전부 볼 수 있다)"
+                if vsec > 0.0 else "검출 로그 항상 INFO(verbose_sec=0)"))
+
+    def _verbose(self):
+        """지금이 '도킹 구간'이라 검출 로그를 INFO 로 보여줄 때인가."""
+        sec = float(self.get_parameter("verbose_sec").value)
+        if sec <= 0.0:            # 0 이하 = 항상 INFO(옛 동작으로 되돌리는 탈출구)
+            return True
+        return self.verbose_until is not None and time.monotonic() < self.verbose_until
+
+    def _say(self, msg, warn=False):
+        """도킹 구간이면 INFO(warn=True 면 WARN), 그 밖에는 DEBUG 로 내려 남긴다.
+
+        내리기만 하고 지우지 않는 게 핵심이다 — 예전에 '후보 0개' 상황에 아무 로그도
+        안 남아, 도킹이 마커 없음으로 실패했을 때 검출기가 못 본 것인지 게이트가 막은
+        것인지 구분할 수 없었다. --log-level debug 면 순찰 중 것도 전부 다시 보인다.
+        """
+        log = self.get_logger()
+        if not self._verbose():
+            log.debug(msg)
+        elif warn:
+            log.warn(msg)
+        else:
+            log.info(msg)
 
     def on_lock_reset(self, _msg):
-        """도킹 시작 알림 → 목표 lock 을 버린다(다음 검출에서 멈춘 채로 다시 잡는다)."""
+        """도킹 시작 알림 → 목표 lock 을 버린다(다음 검출에서 멈춘 채로 다시 잡는다).
+
+        같은 자리에서 로그 창도 연다. 이 알림은 도킹 서버가 goal 을 받자마자 쏘므로,
+        여기가 '도킹 직전'을 알 수 있는 유일하고 확실한 시점이다.
+        """
+        sec = float(self.get_parameter("verbose_sec").value)
+        if sec > 0.0:
+            self.verbose_until = time.monotonic() + sec
         if self.lock is None:
             self.get_logger().info("도킹 시작 알림 — 찜해 둔 목표 없음(그대로 진행)")
             return
@@ -178,10 +226,13 @@ class MarkerDetector(Node):
         if wait > 0.0 and (now - self.acq_block_t) > wait:
             if not self.acq_fallback_warned:
                 self.acq_fallback_warned = True
-                self.get_logger().warn(
+                # 순찰 주행 중에는 이 상황이 정상이라(계속 움직이니 당연히 막힌다)
+                # 도킹 구간 밖에서는 DEBUG. 도킹 중에 뜨면 진짜 신호다.
+                self._say(
                     f"정지 게이트가 {wait:.1f}초 넘게 lock 획득을 막고 있다 "
                     f"(추정 v={self.speed:.3f}m/s w={self.omega:.3f}rad/s) → "
-                    f"게이트를 건너뛰고 획득한다. odom 이 튀는지 확인할 것"
+                    f"게이트를 건너뛰고 획득한다. odom 이 튀는지 확인할 것",
+                    warn=True,
                 )
             return False
         return True
@@ -243,7 +294,7 @@ class MarkerDetector(Node):
                 # TTL 기준 시각을 여기서 세운다. 이게 없으면 'lock 은 있는데 기준 시각은
                 # None' 인 창이 생겨 _expire_lock 이 그 lock 을 영영 못 푼다.
                 self.last_target_t = time.monotonic()
-                self.get_logger().info(
+                self._say(
                     f"목표 lock(안정 {self.acq_count}프레임): "
                     f"월드=({self.lock[0]:+.2f},{self.lock[1]:+.2f})"
                 )
@@ -285,7 +336,7 @@ class MarkerDetector(Node):
             return
         if self.last_target_t is None or (now - self.last_target_t) <= ttl:
             return
-        self.get_logger().info(
+        self._say(
             f"목표 lock 해제: {now - self.last_target_t:.1f}초 동안 목표를 못 봄 "
             f"(주행 중 등) → 다음 검출 때 다시 획득한다"
         )
@@ -307,28 +358,27 @@ class MarkerDetector(Node):
         self.acq_fallback_warned = False
 
     def _note_state(self, state, n_markers, dlock):
-        """검출 상태가 **바뀔 때만** INFO 한 줄. 같은 상태가 이어지면 아무것도 안 찍는다.
+        """검출 상태가 **바뀔 때만** 한 줄. 같은 상태가 이어지면 아무것도 안 찍는다.
 
         state: 'ok' 채택·발행 중 / 'gated' 마커는 보이나 lock 밖 / 'none' 후보 없음.
-        매 프레임 로그를 없애려는 것이면서, 동시에 진단을 **더** 잘 되게 하는 장치다 —
-        예전엔 후보가 0개인 상황에 아무 로그도 안 남아, 도킹이 '마커 없음'으로 실패해도
-        검출기가 못 본 것인지 게이트가 막은 것인지 구분할 수 없었다.
+        전이만 찍어도 순찰 주행 중엔 이 셋이 계속 왕복해 초당 여러 줄이 되므로,
+        도킹 구간(_say)에서만 INFO 로 낸다.
         """
         if state == self.pub_state:
             return
         self.pub_state = state
         if state == "ok":
             extra = "" if dlock is None else f", lock거리 {dlock * 100:.1f}cm"
-            self.get_logger().info(
+            self._say(
                 f"목표 채택 시작(후보 {n_markers}개{extra}) → /docking_marker_pose 발행"
             )
         elif state == "gated":
-            self.get_logger().info(
+            self._say(
                 f"마커 {n_markers}개 보이나 lock 밖 → 발행 중단 "
                 f"(옆 충전소이거나 lock 이 낡았다)"
             )
         else:
-            self.get_logger().info("마커 후보 없음 → 발행 중단")
+            self._say("마커 후보 없음 → 발행 중단")
 
     def on_scan(self, msg):
         # LaserScan → (각도[도], 거리, 밝기) 목록

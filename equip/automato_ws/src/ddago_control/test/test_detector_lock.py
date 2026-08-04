@@ -225,3 +225,110 @@ def test_dock_start_reset_is_safe_without_lock(det):
     """lock 이 없을 때 알림이 와도 예외 없이 넘어간다(도킹을 막지 않는다)."""
     det.on_lock_reset(None)
     assert det.lock is None
+
+
+# ------------------------------------------------------- 로그 창(verbose) --- #
+class _FakeLogger:
+    """어느 레벨로 나갔는지만 기록하는 로거 대역(메시지 내용은 검사하지 않는다)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def info(self, m):
+        self.calls.append(("info", m))
+
+    def debug(self, m):
+        self.calls.append(("debug", m))
+
+    def warn(self, m):
+        self.calls.append(("warn", m))
+
+    def levels(self):
+        return [lv for lv, _ in self.calls]
+
+
+def _capture(node):
+    """노드의 로거를 대역으로 바꿔 이후 로그가 어느 레벨로 나가는지 본다."""
+    fake = _FakeLogger()
+    node.get_logger = lambda: fake
+    return fake
+
+
+def test_quiet_until_dock_start(det):
+    """도킹 알림을 받기 전에는 검출 로그가 INFO 로 나가지 않는다.
+
+    검출기는 bringup 과 함께 순찰 내내 떠 있다. 이 장치가 없으면 주행 구간 내내
+    로그가 흘러 같은 런치의 카메라·텔레메트리·도킹 서버 로그를 덮어버린다.
+    """
+    fake = _capture(det)
+    det._say("검출 상태 한 마디")
+    assert fake.levels() == ["debug"]
+    assert det._verbose() is False
+
+
+def test_dock_start_opens_log_window(det):
+    """도킹 시작 알림이 로그 창을 연다 — 이 알림 시점이 곧 '도킹 직전'이다.
+
+    도킹 서버가 goal 을 받자마자 /ddago/dock_lock_reset 을 쏘므로, 새 토픽 없이
+    이 신호 하나로 '지금부터 도킹'을 알 수 있다.
+    """
+    det.on_lock_reset(None)
+    assert det._verbose() is True
+
+    fake = _capture(det)
+    det._say("도킹 중 한 마디")
+    det._say("도킹 중 경고", warn=True)
+    assert fake.levels() == ["info", "warn"]
+
+
+def test_log_window_closes_after_verbose_sec(det):
+    """창은 verbose_sec 뒤 저절로 닫힌다.
+
+    도킹이 '끝났다'는 신호는 따로 오지 않으므로(시작 알림만 있다) 시간으로 닫는다.
+    """
+    det.on_lock_reset(None)
+    assert det._verbose() is True
+
+    det.verbose_until = time.monotonic() - 0.1     # 창이 만료된 상태로 만든다
+    assert det._verbose() is False
+    fake = _capture(det)
+    det._say("다시 조용")
+    assert fake.levels() == ["debug"]
+
+
+def test_verbose_sec_zero_restores_old_behavior(det):
+    """0 이하면 알림과 무관하게 항상 INFO — 옛 동작으로 되돌리는 탈출구.
+
+    이 장치가 정작 도킹 실패 때 필요한 로그를 가리는 것이 최악이다. 그때 로봇에서
+    ros2 param set 한 줄로 즉시 되돌릴 수 있어야 한다(재빌드·재배포 없이).
+    ⚠️ 도킹 서버의 reset_lock_on_start 를 끄면 알림이 아예 오지 않으므로,
+       그 조합에서는 이 값을 0 으로 두어야 도킹 로그가 보인다.
+    """
+    det.set_parameters([Parameter("verbose_sec", value=0.0)])
+    assert det.verbose_until is None               # 알림을 한 번도 안 받았는데도
+    assert det._verbose() is True
+
+    fake = _capture(det)
+    det._say("항상 보인다")
+    assert fake.levels() == ["info"]
+
+
+def test_state_transitions_are_quiet_while_patrolling(det):
+    """순찰 중 상태 전이는 INFO 로 새지 않는다 — 이번 수정이 잡으려는 본체.
+
+    '상태가 바뀔 때만 INFO' 만으로는 부족했다. 주행 중엔 스치는 반사물 탓에
+    채택↔후보없음 이 쉴 새 없이 뒤집혀, 전이만 찍어도 초당 여러 줄이 쏟아진다.
+    """
+    fake = _capture(det)
+    for i in range(10):
+        det._note_state("ok" if i % 2 == 0 else "none", 1, None)
+    assert fake.levels() == ["debug"] * 10         # 전이는 다 남되 전부 DEBUG
+
+
+def test_state_transitions_visible_while_docking(det):
+    """도킹 중에는 같은 전이가 INFO 로 보인다 — 진단이 실제로 필요한 구간이다."""
+    det.on_lock_reset(None)
+    fake = _capture(det)
+    det._note_state("ok", 1, 0.03)
+    det._note_state("none", 0, None)
+    assert fake.levels() == ["info", "info"]
