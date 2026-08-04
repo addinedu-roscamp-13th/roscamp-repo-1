@@ -1853,7 +1853,18 @@ def _apply_detection_to_heat(d):
 
 
 def _commit_heat_on_patrol_completed(d):
-    """순찰 완료 → 버퍼를 **방문 웨이포인트 평균**으로 확정해 작물 % 를 채운다.
+    """순찰 완료 → 작물 % 를 확정한다.
+
+       [값의 출처 두 갈래]
+       ① ACS 가 완료 콜백에 **전체 평균**을 실어주면 그걸 그대로 쓴다(우선).
+          보연님이 순찰이 끝나면 평균값을 한 번에 보내주기로 했다(이건수 확인 2026-08-04).
+          필드는 detections/notify 와 같은 이름을 받는다:
+            ripe_percent / unripe_percent / rotten_percent / disease_percent
+          (summary 안에 들어와도 읽는다)
+       ② 안 실려오면 이쪽에서 쌓아둔 pending 을 방문 지점 평균으로 낸다(폴백).
+
+       ACS 값을 우선하는 이유: 순찰 도중 검출 콜백이 몇 건 유실되면 이쪽 평균은 그만큼
+       치우친다. ACS 가 낸 전체 평균이 더 정확하다.
 
        히트맵(by_waypoint)은 순찰 도중에 이미 실시간으로 채워져 있다. 여기서 하는 일은
        **작물 상태 % 를 확정하는 것 하나뿐**이다 — 절반만 돈 평균이 최종값처럼 보이면
@@ -1862,16 +1873,30 @@ def _commit_heat_on_patrol_completed(d):
        평균은 방문한 지점 수로 나눈다(안 간 곳은 계산에 안 들어간다).
        버퍼가 비어 있으면(검출 콜백이 하나도 안 왔으면) 화면을 건드리지 않는다 —
        0% 로 지워버리면 직전 순찰 결과까지 잃는다."""
+    # ── ① ACS 가 보낸 전체 평균이 있으면 그것을 쓴다 ──
+    src = d if isinstance(d.get("ripe_percent"), (int, float)) else (d.get("summary") or {})
+    acs_avg = None
+    if isinstance(src, dict) and isinstance(src.get("ripe_percent"), (int, float)):
+        acs_avg = {"ripe": float(src.get("ripe_percent") or 0.0),
+                   "unripe": float(src.get("unripe_percent") or 0.0),
+                   "rot": float(src.get("rotten_percent") or 0.0),
+                   "pest": float(src.get("disease_percent") or 0.0)}
+
     with LOCK:
         h = load_heat()
         pend = h.get("pending") or {}
         wps = pend.get("waypoints") or {}
-        if not wps:
+        if not wps and acs_avg is None:
             return
         n = len(wps)
-        avg = {}
-        for name in ("ripe", "unripe", "rot", "pest"):
-            avg[name] = sum(float(v.get(name) or 0.0) for v in wps.values()) / n
+        if acs_avg is not None:
+            avg = acs_avg
+            wlog("   작물 상태: ACS 가 보낸 전체 평균 사용 (익음 %.1f%% 병해충 %.1f%%)"
+                 % (avg["ripe"], avg["pest"]))
+        else:
+            avg = {}
+            for name in ("ripe", "unripe", "rot", "pest"):
+                avg[name] = sum(float(v.get(name) or 0.0) for v in wps.values()) / n
         # heat.json 은 개수로 저장하고 화면이 합으로 비율을 다시 낸다.
         # 1000 스케일로 넣으면 화면 비율 = 평균 퍼센트가 그대로 된다.
         h["crop"] = {name: int(round(v * 10)) for name, v in avg.items()}
@@ -1888,8 +1913,9 @@ def _commit_heat_on_patrol_completed(d):
         # 방금 그린 히트맵을 지워버리는 것을 막는다.
         h["pending"] = {"task_id": pend.get("task_id"), "waypoints": {}}
         save_heat(h)
-        wlog("   작물 상태 확정: 웨이포인트 %d곳 평균 → 익음 %.1f%% 병해충 %.1f%%"
-             % (n, avg["ripe"], avg["pest"]))
+        wlog("   작물 상태 확정(%s): 익음 %.1f%% 병해충 %.1f%%"
+             % ("ACS 평균" if acs_avg is not None else "웨이포인트 %d곳 평균" % n,
+                avg["ripe"], avg["pest"]))
 
 
 
