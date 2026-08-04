@@ -411,7 +411,7 @@ def drop_to_basket(arm: ArmBackend, grade: str, speed: int = TRANSIT_SPEED) -> b
 
 
 def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
-         to_basket: bool = True) -> bool:
+         to_basket: bool = True, on_step=None) -> bool:
     """토마토 1개 파지(+투하) 1회 시도. 성공하면 True.
 
     target_xyz  : base 기준 [x,y,z] (mm) — tf_transform.camera_to_base 결과
@@ -419,7 +419,19 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
     orientation : 그리퍼 자세 [rx,ry,rz]. None이면 기본 GRIPPER_ORI.
                   AI 기울기값이 있으면 그걸 넘긴다(고정방향 → 방향정렬 확장 지점).
     to_basket   : False면 바구니 투하 생략(파지→후퇴까지만). TF/파지 검증용.
+    on_step     : 단계 경계마다 부르는 콜백. 액션 Feedback 을 이 시점에 쏜다.
+
+    ⚠ on_step 이 필요한 이유 — 파지 1회가 실측 ~40초인데 DG 의 수확 워치독은
+      30초(harvest_feedback_timeout_sec)다. 열매 단위로만 Feedback 을 쏘면
+      **정상 수확 중에 취소당한다**(실측: 마지막 Feedback 후 30.5초에 취소).
+      단계 경계에서 쏘므로 팔이 실제로 멎으면 여전히 신호가 끊긴다 —
+      워치독의 '멎음 감지' 는 그대로 살아 있다. 그래서 아래 _step 위치를 옮기거나
+      타이머 하트비트로 바꾸면 안 된다 — 멎은 팔도 살아 있다고 보고하게 된다.
     """
+    def _step(name: str) -> None:
+        if on_step is not None:
+            on_step(name)
+
     # 접근 자세 결정: 위치별 티칭 모델(taught_approaches 보간)이 있으면 그걸로 — 끝
     # 토마토는 바깥에서 접근하는 등 위치마다 다른 자세가 필요. 시연 없으면 고정 오프셋 폴백.
     plan = (approach_model.plan(target_xyz, zone_fn=lambda b: zone_of(b[1]))
@@ -452,6 +464,7 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
         # 후퇴 좌표는 여기서 만들지 않는다 — 그랩 명령이 확정된 뒤 그 좌표를 기준으로
         # 계산해야 순수 후진이 보장된다(아래 참조).
 
+    _step("plan")
     # 그랩점(approach)은 반드시 도달 가능해야 파지가 성립한다. 범위 밖이면 거부.
     if not in_workspace(approach):
         log(f"  [거부] 접근점 {[round(c,1) for c in approach[:3]]} 가동범위 밖 — 목표/TF 확인")
@@ -504,6 +517,7 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
         raise RuntimeError(
             f"진입 불가(standoff 확보 실패): 목표 {[round(c, 1) for c in grasp_xyz]}"
             f" — 손목을 세울 자리가 없어 포기(옆 열매 보호)")
+    _step("standoff")
     grasp_cmd = grasp_xyz + ori
     # 후퇴는 '실제 명령한 그랩 좌표'에서 접근축으로만 뺀다 — 목표 기준으로 계산하면
     # 도착보정분이 좌우/상하 성분으로 섞여 물고 있는 열매에 전단력이 생긴다.
@@ -516,6 +530,7 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
         derr = [round(cur[i] - approach[i], 1) for i in range(3)]
         log(f"    도착오차 {derr} mm (목표기준) "
               f"명령 {[round(c, 1) for c in grasp_cmd[:3]]}")
+    _step("grasp")
     arm.close_gripper(GRIP_SPEED)
     time.sleep(SETTLE)
     # 이 값은 참고·튜닝용(캐노피 안이라 잎·줄기 접촉으로 오염될 수 있음).
@@ -524,6 +539,7 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
     log(f"    그리퍼값 {grip_val} (임계 {GRIP_THRESHOLD}) → "
           f"{'파지O' if grip_val > GRIP_THRESHOLD else '파지X'} (참고)")
 
+    _step("retreat")
     # 3) 후퇴(직선 우선, 관절 폴백) — 파지물을 접근축 역방향으로 곧게 뺀다.
     if not _try_move(arm, retreat, RETREAT_SPEED, mode=1):
         _try_move(arm, retreat, RETREAT_SPEED, mode=0)
@@ -534,6 +550,7 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
     #    신뢰도: 45mm 곧게 빼는 후퇴 자체가 식물에 붙은 잎·가지를 떼어내는 필터라
     #    (실측: 파지값 80·92·67 이 후퇴·상승 후 0) 여기서 살아남으면 떼어낸 열매다.
     #    파지 직후 값은 손가락이 옆 열매·줄기에 닿아 오염될 수 있어 쓰지 않는다.
+    _step("verdict")
     arm.close_gripper(GRIP_SPEED)
     time.sleep(SETTLE)
     val = arm.gripper_value()
@@ -552,6 +569,7 @@ def pick(arm: ArmBackend, target_xyz, grade: str, orientation=None,
 
     # 6) 바구니 투하 (검증 모드면 생략)
     if to_basket:
+        _step("basket")          # 투하는 왕복이라 여기서 한 번 더 알린다
         return drop_to_basket(arm, grade)
     return True
 
