@@ -105,11 +105,50 @@ def test_centerline_plan_only_at_reliable_distance():
     fsm.state = 'CENTERLINE'
     v, w = fsm.update(True, 0.20, 0.0, 0.0, 0.0, 0, 0, plan=plan, odom_xy=(0, 0), n=99)
     assert fsm.cl_phase == 'PLAN'           # 아직 계획 안 잡힘
-    # 신뢰거리 + 미정렬(yaw 10°): d=0.35 → 계획 잡힘 → TURN1
+    # 신뢰거리 + 미정렬(yaw 10°): d=0.35 → 안정 N프레임 후 계획 잡힘 → TURN1
     fsm2 = F.DockFsm()
     fsm2.state = 'CENTERLINE'
-    fsm2.update(True, 0.35, 0.0, math.radians(10.0), 0.0, 0, 0, plan=plan, odom_xy=(0, 0), n=99)
+    for _ in range(F.CL_PLAN_STABLE_N):     # 안정 확정(튄 프레임 방지)에 N프레임 필요
+        fsm2.update(True, 0.35, 0.0, math.radians(10.0), 0.0, 0, 0, plan=plan, odom_xy=(0, 0), n=99)
     assert fsm2.cl_phase == 'TURN1'
+
+
+def test_plan_aborts_when_yaw_too_large():
+    """yaw 좁히기 정책 ③: 안정 yaw 가 YAW_NARROW_MAX 초과면 1회로도 못 좁힘 → 즉시 ABORT."""
+    F.configure(D_STAGE=0.20)
+    plan = (0.1, 0.10, 0.1)
+    fsm = F.DockFsm()
+    fsm.state = 'CENTERLINE'
+    fsm.cl_phase = 'PLAN'
+    for _ in range(F.CL_PLAN_STABLE_N):     # yaw 45°(임계 35° 초과) 안정 → 시도 없이 중단
+        fsm.update(True, 0.30, 0.0, math.radians(45.0), 0.0, 0, 0, plan=plan, odom_xy=(0, 0), n=99)
+    assert fsm.state == 'ABORT'
+
+
+def test_plan_skips_maneuver_when_yaw_in_band():
+    """yaw 좁히기 정책 ①: 안정 yaw 가 신뢰밴드(≤YAW_NARROW_OK)면 기동 없이 바로 ALIGN(진행)."""
+    F.configure(D_STAGE=0.20)
+    plan = (0.5, 0.10, -0.5)                 # th1 큰 값이라도 밴드면 기동 스킵돼야 함
+    fsm = F.DockFsm()
+    fsm.state = 'CENTERLINE'
+    fsm.cl_phase = 'PLAN'
+    for _ in range(F.CL_PLAN_STABLE_N):     # yaw 3°(밴드 8° 안) → 기동 없이 ALIGN
+        fsm.update(True, 0.30, 0.0, math.radians(3.0), 0.0, 0, 0, plan=plan, odom_xy=(0, 0), n=99)
+    assert fsm.state == 'ALIGN'
+    assert fsm.cl_done is True
+
+
+def test_plan_waits_for_stable_yaw():
+    """PLAN 확정은 yaw 안정(좁은 범위) N프레임 필요 — yaw 가 ±플립하면 확정 보류(PLAN 유지)."""
+    F.configure(D_STAGE=0.20)
+    plan = (0.1, 0.10, 0.1)
+    fsm = F.DockFsm()
+    fsm.state = 'CENTERLINE'
+    fsm.cl_phase = 'PLAN'
+    for i in range(F.CL_PLAN_STABLE_N + 3):     # yaw 가 매 프레임 크게 튐(-40 ↔ +40)
+        yaw = math.radians(40.0 if i % 2 else -40.0)
+        fsm.update(True, 0.30, 0.0, yaw, 0.0, 0, 0, plan=plan, odom_xy=(0, 0), n=99)
+    assert fsm.cl_phase == 'PLAN'               # 튐 지속 → 확정 보류(나쁜 프레임 커밋 방지)
 
 
 def test_plan_backup_no_rotation():
@@ -161,10 +200,11 @@ def test_plan_reliable_window_gates():
                           plan=plan, odom_xy=(0.0, 0.0), n=99)
         assert v > 0.0                       # 너무 멂 → 접근(전진)
         assert fsm.cl_phase == 'PLAN'         # 아직 계획 전
-        # d=0.25 in [0.20,0.29]: 계획됨(미정렬 yaw10° → TURN1)
+        # d=0.25 in [0.20,0.29]: 안정 N프레임 후 계획됨(미정렬 yaw10° → TURN1)
         fsm2 = F.DockFsm(); fsm2.state = 'CENTERLINE'
-        fsm2.update(True, 0.25, 0.0, math.radians(10.0), 0.0, 0, 0,
-                    plan=plan, odom_xy=(0.0, 0.0), n=99)
+        for _ in range(F.CL_PLAN_STABLE_N):
+            fsm2.update(True, 0.25, 0.0, math.radians(10.0), 0.0, 0, 0,
+                        plan=plan, odom_xy=(0.0, 0.0), n=99)
         assert fsm2.cl_phase == 'TURN1'
     finally:
         F.configure(D_RELIABLE_MIN=0.24, D_RELIABLE_MAX=10.0)   # 기본 복원(교차오염 방지)
@@ -227,26 +267,26 @@ def test_face_trusts_centerline():
 
 
 def test_verify_passes_to_align_when_aligned():
-    """TURN2 후 VERIFY: 신뢰거리(d≥0.25)서 bearing/yaw 양호 → ALIGN(cl_done=True)."""
+    """TURN2 후 VERIFY: 신뢰거리(d≥0.25)서 안정 N프레임 bearing/yaw 양호 → ALIGN(cl_done=True)."""
     F.configure(CL_VERIFY_D=0.25)
     fsm = F.DockFsm()
     fsm.state = 'CENTERLINE'
     fsm.cl_phase = 'VERIFY'
-    fsm.update(True, 0.30, 0.0, 0.0, 0.0, 0, 0, odom_xy=(0.0, 0.0))
+    for _ in range(F.CL_PLAN_STABLE_N):     # 안정 프레임 필요(튄 프레임 판정 방지)
+        fsm.update(True, 0.30, 0.0, 0.0, 0.0, 0, 0, odom_xy=(0.0, 0.0))
     assert fsm.state == 'ALIGN'
     assert fsm.cl_done is True
 
 
-def test_verify_replans_when_skewed():
-    """VERIFY: 신뢰거리서 yaw 벗어남 → 재계획(PLAN), cl_replans 증가(수렴 반복)."""
-    F.configure(CL_VERIFY_D=0.25, CL_MAX_REPLANS=2)
+def test_verify_aborts_when_still_skewed():
+    """VERIFY(1회 좁힘 후): 안정 N프레임인데 yaw 신뢰밴드(YAW_NARROW_OK) 밖 → 재계획 없이 ABORT."""
+    F.configure(CL_VERIFY_D=0.25)
     fsm = F.DockFsm()
     fsm.state = 'CENTERLINE'
     fsm.cl_phase = 'VERIFY'
-    fsm.update(True, 0.30, 0.0, math.radians(10.0), 0.0, 0, 0, odom_xy=(0.0, 0.0))
-    assert fsm.cl_phase == 'PLAN'
-    assert fsm.cl_replans == 1
-    assert fsm.state == 'CENTERLINE'
+    for _ in range(F.CL_PLAN_STABLE_N):     # yaw 20°(밴드 8° 밖)로 안정 → 좁힘 실패 판정
+        fsm.update(True, 0.30, 0.0, math.radians(20.0), 0.0, 0, 0, odom_xy=(0.0, 0.0))
+    assert fsm.state == 'ABORT'
 
 
 def test_verify_trusts_plan_when_not_found():
@@ -266,7 +306,8 @@ def test_centerline_skip_when_aligned():
     fsm = F.DockFsm()
     fsm.state = 'CENTERLINE'
     fsm.cl_phase = 'PLAN'
-    fsm.update(True, 0.30, 0.0, 0.0, 0.0, 0, 0, plan=(0.1, 0.05, 0.1), odom_xy=(0, 0), n=99)
+    for _ in range(F.CL_PLAN_STABLE_N):     # 안정 N프레임 후 정렬 판단(median)
+        fsm.update(True, 0.30, 0.0, 0.0, 0.0, 0, 0, plan=(0.1, 0.05, 0.1), odom_xy=(0, 0), n=99)
     assert fsm.state == 'ALIGN'
     assert fsm.cl_done is True
 
@@ -337,6 +378,83 @@ def test_advance_target_clamped_to_window():
         assert abs(fsm.adv_target - (0.18 + 0.0875)) < 1e-6
     finally:
         F.configure(D_RELIABLE_MAX=10.0)
+
+
+def test_search_no_read_when_disabled():
+    """read_enable=False(task_point_id 가 '1'~'3' 아님): H 검출 즉시 CENTERLINE(로마 인식 없음, 기존)."""
+    fsm = F.DockFsm()
+    fsm.update(True, 0.30, 0.0, 0.0, 0.0, 0, 0, plan=(0.1, 0.1, 0.1),
+               odom_xy=(0, 0), n=99, read_enable=False)
+    assert fsm.state == 'CENTERLINE'
+
+
+def test_search_enters_read_when_enabled():
+    """read_enable=True: SEARCH서 H 검출(경사 OK) → 정지하고 READ(로마 읽기) 진입(v=w=0)."""
+    fsm = F.DockFsm()
+    v, w = fsm.update(True, 0.30, 0.0, 0.0, 0.0, 0, 0, plan=(0.1, 0.1, 0.1),
+                      odom_xy=(0, 0), n=99, read_enable=True, station_ok=False)
+    assert fsm.state == 'READ'
+    assert v == 0.0 and w == 0.0
+
+
+def test_search_skips_read_when_too_oblique():
+    """경사 과대(|yaw|>YAW_NARROW_MAX)면 READ 안 하고 계속 회전(부정확 카운트로 오매치 방지)."""
+    fsm = F.DockFsm()
+    v, w = fsm.update(True, 0.30, 0.0, math.radians(45.0), 0.0, 0, 0, plan=(0.1, 0.1, 0.1),
+                      odom_xy=(0, 0), n=99, read_enable=True, station_ok=True)
+    assert fsm.state == 'SEARCH'
+    assert w == F.SEARCH_W                       # 회전 계속
+
+
+def test_read_advances_when_station_matches():
+    """READ서 station_ok=True + READ_HOLD 경과 → 목표 스테이션 확정 → CENTERLINE 진행."""
+    fsm = F.DockFsm()
+    fsm.state = 'READ'
+    fsm.read_start = time.monotonic() - (F.READ_HOLD_SEC + 0.1)
+    fsm.update(True, 0.30, 0.0, 0.0, 0.0, 0, 0, plan=(0.1, 0.1, 0.1),
+               odom_xy=(0, 0), n=99, read_enable=True, station_ok=True)
+    assert fsm.state == 'CENTERLINE'             # use_centerline=True 기본
+
+
+def test_read_waits_while_station_mismatch():
+    """READ서 station_ok=False면 READ_HOLD 지나도 진행 안 함(타임아웃 전까진 계속 읽음)."""
+    fsm = F.DockFsm()
+    fsm.state = 'READ'
+    fsm.read_start = time.monotonic() - (F.READ_HOLD_SEC + 0.1)   # HOLD 는 지났지만
+    fsm.update(True, 0.30, 0.0, 0.0, 0.0, 0, 0, plan=(0.1, 0.1, 0.1),
+               odom_xy=(0, 0), n=99, read_enable=True, station_ok=False)
+    assert fsm.state == 'READ'                   # 불일치 → 진행 보류
+
+
+def test_read_timeout_rejects_wrong_station():
+    """READ서 READ_TIMEOUT 넘게 목표ID 불일치 → 옆 스테이션 → SEARCH 복귀 + 쿨다운(지나침)."""
+    fsm = F.DockFsm()
+    fsm.state = 'READ'
+    fsm.read_start = time.monotonic() - (F.READ_TIMEOUT + 0.1)
+    v, w = fsm.update(True, 0.30, 0.0, 0.0, 0.0, 0, 0, plan=(0.1, 0.1, 0.1),
+                      odom_xy=(0, 0), n=99, read_enable=True, station_ok=False)
+    assert fsm.state == 'SEARCH'
+    assert w == F.SEARCH_W                        # 회전해 지나침
+    assert fsm.read_cooldown_until > time.monotonic()
+
+
+def test_read_returns_to_search_when_marker_lost():
+    """READ 중 H 놓치면(found=False) 재탐색(SEARCH)."""
+    fsm = F.DockFsm()
+    fsm.state = 'READ'
+    fsm.read_start = time.monotonic()
+    fsm.update(False, 0, 0, 0, 0.0, 0, 0, read_enable=True, station_ok=True)
+    assert fsm.state == 'SEARCH'
+
+
+def test_station_id_from_point():
+    """task_point_id '1'~'3'→그 번호(로마 게이트 ON), 그 외/비숫자→0(게이트 OFF, 기존 도킹)."""
+    from ddago_control.floor_dock import floor_detector as D
+    assert D.station_id_from_point('1') == 1
+    assert D.station_id_from_point('3') == 3
+    assert D.station_id_from_point('CHARGE_01') == 0    # 예시 point → 게이트 off
+    assert D.station_id_from_point('4') == 0            # ROMAN_MAX_ID 초과 → off
+    assert D.station_id_from_point('') == 0
 
 
 def test_single_dock_no_hold_no_advance():

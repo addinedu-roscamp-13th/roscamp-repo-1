@@ -35,6 +35,78 @@ SIDE_MIN = 0.14
 SIDE_MAX = 0.26
 SIDE_RATIO_TOL = 0.30
 
+# ── 스테이션 ID: 로마 숫자 인식(H 안 연두색 획) ──
+#  goal.task_point_id 가 '1'~'3' 이면 그 번호 H(세로획 개수)만 채택(옆 스테이션 오검출 방지).
+#  획은 청색 H 와 색이 달라(연두) 청색 검출 간섭 없음. GREEN_* 는 실측 테이프로 튜닝할 것.
+#  현행 I/II/III(세로획 개수)만 = 3 스테이션. 향후 V/X 모양+좌우순서로 IV 이상 확장(C).
+ROMAN_ENABLE = True
+GREEN_LO = (35, 60, 60)          # 연두 HSV 하한 (OpenCV H 0~180)
+GREEN_HI = (85, 255, 255)        # 연두 HSV 상한
+ROMAN_MIN_AREA = 40              # 획 최소 픽셀면적(1차 노이즈 배제; 실측 크기는 아래로 판정)
+ROMAN_THICK_MM = (10.0, 15.0)   # 획 두께 실측 범위 [mm] (바닥평면 투영)
+ROMAN_LEN_MM = (43.0, 55.0)     # 획 길이 실측 범위 [mm]
+ROMAN_MAX_ID = 3                 # 현행 인식 한계(I~III)
+
+
+def station_id_from_point(task_point_id):
+    """goal.task_point_id 가 '1'~'3'(로마숫자 I~III 스테이션)이면 그 번호, 아니면 0.
+    0 = 로마 인식 게이트 미사용(어떤 H 나 도킹, 기존 동작)."""
+    s = str(task_point_id).strip()
+    if s.isdigit() and 1 <= int(s) <= ROMAN_MAX_ID:
+        return int(s)
+    return 0
+
+
+def recognize_roman(frame, mapper, q):
+    """H 윤곽/코너(q) 주변 연두색 로마 숫자 인식 → 규격 맞는 세로획 개수(I~III → ID 1~3).
+    (ID숫자, boxes[(poly,두께mm,길이mm)], rejects[(poly,두께mm,길이mm)]) 반환. frame=오버레이 전 BGR.
+    ★검출은 H 마커 내부(convex hull 을 pad 만큼 dilate)에서만 — 밖의 반사·타마커 잡검출 제거.
+    (floor_dock_ws/floor_pose.recognize_roman 이식본, ddago02 실기 검증)."""
+    x, y, w, h = cv2.boundingRect(q.astype(np.int32))
+    pad = int(0.12 * max(w, h))     # H 경계 밖 여유(근접서 획 near부가 H 경계에 닿아 잘리는 것 방지)
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1 = min(frame.shape[1], x + w + pad)
+    y1 = min(frame.shape[0], y + h + pad)
+    roi = frame[y0:y1, x0:x1]
+    if roi.size == 0:
+        return 0, [], []
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array(GREEN_LO, np.uint8), np.array(GREEN_HI, np.uint8))
+    # ★H 근처에서만★: H convex hull 을 pad 만큼 ★확장(dilate)★한 영역으로 제한.
+    #  (erode 는 근접서 획 near부를 잘라먹었음. 파랑은 green∩ 로 이미 제외 → 확장해도 무해,
+    #   대신 밖의 반사·타마커 잡검출은 여전히 H에서 멀어 배제.)
+    hull = cv2.convexHull(q.astype(np.int32)) - np.array([[x0, y0]], np.int32)
+    hmask = np.zeros(mask.shape, np.uint8)
+    cv2.fillConvexPoly(hmask, hull, 255)
+    k = max(3, pad)
+    hmask = cv2.dilate(hmask, np.ones((k, k), np.uint8))
+    mask = cv2.bitwise_and(mask, hmask)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []            # 규격 통과 획: (poly(N,2 프레임픽셀), 두께mm, 길이mm) — 마름모 그대로
+    rejects = []          # 크기 제한 밖: (poly(N,2), 두께mm, 길이mm)
+    for c in cnts:
+        if cv2.contourArea(c) < ROMAN_MIN_AREA:
+            continue
+        px = c.reshape(-1, 2).astype(np.float32) + np.array([x0, y0], np.float32)  # 프레임 픽셀 윤곽
+        gp = mapper.pixel_to_ground(px)              # 바닥평면 [m]
+        gp = gp[np.all(np.isfinite(gp), axis=1)]
+        if len(gp) < 5:
+            continue
+        # ★바닥평면(실측)서 회전사각형★ → 원근/방향 무관한 실제 두께/길이(측정용).
+        (_gc, (gw, gh), _ga) = cv2.minAreaRect(gp.astype(np.float32))
+        short, lng = min(gw, gh) * 1000.0, max(gw, gh) * 1000.0      # [mm]
+        # 표시용: minAreaRect(직각) 대신 ★실제 윤곽★(마름모/평행사변형 반영). approxPolyDP로 단순화.
+        eps = 0.03 * cv2.arcLength(c, True)
+        poly = cv2.approxPolyDP(c, eps, True).reshape(-1, 2).astype(np.float32) + np.array([x0, y0], np.float32)
+        if (ROMAN_THICK_MM[0] <= short <= ROMAN_THICK_MM[1]
+                and ROMAN_LEN_MM[0] <= lng <= ROMAN_LEN_MM[1]):
+            boxes.append((poly, short, lng))
+        else:
+            rejects.append((poly, short, lng))
+    boxes.sort(key=lambda b: float(b[0][:, 0].min()))   # 좌→우 정렬(번호 일관)
+    return len(boxes), boxes, rejects
+
 
 class FloorMapper:
     """floor_calib.npz(바닥 평면 + 내장 mtx/dist)로 픽셀↔바닥 좌표 변환."""
