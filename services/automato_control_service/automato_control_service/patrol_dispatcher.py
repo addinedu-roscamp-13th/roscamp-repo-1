@@ -366,9 +366,15 @@ class PatrolDispatcher:
         보게 되고, 코너 한 면이 짧게 읽혀 검출에서 탈락한다 → 도킹이 '마커 없음'으로
         실패한다. 언도킹(undock_step)에는 같은 방어가 이미 있었고 그 짝이 빠져 있었다.
 
+        **포기(skipped)로 끝나기 전에 다시 시도한다**(drive_retry). 복귀는 목적지가
+        자기 충전소 하나뿐이라, 한 번의 포기가 곧 22-2 현장 정지(IMMOBILIZED — 사람이
+        가서 로봇을 옮겨야 풀린다)로 직결된다. 그런데 충전소는 출구가 wp15 하나뿐인
+        막다른 길이고 거기에 충전소 셋이 다 붙어 있어, 다른 로봇이 잠깐 지나가는 것만으로
+        길이 없어 보인다. 몇 초 뒤면 열릴 길 때문에 사람을 부르지 않도록 버틴다.
+
         반환: (outcome, 도달한 노드).
           'arrived' 목표(충전소 진입 노드) 도달 → 다음은 도킹.
-          'skipped' 우회로도 없어 못 감 → 호출부가 22-2(현장 정지)로 넘긴다.
+          'skipped' 재시도 시간 내내 우회로가 없었음 → 호출부가 22-2(현장 정지)로 넘긴다.
           'aborted' 로봇이 중단 보고 / Navigate 서버 미기동.
         """
         if not client.wait_for_server(timeout_sec=SERVER_WAIT_SEC):
@@ -383,7 +389,7 @@ class PatrolDispatcher:
         # 훅을 안 넘긴다 = DriveHooks 기본값(촬영·짝·방문 마킹 없는 평범한 주행).
         # 예전에는 _navigate(capture=False) 로 순찰 로직을 '껐'지만, 지금은 그 로직이
         # 애초에 drive 밖(_PatrolHooks)에 있어 안 넘기면 그만이다.
-        return self.runner.drive(
+        return self.runner.drive_retry(
             engine, client, task_id, robot_id, current, target,
             final_yaw=final_yaw)
 

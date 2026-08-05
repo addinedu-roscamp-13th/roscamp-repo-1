@@ -21,6 +21,7 @@ RP-78 에서 만든 순찰 교통관제(세그먼트 예약·룩어헤드·막�
    블랙리스트(막힌 통로)와 wp_meta(좌표)가 갈리면, 순찰이 '막혔다'고 판정한 통로로
    수확 로봇이 그대로 들어간다. 예약표(engine)를 하나로 공유하는 것과 같은 이유다.
 """
+import contextlib
 import math
 import threading
 import time
@@ -30,12 +31,14 @@ from automato_interfaces.msg import Waypoint
 
 from automato_control_service.patrol_config import (
     BLOCK_TTL_SEC,
+    DRIVE_RETRY_SEC,
     GOAL_ACCEPT_TIMEOUT_SEC,
     HEARTBEAT_SEC,
     MIN_BLOCK_ELAPSED_SEC,
     RESERVE_POLL_SEC,
     RESERVE_WAIT_SEC,
     SEGMENT_TIMEOUT_SEC,
+    YIELD_TTL_SEC,
 )
 from automato_control_service.routing_engine import Route
 
@@ -127,18 +130,22 @@ class RouteRunner:
     def _blacklist_add(self, corridor_id, robot_id=None) -> None:
         """회피 목록에 올린다. robot_id 를 주면 **그 로봇에게만** 보이는 회피가 된다.
 
-        한 바구니에 성격이 다른 둘이 들어오기 때문에 구분이 필요하다:
+        한 바구니에 성격이 다른 둘이 들어오기 때문에 구분이 필요하다. 범위(누가 피하나)와
+        시간(얼마나 피하나)이 **둘 다** 갈린다:
           · robot_id=None : 진짜 막힘(주행이 실패했다) — 물리적 장애물이므로 모두가 피해야
-            한다. 전역으로 공유한다.
+            한다. 전역으로 공유하고, 사람이 치우기 전엔 그대로라 길게(BLOCK_TTL_SEC) 피한다.
           · robot_id=지정 : 양보(통로·자리를 남이 쥐고 있어 비켜 줬다) — 이건 **그 로봇의
             사정**일 뿐 길이 사라진 게 아니다. 전역으로 퍼뜨리면 아무 상관 없는 로봇까지
             그 지점을 목표로 삼지 못해 '경로 없음 → 건너뜀'이 연쇄한다.
             (실측: dg_02 가 지점 9 에 서 있어 dg_03 이 양보했을 뿐인데, 무관한 dg_01 의
              9 행 3건이 전부 차단됐다.)
+            시간도 짧다(YIELD_TTL_SEC) — 앞 로봇이 지나가면 몇 초 만에 풀릴 자원이라,
+            막힘과 같은 30초를 매기면 그 사이 재시도가 전부 헛돈다. 작업 지점은 전부
+            출구가 하나뿐인 막다른 길이라 그 출구를 오래 지워 두면 아예 못 나간다.
         """
+        ttl = BLOCK_TTL_SEC if robot_id is None else YIELD_TTL_SEC
         with self._bl_lock:
-            self._blacklist[corridor_id] = (
-                time.monotonic() + BLOCK_TTL_SEC, robot_id)
+            self._blacklist[corridor_id] = (time.monotonic() + ttl, robot_id)
 
     def _blacklist_active(self, robot_id=None) -> set:
         """지금 회피해야 할 자원. robot_id 를 주면 '전역 막힘 + 그 로봇 몫'만 돌려준다.
@@ -168,6 +175,51 @@ class RouteRunner:
             active = set(self._blacklist.keys())
         corridors, nodes = self._split_blocked(engine, active)
         return {"corridors": sorted(corridors), "nodes": sorted(nodes)}
+
+    # ---------------------------- 미리 맡아 둔 자원 지키기 ---------------------------- #
+    @contextlib.contextmanager
+    def hold_slot(self, engine, resource_id, robot_id):
+        """블록이 도는 동안 '미리 잡아 둔 자원'의 예약을 하트비트로 살려 둔다.
+
+        왜 필요한가: 예약은 RESERVATION_TTL_SEC(15초) 동안 갱신이 없으면 죽은 것으로 보고
+        회수된다. 그런데 주행(drive)은 **자기가 잡은 자원만** 하트비트를 친다 — 출발 전에
+        호출부가 따로 맡아 둔 자리는 모른다. 수확지에서 예냉실까지는 7홉(실제 100초 남짓)
+        이라, 이게 없으면 도착하기도 전에 맡아 둔 자리를 남에게 빼앗긴다.
+
+        쓰는 곳: 목적지가 '단 하나뿐이고 남과 겹치는' 주행. 지금은 예냉실 이송(E5)이다.
+        출발 전에 자리를 맡아 두면 두 로봇이 동시에 수확을 마쳐도 한 대만 출발하고,
+        나머지는 자기 수확지에서 기다린다 → 좁은 관문(wp17)에서 마주칠 일이 없어진다.
+
+        예약과 반납은 **호출부 책임**이다. 이 헬퍼는 '살려두기'만 한다 — 블록을 벗어날 때
+        예약을 놓지 않는다. 도착에 성공하면 그 자리를 계속 써야 하고(도킹·하역이 이어진다),
+        실패했을 때만 호출부가 반납하기 때문이다. 여기서 일괄로 놓으면 성공 경로에서
+        도착하자마자 자리가 비어 남이 들어온다.
+
+        스레드를 쓰는 이유: 주행은 호출부 스레드를 통째로 붙잡고 있어서, 그 사이 하트비트를
+        칠 자리가 없다. drive 안에 인자를 밀어 넣는 방법도 있지만 그러면 예약 반납 로직
+        여러 곳이 '이건 놓으면 안 되는 자원'을 알아야 해서 주행 엔진이 복잡해진다.
+        """
+        stop = threading.Event()
+
+        def _beat():
+            # 첫 갱신은 호출부의 try_reserve 가 방금 했으므로 한 박자 쉬고 시작한다.
+            while not stop.wait(HEARTBEAT_SEC):
+                engine.heartbeat(resource_id, robot_id)
+
+        keeper = threading.Thread(
+            target=_beat, name=f"hold-{robot_id}-{resource_id}", daemon=True)
+        keeper.start()
+        self._log.debug(
+            f"{self._res_name(engine, resource_id)} 맡아 둔 예약 유지 시작 "
+            f"({robot_id})")
+        try:
+            yield
+        finally:
+            stop.set()
+            keeper.join(timeout=HEARTBEAT_SEC)
+            self._log.debug(
+                f"{self._res_name(engine, resource_id)} 맡아 둔 예약 유지 종료 "
+                f"({robot_id})")
 
     # ---------------------------- 도킹 진입 방향 ---------------------------- #
     def entry_yaw(self, wp, task_id=None):
@@ -248,8 +300,78 @@ class RouteRunner:
         return code == 0
 
     # ---------------------------- 주행 본체 ---------------------------- #
+    def drive_retry(self, engine, client, task_id, robot_id, current, target,
+                    hooks=None, final_yaw=None, retry_sec=None):
+        """drive 와 같되, '포기(skipped)'로 끝나면 retry_sec 안에서 다시 시도한다.
+
+        **목적지가 하나뿐인 주행에만 쓴다**(수확 이송·충전소 복귀). 순찰은 목표가 12곳이라
+        한 곳을 포기하면 다음 지점으로 넘어가는 게 맞아서 그냥 drive 를 쓴다.
+
+        왜 '다시 부르기'만으로 되는가:
+          drive 는 실패한 자원을 attempt_block 에 담아 두는데, 이건 **호출 한 번 동안만
+          사는 지역변수**다. 다시 부르면 빈 상태로 시작하므로 그 목적지를 다시 노린다.
+          양보로 생긴 회피 목록도 YIELD_TTL_SEC(5초)면 풀린다. 그래서 주행 알고리즘도
+          예약 엔진도 건드릴 필요가 없다 — 포기를 '최종 판정'에서 '한 번의 시도 결과'로
+          낮춰 보는 것뿐이다.
+
+        왜 필요한가:
+          작업 지점(충전소·수확지·예냉실)은 전부 출구가 하나뿐인 막다른 길이다. 그 출구를
+          남이 잠깐 쓰고 있으면 우회로가 없어 곧바로 '경로 없음 → 포기'가 되고, 목적지가
+          하나인 주행에서는 그게 작업 전체의 실패로 직결된다(실측: 3대 동시 주행에서
+          출발 3.5초 만에 수확 task 사망, 예냉실 이송은 토마토를 실은 채 FAILED).
+          앞 로봇은 몇 초 뒤 비켜 주므로, 그동안 서서 기다렸다 다시 가면 될 일이다.
+
+        재시도 중에도 '서 있는 자리'는 계속 쥔 채다 — drive 가 그 한 장을 남기고 나오고
+        (finally 의 _release_except), 아래 대기 루프가 하트비트로 살려 둔다. 안 그러면
+        기다리는 사이 TTL 로 회수돼 남이 내 자리로 들어온다.
+
+        retry_sec: 재시도 상한(초). None 이면 설정값 DRIVE_RETRY_SEC 을 그때그때 읽는다.
+          기본 인자에 상수를 직접 박지 않는 이유 — 기본값은 함수를 '정의할 때' 한 번
+          평가돼 버려서, 테스트가 이 값을 짧게 바꿔 끼울 수 없다(길 막힘을 검증하는
+          테스트가 매번 30초씩 실제로 기다리게 된다).
+
+        반환은 drive 와 같다: (outcome, 도달한 노드).
+        """
+        retry_sec = DRIVE_RETRY_SEC if retry_sec is None else retry_sec
+        deadline = time.monotonic() + retry_sec
+        tries = 0
+        while True:
+            tries += 1
+            outcome, current = self.drive(
+                engine, client, task_id, robot_id, current, target,
+                # 첫 시도만 '경로 없음'을 경고로 남긴다. 그 뒤는 같은 사실을 0.5초마다
+                # 되풀이하는 것뿐이라(한 구간 최대 60줄) 순찰·수확 로그를 덮는다.
+                hooks=hooks, final_yaw=final_yaw, quiet=(tries > 1))
+            if outcome != "skipped":
+                if tries > 1:
+                    self._log.info(
+                        f"주행 재시도 {tries}회 만에 결론 task={task_id} {robot_id} "
+                        f"→ {outcome} (위치 {current}, 목표 {target})")
+                return outcome, current
+            if time.monotonic() >= deadline:
+                self._log.warn(
+                    f"주행 포기 확정 task={task_id} {robot_id} {current}→{target} "
+                    f"— {retry_sec:.0f}초 동안 {tries}회 시도했으나 길이 열리지 않음")
+                return outcome, current
+            if tries == 1:
+                self._log.info(
+                    f"주행 포기 → 재시도 시작 task={task_id} {robot_id} "
+                    f"{current}→{target} (최대 {retry_sec:.0f}초, 자리 유지)")
+            else:
+                self._log.debug(
+                    f"주행 재시도 {tries} task={task_id} {robot_id} {current}→{target}")
+            # 쉬는 동안 서 있는 자리를 놓지 않는다(TTL 방어).
+            engine.heartbeat(engine.node_slot(current), robot_id)
+            # 간격은 다른 자원 대기와 같은 RESERVE_POLL_SEC(0.5초)로 짧게 유지한다.
+            # ⚠️ 이 값을 늘리지 말 것. 한 번의 시도가 이미 RESERVE_WAIT_SEC(10초)를
+            #    쓰기 때문에, 간격을 5초로만 늘려도 30초 예산 안에서 시도가 2회로 줄어
+            #    성공률이 눈에 띄게 떨어진다(실측: 수확 완주 10/10 → 10/12).
+            #    반복되는 '경로 없음' 로그가 거슬려 늘렸다가 되돌린 자리다 —
+            #    로그는 아래 quiet 인자로 접는다(주기는 성공률을 좌우하므로 건드리지 않는다).
+            time.sleep(RESERVE_POLL_SEC)
+
     def drive(self, engine, client, task_id, robot_id, current, target,
-              hooks=None, final_yaw=None):
+              hooks=None, final_yaw=None, quiet=False):
         """current→target 까지 '세그먼트 + 룩어헤드'로 이동. 반환: (outcome, 도달한 노드).
 
         상태 2개로 움직인다:
@@ -263,6 +385,10 @@ class RouteRunner:
         final_yaw: target 에 도착할 때의 방향(rad). **목표에 닿는 마지막 세그먼트의 마지막
                    노드에만** 실린다(reached 판정 재사용) — 중간 세그먼트는 평소대로다.
                    복귀 주행이 도킹 진입 노드의 DB yaw 를 넘긴다(_dispatch_segment 참고).
+        quiet: '경로 없음'을 경고로 남기지 않는다(동작은 완전히 동일). drive_retry 가
+                   두 번째 시도부터 켠다 — 같은 사실을 0.5초마다 되풀이해 찍으면 정작
+                   봐야 할 로그가 묻히기 때문이다. 첫 시도의 경고는 그대로 남으므로
+                   '막혔다'는 신호 자체는 사라지지 않는다.
         """
         hooks = hooks or DriveHooks()
         attempt_block = set()   # 이번 target 시도에서 회피할 통로(예약실패/막힘 누적)
@@ -288,8 +414,9 @@ class RouteRunner:
                     route = self._plan_route(
                         engine, current, target, attempt_block, robot_id)
                     if route is None:
-                        self._log.warn(
-                            f"경로 없음 task={task_id} {current}→{target} → 건너뜀")
+                        if not quiet:
+                            self._log.warn(
+                                f"경로 없음 task={task_id} {current}→{target} → 건너뜀")
                         return "skipped", current
                     seg = self._acquire_segment(
                         engine, robot_id, route.hops(), attempt_block, held)
