@@ -578,11 +578,17 @@ class FloorDockServer(Node):
         lateral = float(goal.lateral_offset_m) if float(goal.lateral_offset_m) != 0.0 else None
         self._apply_fsm_params(wall_gap=wall_gap, lateral=lateral)
 
+        # 스테이션 ID 게이트: task_point_id 가 '1'~'3' 이면 그 번호 H(로마 세로획 개수)만 채택.
+        #  아니면(예 'CHARGE_01') station_id=0 → 로마 인식 없이 검출되는 H 로 도킹(기존 동작).
+        station_id = detector.station_id_from_point(goal.task_point_id)
+        read_enable = bool(detector.ROMAN_ENABLE and station_id > 0)
+
         fsm = fsm_mod.DockFsm()      # auto=True, use_centerline=True 기본
         fsm.post_advance_m = float(self.get_parameter('post_advance_m').value)
         period = 1.0 / max(float(self.get_parameter('control_hz').value), 1.0)
-        log.info('바닥 H 도킹 시작: task=%d point=%s wall_gap=%s lateral=%s'
+        log.info('바닥 H 도킹 시작: task=%d point=%s station=%s wall_gap=%s lateral=%s'
                  % (goal.task_id, goal.task_point_id,
+                    ('로마 I~III=%d' % station_id) if read_enable else 'off(어떤 H나)',
                     ('%.3f' % wall_gap) if wall_gap else 'default',
                     ('%.3f' % lateral) if lateral is not None else 'default'))
         task_msg = Int64()
@@ -625,6 +631,8 @@ class FloorDockServer(Node):
 
                 # 후진/회전/후퇴(블라인드) 중엔 정면 마커 무시(검출 건너뜀). VERIFY 는 검출 필요.
                 found, d, bearing, yaw, plan, size = False, 0.0, 0.0, 0.0, None, 0.0
+                station_ok = True             # 로마 게이트: 락 후·미사용 시 항상 통과
+                roman_now = -1                # 로그용(검출된 획 개수, -1=미인식)
                 blind = fsm.state in ('TURN', 'REVERSE', 'HOLD', 'ADVANCE')
                 det = None if blind else detector.find_dock(frame, self._mapper)
                 if det is not None:
@@ -633,6 +641,14 @@ class FloorDockServer(Node):
                     d += self._dw_offset          # 로봇별 실측 보정(dw=d+상수라 offset 동일)
                     th1, dist_pl, th2, _gx, _gy = fsm_mod.centerline_plan(center, heading)
                     plan, found = (th1, dist_pl, th2), True
+                    # 로마 스테이션 ID 인식: ★SEARCH·READ(락 판정)에서만★ — 락 이후엔 불필요(CPU·소음).
+                    #  단 SEARCH 서 경사 과대(|yaw|>YAW_NARROW_MAX)면 카운트 부정확 → skip(어차피
+                    #  FSM lockable=False 라 회전 계속). READ 는 정지 상태라 항상 인식(정확한 게이트).
+                    if read_enable and fsm.state in ('SEARCH', 'READ') and not (
+                            fsm.state == 'SEARCH' and abs(yaw) > fsm_mod.YAW_NARROW_MAX):
+                        roman_now, _rb, _rj = detector.recognize_roman(
+                            frame, self._mapper, contour)
+                        station_ok = (roman_now == station_id)
 
                 odom_yaw, odom_xy = self._odom_snapshot()
                 # 라이다 섹터 1회 계산(게이트·ADVANCE·디버그 공용). ADVANCE 중 전방 장애물이면
@@ -654,7 +670,8 @@ class FloorDockServer(Node):
 
                 v, w = fsm.update(found, d, bearing, yaw, odom_yaw, 0.0, 0.0,
                                   proceed=True, n=99 if found else 0,
-                                  plan=plan, odom_xy=odom_xy)
+                                  plan=plan, odom_xy=odom_xy,
+                                  read_enable=read_enable, station_ok=station_ok)
 
                 # 라이다 장애물 게이트: 진행방향 근접 시 정지, 지속되면 ABORT
                 #  (TURN/REVERSE/HOLD/ADVANCE 제외). 디바운스: 연속 프레임이라야 정지(스파이크 무시).
@@ -685,6 +702,10 @@ class FloorDockServer(Node):
                 det_s = ('d=%5.1fcm dw=%5.1fcm b=%+5.1f y=%+5.1f n=99'
                          % (d * 100, dw, math.degrees(bearing), math.degrees(yaw))
                          if found else 'H not found')
+                if roman_now >= 0:            # 로마 게이트 판정 중(SEARCH/READ)
+                    det_s += (' | 로마 타겟=%d 검출=%d %s'
+                              % (station_id, roman_now,
+                                 '일치' if station_ok else '불일치'))
                 nt = ('  | ' + fsm.note) if fsm.note else ''
 
                 if self._stream:

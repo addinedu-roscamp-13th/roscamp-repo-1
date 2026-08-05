@@ -248,6 +248,13 @@ services/automato_web_service/telegram.json
 # Claude Code 로컬 설정/세션 폴더
 .claude/
 
+# 대시보드에서 고친 실행 명령(로봇·장비마다 다른 값). 기본값은 dg_web/cmdcfg.py 가 갖는다.
+equip/automato_ws/dg_web/commands.local.json
+# 실서버 대시보드의 로봇 인벤토리 — 주소·에이전트 토큰이 들어가므로 올리지 않는다.
+equip/automato_ws/dg_web/agents.local.json
+# 충전소 복귀 좌표 — 맵·장비마다 다른 값이라 커밋 대상이 아니다.
+equip/automato_ws/dg_web/home.local.json
+
 # 개인/로컬 파일 — 저장소에 올리지 않음
 /roscamp-repo-1.code-workspace
 /client/system_admin_app/maps/automato_map_legacy.pgm

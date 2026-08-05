@@ -8,6 +8,10 @@
 - DG AI Service TCP 접속 대상(실서버/시뮬 IP) 저장·조회
     GET  /api/ai-target              → {real, sim, active}
     POST /api/ai-target  {real,sim}  → 저장(active 유지)
+- 실행 명령 조회·편집 (정의는 cmdcfg.py, 편집분은 commands.local.json)
+    GET  /api/commands                       → [{key,label,params,cmdline,effective,...}]
+    POST /api/commands/<key> {params,cmdline}→ 저장 후 그 항목 반환
+    POST /api/commands/<key>/reset           → 기본값 복귀
 - E0/E1/E2 항목별 테스트 실행·판정 (PASS/FAIL + 근거 로그)
     POST /api/test/e0                → 상시 모니터링(FleetTelemetry 취합) 판정
     POST /api/test/e1                → 순찰 시작(Navigate 경로 접수→DdaGo 하달) 판정
@@ -27,9 +31,12 @@ import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-WEB_DIR = os.path.dirname(os.path.abspath(__file__))       # .../automato_ws/dg_web
-WS_DIR = os.path.dirname(WEB_DIR)                           # .../automato_ws
-DASH = os.path.join(WS_DIR, 'dashboard.sh')
+from urllib.parse import quote
+
+import cmdcfg   # 실행 명령 정의·편집 (dashboard.sh 도 같은 것을 읽는다)
+from dgcommon import (DASH, WEB_DIR, agent_call, first_robot, is_up, robot_id,
+                      single_instance, tail_bytes as _tail_bytes)
+
 TARGET = os.path.join(WEB_DIR, 'dg_ai_target.json')
 
 # 제어 가능한 컴포넌트: 이름 → (검사종류, 대상)
@@ -46,16 +53,6 @@ SIMS = ('acs', 'ddago', 'ddagi', 'dg_ai')   # 시뮬 4종
 
 # 로봇 식별자: dashboard.sh 와 같은 출처(환경변수 ROBOT_ID, ~/.bashrc)를 읽는다.
 # 노드들의 토픽/액션 이름(/{robot_id}/...)이 이 값으로 만들어지므로 화면에도 그대로 보여준다.
-def robot_id():
-    return os.environ.get('ROBOT_ID', 'dg_01')
-
-
-def is_up(kind, target):
-    if kind == 'proc':
-        return subprocess.run(['pgrep', '-f', target],
-                              stdout=subprocess.DEVNULL).returncode == 0
-    out = subprocess.run(['ss', '-ltn'], capture_output=True, text=True).stdout
-    return (':' + target + ' ') in out
 
 
 def status():
@@ -115,16 +112,6 @@ def _tail_since(path, keywords, since, n=12):
     return out[-n:]
 
 
-def _tail_bytes(path, nbytes=131072):
-    try:
-        with open(path, 'rb') as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - nbytes))
-            data = f.read()
-        return data.decode('utf-8', 'replace').splitlines()
-    except OSError:
-        return []
 
 
 WIRE_SINCE_FILE = '/tmp/dash_wire_since'   # clear 기준 시각을 파일에 저장(서버 재시작에도 유지)
@@ -191,6 +178,54 @@ def read_logs():
                                '순찰 완료', 'Fleet 수신', '수확 시작 하달', '수확 진행',
                                '수확 결과']),
     }
+
+
+def read_exec_log(key, n=400):
+    """단발 명령의 마지막 실행 출력(stdout+stderr). dashboard.sh 의 run_cmd 가 남긴다."""
+    lines = _tail_bytes('/tmp/dash_cmd_%s.log' % key, 262144)
+    return lines[-n:] if lines else []
+
+
+def read_node_log(name, n=400):
+    """노드 프로세스의 stdout+stderr 원문 꼬리. start_one 이 리다이렉트해 둔 파일을 읽는다.
+    /api/logs 는 흐름만 추려 주는 반면 이쪽은 걸러내지 않은 원문이라, 노드가 뜨다 죽었을 때
+    (import 실패·파라미터 오류 등) 이유가 여기에만 남는다."""
+    tag = {'dg_ai': 'ai', 'rosbridge': 'rb', 'web': 'http'}.get(name, name)
+    lines = _tail_bytes('/tmp/dash_%s.log' % tag, 262144)
+    # 시계열 표시용 @@WIRE@@ 는 사람이 읽을 로그가 아니라 뺀다(메시지 로그 패널이 따로 본다).
+    return [ln for ln in lines if '@@WIRE@@' not in ln][-n:]
+
+
+_GUARD_CACHE = {'t': 0.0, 'up': False}
+
+
+def robot_ddago_up(ttl=5.0):
+    """실장비 DdaGo(로봇 온보드)가 떠 있는지 로봇 에이전트에 물어본다.
+
+    시뮬 서버는 실서버 화면과 완전히 분리돼 있지만, **이 판정 하나만은 남겨 둔다** —
+    실장비가 붙은 채 같은 이름의 시뮬 액션 서버를 띄우면 goal 이 어디로 갈지 알 수 없다.
+    로봇이 안 잡히면 False(=막지 않음)로 둔다. 로봇이 꺼져 있을 때까지 시뮬을 못 켜면
+    개발이 막히기 때문이다. 짧게 캐시해 버튼마다 왕복하지 않는다."""
+    now = time.time()
+    if now - _GUARD_CACHE['t'] < ttl:
+        return _GUARD_CACHE['up']
+    chk = cmdcfg.DEFAULTS.get('robot-ddago', {}).get('check', '')
+    r = agent_call(first_robot(), '/procs?match=' + quote(chk or '.'), timeout=3)
+    up = bool(not r.get('error') and r.get('procs'))
+    _GUARD_CACHE['t'], _GUARD_CACHE['up'] = now, up
+    return up
+
+
+def stack_up(no_sim=False):
+    """시뮬 스택 전체 기동 (dashboard.sh up). 화면의 '전체 기동' 버튼이 쓴다."""
+    args = ['bash', DASH, 'up'] + (['--no-sim'] if no_sim else [])
+    r = subprocess.run(args, capture_output=True, text=True, timeout=120)
+    return {'ok': r.returncode == 0, 'lines': (r.stdout + r.stderr).splitlines()}
+
+
+def stack_down():
+    r = subprocess.run(['bash', DASH, 'down'], capture_output=True, text=True, timeout=60)
+    return {'ok': r.returncode == 0, 'lines': (r.stdout + r.stderr).splitlines()}
 
 
 def _trigger_patrol():
@@ -489,6 +524,30 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return {}
 
+    # 노드로 뜨는 명령(백그라운드·로그는 파일) vs 한 번 돌고 끝나는 명령(출력을 바로 돌려줌)
+    NODE_KEYS = ('dcs', 'acs', 'ddago', 'ddagi', 'dg_ai', 'rosbridge')
+
+    def _run_command(self, key):
+        """명령 하나를 실행하고 stdout+stderr 를 그대로 돌려준다.
+        노드는 백그라운드로 떠서 출력이 파일로 가므로, 잠깐 기다렸다 그 파일을 읽어 준다
+        (뜨자마자 죽는 경우가 가장 흔한 실패라 그 흔적이 남아야 한다)."""
+        try:
+            if key in self.NODE_KEYS:
+                subprocess.run(['bash', DASH, 'start', key],
+                               capture_output=True, text=True, timeout=30)
+                time.sleep(1.5)
+                return {'key': key, 'kind': 'node', 'ok': is_up(*CHECKS[key]),
+                        'lines': read_node_log(key, 200)}
+            r = subprocess.run(['bash', DASH, key],
+                               capture_output=True, text=True, timeout=200)
+            out = (r.stdout or '') + (r.stderr or '')
+            return {'key': key, 'kind': 'oneshot', 'ok': r.returncode == 0,
+                    'lines': out.splitlines() or read_exec_log(key, 200)}
+        except subprocess.TimeoutExpired:
+            # 도킹처럼 오래 걸리는 명령이 상한을 넘긴 경우. 그때까지의 출력은 파일에 남아 있다.
+            return {'key': key, 'kind': 'oneshot', 'ok': False,
+                    'lines': read_exec_log(key, 200) + ['(대시보드 대기 상한 초과 — 명령은 계속 돌고 있을 수 있음)']}
+
     def do_GET(self):
         path = self.path.split('?')[0]
         if path == '/api/status':
@@ -498,6 +557,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(read_target())
         if path == '/api/logs':
             return self._json(read_logs())
+        if path == '/api/commands':
+            # 이 서버는 시뮬 전용이다. 실서버 명령은 여기서 아예 보이지 않는다
+            # (실장비 조작은 :8010 real_server 가 맡는다).
+            return self._json(cmdcfg.describe_all('sim'))
+        # /api/commands/<key>/log , /api/node/<name>/log
+        parts = path.strip('/').split('/')
+        if len(parts) == 4 and parts[0] == 'api' and parts[3] == 'log':
+            if parts[1] == 'commands' and parts[2] in cmdcfg.DEFAULTS:
+                return self._json({'key': parts[2], 'lines': read_exec_log(parts[2])})
+            if parts[1] == 'node' and parts[2] in CHECKS:
+                return self._json({'name': parts[2], 'lines': read_node_log(parts[2])})
         if path == '/api/wire':
             limit = WIRE_MAX
             if '?' in self.path:
@@ -528,6 +598,31 @@ class Handler(BaseHTTPRequestHandler):
             ok, evidence = EVALS[key]()
             return self._json({'item': key, 'name': EVAL_NAMES[key],
                                'ok': ok, 'evidence': evidence})
+        # 스택 전체 기동·종료 — /api/stack/<up|down>[?no-sim]
+        if path == '/api/stack/up':
+            return self._json(stack_up('no-sim' in self.path))
+        if path == '/api/stack/down':
+            return self._json(stack_down())
+
+        # 실행 명령 편집·실행 — /api/commands/<key>[/reset|/run]
+        parts = path.strip('/').split('/')
+        if len(parts) >= 3 and parts[0] == 'api' and parts[1] == 'commands':
+            key = parts[2]
+            if key not in cmdcfg.DEFAULTS:
+                return self._json({'error': 'unknown command: %s' % key}, 404)
+            action = parts[3] if len(parts) == 4 else ''
+            if action == 'reset':
+                return self._json(cmdcfg.reset(key))
+            if action == 'run':
+                return self._json(self._run_command(key))
+            if action:
+                return self._json({'error': 'bad action'}, 400)
+            body = self._read_body()
+            # cmdline 은 키가 있을 때만 건드린다(빈 문자열 = 전체편집 해제).
+            return self._json(cmdcfg.set_command(
+                key, params=body.get('params'),
+                cmdline=body.get('cmdline') if 'cmdline' in body else None))
+
         if path == '/api/ai-target':
             body = self._read_body()
             cfg = read_target()
@@ -543,6 +638,15 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[0] == 'api' and parts[1] == 'node':
             name, action = parts[2], parts[3]
             if name in CHECKS and action in ('start', 'stop'):
+                # 실장비가 떠 있는데 같은 역할의 시뮬을 켜면 액션 서버가 둘이 되어
+                # goal 이 어디로 갈지 알 수 없다. 사람 기억이 아니라 여기서 막는다.
+                if action == 'start' and name in ('ddago', 'ddagi'):
+                    if robot_ddago_up():
+                        return self._json(
+                            {'error': '로봇 DdaGo(실장비)가 떠 있어 시뮬을 켤 수 없습니다. '
+                                      '같은 이름의 액션 서버가 둘이 되면 goal 이 엉뚱한 쪽으로 갑니다.',
+                             'nodes': status(), 'ai_target': read_target(),
+                             'robot_id': robot_id()}, 409)
                 subprocess.run(['bash', DASH, action, name], timeout=30)
                 return self._json({'name': name, 'action': action,
                                    'nodes': status(), 'ai_target': read_target(),
@@ -573,5 +677,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == '__main__':
+    _lock = single_instance('control_server')   # 살려 둬야 락이 유지된다
     print('[dg_web control_server] http://127.0.0.1:8000  (정적 + /api)')
-    ThreadingHTTPServer(('127.0.0.1', 8000), Handler).serve_forever()
+    try:
+        ThreadingHTTPServer(('127.0.0.1', 8000), Handler).serve_forever()
+    except OSError as e:
+        raise SystemExit('[control_server] 포트 8000 을 열 수 없습니다: %s' % e)

@@ -21,6 +21,11 @@ SEARCH_W = 0.2                    # SEARCH 회전 각속도 [rad/s]
 SEARCH_REVS = 1.1                 # 최대 회전 바퀴수(초과 시 ABORT)
 SEARCH_TIMEOUT = SEARCH_REVS * 2 * math.pi / SEARCH_W
 LOST_TIMEOUT = 1.0                # 놓친 뒤 SEARCH 복귀까지 [s]
+# SEARCH 중 H 검출 시 정지하고 로마 숫자(스테이션 ID) 읽기 (READ). read_enable=True 일 때만.
+#  goal.task_point_id 가 '1'~'3' 이면 노드가 read_enable=True + station_ok(목표ID 일치)를 넣는다.
+READ_HOLD_SEC = 1.0               # H 검출 시 정지하고 로마 숫자 읽는 최소 시간 [s]
+READ_TIMEOUT = 2.5                # 읽기 최대 — 합의 실패(옆 스테이션)면 재탐색 [s]
+READ_COOLDOWN = 2.0               # 옆 스테이션 거부 후 재READ 금지(회전해 지나침) [s]
 # ── 접근 / 중심선 정렬 ──
 V_APPROACH = 0.05                 # 접근 전진 속도 [m/s]
 V_DECEL_ZONE = 0.05               # STAGED 목표 앞 이 거리부터 감속 [m] (오버슛 방지)
@@ -44,12 +49,26 @@ STAGE_SETTLE_SEC = 0.6           # STAGED(auto) 후진 전 정착 대기 [s]. �
 # ── CENTERLINE ──
 N_PLAN = 1                        # 계획 확정 최소 프레임(H는 검출 1장이면 계획)
 CL_PLAN_TIMEOUT = 8.0
+# 거리 유효성 안전장치: d가 실제 이동(odom)보다 크게 왔다갔다 하면 '유효 거리 아님' → 도킹 중단.
+D_UNSTABLE_SPREAD = 0.04         # 창 내 d(max-min)가 odom 이동보다 이만큼 더 크면 불안정 [m]
+D_UNSTABLE_WIN = 8               # 판정 프레임 창(검출 프레임 기준)
+D_UNSTABLE_HOLD = 0.7            # 불안정이 이만큼 지속되면 중단 [s]
 CL_PLAN_BACKUP_MAX = 0.15         # PLAN서 근접이면 후진 한계 [m]
 # 중심선 기동 후 재정렬 검증(VERIFY): TURN2 직후 d 가 신뢰거리 아래라 근접 노이즈로 바로
 #  STAGED 하면 삐뚤어진다 → 신뢰거리로 물러나 재확인, 벗어나면 재계획(수렴 반복). 놓치면 후진
 #  재획득, 한도 넘으면 SEARCH(무한대기 방지). (ddago01 실주행 검증)
 CL_VERIFY_D = 0.25               # 재확인 최소 거리 [m] (yaw 신뢰거리보다 살짝 위)
-CL_MAX_REPLANS = 2               # 재계획 최대 횟수(초과 시 현재 정렬로 진행)
+CL_MAX_REPLANS = 2               # (구)재계획 한도 — yaw 좁히기 정책선 미사용(1회 시도 후 중단)
+# yaw 좁히기 정책(사용자 지시): PLAN 안정 yaw 가
+#  ① |yaw| ≤ YAW_NARROW_OK  → 이미 신뢰밴드 → 기동 없이 진행(ALIGN)
+#  ② YAW_NARROW_OK<|yaw|≤YAW_NARROW_MAX → 1회 turn-drive-turn(횡이동+재정면) → VERIFY
+#  ③ |yaw| > YAW_NARROW_MAX → 즉시 ABORT. VERIFY: 신뢰밴드면 진행, 아니면 중단(재계획 없음).
+YAW_NARROW_OK = math.radians(8.0)     # 진행 허용 yaw(신뢰밴드) [rad]
+YAW_NARROW_MAX = math.radians(35.0)   # 이 이상이면 시도 없이 ABORT [rad]
+# PLAN 안정 확정: 튄 프레임(특히 yaw ±플립) 1장에 확정하지 않도록 최근 N프레임 yaw 가
+#  좁게 모일 때만 median 값으로 확정. yaw 튐 지속 시 CL_PLAN_TIMEOUT→ALIGN 폴백.
+CL_PLAN_STABLE_N = 5             # 확정에 필요한 연속 안정 프레임 수
+CL_PLAN_YAW_SPREAD = math.radians(10.0)   # 이 안에 yaw 들이 모여야 안정 [rad]
 # 중심선 기동 목표점 거리 [m]. 스테이징(D_STAGE)이 아니라 신뢰거리(≥YAW_RELIABLE_D)에 두어,
 #  기동이 끝난 자리서 VERIFY 가 후진 없이 바로 판정하게 한다(불필요한 후진 제거). ALIGN 이 이후
 #  D_STAGE 까지 접근. 07-28: VERIFY 왕복 후진 제거 목적.
@@ -78,6 +97,9 @@ _TUNABLE = (
     'SEARCH_W', 'TURN_W', 'FACE_TIMEOUT', 'STAGE_SETTLE_SEC', 'CL_VERIFY_D',
     'CL_MAX_REPLANS', 'CL_TARGET_D', 'POST_DOCK_HOLD_SEC', 'V_ADVANCE',
     'D_RELIABLE_MIN', 'D_RELIABLE_MAX',
+    'D_UNSTABLE_SPREAD', 'D_UNSTABLE_WIN', 'D_UNSTABLE_HOLD',
+    'YAW_NARROW_OK', 'YAW_NARROW_MAX',
+    'READ_HOLD_SEC', 'READ_TIMEOUT', 'READ_COOLDOWN',
 )
 
 
@@ -95,6 +117,14 @@ def _clamp(x, lim):
 
 def _ang_norm(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def _median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    if n == 0:
+        return 0.0
+    return xs[n // 2] if n % 2 else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
 
 
 def square_geometry(center, heading):
@@ -161,6 +191,10 @@ class DockFsm:
         self.state = "SEARCH"
         self.lost_since = None
         self.search_start = None
+        self.read_start = None        # READ(H검출 후 정지하고 로마 숫자 읽기) 시작시각
+        self.read_cooldown_until = 0.0  # 거부한 옆 스테이션 재READ 방지 종료시각(monotonic)
+        self.dbuf = []                # 거리 유효성 판정용 최근 (d, ox, oy)
+        self.unstable_since = None    # d 불안정 시작 시각(유효거리 아님→중단 판정)
         self.turn_target = None
         self.reverse_start = None
         self.rev_xy0 = None
@@ -185,6 +219,7 @@ class DockFsm:
         self.cl_xy0 = None
         self.cl_plan_since = None
         self.cl_plan_xy0 = None
+        self.cl_pbuf = []             # PLAN 안정 확정용 최근 (yaw, bearing, th1, dist, th2)
         self.cl_plan = None           # (th1_deg, dist_cm, th2_deg) 로깅용
         self.cl_replans = 0           # VERIFY 재계획 횟수(한도 CL_MAX_REPLANS)
         self.cl_verify_since = None   # VERIFY 재획득 시작시각(무한대기 방지)
@@ -209,6 +244,17 @@ class DockFsm:
     def _warn(self, why):
         self.note = why
 
+    def _enter_after_search(self):
+        """SEARCH/READ 완료(목표 스테이션 확정) → 중심선기동 or 정렬 진입."""
+        self.state = "CENTERLINE" if self.use_centerline else "ALIGN"
+        self.cl_phase = "PLAN"
+        self.cl_plan_since = None
+        self.cl_plan_xy0 = None
+        self.cl_replans = 0
+        self.cl_verify_since = None
+        self.lost_since = None
+        self.search_start = None
+
     def _reverse_dist(self):
         """동적 후진거리: STAGED d(중앙값)로 후면이 목표 벽갭에 서도록 계산 + 안전 클램프."""
         if not DYNAMIC_REVERSE:
@@ -227,7 +273,7 @@ class DockFsm:
         return rev_c
 
     def update(self, found, d, bearing, yaw, odom_yaw, gx, gy, proceed=True, n=99,
-               plan=None, odom_xy=None, n_plan=None):
+               plan=None, odom_xy=None, n_plan=None, read_enable=False, station_ok=True):
         now = time.monotonic()
         if n_plan is None:
             n_plan = N_PLAN
@@ -238,6 +284,38 @@ class DockFsm:
         # 신뢰거리서 yaw 가 좋았는지 한 번 기록(근접 FACE 완화 근거)
         if found and d > YAW_RELIABLE_D and abs(yaw) < YAW_TOL:
             self.yaw_verified = True
+
+        # ── 거리 유효성 안전장치 ──
+        #  d가 로봇 실제 이동(odom 위치)보다 크게 왔다갔다 하면(비단조 요동) = '유효 거리 아님'
+        #  → 나쁜 접근으로 진행 말고 ★도킹 중단★(안전).
+        #  ★적용 = ALIGN·STAGED 만★: d를 믿고 접근/정차하는 곳. 회전·개루프 기동(SEARCH 회전·
+        #  CENTERLINE turn-drive-turn)은 뷰변화로 d가 정상적으로 뜀 → 제외(오발동). PLAN/VERIFY
+        #  는 자체 median 안정화 담당.
+        if found and self.state in ("ALIGN", "STAGED"):
+            ox, oy = odom_xy if odom_xy is not None else (0.0, 0.0)
+            self.dbuf = (self.dbuf + [(d, ox, oy)])[-D_UNSTABLE_WIN:]
+            if len(self.dbuf) >= D_UNSTABLE_WIN:
+                ds = [b[0] for b in self.dbuf]
+                spread = max(ds) - min(ds)                 # d 요동폭
+                omove = 0.0                                # 창 동안 로봇 실제 이동(odom)
+                if odom_xy is not None:
+                    xs = [b[1] for b in self.dbuf]
+                    ys = [b[2] for b in self.dbuf]
+                    omove = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+                if spread - omove > D_UNSTABLE_SPREAD:      # 이동으로 설명 안 되는 요동
+                    self.unstable_since = self.unstable_since or now
+                    if now - self.unstable_since > D_UNSTABLE_HOLD:
+                        self._abort('거리 측정 불안정(Δd=%.1fcm vs odom %.1fcm, %.1fs) '
+                                    '— 유효 거리 아님, 도킹 중단'
+                                    % (spread * 100, omove * 100, now - self.unstable_since))
+                        self.dbuf = []
+                        self.unstable_since = None
+                        return 0.0, 0.0
+                else:
+                    self.unstable_since = None
+        else:
+            self.dbuf = []            # 기동 아님/블라인드 → 버퍼 리셋(기동 진입 후 새로 판정)
+            self.unstable_since = None
 
         # ── 블라인드 기동(odom) ──
         if self.state == "TURN":
@@ -326,9 +404,14 @@ class DockFsm:
                 if self.cl_plan_since is None:
                     self.cl_plan_since = now
                     self.cl_plan_xy0 = odom_xy
-                # 신뢰 창(D_RELIABLE_MIN≤d≤D_RELIABLE_MAX)서 좋은 프레임일 때만 계획
+                # 계획은 [계획하한, D_RELIABLE_MAX] 서 좋은 프레임일 때만.
+                #  계획하한 = max(D_RELIABLE_MIN, YAW_RELIABLE_D): 거리 신뢰창 안이라도 yaw 신뢰거리
+                #  보다 가까우면(각도 부정확) 계획 금지 → 회색지대[MIN,YAW_D]는 (B)로 직진 후진해
+                #  yaw 신뢰거리까지 물러난 뒤 재계획.
+                cl_plan_dmin = max(D_RELIABLE_MIN, YAW_RELIABLE_D)
                 if not (found and plan is not None and n >= n_plan
-                        and D_RELIABLE_MIN <= d <= D_RELIABLE_MAX):
+                        and cl_plan_dmin <= d <= D_RELIABLE_MAX):
+                    self.cl_pbuf = []           # 창 이탈/미검출 → 안정버퍼 리셋(재진입 시 새로 모음)
                     backed = 0.0
                     if odom_xy is not None and self.cl_plan_xy0 is not None:
                         backed = math.hypot(odom_xy[0] - self.cl_plan_xy0[0],
@@ -373,18 +456,38 @@ class DockFsm:
                 if odom_yaw is None:
                     self._abort('odom 없음 — 중심선 기동 불가 (bringup 미실행?)')
                     return 0.0, 0.0
-                self.cl_th1, self.cl_dist, self.cl_th2 = plan
-                # 이미 정렬(신뢰거리서 bearing·yaw 작음)이면 turn-drive-turn 스킵 → 바로 ALIGN.
-                if abs(bearing) < BEARING_TOL and abs(yaw) < YAW_TOL:
-                    self._warn('이미 정렬됨 — 중심선 기동 스킵 → ALIGN')
+                # ★안정 확정: 최근 N프레임 yaw 가 좁게 모일 때만 median 으로 확정(튄 프레임 커밋 방지).
+                #  정지하고 안정 대기 → yaw ±플립 지속되면 위 CL_PLAN_TIMEOUT→ALIGN 폴백.
+                self.cl_pbuf = (self.cl_pbuf
+                                + [(yaw, bearing, plan[0], plan[1], plan[2])])[-CL_PLAN_STABLE_N:]
+                yy = [p[0] for p in self.cl_pbuf]
+                if (len(self.cl_pbuf) < CL_PLAN_STABLE_N
+                        or (max(yy) - min(yy)) > CL_PLAN_YAW_SPREAD):
+                    return 0.0, 0.0          # 정지하고 안정 프레임 수집 중(튐이면 확정 보류)
+                myaw, mbrg = _median(yy), _median([p[1] for p in self.cl_pbuf])
+                # ★yaw 좁히기 정책★
+                if abs(myaw) > YAW_NARROW_MAX:        # ③ 너무 벌어짐 → 시도 없이 중단
+                    self._abort('yaw 너무 벌어짐(%.1f° > %.1f°) — 1회 횡이동으로도 못 좁힘, 도킹 중단'
+                                % (math.degrees(myaw), math.degrees(YAW_NARROW_MAX)))
+                    self.cl_pbuf = []
+                    return 0.0, 0.0
+                if abs(myaw) <= YAW_NARROW_OK:        # ① 이미 신뢰밴드 → 기동 없이 진행
+                    self._warn('yaw %.1f° ≤ %.1f° 신뢰밴드 — 중심선 기동 스킵 → ALIGN'
+                               % (math.degrees(myaw), math.degrees(YAW_NARROW_OK)))
                     self.state = "ALIGN"
                     self.cl_done = True
                     self.lost_since = None
+                    self.cl_pbuf = []
                     return 0.0, 0.0
+                # ② 좁힐 수 있는 구간 → 1회 turn-drive-turn, 이후 VERIFY 판정
+                self.cl_th1 = _median([p[2] for p in self.cl_pbuf])
+                self.cl_dist = _median([p[3] for p in self.cl_pbuf])
+                self.cl_th2 = _median([p[4] for p in self.cl_pbuf])
                 self.cl_odom0 = odom_yaw
                 self.cl_plan = (math.degrees(self.cl_th1), self.cl_dist * 100,
                                 math.degrees(self.cl_th2))
                 self.cl_phase = "TURN1"
+                self.cl_pbuf = []
                 return 0.0, 0.0
             if odom_yaw is None:
                 self._abort('odom 끊김 — 중심선 기동 중단 (%s)' % self.cl_phase)
@@ -419,58 +522,97 @@ class DockFsm:
             if self.cl_phase == "TURN2":
                 err = _ang_norm(self.cl_odom0 + self.cl_th1 + self.cl_th2 - odom_yaw)
                 if abs(err) < TURN_TOL:
-                    self.cl_phase = "VERIFY"   # 신뢰거리 재확인 → OK면 ALIGN, 벗어나면 재계획
+                    self.cl_phase = "VERIFY"   # 1회 좁힘 후 재확인 → 신뢰밴드면 진행, 아니면 중단
+                    self.cl_verify_since = None
+                    self.cl_pbuf = []
                     self.lost_since = None
                     return 0.0, 0.0
                 return 0.0, _clamp(K_TURN * err, TURN_W)
+            # 재정렬 검증(1회 좁힘 후): 안정 프레임으로 재확인 → 신뢰밴드면 진행, 아니면 중단.
+            #  ★재계획 루프 없음(사용자 지시: 1회만 시도).★
             if self.cl_phase == "VERIFY":
-                # 기동이 신뢰거리(CL_TARGET_D≥YAW_RELIABLE_D)에서 끝났으므로 ★후진 없이★ 그 자리서
-                #  판정. 미검출/근접(yaw 불신)이면 계획을 신뢰하고 진행(불필요한 후진 제거, 07-28).
+                # 미검출/근접(yaw 불신)이면 계획을 신뢰하고 진행(후진 없이 그 자리 판정).
                 if (not found) or d < YAW_RELIABLE_D:
                     self.state = "ALIGN"
                     self.cl_done = True
                     self.lost_since = None
+                    self.cl_pbuf = []
                     return 0.0, 0.0
-                if abs(bearing) < BEARING_TOL and abs(yaw) < YAW_TOL:
+                # 튄 프레임 판정 방지: 안정 N프레임 모아 median 으로 판정.
+                if self.cl_verify_since is None:
+                    self.cl_verify_since = now
+                    self.cl_pbuf = []
+                self.cl_pbuf = (self.cl_pbuf + [(yaw, bearing)])[-CL_PLAN_STABLE_N:]
+                yv = [p[0] for p in self.cl_pbuf]
+                if (len(self.cl_pbuf) < CL_PLAN_STABLE_N
+                        or (max(yv) - min(yv)) > CL_PLAN_YAW_SPREAD):
+                    if now - self.cl_verify_since > CL_PLAN_TIMEOUT:
+                        self._abort('VERIFY yaw 불안정 지속(%.1fs) — 유효 정렬 확인 불가, 도킹 중단'
+                                    % (now - self.cl_verify_since))
+                        self.cl_pbuf = []
+                        return 0.0, 0.0
+                    return 0.0, 0.0          # 정지하고 안정 프레임 수집
+                myaw = _median(yv)
+                mbrg = _median([p[1] for p in self.cl_pbuf])
+                self.cl_pbuf = []
+                if abs(mbrg) < BEARING_TOL and abs(myaw) < YAW_NARROW_OK:   # 신뢰밴드 → 진행
                     self.state = "ALIGN"
-                    self.cl_done = True                  # 검증 통과 → 근접 yaw 신뢰(FACE)
+                    self.cl_done = True
                     self.lost_since = None
+                    self._warn('CL VERIFY OK b=%.1f y=%.1f (1회 좁힘) → ALIGN'
+                               % (math.degrees(mbrg), math.degrees(myaw)))
                     return 0.0, 0.0
-                if self.cl_replans < CL_MAX_REPLANS:
-                    self.cl_replans += 1
-                    self._warn('중심선 재정렬 %d/%d: b=%.1f y=%.1f 벗어남 → 재계획'
-                               % (self.cl_replans, CL_MAX_REPLANS,
-                                  math.degrees(bearing), math.degrees(yaw)))
-                    self.cl_phase = "PLAN"               # 물러난 포즈서 다시 계획
-                    self.cl_plan_since = None
-                    self.cl_plan_xy0 = None
-                    return 0.0, 0.0
-                self._warn('중심선 재계획 한도(%d) 초과 — 현재 정렬로 진행' % CL_MAX_REPLANS)
-                self.state = "ALIGN"
-                self.cl_done = True
-                self.lost_since = None
+                self._abort('1회 좁힘 후에도 벌어짐(b=%.1f y=%.1f, 밴드 ±%.1f°) — 도킹 중단'
+                            % (math.degrees(mbrg), math.degrees(myaw),
+                               math.degrees(YAW_NARROW_OK)))
                 return 0.0, 0.0
             return 0.0, 0.0
 
         # ── 탐색 ──
         if self.state == "SEARCH":
-            if found:
-                self.state = "CENTERLINE" if self.use_centerline else "ALIGN"
-                self.cl_phase = "PLAN"
-                self.cl_plan_since = None
-                self.cl_plan_xy0 = None
-                self.cl_replans = 0
-                self.cl_verify_since = None
-                self.lost_since = None
+            # read_enable=True(task_point_id '1'~'3')면 H 검출 시 정지하고 로마 숫자를 읽는다(READ).
+            #  ★경사 과대(|yaw|>YAW_NARROW_MAX)면 락 후보 아님 — ID 검출/READ 없이 계속 회전.
+            #  (경사 크면 로마 카운트·포즈 부정확 → 언더카운트 오매치 위험. 회전으로 다른 각/스테이션 탐색.)
+            lockable = found and read_enable and abs(yaw) <= YAW_NARROW_MAX
+            if lockable:
+                if now < self.read_cooldown_until:
+                    return 0.0, SEARCH_W          # 방금 거부한 옆 스테이션 — 회전해 지나침
+                self.state = "READ"               # H 검출 + 경사 OK → 정지하고 로마 숫자 읽기
+                self.read_start = now
                 self.search_start = None
+                return 0.0, 0.0
+            if found and not read_enable:
+                self._enter_after_search()        # 로마 인식 미사용 → 즉시 진행(기존 동작)
             else:
+                # 미검출 or 경사 과대 → 회전 계속(+타임아웃 시 중단)
                 if self.search_start is None:
                     self.search_start = now
                 if now - self.search_start > SEARCH_TIMEOUT:
-                    self._abort('탐색 실패 — %.0f초 회전했는데 마커 미검출' % SEARCH_TIMEOUT,
+                    self._abort('탐색 실패 — %.0f초(%.1f바퀴) 회전(마커 미검출 또는 경사 과대>%.0f°)'
+                                % (SEARCH_TIMEOUT, SEARCH_REVS, math.degrees(YAW_NARROW_MAX)),
                                 code=1)
                     return 0.0, 0.0
                 return 0.0, SEARCH_W
+
+        # ── H 검출 후 정지하고 로마 숫자(스테이션 ID) 읽기 ──
+        if self.state == "READ":
+            if not found:                         # 읽는 중 H 놓침 → 재탐색
+                self.state = "SEARCH"
+                self.read_start = None
+                self.search_start = None
+                return 0.0, 0.0
+            waited = now - (self.read_start or now)
+            if station_ok and waited >= READ_HOLD_SEC:
+                self._enter_after_search()        # 최소 HOLD 정지 + 목표ID 일치 → 진행
+                self.read_start = None
+                return 0.0, 0.0
+            if waited > READ_TIMEOUT:             # 합의 실패(옆 스테이션 등) → 지나쳐 재탐색
+                self.state = "SEARCH"
+                self.read_start = None
+                self.search_start = now
+                self.read_cooldown_until = now + READ_COOLDOWN
+                return 0.0, SEARCH_W
+            return 0.0, 0.0                       # 계속 정지하고 읽는다
 
         # ── ALIGN/FACE 중 놓치면 ──
         if not found:
