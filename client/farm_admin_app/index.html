@@ -16,7 +16,7 @@
     /* ⚠ 핸드오프 기본 테마는 dark 다 (Component.theme() 의 폴백이 "dark").
        라이트로 맞췄더니 라임·레드가 흰 배경에 묻혀 '집중이 안 된다' 는 지적을 받았다.
        다크 토큰으로 되돌린다 — 라임 액센트가 살아나는 게 이 디자인의 핵심이다. */
-    --sc-accentT:#C9F24D; --sc-amberTx:#F2B33D; --sc-redT:#FF9184;
+    --sc-accentT:#C9F24D; --sc-amberTx:#F2B33D; --sc-redT:#FF9184; --sc-rotTx:#C4A488;
     --sc-brownT:#C0A184; --sc-blueT:#93B0FF;
     --sc-fg:#EEF3EA; --sc-mut:#7E8B7F; --sc-mut2:#8A948B; --sc-mut3:#9FAC9F; --sc-mut5:#B9C4B6;
     --sc-card:rgba(255,255,255,.04); --sc-card2:rgba(255,255,255,.05); --sc-card3:rgba(255,255,255,.06);
@@ -124,7 +124,7 @@
     --sc-track:rgba(20,30,23,.1); --sc-track2:rgba(20,30,23,.14);
     --sc-inner:#F5F8F1; --sc-inner2:#F1F5EC; --sc-shell:#F5F8F1; --sc-shell2:#FFFFFF;
     --sc-scrim:rgba(20,30,23,.4);
-    --sc-accentT:#3F6B0F; --sc-amberTx:#8A5A08; --sc-redT:#C2442F;
+    --sc-accentT:#3F6B0F; --sc-amberTx:#8A5A08; --sc-redT:#C2442F; --sc-rotTx:#6B4A2E;
     --sc-brownT:#7A5A3C; --sc-blueT:#3D62C4;
     /* 레거시 팔레트도 같이 되돌린다 */
     --ink:#10231a; --ink-2:#33483f; --muted:#6d8077;
@@ -365,11 +365,13 @@
   .sc-title{ margin:0; font-size:16px; font-weight:700; letter-spacing:-.3px; color:var(--sc-fg); }
   .sc-sub{ font-family:ui-monospace,'JetBrains Mono',Menlo,monospace; font-size:11px;
            color:var(--sc-mut); margin-top:4px; }
-  .sc-legend{ display:flex; align-items:center; gap:8px; }
+  .sc-legend{ display:flex; align-items:center; gap:10px; }
+  .sc-legend-t i{ margin-right:3px; vertical-align:-1px; }
   .sc-legend-t{ font-family:ui-monospace,'JetBrains Mono',Menlo,monospace;
                 font-size:10.5px; font-weight:700; color:var(--sc-mut2); }
-  .sc-legend-bar{ width:64px; height:6px; border-radius:99px;
-                  background:linear-gradient(90deg,var(--sc-track2),#C9F24D 55%,#FF6B5A); }
+  /* 색은 '무엇이 가장 많았나'(3종), 진하기는 '얼마나'. 그래서 그라데이션 막대가 아니라
+     3색 점으로 표기한다. LOW—HIGH 막대는 색=크기 로 오해하게 만든다. */
+  .sc-legend-d{ width:9px; height:9px; border-radius:50%; display:inline-block; }
   .sc-inner{ background:var(--sc-inner2); border:1px solid var(--sc-card3);
              border-radius:var(--sc-r-inner); padding:18px; }
   /* 요약·로봇위치 행 — 라벨은 반폭 카드에서 글자 단위로 깨지므로 nowrap 필수(핸드오프 경고) */
@@ -1312,7 +1314,7 @@ function desktopDashHTML(){ return `    <!-- ══ Syncult 핸드오프 데스�
     <div class="dc-head">
       <div class="dc-logo">DG</div>
       <div style="flex:1;min-width:0">
-        <div class="dc-h1">대광 스마트팜 · 방울토마토 A동</div>
+        <div class="dc-h1">스마트팜 · 방울토마토 A동</div>
         <div class="dc-h2 mono" id="dcHeadSub">—</div>
       </div>
       <div class="dc-seg" id="dcSeg"></div>
@@ -1332,9 +1334,9 @@ function desktopDashHTML(){ return `    <!-- ══ Syncult 핸드오프 데스�
               <div class="sc-sub" id="heatSub">순찰 스캔 대기 중</div>
             </div>
             <div class="sc-legend">
-              <span class="sc-legend-t">LOW</span>
-              <span class="sc-legend-bar"></span>
-              <span class="sc-legend-t">HIGH</span>
+              <span class="sc-legend-t"><i class="sc-legend-d" style="background:var(--sc-ripe)"></i> 익음</span>
+              <span class="sc-legend-t"><i class="sc-legend-d" style="background:#B0D658"></i> 안익음</span>
+              <span class="sc-legend-t"><i class="sc-legend-d" style="background:var(--sc-rot)"></i> 병충해</span>
             </div>
           </div>
           <!-- 핸드오프는 14×5 셀 그리드였다. 우리는 실제 맵(PGM 기준 좌표)을 쓰므로
@@ -1434,10 +1436,12 @@ function mbTitle(){
 function mbHeatCard(){
   return '<div class="mb-card">'
     +'<div class="mb-ch"><div class="mb-ct">완숙 밀집 히트맵</div>'
-    // 데스크톱과 같은 LOW—HIGH 범례. 색이 뭘 뜻하는지 없으면 히트맵을 읽을 수 없다.
-    +'<div class="sc-legend" style="gap:5px">'
-      +'<span class="sc-legend-t">LOW</span><span class="sc-legend-bar" style="width:44px"></span>'
-      +'<span class="sc-legend-t">HIGH</span></div></div>'
+    // 데스크톱과 같은 3색 범례. 색이 뭘 뜻하는지 없으면 히트맵을 읽을 수 없다.
+    +'<div class="sc-legend" style="gap:7px">'
+      +'<span class="sc-legend-t"><i class="sc-legend-d" style="background:var(--sc-ripe)"></i> 익음</span>'
+      +'<span class="sc-legend-t"><i class="sc-legend-d" style="background:#B0D658"></i> 안익음</span>'
+      +'<span class="sc-legend-t"><i class="sc-legend-d" style="background:var(--sc-rot)"></i> 병충해</span>'
+      +'</div></div>'
     +'<div class="mono" style="font-size:10.5px;color:var(--sc-mut);margin:-6px 0 10px" id="heatSub">스캔 대기</div>'
     +'<div class="sc-inner" style="height:250px;display:flex;align-items:center;justify-content:center;padding:0;overflow:hidden">'
     +'<canvas id="farmHeat" width="356" height="660" style="transform:rotate(90deg);border-radius:10px"></canvas></div>'
@@ -1697,7 +1701,16 @@ try{
   document.documentElement.setAttribute('data-theme',window._theme);
   document.documentElement.setAttribute('data-view',window._view);
 }catch(e){}
-function nodeCount(){ try{ return (FARM&&FARM.waypoints)?FARM.waypoints.length:21; }catch(e){ return 21; } }
+/* 농장의 '지점' 수. 짝 노드(pair)는 빼고 센다.
+   18·19 는 새 장소가 아니라 10·13 과 **같은 자리에서 방향만 바꿔 한 번 더 찍는** 것이다
+   (시나리오1 E2 20-1: x·y 가 같고 yaw 만 반대, corridors 에도 넣지 않는다).
+   배열 길이를 그대로 쓰면 21곳인 농장이 23곳으로 보인다. */
+function nodeCount(){
+  try{
+    if(!FARM||!FARM.waypoints) return 21;
+    return FARM.waypoints.filter(function(w){ return !w.pair; }).length;
+  }catch(e){ return 21; }
+}
 function renderDcHead(){
   // ⚠ 세그먼트를 먼저 그린다. 예전엔 dcHeadSub 가 없으면(=모바일) 바로 return 해서
   //   모바일에 테마/뷰 토글이 아예 안 붙었고, 한 번 모바일로 가면 데스크톱으로
@@ -1782,7 +1795,11 @@ window.renderAlertLog=function(){
     return '<div style="display:flex;align-items:center;gap:11px;padding:11px 13px;border-radius:13px;'
       +'background:'+(dis?'rgba(255,107,90,.09)':'var(--sc-inner)')+';'
       +'border:1px solid '+(dis?'rgba(255,107,90,.26)':'var(--sc-bd)')+'">'
-      +(a.img?'<img src="'+a.img+'" onerror="this.style.display=\'none\'" '
+      /* 로컬에 실촬영본이 없으면 ACS 원본(imgAlt)으로 한 번 더 시도한 뒤 숨긴다.
+         목업이 아니라 로봇이 실제로 찍은 사진을 보여주기 위한 폴백. */
+      +(a.img?'<img src="'+a.img+'" onerror="'
+        +(a.imgAlt?('this.onerror=null;this.src=\''+a.imgAlt+'\'')
+                  :'this.style.display=\'none\'')+'" '
         +'style="width:46px;height:46px;border-radius:10px;object-fit:cover;flex:none;cursor:pointer" '
         +'onclick="window.open(this.src,\'_blank\')">'
        :'<span style="width:46px;height:46px;border-radius:10px;flex:none;display:flex;align-items:center;'
@@ -1972,7 +1989,7 @@ async function harvestReset(){await fetch('/api/v1/patrol/reset',{method:'POST'}
 window._heatDens=window._heatDens||null; window._heatByWp=window._heatByWp||null; window._heatCrop=window._heatCrop||null; window._heatMeta=window._heatMeta||null;
 /* 웨이포인트별 익음 비율 → 베드별 밀집도(0~1).
    AI 는 순찰 지점(웨이포인트) 단위로만 검출 비율을 낸다. 히트맵은 '어느 베드가 많은가' 를
-   보여줘야 하므로, 각 순찰점을 가장 가까운 베드에 묶고 그 평균을 그 베드의 밀집도로 쓴다.
+   보여줘야 하므로, 각 순찰점을 그 점이 촬영하는 베드(waypoints 의 bed)에 묶고 평균을 낸다.
    촬영한 지점이 하나도 없는 베드는 null 로 남겨 그 베드만 안 칠한다(없는 데이터를 0 으로
    칠하면 '검사했고 익은 게 없다' 로 읽힌다). */
 function bedDensityFromWaypoints(byWp){
@@ -1983,13 +2000,15 @@ function bedDensityFromWaypoints(byWp){
     var w=FARM.waypoints.find(function(v){return String(v.id)===String(id);});
     var r=byWp[id]&&byWp[id].ripe;
     if(!w||typeof r!=='number') return;
-    var best=-1,bd=Infinity;
-    FARM.pillars.forEach(function(p,i){                 // 베드 사각형까지의 최단거리
-      var lenX=p.face==='x'?p.w:p.d, lenZ=p.face==='x'?p.d:p.w;
-      var dx=Math.max(Math.abs(w.x-p.x)-lenX/2,0), dz=Math.max(Math.abs(w.z-p.z)-lenZ/2,0);
-      var dist=Math.hypot(dx,dz); if(dist<bd){bd=dist;best=i;}
-    });
-    if(best>=0){ beds[best].sum+=r; beds[best].n++; }
+    /* 소속 베드는 waypoints 의 bed 필드로 **못박아** 둔다. 예전엔 '가장 가까운 베드'
+       로 추정했는데 두 가지가 깨졌다.
+         ① 짝 노드(10↔18, 13↔19)는 같은 자리에서 방향만 돌려 반대쪽 베드를 찍는다.
+            물리적으로 같은 좌표라 거리로는 원리상 구분이 불가능하다.
+         ② 베드를 조금만 옮겨도 소속이 바뀌어 4/4/4 가 3/5 로 깨졌다
+            (2026-08-04 통로 균등화 때 실제로 13번이 넘어갔다).
+       어느 베드를 향해 찍는지는 측정으로 정해진 사실이지 좌표에서 유추할 것이 아니다. */
+    var b=w.bed;
+    if(typeof b==='number' && beds[b]){ beds[b].sum+=r; beds[b].n++; }
   });
   if(!beds.some(function(b){return b.n;})) return null;
   return beds.map(function(b){ return b.n?Math.max(0,Math.min(1,(b.sum/b.n)/100)):null; });
@@ -2011,6 +2030,10 @@ async function loadHeat(){
       else if(Array.isArray(d.pillars)) window._heatDens=d.pillars;   // 누가 pillars 를 보내주면 그걸 우선
       if(d.crop) window._heatCrop=d.crop;
     }
+    /* 히트맵은 찍는 대로 늘어나고, 작물 % 는 순찰이 끝나야 나온다.
+       crop_pending = 검출은 들어오는 중인데 아직 완료 신호(patrol_completed)가 안 왔다는 뜻. */
+    window._heatPending=!!d.crop_pending;
+    window._heatShot=Object.keys(d.by_waypoint||{}).length;   // 지금까지 찍은 지점 수
     window._heatMeta={count:d.patrol_count,at:d.updated_at};
   }catch(e){}
   if(document.getElementById('farmHeat')) drawFarmHeat();     // 밀집 히트맵 다시 그림(서버 밀집도)
@@ -2027,7 +2050,9 @@ function renderHeatSummary(){
   var el=document.getElementById('heatSummary');
   var sub=document.getElementById('heatSub');
   if(sub){ var m=window._heatMeta;
-    sub.textContent=(m&&m.at)?(m.at+' 순찰 스캔 기준 · 베드 3열'):'순찰 스캔 대기 중'; }
+    sub.textContent=window._heatPending
+      ? ('순찰 중 · '+(window._heatShot||0)+'/12 구역 촬영 완료')
+      : ((m&&m.at)?(m.at+' 순찰 스캔 기준 · 베드 3열'):'순찰 스캔 대기 중'); }
   if(!el)return;
   var dens=window._heatDens, crop=window._heatCrop;
   if(!dens&&!crop){ el.innerHTML=''; return; }
@@ -2089,12 +2114,22 @@ function renderRobotPosList(){
 function renderCropCard(){
   var box=document.getElementById('cropCardBox'); if(!box)return;
   if(!window._heatCrop){   // 아직 순찰 검출 없음 — 시드값을 실측처럼 보여주지 않는다
+    /* 두 가지 상태를 구분해 보여준다.
+       진행 중  : 히트맵에는 점이 찍히고 있는데 순찰이 아직 안 끝난 상태.
+                 여기서 절반만 돈 평균을 내보이면 그게 최종값인 줄 알고 판단하게 되므로 미룬다.
+       대기     : 순찰을 아예 시작한 적 없음. */
+    var run=!!window._heatPending, shot=window._heatShot||0;
     box.innerHTML=(window._view==='mobile'
         ? '<div class="mb-ct" style="margin-bottom:10px">작물 상태 · 순찰 확인</div>'
-        : '<div class="sc-head"><div><h3 class="sc-title">작물 상태</h3><div class="sc-sub">순찰 스캔 대기 중</div></div></div>')
+        : '<div class="sc-head"><div><h3 class="sc-title">작물 상태</h3><div class="sc-sub">'
+          +(run?('순찰 중 · '+shot+'/12 구역'):'순찰 스캔 대기 중')+'</div></div></div>')
       +'<div class="sc-inner" style="text-align:center;padding:28px 18px">'
-      +'<div style="font-size:14px;font-weight:700;color:var(--sc-mut5)">🚜 아직 순찰 검출 결과가 없습니다</div>'
-      +'<div style="font-size:12px;color:var(--sc-mut2);margin-top:6px">순찰이 완료되면 익음·안익음·병해충 비율이 채워집니다.</div></div>';
+      +(run
+        ? '<div style="font-size:14px;font-weight:700;color:var(--sc-mut5)">🛰️ 순찰 중 — '+shot+'/12 구역 촬영 완료</div>'
+          +'<div style="font-size:12px;color:var(--sc-mut2);margin-top:6px">촬영된 구역은 위 히트맵에 바로 표시됩니다. 비율은 순찰이 끝나면 전체 평균으로 확정됩니다.</div>'
+        : '<div style="font-size:14px;font-weight:700;color:var(--sc-mut5)">🚜 아직 순찰 검출 결과가 없습니다</div>'
+          +'<div style="font-size:12px;color:var(--sc-mut2);margin-top:6px">순찰이 완료되면 익음·안익음·병해충 비율이 채워집니다.</div>')
+      +'</div>';
     try{renderHeatSummary();}catch(e){}
     return;
   }
@@ -2108,7 +2143,7 @@ function renderCropCard(){
      병충해 = disease + rot 로 합쳐 3칸으로 보여준다. */
   var C=[['익음','수확 대상',cr.ripe||0,'var(--sc-ripe)','var(--sc-redT)','rgba(255,107,90,.08)'],
          ['안익음','관찰',    cr.unripe||0,'var(--sc-lime)','var(--sc-accentT)','rgba(201,242,77,.08)'],
-         ['병충해','방제 필요',(cr.pest||0)+(cr.rot||0),'var(--sc-pest)','var(--sc-amberTx)','rgba(242,179,61,.08)']];
+         ['병충해','방제 필요',(cr.pest||0)+(cr.rot||0),'var(--sc-rot)','var(--sc-rotTx)','rgba(138,106,74,.10)']];
   var tot=C.reduce(function(s,c){return s+c[2];},0)||1;
   var bar=C.map(function(c){return '<i style="width:'+(c[2]/tot*100)+'%;background:'+c[3]+'"></i>';}).join('');
   var tiles=C.map(function(c){ var pct=(c[2]/tot*100).toFixed(1);
@@ -2412,8 +2447,20 @@ var FARM={
     //   노드 5·6 열(z≈-4.6) 사이 띠가 5.30 뿐이라 2.80/중심 -7.35 로 잡아 앞뒤 주행 여유를
     //   +0.60 / +0.62 로 맞췄다. (PGM 점유는 z -7.31~-6.09 로 더 얇지만 그대로 쓰면 막대가 된다)
     {x:-2.33, z:-7.35, w:2.80, d:7.67, face:'z'},
-    {x:-1.53, z: 0.57, w:2.10, d:7.32, face:'x'},  // 세로 베드 (노드열 사이)
-    {x: 2.47, z: 0.57, w:1.90, d:7.32, face:'x'}   // 세로 베드
+    /* 세로 베드 2개. **세 통로 폭이 똑같아지도록** 잡았다 (이건수 지시 2026-08-04).
+       예전 값(-1.53/2.47, 폭 2.10/1.90)은 통로가 3.92 / 2.00 / 3.08 로 제각각이라
+       가운데만 좁아 보였다. 지금은 3.20 / 3.20 / 3.20.
+         좌벽 -6.50 │ 3.20 │ 베드2 -3.30~-1.51 │ 3.20 │ 베드3 1.68~3.30 │ 3.20 │ 우벽 6.50
+
+       [왜 폭도 줄였나 — 균등 간격과 주행 여유의 맞바꿈]
+       통로가 균등하면 3g + 베드폭합 = 13.00 이 강제된다. 즉 베드를 두껍게 할수록 통로가
+       좁아지고, 왼쪽 통로의 촬영점(WP12 x=-3.63)에 선 Pinky(폭 0.95)가 베드2를 파고든다.
+         g=3.00(폭 그대로) → 0.35 파고듦   g=3.20(폭 15%↓) → 0.15   g=3.35(폭 26%↓) → 0
+       0.15 는 로봇 폭 0.95 중 일부라 화면에서 거의 드러나지 않고, 베드도 26%까지 얇아지지
+       않아 빈약해 보이지 않는다. 그 절충점이 아래 값이다.
+       (map_layout.py 가 "구조물은 배치·비율만 참고, 노드·통로만 진짜"라 명시 → 폭 조정 허용) */
+    {x:-2.41, z: 0.57, w:1.79, d:7.32, face:'x'},  // 세로 베드 (노드열 사이)
+    {x: 2.49, z: 0.57, w:1.62, d:7.32, face:'x'}   // 세로 베드
   ],
   // ★ 하단 벽 = 맵 아래쪽 '외벽'. 가운데가 뚫려 있다
   //   (PGM rows 61~63: 열 0~11 벽 / 열 12~25 개방 42cm / 열 26~38 벽).
@@ -2439,29 +2486,61 @@ var FARM={
   ],
   // 시설은 맵 아래쪽 벽(z 13)에 붙인다 — 안쪽 주행 공간을 넓게 비우기 위해.
   cold:{x:4.30, z:12.10, w:2.4, d:1.8, h:2.0},    // 예냉실 (진입 노드 25)
-  stations:[{x:-4.29,z:12.03},{x:-1.69,z:12.03},{x:0.21,z:12.03}],  // 충전 1~3 (노드 22·23·24)
+  /* DG 충전 스테이션 3개 (노드 22·23·24 = 충전소1~3).
+     [왜 z 를 12.03 → 7.50 으로 옮겼나 — 로봇이 주차칸 앞에 서 보이던 문제]
+     로봇의 3D 위치는 _map_to_norm 으로 변환한 **실측 좌표**로 찍힌다. 그런데 이 박스는
+     눈대중으로 뒤쪽 벽(z≈12)에 붙여놨어서, 도킹 노드(z 6.80·7.56·7.45)와 4.5~5.2m 어긋났다.
+     그래서 dg_03 이 실제로 주차를 마쳐도 화면에서는 칸 앞에 떠 있었다(2026-08-04 이건수 보고).
+     z=7.50 이면 박스(깊이 1.95)가 6.53~8.48 을 덮어 **세 노드가 모두 칸 안에 들어온다.**
+     보연님 map_layout.py 도 시설 박스를 '노드 기준 고정된 행' 에 그린다고 명시한다.
+
+     [x 는 균등·밀착] 실측 노드 간격이 2.60 / 1.90 이라 DG1 만 떨어져 보였다.
+     간격 1.90(박스폭 1.82 → 틈 0.08)으로 붙이고, 세 칸의 노드 오차를 0.35 로 균등하게 나눴다.
+     ※ 더 왼쪽 벽(x=-6.50)까지 밀지 않은 이유: 그만큼 노드에서 멀어져서 방금 고친
+       '로봇이 칸 밖에 서 보이는' 문제가 그대로 되살아난다. 벽까지는 1.50 남긴다. */
+  /* DG 충전 스테이션 3개 — **왼쪽 위 벽 모서리에 붙여, 같은 간격으로** (이건수 결정 2026-08-04).
+       z = 11.91 → 박스 바깥 끝 12.88, 벽(13.00) 안쪽으로 0.12 — 경계선을 넘지 않게
+       x = -5.47 / -3.57 / -1.67 → DG1 이 위쪽 벽(-6.50) 안쪽 0.12, 칸 사이 틈 0.08 로 균일
+
+     [로봇은 이 칸 '앞' 에 서 보인다 — 알고 그렇게 둔 것]
+     로봇 위치는 _map_to_norm 으로 변환한 실측 좌표라 언제나 진짜다. 반면 도킹 노드
+     (22·23·24)는 z = 6.80 / 7.56 / 7.45 로 이 박스보다 4.5~5.2 안쪽이다. 그래서 실제로
+     주차를 마쳐도 화면에서는 칸 앞에 서 있는 것처럼 보인다.
+
+     이 어긋남을 없애려 박스를 도킹 노드로 내려도 봤고(벽에서 5.5 떠서 허공에 뜬 것처럼
+     보였다), 벽부터 노드까지 깊이 6.65 슬롯으로 늘려도 봤다(로봇이 그 구간 어디에 서든
+     주차한 것처럼 보여 화면이 거짓말을 한다). 둘 다 되돌리고 **배치는 벽 기준으로,
+     로봇은 실좌표 그대로** 두기로 했다 — 최소한 로봇 위치는 절대 왜곡하지 않는다.
+
+     ⚠ 정확히 맞추려면 dg_03 을 충전소에 보내 도킹 완료 시점의 map_position 을 실측해
+     그 자리에 박스를 놓으면 된다. 그 전까지는 이 어긋남을 알고 감수하는 것이다.
+
+     [참고] 그려진 경계(z ±13)는 온실 벽이 아니라 PGM 맵 범위다. 실측 노드 전체가
+     z -10.19~7.56 에 들어가므로 +z 쪽 5.44 는 노드가 없는 빈 맵(온실 바깥 여백)이다.
+     시설이 '허공에 뜬 것처럼' 보이던 근본 원인이 이것이다. 예냉실도 마찬가지다. */
+  stations:[{x:-5.47,z:11.91},{x:-3.57,z:11.91},{x:-1.67,z:11.91}],   // 충전 1~3 (노드 22·23·24)
   // 실측 노드 21개. ord = 순찰 촬영 순서(없으면 경유점/시설 진입). gate 는 시설 라벨.
   waypoints:[
-    {id:1, x:-3.42,z: -9.99, ord:8 },
-    {id:2, x:-0.68,z: -9.99, ord:7 },
+    {id:1,bed:0, x:-3.42,z: -9.99, ord:8 , hx:-4.25, hz:-9.30},
+    {id:2,bed:0, x:-0.68,z: -9.99, ord:7 , hx:-0.41, hz:-9.30},
     {id:3, x: 4.09,z: -9.82           },
-    {id:5, x:-2.98,z: -4.69, ord:1 },
-    {id:6, x: 0.03,z: -4.55, ord:2 },
+    {id:5,bed:0, x:-2.98,z: -4.69, ord:1 , hx:-4.25, hz:-5.40},
+    {id:6,bed:0, x: 0.03,z: -4.55, ord:2 , hx:-0.41, hz:-5.40},
     {id:8, x: 3.94,z: -4.51           },
-    {id:9, x:-3.78,z: -0.47, ord:9 },
-    {id:10,x: 0.53,z: -1.52, ord:12},
-    {id:11,x: 4.48,z: -1.06, ord:6 },
-    {id:12,x:-3.63,z:  2.53, ord:10},
-    {id:13,x: 0.27,z:  1.69, ord:11},
+    {id:9,bed:1, x:-3.78,z: -0.47, ord:9 , hx:-3.86, hz:-1.26},
+    {id:10,bed:1, x: 0.53,z: -1.52, ord:12, hx:-0.97, hz:2.40},
+    {id:11,bed:2, x: 4.48,z: -1.06, ord:6 , hx:3.85, hz:-1.26},
+    {id:12,bed:1, x:-3.63,z:  2.53, ord:10, hx:-3.86, hz:2.40},
+    {id:13,bed:2, x: 0.27,z:  1.69, ord:11, hx:1.13, hz:2.40},
     /* 양방향 촬영 지점의 짝 (시나리오1 E2 20-1). 로봇 카메라는 한쪽에 고정이라
        통로 양쪽을 다 찍으려면 같은 자리에서 방향만 돌려 한 번 더 찍는다: 10↔18, 13↔19.
        ACS 는 이 번호로 검출을 보내는데 FARM 에 없어서 **그려지지 않고 버려졌다**
        (2026-08-03 실기: 18·19 유실 → 베드2·3 에 원이 하나씩 비었다).
        좌표는 대표 노드와 같은 자리지만, 히트맵에서 겹치면 한 점으로 보이므로
        각자 '바라보는 베드' 쪽으로 밀어 둔다 — 10은 베드3, 짝 18은 베드2 쪽. */
-    {id:18,x:-1.07,z: -1.52, ord:13, pair:10},
-    {id:19,x: 1.87,z:  1.69, ord:14, pair:13},
-    {id:14,x: 4.50,z:  1.80, ord:5 },
+    {id:18,bed:2, x:-1.07,z: -1.52, ord:13, pair:19, hx:1.13, hz:-1.26},
+    {id:19,bed:1, x: 1.87,z:  1.69, ord:14, pair:18, hx:-0.97, hz:-1.26},
+    {id:14,bed:2, x: 4.50,z:  1.80, ord:5 , hx:3.85, hz:2.40},
     {id:15,x:-3.20,z:  7.20           },
     {id:16,x: 0.41,z:  5.78           },
     {id:17,x: 4.17,z:  6.36           },
@@ -2783,15 +2862,15 @@ function renderFarm(v){
     try{startFleetLive();}catch(e){}
     try{initFarm3D();}catch(e){}
     try{loadHeat();}catch(e){}
-    // 히트맵 자동 갱신. 예전엔 '대시보드 진입' 과 '순찰 요청 1.3초 뒤' 에만 불렀다.
-    // 서버가 순찰 완료 시점에만 crop/by_waypoint 를 확정하므로, 이 폴링이 돌아도
-    // 순찰 도중에는 화면 값이 바뀌지 않는다. patrol_completed 이벤트가 유실돼도
-    // 5초 안에 결과를 주워오는 **안전망** 역할이다.
+    /* 히트맵 자동 갱신. 서버가 검출 1건마다 by_waypoint 를 즉시 채우므로
+       이 폴링이 곧 '실시간 누적' 을 화면에 옮기는 통로다. 한 지점 촬영에 수 초가
+       걸리니 2초면 찍는 즉시 뜨는 것처럼 보인다.
+       (작물 % 는 서버가 순찰 완료 전까지 내주지 않으므로 이 폴링으로도 안 바뀐다.) */
     if(window._heatTimer)clearInterval(window._heatTimer);
     window._heatTimer=setInterval(function(){
       if(!document.getElementById('farmHeat')){clearInterval(window._heatTimer);window._heatTimer=null;return;}
       try{loadHeat();}catch(e){}
-    },5000);
+    },2000);
     try{loadHarvestStats();}catch(e){}
   }
   if(v==='f_work') el.innerHTML=`
@@ -2914,17 +2993,47 @@ function drawFarmHeat(){
       var w=F.waypoints.find(function(v){return String(v.id)===String(id);});
       var rec=byWp[id];
       if(!w||!rec||typeof rec.ripe!=='number') return;      // 안 찍힌 곳은 건너뛴다
-      var d=Math.max(0,Math.min(1,rec.ripe/100));
-      if(d<=0) return;
+      /* 익음 0% 여도 **그린다**. 여기는 '완숙 밀집' 지도지만, 원이 없으면 농장주는
+         '안 찍은 곳' 으로 읽는다. 실제로 2026-08-04 실기에서 WP13·WP10 이
+         병해충 100%/익음 0% 로 와서 원 2개가 통째로 빠졌고, 12곳을 다 돌았는데도
+         10개만 보였다. 값은 **색**으로 나타내고(LOW 초록 → HIGH 빨강), 촬영 여부는
+         **원의 존재**로 나타낸다 — 두 정보를 섞지 않는다. */
+      var d=Math.max(0,Math.min(1,(rec.ripe||0)/100));
       // 반경은 '카메라가 한 지점에서 보는 정도'. 베드를 통째로 덮지 않게 작게 잡는다.
       var rx=sw(1.55), ry=sh(1.55), R=Math.max(rx,ry);
-      g.save(); g.translate(sx(w.x),sy(w.z));
+      /* hx = 그릴 x. 짝 노드(10↔18, 13↔19)는 같은 자리에서 방향만 돌려 통로 양쪽을
+         찍으므로 실좌표가 같다 — 그대로 그리면 두 원이 겹쳐 한 점으로 보인다.
+         그래서 각자 '바라보는 베드' 쪽으로 밀어 그린다. 실좌표 x 는 손대지 않는다
+         (로봇 위치 변환에 계속 쓰이므로). */
+      /* hx·hz = 히트맵 그리기 전용 자리. 실좌표(x·z)로 그리면 통로에서 로봇이 멈춘
+         자리 그대로라 12개가 제각각 흩어져 지저분했다(2026-08-04 이건수 지적).
+         실제 촬영은 '베드 한 면당 2곳' 이므로, 베드마다 양면 2줄 × 길이 1/4·3/4 지점의
+         2×2 격자에 맞춰 그린다 — 배치의 뜻은 그대로면서 화면은 반듯해진다.
+         짝 노드(10↔18, 13↔19)가 한 점으로 겹치는 것도 이걸로 함께 해결된다.
+         실좌표는 손대지 않는다(로봇 위치 변환·베드 밀집도 계산에 계속 쓰임). */
+      var wx=(typeof w.hx==='number')?w.hx:w.x;
+      var wz=(typeof w.hz==='number')?w.hz:w.z;
+      g.save(); g.translate(sx(wx),sy(wz));
+      /* 색은 **작물 상태 카드와 같은 3가지**만 쓴다 — 익음(빨강)·안익음(연두)·병충해(갈색).
+         전에는 익음 비율을 4색 띠(초록→노랑→주황→빨강)로 칠했는데, 화면에 색이 네 가지나
+         떠서 지저분하고 카드 색과도 안 맞았다(이건수 지적 2026-08-04).
+
+         [규칙] 그 지점에서 **가장 많았던 항목**으로 색을 고르고, **그 값의 크기로 진하기**를
+         정한다. 색 = 무엇이, 진하기 = 얼마나. 두 정보가 섞이지 않는다.
+         병해충 100% 인 지점이 '익음 0' 이라는 이유로 안전한 초록으로 칠해지던 문제도
+         이걸로 함께 해결된다. */
+      var _rp=rec.ripe||0, _un=rec.unripe||0, _ds=(rec.pest||0)+(rec.rot||0);
+      var RGB, top;
+      if(_ds>=_rp && _ds>=_un){ RGB='138,106,74';  top=_ds; }        // 병충해 — 갈색
+      else if(_rp>=_un)       { RGB='255,107,90';  top=_rp; }        // 익음   — 빨강
+      else                    { RGB='176,214,88';  top=_un; }        // 안익음 — 연두
+      // 진하기: 값이 0 이어도 '찍은 곳' 은 보여야 하므로 최소 농도를 남긴다.
+      var A=0.30+0.58*Math.max(0,Math.min(1,top/100));
       var grd=g.createRadialGradient(0,0,2,0,0,R);
-      grd.addColorStop(0,   'rgba(214,28,20,'+(0.90*d)+')');
-      grd.addColorStop(0.30,'rgba(236,96,36,'+(0.64*d)+')');
-      grd.addColorStop(0.58,'rgba(250,190,55,'+(0.42*d)+')');
-      grd.addColorStop(0.80,'rgba(180,214,90,'+(0.20*d)+')');
-      grd.addColorStop(1,   'rgba(150,205,110,0)');
+      grd.addColorStop(0,   'rgba('+RGB+','+A.toFixed(3)+')');
+      grd.addColorStop(0.32,'rgba('+RGB+','+(A*0.68).toFixed(3)+')');
+      grd.addColorStop(0.62,'rgba('+RGB+','+(A*0.36).toFixed(3)+')');
+      grd.addColorStop(1,   'rgba('+RGB+',0)');
       g.fillStyle=grd; g.beginPath(); g.ellipse(0,0,rx,ry,0,0,7); g.fill(); g.restore();
     });
   }
@@ -2993,7 +3102,7 @@ function drawFarmHeat(){
   // 예냉실 · 충전소 — 수확대와 같은 규칙
   var c=F.cold; facBox(sx(c.x),sy(c.z),sw(c.w),sh(c.d),'예냉실',10);
   F.stations.forEach(function(s,i){
-    facBox(sx(s.x),sy(s.z),Math.max(24,sw(0.9)),Math.max(17,sh(0.85)),'DG'+(i+1),9);
+    facBox(sx(s.x),sy(s.z),Math.max(24,sw(1.82)),Math.max(17,sh(1.95)),'DG'+(i+1),9);
   });
 }
 function sliderRow(lab,val,pct){return `<div class="pr" style="margin-bottom:16px"><div class="top"><span>${lab}</span><b>${val}</b></div>
@@ -3252,9 +3361,20 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
       if(!wasLive){ try{loadPatrol();}catch(_){} }   // 순찰 시작 → 순찰 화면(양 탭) 즉시 '요청 불가'로
     } else if(e.event==='disease_alert'){
       var msg='병해충 발견 · '+val(e.robot_id,'로봇')+' · WP'+val(e.waypoint_id)+' · '+num(e.disease_percent)+'%';
-      // image_path 는 ACS 가 준 값이다. 속성값에 그대로 넣으면 따옴표를 닫고 onload= 를 주입할 수 있어
-      // encodeURI + esc 로 이중 처리한다(2026-07-29 감사 지적).
-      var thumb=e.image_path?('<img src="/detections/'+esc(encodeURI(String(e.image_path)))+'" onerror="this.parentNode.innerHTML=\'🐛\'" style="width:100%;height:100%;object-fit:cover">'):'🐛';
+      /* 사진은 **로봇이 실제로 찍은 것**이어야 한다. 서버가 disease_alert 를 받을 때
+         image_data(base64) 를 저장하거나 ACS 에서 내려받아 /detections/<image_path> 에
+         실촬영본을 확보한다(_ensure_local_detection_image).
+         그래도 로컬에 없으면 ACS 원본 URL 로 한 번 더 시도한 뒤 아이콘으로 떨어진다 —
+         예전 시험 때 남은 목업 파일이 대신 보이던 문제를 여기서 끊는다
+         (2026-08-04 이건수: "텔레그램에는 실제 찍은 사진을 잘만 보내더만").
+
+         image_path·image_url 은 ACS 가 준 값이다. 속성값에 그대로 넣으면 따옴표를 닫고
+         onload= 를 주입할 수 있어 encodeURI + esc 로 이중 처리한다(2026-07-29 감사 지적). */
+      var _src=e.image_path?('/detections/'+esc(encodeURI(String(e.image_path)))):'';
+      var _alt=e.image_url?esc(encodeURI(String(e.image_url))):'';
+      var _fb=_alt?('this.onerror=null;this.src=\''+_alt+'\'')
+                  :'this.parentNode.innerHTML=\'🐛\'';
+      var thumb=(_src||_alt)?('<img src="'+(_src||_alt)+'" onerror="'+_fb+'" style="width:100%;height:100%;object-fit:cover">'):'🐛';
       banner(
         '<div style="background:linear-gradient(180deg,#e5462f,#c0392b);color:#fff;border-radius:16px;padding:15px 16px;display:flex;gap:14px;align-items:center;animation:dzIn .3s ease, dzGlow 1.9s ease-in-out infinite">'
         +'<div style="width:56px;height:56px;flex:none;border-radius:12px;overflow:hidden;background:rgba(255,255,255,.2);display:flex;align-items:center;justify-content:center;font-size:30px">'+thumb+'</div>'
@@ -3270,7 +3390,8 @@ let tT;function toast(msg){const t=document.getElementById('toast');t.innerHTML=
       try{toast(msg);}catch(_){}
       pushAlertLog({seq:e.seq, kind:'disease', at:e.detected_at||new Date().toISOString(),
                     title:'병해충 발견', body:msg, pct:e.disease_percent,
-                    img:e.image_path?('/detections/'+encodeURI(String(e.image_path))):null});
+                    img:e.image_path?('/detections/'+encodeURI(String(e.image_path))):(e.image_url||null),
+                    imgAlt:e.image_url||null});   // 로컬 실패 시 ACS 원본으로 대체
     } else if(e.event==='patrol_completed'){
       // 히트맵·작물 상태는 **여기서만** 바뀐다. 서버가 patrol_completed 에서
       // 방문 웨이포인트 평균을 확정하므로, 그 직후 한 번 읽으면 된다.
