@@ -18,7 +18,9 @@
           순서대로 흘려보내 **DCS 의 중계**(feedback·result·cancel)를 검증한다.
         - 취소 요청 시 그 자리에서 CANCELED + result_code=3
         - dock_mode 로 실패를 주입한다: success(0) / no_marker(1) / error_exceeded(2) /
-          hang(무응답 → DCS timeout). 테스트가 self.dock_mode 를 바꿔 4종을 검증한다.
+          hang(무응답 → DCS timeout) / empty_abort(ABORTED 인데 결과는 전 필드 0 —
+          로봇 rclpy 7.1.9 재현, DCS 가 status 로 걸러내는지 검증).
+          테스트가 self.dock_mode 를 바꿔 5종을 검증한다.
           모드는 3종이 공유한다(같은 로봇의 같은 도킹 실패 양상이라 방식별로 나눌 게 없다).
         - 동시에 실행된 도킹 goal 수를 dock_concurrent_max 에 기록한다 — DCS 가 방식이
           다른 도킹까지 하나의 락으로 직렬화하는지 테스트가 이 값으로 확인한다.
@@ -124,7 +126,7 @@ class DdagoSim(Node):
             'DdaGo 시뮬 시작: /ddago/{telemetry,navigate,%s} (dock_mode=%s)'
             % (','.join(s.name for s in self.DOCK_KINDS), self.dock_mode))
 
-    VALID_DOCK_MODES = ('success', 'no_marker', 'error_exceeded', 'hang')
+    VALID_DOCK_MODES = ('success', 'no_marker', 'error_exceeded', 'hang', 'empty_abort')
 
     def _on_set_params(self, params):
         for p in params:
@@ -306,6 +308,19 @@ class DdagoSim(Node):
         self.get_logger().info(
             '도킹 goal 수신: 방식=%s task=%d point=%s %s mode=%s'
             % (spec.name, req.task_id, req.task_point_id, extra, mode))
+
+        # empty_abort: **abort 인데 결과는 빈 Result(전 필드 0)** 로 돌아오는 상황.
+        #  실기에서 실제로 일어난다 — 로봇의 rclpy 7.1.9 는 인자 없는 abort() 에서 빈 Result 를
+        #  먼저 보내고 콜백의 return 값을 버린다(노트북 7.1.11 은 가드가 있어 정상).
+        #  result_code 는 0 이 성공이라 **빈 결과 = 성공** 으로 읽히는 fail-open 이 된다.
+        #  08-05 에 이것 때문에 도킹 실패인데 E3 게이트가 열려 팔이 움직였다.
+        #  로봇 쪽을 고쳐도 통신 이상·서버 예외에서 같은 모양이 나오므로, **DCS 가 status 로
+        #  걸러내는지**를 여기서 상시 검증한다(노트북 rclpy 로는 이 모드 없이는 재현 불가).
+        if mode == 'empty_abort':
+            self.get_logger().warn('빈 결과 abort 시뮬 → status=ABORTED, result 는 전 필드 0')
+            r = spec.action.Result()          # 전부 0 — result_code=0(=성공값)
+            goal_handle.abort(r)
+            return r
 
         # hang: 결과를 돌려주지 않는다 → DCS 의 dock_result_timeout 검증용.
         # 취소/종료 시 빠져나오도록 유계 루프로 대기(테스트 teardown 안전).

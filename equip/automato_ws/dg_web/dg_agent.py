@@ -11,7 +11,9 @@
 
 API (전부 Authorization: Bearer <토큰> 필요, /health 만 예외)
     GET  /health                  → {ok, host, time, uptime}
-    GET  /system                  → cpu·mem·온도·스로틀·네트워크·시계·배터리
+    GET  /system                  → cpu·mem·온도·스로틀·네트워크·시계
+                                    (배터리는 여기 없다 — /battery/* 토픽이 정본이라
+                                     대시보드가 rosbridge 로 직접 구독한다)
     GET  /procs?match=<정규식>    → 프로세스 목록(등록 서비스 확인용)
     GET  /log?name=<이름>&n=200   → 이 에이전트가 띄운 프로세스의 stdout+stderr
     POST /run   {name, cmdline}   → 백그라운드 실행(로그는 /tmp/dg_agent_<name>.log)
@@ -221,61 +223,6 @@ def clock():
             'tz': time.strftime('%Z%z')}
 
 
-# ── 배터리 ─────────────────────────────────────────────────────────────
-# 로봇 배터리는 I2C ADC(버스1 / 0x08 / 레지스터 0xF8)에 물려 있다. 값 환산은
-# pinky_bringup 의 Battery 클래스와 같은 식을 쓴다(분압비 13/28, 4.096V 기준).
-BATT_BUS, BATT_ADDR, BATT_REG = 1, 0x08, 0xF8
-BATT_FULL_V, BATT_EMPTY_V = 7.6, 6.8
-
-
-def _proc_running(pat):
-    try:
-        return subprocess.run(['pgrep', '-f', pat],
-                              stdout=subprocess.DEVNULL, timeout=5).returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
-
-
-def battery():
-    """배터리 전압·잔량. ROS 없이 I2C 를 직접 읽는다 — 스택이 안 떠 있을 때도 봐야 하니까
-    (충전 안 된 걸 모르고 나갔다가 로봇이 방전돼 배포를 못 한 적이 있다).
-
-    ⚠ 다만 bringup 의 battery_publisher 가 **같은 장치를 폴링**한다. 읽기가
-    '채널 선택 → 값 읽기' 두 단계라 두 프로세스가 끼어들면 엉뚱한 채널 값이 나온다.
-    그래서 그쪽이 돌고 있으면 아예 읽지 않고, 대시보드가 DCS 텔레메트리(같은 값)를 쓰게 한다."""
-    if _proc_running('battery_publisher'):
-        return {'source': 'ros', 'percent': None, 'voltage': None,
-                'note': 'bringup 이 I2C 사용 중 — 텔레메트리 값을 쓰세요'}
-    try:
-        import smbus2
-    except ImportError:
-        return {'source': 'none', 'percent': None, 'voltage': None,
-                'error': 'smbus2 미설치'}
-    try:
-        bus = smbus2.SMBus(BATT_BUS)
-    except OSError as e:
-        return {'source': 'none', 'percent': None, 'voltage': None, 'error': str(e)}
-    vals = []
-    try:
-        for _ in range(20):
-            bus.write_byte(BATT_ADDR, BATT_REG)
-            time.sleep(0.001)
-            d = bus.read_i2c_block_data(BATT_ADDR, 0, 2)
-            vals.append((d[0] << 4) | (d[1] >> 4))
-    except OSError as e:
-        return {'source': 'none', 'percent': None, 'voltage': None, 'error': str(e)}
-    finally:
-        try:
-            bus.close()
-        except Exception:
-            pass
-    if not vals:
-        return {'source': 'none', 'percent': None, 'voltage': None, 'error': '읽기 실패'}
-    v = (sum(vals) / len(vals) / 4096.0) * 4.096 / (13.0 / 28.0)
-    pct = max(0.0, min(100.0, (v - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V) * 100))
-    return {'source': 'i2c', 'voltage': round(v, 3), 'percent': round(pct, 1)}
-
-
 def procs(match=''):
     try:
         out = subprocess.run(['ps', '-eo', 'pid,pcpu,pmem,rss,etimes,args', '--sort=-pcpu'],
@@ -396,8 +343,13 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path == '/health':
+            # uptime_s 는 **머신 부팅** 경과라 재기동 여부를 알려주지 못한다(재기동해도 그대로).
+            #  실제로 새 프로세스가 떴는지는 pid·agent_uptime_s 로 판단한다 — 배포·기동 후
+            #  pid 가 바뀌고 agent_uptime_s 가 0 근처면 진짜 재기동된 것이다.
             return self._json({'ok': True, 'host': socket.gethostname(),
-                               'time': time.time(), 'uptime_s': _uptime()})
+                               'time': time.time(), 'uptime_s': _uptime(),
+                               'pid': os.getpid(),
+                               'agent_uptime_s': round(time.monotonic() - _STARTED, 1)})
         if not self._authed():
             return self._json({'error': 'unauthorized'}, 401)
         if u.path == '/system':
@@ -406,7 +358,6 @@ class Handler(BaseHTTPRequestHandler):
                 'cpu_pct': cpu_percent(), 'loadavg': os.getloadavg(),
                 'mem': meminfo(), 'temp_c': temperature_c(), 'throttled': throttled(),
                 'net': net_bytes(), 'wifi': wifi_link(), 'wifi_errors': dmesg_wifi(),
-                'battery': battery(),
                 'ros': ros_env(), 'clock': clock(),
             })
         if u.path == '/procs':
@@ -439,10 +390,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _uptime():
+    """머신 부팅 경과 [s]. 프로세스 재기동과 무관하다 — 그 판단은 _STARTED 를 쓴다."""
     try:
         return int(float(_read('/proc/uptime').split()[0]))
     except (IndexError, ValueError):
         return None
+
+
+# 이 프로세스가 뜬 시각(단조시계). /health 의 agent_uptime_s 근거 — 배포·기동이 실제로
+#  새 프로세스를 띄웠는지 확인하는 유일한 수단이다(pid 와 함께 본다).
+_STARTED = time.monotonic()
 
 
 if __name__ == '__main__':

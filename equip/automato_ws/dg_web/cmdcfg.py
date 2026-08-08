@@ -205,7 +205,17 @@ REAL_DEFAULTS = {
     #       bash -ic 'nav2_ddago02' (alias 로 띄우고 싶을 때 — alias 는 대화형 셸에서만 펼쳐진다)
     #       ros2 launch pinky_navigation bringup_launch.xml ...
     'real-nav2': {
-        'check': 'bt_navigator',    # 어떻게 띄우든 nav2 면 이 노드가 뜬다
+        # Nav2 는 로봇이 서 있어야만 산다 — odom→base_footprint TF 와 /scan 이 없으면
+        #  AMCL·costmap 이 활성화되지 못하고 lifecycle_manager 가 무한 대기로 멎는다.
+        #  그 상태는 화면에 '기동 실패' 로만 보여 원인을 알 수 없으니, 아예 띄우기 전에 막는다.
+        'requires': ['robot-bringup'],
+        # ⚠️ 노드 이름(bt_navigator)으로 찾으면 안 된다 — nav2 는 **컴포지션**으로 뜨고
+        #   bt_navigator 는 컨테이너 안의 컴포넌트라 **프로세스가 없다**. is_up() 은
+        #   `pgrep -f` 로 명령줄을 보므로 영영 못 잡고 화면에 '꺼짐' 으로 뜬다
+        #   (08-06: 실제로는 정상 동작 중인데 표시만 틀렸다).
+        #   컨테이너 프로세스의 명령줄에 실제로 들어 있는 `nav2_container` 로 잡는다.
+        #   (종료 패턴으로도 쓰이는데, 컨테이너를 죽이면 그 안의 nav2 노드가 전부 내려간다)
+        'check': 'nav2_container',
         # nav.sh 는 nav2 를 백그라운드로 띄우고 **자기 로그 파일에** 쌓는다. 그래서 대시보드가
         # 잡는 실행 출력에는 스크립트가 찍은 몇 줄만 남고 정작 nav2 로그는 안 보인다.
         # 두 파일을 한 화면에 나란히 보여주려고 여기 같이 적어 둔다.
@@ -227,10 +237,20 @@ REAL_DEFAULTS = {
     'robot-bringup': {
         'check': 'pinky_bringup bringup_robot.launch',
         'group': '실서버 · 로봇 온보드',
-        'label': '로봇 bringup (라이다·모터·odom)',
+        'label': '로봇 bringup (라이다·모터·odom·IMU+EKF)',
         'host': 'robot',
-        'template': 'ros2 launch pinky_bringup bringup_robot.launch.xml',
-        'params': {},
+        # ⚠️ IMU 인자를 **반드시 명시**한다. 런치 기본값은 use_imu=false·publish_tf=true 라
+        #   인자 없이 띄우면 IMU·EKF 가 빠진 채 bringup 이 odom TF 를 직접 쏜다
+        #   (~/imu.sh on 으로 띄운 것과 정반대 구성). 08-06 대시보드에서 실제로 그랬다.
+        #   use_imu 와 publish_tf 는 **짝**이다 — 둘 다 TF 를 쏘면 odom→base_footprint 가
+        #   이중 발행돼 위치가 튄다. EKF 를 쓰면 bringup 은 반드시 publish_tf:=false.
+        #   ekf_freq 15: 25Hz 는 Pi 가 못 맞춘다(Failed to meet update rate). 로봇 ~/bringup.sh
+        #   의 DEF_EKF_FREQ 와 같은 값으로 유지할 것.
+        'template': ('ros2 launch pinky_bringup bringup_robot.launch.xml '
+                     'use_imu:=<use_imu> publish_tf:=<publish_tf> '
+                     'ekf_freq:=<ekf_freq> imu_rate:=<imu_rate>'),
+        'params': {'use_imu': 'true', 'publish_tf': 'false',
+                   'ekf_freq': '15.0', 'imu_rate': '50.0'},
     },
     'robot-ddago': {
         'check': 'ddago_bringup.launch',
@@ -266,14 +286,15 @@ REAL_DEFAULTS = {
         'oneshot': True,
         'check': 'action send_goal .*navigate',
         'group': '실서버 · 충전소 복귀',
-        'label': '① 복귀 주행 (DCS 경유 Navigate)',
+        'label': '① 충전소 진입점까지 주행 (DCS 경유 Navigate)',
         # ACS 가 하던 것과 같은 인터페이스를 탄다. waypoint 하나(capture:false)만 주면
         # 경로는 Nav2 가 짠다. DCS→DdaGo 중계를 거치므로 navigate_server 의 출발 정렬·
         # yaw 보정을 그대로 받고, 취소 중계도 이미 구현돼 있다.
         'template': ("ros2 action send_goal /<robot_id>/navigate "
                      "automato_interfaces/action/Navigate "
                      "'{task_id: <task_id>, waypoints: [{waypoint_id: <wp_id>, "
-                     "x: <x>, y: <y>, yaw: <yaw>, capture: false}]}' --feedback"),
+                     "x: <x>, y: <y>, yaw: <yaw>, capture: false, "
+                     "hold_yaw: true}]}' --feedback"),
         'params': {'robot_id': '${ROBOT_ID}', 'task_id': '0', 'wp_id': '0',
                    'x': '0.0', 'y': '0.0', 'yaw': '0.0'},
     },
@@ -289,6 +310,35 @@ REAL_DEFAULTS = {
                      "stop_gap_m: <stop_gap_m>}' --feedback"),
         'params': {'robot_id': '${ROBOT_ID}', 'task_id': '0',
                    'task_point_id': 'CHARGE_01', 'stop_gap_m': '0.0'},
+    },
+
+    # ── 지도에서 찍은 웨이포인트 경로 주행 ──
+    # 여러 점을 **한 goal 로** 보낸다. Navigate.action 의 waypoints 가 배열이라 그대로 되고,
+    # 구간마다 goal 을 새로 던지면 그 사이에 로봇이 멈춰 서고 취소 처리도 갈래가 늘어난다.
+    # <waypoints> 자리는 서버가 통째로 만들어 넣는다(배열이라 params 치환으로는 못 만든다).
+    'real-route-nav': {
+        'oneshot': True,
+        'check': 'action send_goal .*navigate',
+        'group': '실서버 · 경로 주행',
+        'label': '① 선택 경로 주행 (DCS 경유 Navigate)',
+        'template': ("ros2 action send_goal /<robot_id>/navigate "
+                     "automato_interfaces/action/Navigate "
+                     "'{task_id: <task_id>, waypoints: [<waypoints>]}' --feedback"),
+        'params': {'robot_id': '${ROBOT_ID}', 'task_id': '0', 'waypoints': ''},
+    },
+    'real-route-floor-dock': {
+        'oneshot': True,
+        'check': 'action send_goal .*floor_dock',
+        'group': '실서버 · 경로 주행',
+        'label': '② H마커 도킹 (FloorDock)',
+        # 마커리스라 goal 에 마커 규격이 없다. 정차값 0 = 로봇 노드 파라미터 기본값.
+        'template': ("ros2 action send_goal /<robot_id>/floor_dock "
+                     "automato_interfaces/action/FloorDock "
+                     "'{task_id: <task_id>, task_point_id: <task_point_id>, "
+                     "wall_gap_m: <wall_gap_m>, lateral_offset_m: <lateral_offset_m>}' --feedback"),
+        'params': {'robot_id': '${ROBOT_ID}', 'task_id': '0',
+                   'task_point_id': 'HARVEST_01',
+                   'wall_gap_m': '0.0', 'lateral_offset_m': '0.0'},
     },
 }
 

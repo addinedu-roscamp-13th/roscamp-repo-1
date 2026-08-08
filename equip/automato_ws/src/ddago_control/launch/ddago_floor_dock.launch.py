@@ -78,19 +78,19 @@ def generate_launch_description():
         DeclareLaunchArgument('post_advance_m', default_value='0.0'),
         # 반복 시 도킹 완료 후 정지 유지[s] (post_advance_m>0 경로에서만 적용).
         DeclareLaunchArgument('post_dock_hold_sec', default_value='2.5'),
-        # 라이다 충돌 방지(opt-in). 후진-투-벽(TURN/REVERSE/HOLD) 제외. ⚠️lidar_front_deg·임계값 현장 튜닝.
-        DeclareLaunchArgument('obstacle_avoid', default_value='false'),
+        # 라이다 충돌 방지(기본 ON). 후진-투-벽(TURN/REVERSE/HOLD) 제외. ⚠️lidar_front_deg·임계값 현장 튜닝.
+        DeclareLaunchArgument('obstacle_avoid', default_value='true'),
         DeclareLaunchArgument('scan_topic', default_value='scan'),
-        DeclareLaunchArgument('obstacle_stop_m', default_value='0.10'),  # 100mm 이내만
+        DeclareLaunchArgument('obstacle_stop_m', default_value='0.15'),  # 150mm 이내(검출 밴드 100~150mm)
         DeclareLaunchArgument('obstacle_timeout', default_value='5.0'),
         DeclareLaunchArgument('lidar_front_deg', default_value='180.0'),  # 180° 뒤집힌 장착
         DeclareLaunchArgument('lidar_sector_deg', default_value='30.0'),  # 코너 기둥(±45°) 회피
         # 이보다 가까운 반사 무시 하한[m]. 기둥이 경계서 0.08로 튀어 0.10.
         DeclareLaunchArgument('obstacle_min_m', default_value='0.10'),
         DeclareLaunchArgument('obstacle_side_min_m', default_value='0.10'),
-        # ADVANCE 전방 조기정지 170mm / PLAN 후진 후방 조기정지 110mm.
+        # ADVANCE 전방 조기정지 170mm / PLAN 후진 후방 조기정지 150mm.
         DeclareLaunchArgument('advance_obstacle_m', default_value='0.17'),
-        DeclareLaunchArgument('plan_obstacle_m', default_value='0.13'),
+        DeclareLaunchArgument('plan_obstacle_m', default_value='0.15'),
         DeclareLaunchArgument('debug', default_value='false'),
         # 웹 스트리밍(뷰 전용 MJPEG). http://<로봇ip>:<stream_port>/
         DeclareLaunchArgument('stream', default_value='false'),

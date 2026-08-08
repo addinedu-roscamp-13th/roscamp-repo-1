@@ -66,6 +66,7 @@ import threading
 import time
 
 import rclpy
+from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -77,6 +78,23 @@ from automato_interfaces.srv import AnalyzeFrame, SaveDetection
 from sensor_msgs.msg import Image
 
 from dg_control.ai_client import AiTcpClient
+
+
+# 액션 goal 의 종료 상태를 사람이 읽을 수 있게. 로그·@@WIRE@@ 에 code 와 함께 남겨야
+#  '결과 내용은 0인데 실제로는 ABORTED' 같은 상황을 나중에 로그만 보고 분간할 수 있다.
+_GOAL_STATUS_NAME = {
+    GoalStatus.STATUS_UNKNOWN: 'UNKNOWN',
+    GoalStatus.STATUS_ACCEPTED: 'ACCEPTED',
+    GoalStatus.STATUS_EXECUTING: 'EXECUTING',
+    GoalStatus.STATUS_CANCELING: 'CANCELING',
+    GoalStatus.STATUS_SUCCEEDED: 'SUCCEEDED',
+    GoalStatus.STATUS_CANCELED: 'CANCELED',
+    GoalStatus.STATUS_ABORTED: 'ABORTED',
+}
+
+
+def _status_name(st):
+    return _GOAL_STATUS_NAME.get(st, '?(%s)' % st)
 
 
 def _find_ai_target_file():
@@ -547,10 +565,15 @@ class DcsNode(Node):
         result = act.Result()
         if r is not None:
             self._copy_fields(r, result)   # 값 손실 없이 그대로(축별 오차 포함)
-        else:
-            # 중계 자체가 실패(서버 없음/거부/무응답/취소). 도킹 result_code 에는
-            # 인프라 실패용 값이 따로 없으므로 3(중단)으로 보내고 사유는 message 에 담는다.
-            result.result_code = 3
+        if r is None or err:
+            # 실패 경로 두 가지가 여기로 모인다.
+            #   ① r is None  : 중계 자체가 실패(서버 없음/거부/무응답)
+            #   ② err 있음   : goal 이 SUCCEEDED 가 아닌 상태로 끝남(ABORTED/CANCELED/UNKNOWN)
+            # ②에서 result_code 가 0 으로 와 있을 수 있다(빈 결과). 그대로 두면 아래
+            # 게이트가 열려 도킹 안 된 자리에서 팔이 움직인다 → 반드시 0 이 아닌 값으로 덮는다.
+            # 도킹 result_code 에 인프라 실패용 값이 따로 없으므로 3(중단)을 쓴다.
+            if result.result_code == 0:
+                result.result_code = 3
             result.message = err or '중계 실패'
 
         # 취소 요청이 와 있으면 결과가 무엇이든 CANCELED 로 끝낸다. ROS2 goal 은
@@ -618,10 +641,19 @@ class DcsNode(Node):
             return None, 'DdaGo %s goal 거부' % act.__name__
 
         # 결과 대기. 그 사이 ACS 가 취소하면(E2 22-1) DdaGo goal 도 취소 중계한다.
+        #
+        # ⚠️ status 를 반드시 함께 본다. result 내용만 믿으면 안 된다 —
+        #    result_code 는 0 이 성공이라 **빈 결과(전 필드 0) = 성공**으로 읽힌다(fail-open).
+        #    08-05 실기에서 로봇이 '실패(1)' 로 abort 했는데 DCS 는 code=0 으로 받아
+        #    E3 게이트를 열었다(팔이 도킹 안 된 자리에서 동작). 원인은 로봇 rclpy 7.1.9 가
+        #    인자 없는 abort() 에서 빈 Result 를 먼저 보내버리는 것 → status 는 ABORTED 로
+        #    정확히 왔었다. 로봇 쪽을 고쳐도 통신 이상·서버 예외에서 같은 일이 나므로
+        #    중계자 입장에서 status 확인은 상시 안전장치다.
         rholder = {}
         res_ev = threading.Event()
         gh.get_result_async().add_done_callback(
-            lambda f: (rholder.__setitem__('r', f.result().result), res_ev.set()))
+            lambda f: (rholder.update(r=f.result().result, st=f.result().status),
+                       res_ev.set()))
         waited = 0.0
         cancel_sent = False
         while not res_ev.wait(0.5):
@@ -639,10 +671,18 @@ class DcsNode(Node):
         r = rholder.get('r')
         if r is None:
             return None, 'DdaGo 도킹 결과 없음'
+        st = rholder.get('st')
         self.get_logger().info(
-            'DdaGo 도킹 종료: 방식=%s code=%d lateral=%.3fm yaw=%.3frad'
-            % (kind, r.result_code, r.final_lateral_m, r.final_yaw_error))
-        self._wire('to_dcs', '%s(→DdaGo)/result' % act.__name__, self._msg_to_dict(r))
+            'DdaGo 도킹 종료: 방식=%s status=%s code=%d lateral=%.3fm yaw=%.3frad'
+            % (kind, _status_name(st), r.result_code, r.final_lateral_m, r.final_yaw_error))
+        self._wire('to_dcs', '%s(→DdaGo)/result' % act.__name__,
+                   dict(self._msg_to_dict(r), _status=_status_name(st)))
+        if st != GoalStatus.STATUS_SUCCEEDED:
+            # 성공이 아니면 result 내용과 무관하게 실패다(사유는 err 로 올린다).
+            #  단 result 자체는 그대로 돌려준다 — 축별 오차(final_lateral_m/final_yaw_error)는
+            #  ACS 가 실패 원인을 판정·기록하는 근거라, 실패라고 버리면 어느 축이 문제였는지
+            #  알 수 없게 된다. '실패로 처리하되 값은 보존' 이 맞다.
+            return r, 'DdaGo 도킹 %s (code=%d)' % (_status_name(st), r.result_code)
         return r, ''
 
     # ===== S2 E3~E5 Harvest 중계 — ACS 의 수확 지시를 Ddagi 로 그대로 =====

@@ -27,9 +27,13 @@ API
     GET  /api/map                   → 맵 이미지(raw PGM base64) + origin/resolution
     GET|POST /api/home              → 충전소 위치 조회·저장(robot_id 별)
     POST /api/home/clear            → 저장된 충전소 위치 삭제
-    GET  /api/pose/once             → /amcl_pose 를 1회 읽음(rosbridge 폴백)
-    POST /api/return/start          → 2단계 복귀 시작(주행 → 도킹)
+    GET  /api/pose/once             → 로봇 위치 1회 (map→base_footprint TF, /amcl_pose 폴백)
+  ── 웨이포인트 경로 ──
+    GET|POST /api/waypoints         → 지도에서 찍은 웨이포인트 조회·저장(통째로)
+    POST /api/route/start           → 선택한 순서대로 주행 → (확인) → 도킹
+    POST /api/return/start          → 2단계 복귀 시작(주행 → **확인** → 도킹)
     GET  /api/return/status         → 진행 상황 폴링
+    POST /api/return/confirm        → 접근점 도착 확인 → 도킹 진행 승인
     POST /api/return/stop           → 취소 요청 + 프로세스 종료 + cmd_vel 0
 """
 import base64
@@ -46,14 +50,14 @@ from urllib.parse import quote, urlparse, parse_qs
 import cmdcfg
 from dgcommon import (DASH, WEB_DIR, agent_call, clear_wire, first_robot, is_up,
                       load_map, map_fingerprint, occupancy_at, read_agents,
-                      read_home, read_wire, robot_id, single_instance,
-                      tail_bytes, write_home)
+                      read_home, read_waypoints, read_wire, robot_id,
+                      single_instance, tail_bytes, write_home, write_waypoints)
 
 PORT = int(os.environ.get('DG_REAL_PORT', '8010'))
 
 # 에이전트 설치·기동만은 **SSH 로** 한다. 에이전트가 곧 통신 채널이라, 그게 죽어 있으면
 # 에이전트를 통해 살릴 수 없다(로봇을 재부팅하면 늘 이 상황이 된다).
-REALBOARD = os.path.join(os.path.dirname(WEB_DIR), 'realboard.sh')
+REALBOARD = os.path.join(WEB_DIR, 'realboard.sh')   # 08-06: dg_web/ 안으로 이동
 
 # 전체 기동 순서. 로봇이 먼저 서야 노트북 쪽이 붙을 대상이 생긴다.
 #   ① 로봇 bringup(라이다·모터·odom) → ② rosbridge → ③ DdaGo Control(navigate·도킹) →
@@ -68,13 +72,26 @@ STACK_ORDER = ['robot-bringup', 'real-rosbridge', 'robot-ddago', 'real-nav2',
 
 # ── 충전소 복귀 ─────────────────────────────────────────────────────────
 RETURN_KEYS = ('real-return-nav', 'real-return-dock')
+ROUTE_KEYS = ('real-route-nav', 'real-route-floor-dock')
+# 웨이포인트 저장 직전 스냅샷. 실수로 덮었을 때 되돌릴 마지막 수단.
+WAYPOINTS_BAK = os.path.join(WEB_DIR, 'waypoints.local.bak.json')
+DOCK_KIND = {'floor': ('real-route-floor-dock', 'H마커 도킹 (FloorDock)'),
+             'reflective': ('real-return-dock', '반사테이프 도킹 (ReflectiveDock)')}
 NAV_TIMEOUT_S, DOCK_TIMEOUT_S = 240.0, 180.0
 POSE_MAX_AGE_S = 15.0          # 이보다 오래된 위치로는 주행을 시작하지 않는다
+# 복귀 진행 로그. 예전엔 버퍼 400줄에 응답은 60줄뿐이라 화면에서 스크롤할 게 거의 없었다
+#  — 실패 원인은 앞쪽 줄에 있는 경우가 많은데 그게 잘려 나갔다.
+RETURN_LOG_KEEP = 3000         # 서버가 스텝별로 들고 있는 줄 수
+RETURN_LOG_DEFAULT = 500       # 화면이 안 지정하면 보내는 줄 수
+# 접근점 도착 후 도킹 확인을 기다리는 상한. 무한 대기하면 화면을 닫았을 때 프로세스가 남는다.
+DOCK_CONFIRM_TIMEOUT_S = 300.0
 NAV2_PARAMS = os.path.expanduser(
-    '~/dev_ws/pinky_nav_ws/src/pinky_navigation/params/nav2_params.yaml')
+    '~/pinky_pro/install/pinky_navigation/share/pinky_navigation/params/nav2_params_pinky2.yaml')
 
 _RETURN = {'active': False, 'run_id': 0, 'phase': '', 'seq': 0, 'steps': [],
-           'target': None, 'error': None, 'cancel': False, 'procs': []}
+           'target': None, 'error': None, 'cancel': False, 'procs': [],
+           # 접근점 도착 후 도킹 확인 대기 상태. await_dock=True 면 화면이 확인 버튼을 띄운다.
+           'await_dock': False, 'dock_ok': False, 'awaited_at': 0.0}
 _RETURN_LOCK = threading.Lock()
 
 
@@ -152,7 +169,46 @@ def snapshot(ttl=3.0):
     return data
 
 
+def check_requires(key):
+    """cmdcfg 의 requires 를 확인한다. 못 갖췄으면 사유 문자열, 괜찮으면 None.
+
+    선행 서비스 없이 띄우면 '떴다가 아무것도 안 되는' 상태가 되는데, 화면에는 그냥
+    기동 실패로만 보여 원인을 짚기 어렵다(Nav2 가 대표적 — 로봇 TF·스캔이 없으면
+    lifecycle_manager 가 무한 대기로 멎는다). 그래서 시작 전에 걸러 사유를 알려준다.
+    """
+    need = cmdcfg.DEFAULTS[key].get('requires') or []
+    if not need:
+        return None
+
+    # '전체 기동'은 bringup 을 띄운 직후 곧바로 다음 것으로 넘어간다. 로봇 노드가 실제로
+    #  보이기까지 몇 초 걸리므로, 바로 판정하면 멀쩡한 순서인데도 막힌다 → 잠깐 기다린다.
+    #  정말 안 떠 있으면 이 시간만큼 늦게 사유가 나올 뿐, 결과는 같다.
+    deadline = time.time() + 12.0
+    st = service_status()
+    while any(st.get(d) != 'up' for d in need) and time.time() < deadline:
+        time.sleep(2.0)
+        _cache['data'] = None      # 캐시를 비워야 새로 읽는다
+        st = service_status()
+
+    for dep in need:
+        s = st.get(dep)
+        if s == 'up':
+            continue
+        label = cmdcfg.DEFAULTS.get(dep, {}).get('label', dep)
+        if s == 'unknown':
+            return ('%s(%s) 상태를 확인할 수 없습니다 — 로봇에 닿지 않습니다. '
+                    '로봇 전원·네트워크를 확인한 뒤 다시 시도하세요.' % (label, dep))
+        return ('%s(%s) 가 먼저 떠 있어야 합니다 — 로봇의 odom TF 와 /scan 이 없으면 '
+                'Nav2 는 활성화되지 못하고 멎습니다. %s 를 먼저 기동하세요.'
+                % (label, dep, dep))
+    return None
+
+
 def svc_start(key):
+    why = check_requires(key)
+    if why:
+        return {'key': key, 'where': 'local' if not is_robot(key) else first_robot(),
+                'ok': False, 'error': why, 'lines': ['[선행 조건 미충족] ' + why]}
     if not is_robot(key):
         r = subprocess.run(['bash', DASH, 'start-key', key],
                            capture_output=True, text=True, timeout=30)
@@ -218,35 +274,6 @@ def svc_log(key, n=400):
             'lines': res.get('lines') or ['(아직 로그 없음 — 이 화면에서 기동한 적이 없습니다)']}
 
 
-def battery_from_telemetry(max_age=40.0):
-    """배터리의 **정본은 ROS 토픽** /battery/percent·/battery/voltage 다.
-    그 값은 이미 여기까지 와 있다 — battery_publisher(5초 주기) → telemetry_publisher 가
-    DdagoTelemetry 에 실어 DCS 로 보내고, DCS 가 @@WIRE@@ 로 로그에 남긴다.
-    새로 구독할 필요 없이 그 마지막 값을 읽는다(구독자를 하나 더 붙이면 DDS 만 더 시끄러워진다).
-
-    단 이 경로는 bringup+DCS 가 떠 있어야 산다. 스택이 내려가 있으면 값이 없고,
-    그때는 에이전트가 I2C 를 직접 읽은 값을 쓴다(/system 의 battery)."""
-    for ln in reversed(tail_bytes('/tmp/dash_dcs.log', 262144)):
-        i = ln.find('@@WIRE@@ ')
-        if i < 0:
-            continue
-        try:
-            rec = json.loads(ln[i + 9:])
-        except ValueError:
-            continue
-        if rec.get('iface') != 'DdagoTelemetry':
-            continue
-        pl = rec.get('payload') or {}
-        if 'battery_percent' not in pl:
-            continue
-        age = time.time() - (rec.get('ts') or 0)
-        if age > max_age:
-            return None      # 낡은 값을 지금 값인 양 보여주면 안 된다
-        return {'source': 'topic', 'percent': pl.get('battery_percent'),
-                'voltage': pl.get('battery_voltage'), 'age_s': round(age, 1)}
-    return None
-
-
 def agent_restart():
     """realboard.sh agent — scp 로 dg_agent.py 를 올리고 ssh 로 다시 띄운다.
     토큰은 스크립트가 agents.local.json 에서 읽으므로 여기서 다루지 않는다(로그에도 안 남는다)."""
@@ -261,7 +288,19 @@ def agent_restart():
     time.sleep(1.0)
     h = agent_call(first_robot(), '/health', timeout=5)
     ok = not h.get('error')
-    lines.append('— 확인: ' + ('에이전트 응답 OK (%s)' % h.get('host') if ok else h.get('error')))
+    if not ok:
+        lines.append('— 확인: ' + str(h.get('error')))
+    else:
+        # '응답 OK' 만으로는 재기동 여부를 알 수 없다(옛 프로세스도 똑같이 응답한다).
+        #  pid·agent_uptime_s 를 같이 보여줘 새로 뜬 것인지 눈으로 확인되게 한다.
+        age = h.get('agent_uptime_s')
+        fresh = isinstance(age, (int, float)) and age < 30
+        lines.append('— 확인: 에이전트 응답 OK (%s) · PID %s · 기동 후 %s초'
+                     % (h.get('host'), h.get('pid', '?'),
+                        age if age is not None else '?'))
+        lines.append('— 판정: ' + ('새 프로세스로 재기동됨' if fresh else
+                                   '⚠ 기동 후 시간이 오래됐습니다 — 재기동되지 않았을 수 있습니다'
+                                   ' (에이전트가 구버전이면 이 값이 안 나옵니다)'))
     _cache['data'] = None      # 상태 캐시 무효화 — 방금 살아났을 수 있다
     return {'ok': ok, 'lines': lines}
 
@@ -315,14 +354,16 @@ def nav2_initial_pose():
     return out if len(out) == 3 else None
 
 
-def approach_point(home):
-    """저장된 충전소 pose 는 보통 **도킹된 상태**에서 찍은 것이다. 반사테이프 도킹은
-    후진 접붙이기라 그 자리를 목표로 주면 충전소에 처박는다. 헤딩 방향으로
-    approach_offset_m 만큼 앞을 목표로 삼는다(도킹 FSM 이 나머지 정렬을 한다)."""
-    d = float(home.get('approach_offset_m') or 0.0)
-    yaw = float(home['yaw'])
-    return {'x': float(home['x']) + d * math.cos(yaw),
-            'y': float(home['y']) + d * math.sin(yaw), 'yaw': yaw}
+def nav_target(home):
+    """저장된 **충전소 진입점 그 자체**가 주행 목표다. 어떤 오프셋도 더하지 않는다.
+
+    08-06 정정: 예전에는 '저장값 = 도킹된 충전소 자리'로 보고 헤딩 방향으로
+    approach_offset_m(0.3m) 앞을 계산했다. 실제 운용은 **저장하는 위치가 이미 진입점**이라
+    (사용자가 도킹 시작 자리에 로봇을 세우고 저장한다) 오프셋을 또 더해 엉뚱한 곳으로 주행했다.
+    오프셋 개념 자체를 없앴다 — 자리를 바꾸려면 **저장 위치를 다시 잡는다**.
+    화면에서 눈으로 보고 저장하므로 그게 더 직관적이고 어긋날 여지가 없다.
+    """
+    return {'x': float(home['x']), 'y': float(home['y']), 'yaw': float(home['yaw'])}
 
 
 def return_precheck(body):
@@ -367,20 +408,32 @@ def return_precheck(body):
         return {'ok': False, 'error': "위치 frame 이 map 이 아닙니다: %s" % pose['frame_id']}
     age = float(pose.get('age_s') or 0.0)
     if age > POSE_MAX_AGE_S:
-        return {'ok': False, 'error': '로봇 위치가 오래됐습니다(%.0f초 전) — 갱신을 기다리세요' % age}
+        # 화면이 보낸 값이 낡았다고 바로 막지 않는다 — 그 값은 /amcl_pose 기반이라
+        #  서 있는 로봇에서는 낡는 것이 정상이다(update_min_d). TF 로 다시 읽어 본다.
+        tf = pose_tf()
+        if tf.get('ok') and float(tf.get('age_s') or 0.0) <= POSE_MAX_AGE_S:
+            px, py = tf['x'], tf['y']
+            pose = dict(pose, x=px, y=py, yaw=tf['yaw'],
+                        age_s=tf['age_s'], source='tf')
+            age = float(tf['age_s'])
+        else:
+            return {'ok': False,
+                    'error': '로봇 위치를 확인할 수 없습니다 — map→base_footprint TF 가 '
+                             '흐르지 않습니다(%s). Nav2·bringup 기동과 초기 위치를 확인하세요'
+                             % (tf.get('error') or '%.0f초 전' % float(tf.get('age_s') or 0))}
 
     for k in RETURN_KEYS:
         if cmdcfg.cmdline_of(k):
             return {'ok': False, 'error': "'%s' 의 명령줄 전체가 편집돼 있어 좌표 주입이 "
                                           "무시됩니다 — 설정에서 기본값으로 되돌리세요" % k}
 
-    tgt = approach_point(home)
+    tgt = nav_target(home)
     occ = occupancy_at(m, tgt['x'], tgt['y'])
     if occ is None:
         return {'ok': False, 'error': '목표점(%.2f, %.2f)이 맵 밖입니다 — '
-                                      'approach_offset_m 을 줄이세요' % (tgt['x'], tgt['y'])}
+                                      '진입점 위치를 다시 저장하세요' % (tgt['x'], tgt['y'])}
     if occ['state'] == 'occupied':
-        return {'ok': False, 'error': '목표점이 점유 셀(벽)입니다 — approach_offset_m 을 줄이세요'}
+        return {'ok': False, 'error': '목표점이 점유 셀(벽)입니다 — 진입점 위치를 다시 저장하세요'}
 
     diag = math.hypot(m['width'] * m['resolution'], m['height'] * m['resolution'])
     dist = math.hypot(px - float(home['x']), py - float(home['y']))
@@ -433,7 +486,7 @@ def _run_step(step, cmdline, timeout):
         for ln in p.stdout:
             ln = ln.rstrip('\n')
             step['lines'].append(ln)
-            del step['lines'][:-400]
+            del step['lines'][:-RETURN_LOG_KEEP]
             if _NAV_OK.search(ln):
                 ok = True
             m = _NAV_BAD.search(ln)
@@ -508,8 +561,35 @@ def _new_step(key, title):
             'elapsed_s': 0.0, 'lines': [], 'error': None}
 
 
+def _await_dock_confirm():
+    """① 진입점 주행이 끝나면 **여기서 멈추고 사용자 확인을 기다린다**(사용자 지시).
+
+    후진 도킹은 되돌릴 수 없는 기동이다 — 접근점에 제대로 섰는지 눈으로 보고 시작하는 것과
+    주행이 끝나자마자 이어서 후진하는 것은 사고의 대가가 다르다(08-05 에 벽 충돌로 로봇을
+    손으로 집어낸 적이 있다). 그래서 자동 연결을 끊고 확인을 받는다.
+
+    True=진행 / False=취소·타임아웃. 무한 대기는 하지 않는다 — 화면을 닫아 버리면
+    프로세스가 영영 남는다.
+    """
+    _bump(phase='await_dock', await_dock=True, awaited_at=time.time())
+    deadline = time.time() + DOCK_CONFIRM_TIMEOUT_S
+    while time.time() < deadline:
+        with _RETURN_LOCK:
+            if _RETURN['cancel']:
+                _RETURN['await_dock'] = False
+                return False
+            if _RETURN.get('dock_ok'):
+                _RETURN['await_dock'] = False
+                _RETURN['dock_ok'] = False
+                return True
+        time.sleep(0.3)
+    _bump(await_dock=False,
+          error='도킹 확인을 %d초 안에 받지 못해 중단했습니다' % int(DOCK_CONFIRM_TIMEOUT_S))
+    return False
+
+
 def _return_worker(home, target):
-    """① 주행 → ② 도킹. **앞 단계가 실패하면 즉시 멈춘다.**
+    """① 주행 → (확인) → ② 도킹. **앞 단계가 실패하면 즉시 멈춘다.**
     stack_up() 은 '실패해도 계속'이지만 여기는 정반대다 — 잘못된 위치에서 후진 도킹을
     시작하는 것과, 진단용으로 끝까지 훑어보는 것은 실패의 대가가 다르다."""
     steps = _RETURN['steps']
@@ -524,6 +604,12 @@ def _return_worker(home, target):
             if _RETURN['cancel']:
                 step['state'] = 'canceled'
                 break
+            # 도킹 직전에만 확인을 받는다. 주행은 확인 없이 그대로 간다.
+            if phase == 'dock':
+                steps[0]['progress'] = '진입점 도착 — 도킹 확인 대기'
+                if not _await_dock_confirm():
+                    step['state'] = 'canceled'
+                    break
             step['state'] = 'running'
             _bump(phase=phase)
             line = cmdcfg.effective(step['key'], extra=extra)
@@ -533,7 +619,7 @@ def _return_worker(home, target):
     except Exception as e:
         _bump(error='복귀 중 오류: %s' % e)
     finally:
-        _bump(active=False, phase='done')
+        _bump(active=False, phase='done', await_dock=False)
 
 
 def return_start(body):
@@ -556,15 +642,222 @@ def return_start(body):
     return {'ok': True, 'run_id': _RETURN['run_id'], 'target': chk['target']}
 
 
-def return_status():
+def return_status(n=RETURN_LOG_DEFAULT):
+    n = max(50, min(int(n or RETURN_LOG_DEFAULT), RETURN_LOG_KEEP))
     with _RETURN_LOCK:
-        steps = [dict(st, lines=st['lines'][-60:]) for st in _RETURN['steps']]
-        out = {k: _RETURN[k] for k in ('active', 'run_id', 'phase', 'seq', 'target', 'error')}
+        steps = [dict(st, lines=st['lines'][-n:]) for st in _RETURN['steps']]
+        out = {k: _RETURN[k] for k in ('active', 'run_id', 'phase', 'seq', 'target',
+                                       'error', 'await_dock')}
+        # 남은 확인 시간을 같이 준다 — 화면이 '언제까지 눌러야 하는지' 보여줄 수 있게.
+        if _RETURN['await_dock']:
+            left = DOCK_CONFIRM_TIMEOUT_S - (time.time() - (_RETURN['awaited_at'] or 0))
+            out['await_left_s'] = max(0, round(left))
     out['steps'] = steps
     # Nav2 는 백그라운드로 돌며 자기 로그에 쌓는다 — goal 을 거절한 진짜 이유는
     # CLI 출력이 아니라 거기 있다.
     out['extra'] = extra_logs('real-nav2', 120)
     return out
+
+
+def return_confirm_dock():
+    """접근점 도착 확인 → 도킹 진행 승인. 대기 중이 아닐 때 눌리면 아무 일도 하지 않는다
+    (폴링 지연으로 버튼이 잠깐 남아 있을 수 있어, 늦게 눌러도 사고가 나지 않게)."""
+    with _RETURN_LOCK:
+        if not _RETURN['active']:
+            return {'ok': False, 'error': '복귀가 진행 중이 아닙니다'}
+        if not _RETURN['await_dock']:
+            return {'ok': False, 'error': '지금은 도킹 확인 단계가 아닙니다'}
+        _RETURN['dock_ok'] = True
+        _RETURN['seq'] += 1
+    return {'ok': True, 'lines': ['도킹 진행 승인 — 후진 도킹을 시작합니다']}
+
+
+
+# ── 지도에서 찍은 웨이포인트 ─────────────────────────────────────────────
+def wp_list():
+    return (read_waypoints().get(robot_id()) or {}).get('points') or []
+
+
+def wp_save(points):
+    """통째로 덮어쓴다. 화면이 목록 전체를 들고 있으므로 부분 갱신 API 를 따로 두지 않는다
+    (부분 갱신은 화면과 서버의 순서가 어긋날 때 조용히 깨진다)."""
+    out, seen = [], set()
+    for i, p in enumerate(points or []):
+        try:
+            x, y = float(p['x']), float(p['y'])
+        except (KeyError, TypeError, ValueError):
+            return {'ok': False, 'error': '%d번째 점의 좌표가 잘못됐습니다' % (i + 1)}
+        dock = p.get('dock') or 'none'
+        if dock not in ('none', 'floor', 'reflective'):
+            return {'ok': False, 'error': '알 수 없는 도킹 종류: %s' % dock}
+        wid = int(p.get('id') or (i + 1))
+        while wid in seen:          # id 는 Feedback 추적용이라 겹치면 안 된다
+            wid += 1
+        seen.add(wid)
+        out.append({'id': wid, 'name': (p.get('name') or 'WP%d' % wid)[:40],
+                    'x': x, 'y': y, 'yaw': float(p.get('yaw') or 0.0),
+                    # yaw_fixed: 사람이 정한 방향(지도에서 끌기·각도 입력·로봇 자세 복사).
+                    #  켜져 있으면 '다음 점 바라보기' 자동 계산이 덮지 않는다.
+                    'yaw_fixed': bool(p.get('yaw_fixed')),
+                    'dock': dock, 'task_point_id': (p.get('task_point_id') or '')[:40]})
+    data = read_waypoints()
+    # 덮어쓰기 전에 직전 내용을 남긴다. 지도를 클릭해 하나하나 찍어 만든 값이라 날리면
+    #  복구할 방법이 없다(08-07 에 실제로 테스트가 사용자 경로를 덮어썼다).
+    prev = (data.get(robot_id()) or {}).get('points')
+    if prev:
+        try:
+            with open(WAYPOINTS_BAK, 'w', encoding='utf-8') as f:
+                json.dump({'robot_id': robot_id(), 'saved_at': time.time(),
+                           'points': prev}, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass          # 백업 실패가 저장을 막을 이유는 없다
+    data[robot_id()] = {'points': out, 'saved_at': time.time(),
+                        'map': map_fingerprint(load_map())}
+    write_waypoints(data)
+    return {'ok': True, 'points': out}
+
+
+def _is_dock_target(p, i, last):
+    """이 점에서 실제로 도킹을 할 것인가. **경로의 마지막 점**일 때만 참이다.
+    중간에 낀 도킹 지점은 통과 노드로 다룬다."""
+    return i == last and p.get('dock', 'none') != 'none'
+
+
+def _holds_yaw(p, i, last):
+    """이 점에서 목표 방향으로 **고쳐 서야** 하는가 — 마지막 점에서만 참이다.
+
+    중간 지점은 도킹 속성이 붙어 있든 방향을 직접 지정했든 **그냥 지나간다**(사용자 지시).
+    통과 노드마다 고개를 돌리면 지점마다 멈칫거리고, 경로가 길수록 손해만 커진다
+    (Waypoint.msg: "통과 노드 전반에 켜면 안 된다 — 두리번거린다").
+    """
+    if i != last:
+        return False
+    return p.get('dock', 'none') != 'none' or bool(p.get('yaw_fixed'))
+
+
+def _wp_yaw_chain(pts):
+    """yaw 는 **다음 점을 바라보게** 자동 계산한다(사용자 선택).
+    마지막 점은 직전 방향을 유지한다 — 바라볼 다음 점이 없다.
+
+    자동에서 빠지는 두 경우:
+      · 도킹이 걸린 점 — 마커를 정면에서 봐야 도킹이 시작된다. '가는 방향'으로 서면 실패한다
+        (Waypoint.msg 의 hold_yaw 설명과 같은 이유)
+      · yaw_fixed 인 점 — 사람이 지도에서 끌거나 각도를 입력해 정한 값이다. 덮으면 안 된다
+    """
+    out = []
+    last = len(pts) - 1
+    for i, p in enumerate(pts):
+        yaw = float(p.get('yaw') or 0.0)
+        # 도킹 속성은 **마지막 점에서만** 의미가 있다. 중간에 낀 도킹 지점은 그냥 지나가는
+        #  통과 노드로 다룬다(사용자 지시) — 안 그러면 지날 때마다 마커 방향으로 고쳐 서느라
+        #  멈칫거리고, 경로가 길수록 손해만 커진다.
+        if not _holds_yaw(p, i, last):
+            if i + 1 < len(pts):
+                yaw = math.atan2(pts[i + 1]['y'] - p['y'], pts[i + 1]['x'] - p['x'])
+            elif out:
+                yaw = out[-1]['yaw']
+        out.append(dict(p, yaw=yaw))
+    return out
+
+
+def _wp_goal_yaml(pts):
+    """Navigate goal 의 waypoints 배열 문자열. hold_yaw 는 **도킹 지점만** 켠다 —
+    통과 노드마다 켜면 지점마다 고개를 돌리느라 두리번거린다(Waypoint.msg 주석)."""
+    items = []
+    last = len(pts) - 1
+    for i, p in enumerate(pts):
+        # hold_yaw 는 **도킹할 마지막 점**과 사용자가 방향을 직접 정한 점에만 켠다.
+        #  통과 노드 전반에 켜면 지점마다 고개를 돌리느라 두리번거린다(Waypoint.msg 주석).
+        hold = _holds_yaw(p, i, last)
+        items.append(
+            '{waypoint_id: %d, x: %.4f, y: %.4f, yaw: %.4f, capture: false, hold_yaw: %s}'
+            % (int(p['id']), p['x'], p['y'], p['yaw'], 'true' if hold else 'false'))
+    return ', '.join(items)
+
+
+def route_start(body):
+    """선택한 웨이포인트를 **순서대로** 주행하고, 마지막 점에 도킹이 걸려 있으면
+    도착 확인을 받은 뒤 도킹한다. 복귀와 같은 진행/취소/확인 machinery 를 그대로 쓴다."""
+    if _RETURN['active']:
+        return {'ok': False, 'code': 409, 'error': '이미 주행이 진행 중입니다'}
+    ids = body.get('ids') or []
+    if not ids:
+        return {'ok': False, 'error': '주행할 웨이포인트를 선택하세요'}
+    by = {int(p['id']): p for p in wp_list()}
+    pts = [by[int(i)] for i in ids if int(i) in by]
+    if len(pts) != len(ids):
+        return {'ok': False, 'error': '저장되지 않은 웨이포인트가 섞여 있습니다 — 다시 저장하세요'}
+
+    m = load_map()
+    if not m.get('ok'):
+        return {'ok': False, 'error': '맵을 읽지 못해 시작할 수 없습니다'}
+    for p in pts:
+        # ⚠️ occupancy_at 은 **dict** 를 돌려준다({'p','state','col','row'}) — 숫자로 비교하면
+        #    TypeError 로 응답이 통째로 죽는다(08-07 실제 발생). return_precheck 과 같은 방식으로 본다.
+        occ = occupancy_at(m, p['x'], p['y'])
+        if occ is None:
+            return {'ok': False, 'error': "'%s' 가 맵 범위 밖입니다" % p['name']}
+        if occ['state'] == 'occupied':
+            return {'ok': False, 'error': "'%s' 가 점유 셀(벽)입니다 — 위치를 다시 잡으세요" % p['name']}
+
+    pts = _wp_yaw_chain(pts)
+    last = pts[-1]
+    dock_kind = last.get('dock', 'none')
+    if dock_kind != 'none' and not last.get('task_point_id'):
+        return {'ok': False,
+                'error': "'%s' 에 도킹이 걸려 있는데 task_point_id 가 비었습니다" % last['name']}
+
+    steps = [_new_step('real-route-nav',
+                       '① 경로 주행 (%d개 지점)' % len(pts))]
+    if dock_kind != 'none':
+        steps.append(_new_step(DOCK_KIND[dock_kind][0],
+                               '② %s — %s' % (DOCK_KIND[dock_kind][1], last['task_point_id'])))
+    with _RETURN_LOCK:
+        _RETURN.update({
+            'active': True, 'run_id': _RETURN['run_id'] + 1, 'phase': 'start',
+            'seq': _RETURN['seq'] + 1, 'steps': steps, 'error': None, 'cancel': False,
+            'procs': [], 'await_dock': False, 'dock_ok': False,
+            'target': {'x': last['x'], 'y': last['y'], 'yaw': last['yaw']}})
+    # auto_dock: 시작할 때 이미 '도킹까지 진행'을 승인받았으면 도착 확인을 건너뛴다.
+    #  결정 시점을 앞으로 당긴 것일 뿐, 확인 없이 도킹하는 경로는 만들지 않는다.
+    auto_dock = bool(body.get('auto_dock'))
+    threading.Thread(target=_route_worker, args=(pts, dock_kind, auto_dock),
+                     daemon=True).start()
+    return {'ok': True, 'run_id': _RETURN['run_id'], 'points': pts,
+            'auto_dock': auto_dock}
+
+
+def _route_worker(pts, dock_kind, auto_dock=False):
+    steps = _RETURN['steps']
+    try:
+        steps[0]['state'] = 'running'
+        _bump(phase='nav')
+        line = cmdcfg.effective('real-route-nav', extra={'waypoints': _wp_goal_yaml(pts)})
+        steps[0]['lines'].append('$ ' + line)
+        if not _run_step(steps[0], line, NAV_TIMEOUT_S * max(1, len(pts))):
+            return
+        if dock_kind == 'none':
+            return
+        if auto_dock:
+            steps[0]['progress'] = '도착 — 자동 도킹(시작 시 승인됨)'
+            if _RETURN['cancel']:
+                steps[1]['state'] = 'canceled'
+                return
+        else:
+            steps[0]['progress'] = '도착 — 도킹 확인 대기'
+            if not _await_dock_confirm():
+                steps[1]['state'] = 'canceled'
+                return
+        steps[1]['state'] = 'running'
+        _bump(phase='dock')
+        key = DOCK_KIND[dock_kind][0]
+        line = cmdcfg.effective(key, extra={'task_point_id': pts[-1]['task_point_id']})
+        steps[1]['lines'].append('$ ' + line)
+        _run_step(steps[1], line, DOCK_TIMEOUT_S)
+    except Exception as e:
+        _bump(error='경로 주행 중 오류: %s' % e)
+    finally:
+        _bump(active=False, phase='done', await_dock=False)
 
 
 def _cancel_all():
@@ -635,6 +928,42 @@ def return_stop():
     return {'ok': True, 'lines': lines}
 
 
+def pose_tf():
+    """map→base_footprint TF 로 로봇 위치를 읽는다. **위치의 정본은 이쪽이다.**
+
+    ⚠️ 나이 판정에 /amcl_pose 를 쓰면 안 된다 — amcl 은 update_min_d(10cm)·update_min_a
+       를 넘겨 움직였을 때만 발행한다. 그래서 **서 있는 로봇에서는 그 값이 무한정 낡는다**
+       (08-06: '위치가 오래됐습니다(216초 전) — 갱신을 기다리세요' 로 복귀 시작이 막혔다.
+       그런데 움직이지 않는 한 영원히 갱신되지 않으니, 안내가 실행 불가능한 조건을 요구했다).
+       TF 는 amcl 이 갱신하지 않아도 계속 브로드캐스트되고, Nav2 의 costmap·planner 도
+       위치를 TF 로 본다 → 판정 근거를 Nav2 와 같은 것으로 맞춘다.
+
+    tf2_echo 는 1초 주기로 계속 찍으므로 잠깐 돌리고 **마지막 블록**을 쓴다.
+    """
+    cmd = 'timeout 6 ros2 run tf2_ros tf2_echo map base_footprint'
+    try:
+        r = subprocess.run(['bash', DASH, 'run-cmdline', 'posetf', cmd],
+                           capture_output=True, text=True, timeout=25)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {'ok': False, 'error': 'TF 조회 실행 실패: %s' % e}
+    txt = r.stdout + r.stderr
+    for blk in reversed(txt.split('At time ')[1:]):
+        try:
+            stamp = float(blk.split('\n', 1)[0].strip())
+        except (ValueError, IndexError):
+            continue
+        tr = re.search(r'Translation:\s*\[\s*(-?[\d.eE+]+),\s*(-?[\d.eE+]+)', blk)
+        yw = re.search(r'RPY \(radian\)\s*\[\s*-?[\d.eE+]+,\s*-?[\d.eE+]+,\s*(-?[\d.eE+]+)\]', blk)
+        if tr and yw:
+            return {'ok': True, 'source': 'tf', 'frame_id': 'map',
+                    'x': float(tr.group(1)), 'y': float(tr.group(2)), 'yaw': float(yw.group(1)),
+                    'stamp_sec': stamp, 'age_s': round(time.time() - stamp, 1)}
+    return {'ok': False,
+            'error': 'map→base_footprint TF 를 읽지 못했습니다 — Nav2(amcl)와 로봇 bringup 이 '
+                     '떠 있고 초기 위치(2D Pose Estimate)가 잡혔는지 확인하세요',
+            'lines': txt.splitlines()[-15:]}
+
+
 def pose_once():
     """/amcl_pose 를 1회 읽는다. rosbridge 없이도 위치를 볼 수 있어야 하고,
     amcl 은 로봇이 10cm 이상 움직여야 발행하므로(update_min_d) 서 있는 로봇에서는
@@ -702,14 +1031,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(snapshot())
         if u.path == '/api/system':
             host = (q.get('host', [''])[0]) or first_robot()
-            d = agent_call(host, '/system', timeout=10)
-            # 배터리는 ROS 토픽 값(정본)을 우선한다. 스택이 내려가 있어 그 값이 없을 때만
-            # 에이전트가 I2C 로 직접 읽은 값을 쓴다.
-            if isinstance(d, dict) and not d.get('error'):
-                tb = battery_from_telemetry()
-                if tb:
-                    d['battery'] = tb
-            return self._json(d)
+            # 배터리는 여기 없다 — /battery/percent·voltage 토픽이 정본이고,
+            # 화면이 rosbridge 로 직접 구독한다(중계를 거칠수록 값이 늦고 갈린다).
+            return self._json(agent_call(host, '/system', timeout=10))
         if u.path == '/api/commands':
             return self._json(cmdcfg.describe_all('real'))
         if u.path == '/api/map':
@@ -727,7 +1051,7 @@ class Handler(BaseHTTPRequestHandler):
             out = {'robot_id': rid, 'home': home, 'map_ok': bool(m.get('ok')),
                    'map': map_fingerprint(m)}
             if home:
-                out['target'] = approach_point(home)
+                out['target'] = nav_target(home)
                 out['map_changed'] = bool(
                     home.get('map') and m.get('ok')
                     and (home['map'].get('origin') != m['origin']
@@ -736,9 +1060,15 @@ class Handler(BaseHTTPRequestHandler):
                          or home['map'].get('mtime') != m['mtime']))
             return self._json(out)
         if u.path == '/api/pose/once':
-            return self._json(pose_once())
+            # TF 를 먼저 본다 — 서 있는 로봇에서도 항상 최신이다(/amcl_pose 는 낡는다).
+            #  TF 가 없을 때만 latched /amcl_pose 로 폴백.
+            p = pose_tf()
+            return self._json(p if p.get('ok') else pose_once())
+        if u.path == '/api/waypoints':
+            return self._json({'ok': True, 'robot_id': robot_id(), 'points': wp_list()})
         if u.path == '/api/return/status':
-            return self._json(return_status())
+            # 화면이 보고 싶은 줄 수를 정한다(기본 500). 서버 버퍼 상한까지만.
+            return self._json(return_status(q.get('lines', [''])[0] or RETURN_LOG_DEFAULT))
         if u.path == '/api/wire':
             try:
                 limit = max(1, min(5000, int(q.get('limit', ['500'])[0])))
@@ -773,7 +1103,6 @@ class Handler(BaseHTTPRequestHandler):
             data[rid] = {
                 'x': x, 'y': y, 'yaw': yaw, 'frame_id': b.get('frame_id') or 'map',
                 'task_point_id': b.get('task_point_id') or 'CHARGE_01',
-                'approach_offset_m': float(b.get('approach_offset_m') or 0.30),
                 'saved_at': time.time(), 'source': b.get('source') or 'amcl_pose',
                 'cov': b.get('cov') or {},
                 # 맵 지문을 함께 박는다 — 맵을 다시 뜨면 저장 좌표가 조용히 딴 곳을 가리킨다
@@ -781,7 +1110,7 @@ class Handler(BaseHTTPRequestHandler):
             }
             write_home(data)
             return self._json({'ok': True, 'home': data[rid],
-                               'target': approach_point(data[rid])})
+                               'target': nav_target(data[rid])})
         if path == '/api/home/clear':
             rid = robot_id()
             data = read_home()
@@ -791,6 +1120,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/return/start':
             res = return_start(self._body())
             return self._json(res, res.get('code', 200 if res.get('ok') else 400))
+        if path == '/api/waypoints':
+            return self._json(wp_save((self._body() or {}).get('points')))
+        if path == '/api/route/start':
+            r = route_start(self._body() or {})
+            return self._json(r, r.get('code', 200 if r.get('ok') else 400))
+        if path == '/api/return/confirm':
+            return self._json(return_confirm_dock())
         if path == '/api/return/stop':
             return self._json(return_stop())
         if path == '/api/agent/restart':

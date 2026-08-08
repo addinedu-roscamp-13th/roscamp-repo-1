@@ -254,6 +254,9 @@ equip/automato_ws/dg_web/commands.local.json
 equip/automato_ws/dg_web/agents.local.json
 # 충전소 복귀 좌표 — 맵·장비마다 다른 값이라 커밋 대상이 아니다.
 equip/automato_ws/dg_web/home.local.json
+# 지도에서 찍은 웨이포인트(+저장 직전 백업) — 맵·장비마다 다른 값.
+equip/automato_ws/dg_web/waypoints.local.json
+equip/automato_ws/dg_web/waypoints.local.bak.json
 
 # 개인/로컬 파일 — 저장소에 올리지 않음
 /roscamp-repo-1.code-workspace

@@ -276,6 +276,33 @@ def test_dock_failure_error_exceeded(system):
     assert not dcs.is_docked(task_id)
 
 
+def test_dock_empty_abort_is_failure(system):
+    """**ABORTED 인데 결과가 빈 Result(전 필드 0)** 로 와도 DCS 가 실패로 처리한다.
+
+    회귀 방지 테스트. 08-05 실기에서 로봇은 '실패(1)' 로 abort 했는데 DCS 는 code=0 을
+    받아 성공으로 올리고 E3 게이트까지 열었다(도킹 안 된 자리에서 팔이 움직임). 원인은
+    로봇 rclpy 7.1.9 가 인자 없는 abort() 에서 빈 Result 를 먼저 보내는 것 —
+    **status 는 ABORTED 로 정확히 왔었다.** DCS 가 result 내용만 보고 status 를 버린 것이
+    실질 결함이라, 여기서는 status 로 걸러내는지를 본다.
+
+    ⚠️ 노트북 rclpy(7.1.11)에는 그 버그가 없어 시뮬이 일부러 이 모양을 만들지 않으면
+       재현 자체가 불가능하다 → ddago_sim 의 dock_mode='empty_abort'.
+    """
+    acs, dcs = system['acs'], system['dcs']
+    system['ddago'].dock_mode = 'empty_abort'
+    task_id = acs.send_harvest_move(num_waypoints=HARVEST_WP, seg_size=HARVEST_SEG)
+
+    assert _wait(lambda: acs.dock_done), '도킹 결과 미수신'
+    assert acs.last_dock_result.result_code != 0, \
+        '빈 결과(code=0)가 성공으로 올라감 — status 확인이 빠졌다'
+    assert not dcs.is_docked(task_id), '빈 결과인데 E3 게이트가 열림'
+
+    # 게이트가 실제로 팔을 막는지까지 확인한다(이게 이 버그의 최종 피해였다).
+    acs.send_harvest_action(task_id)
+    assert _wait(lambda: acs.harvest_done), '수확 goal 응답 없음'
+    assert acs.harvest_accepted is False, '도킹 실패인데 Harvest 가 accept 됨'
+
+
 def test_dock_cancel(system):
     """ACS 취소(E2 22-1)가 DCS 를 거쳐 DdaGo 까지 전파되어 도킹이 중단(code 3)된다."""
     acs, ddago, dcs = system['acs'], system['ddago'], system['dcs']

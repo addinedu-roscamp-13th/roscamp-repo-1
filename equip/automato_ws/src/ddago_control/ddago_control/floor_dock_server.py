@@ -170,12 +170,19 @@ class FloorDockServer(Node):
         self.declare_parameter('post_advance_m', 0.0)
         # 반복 시 도킹 완료 후 정지 유지 [s] (post_advance_m>0 경로에서만).
         self.declare_parameter('post_dock_hold_sec', float(fsm_mod.POST_DOCK_HOLD_SEC))
-        # 라이다 충돌 방지(opt-in). 진행방향 섹터에 물체 근접 시 정지, 지속되면 ABORT(rc=5).
-        #  후진-투-벽(TURN/REVERSE/HOLD)은 제외. ⚠️lidar_front_deg(장착 전방각)·임계값 현장 튜닝 필요.
-        self.declare_parameter('obstacle_avoid', False)
+        # 라이다 충돌 방지. 진행방향 섹터에 물체 근접 시 정지, 지속되면 ABORT(rc=5).
+        #  후진-투-벽(TURN/REVERSE/HOLD)은 제외 — 목표 갭이 25~30mm 라 라이다로 막을 수 없다
+        #  (obstacle_min_m 하한 아래). 그 구간 보호는 STAGED 사전 검증·후진량 산출로 따로 한다.
+        #  ⚠️lidar_front_deg(장착 전방각)·임계값 현장 튜닝 필요.
+        #  기본 ON: 08-05 통합 테스트가 이 값 false 로 돌아 모든 후진이 무방비였다(후진 충돌).
+        self.declare_parameter('obstacle_avoid', True)
         self.declare_parameter('scan_topic', 'scan')
-        self.declare_parameter('obstacle_stop_m', 0.10)     # 정지 임계 거리 [m] (100mm 이내만)
-        self.declare_parameter('obstacle_timeout', 5.0)     # 이 시간 지속 정지 시 ABORT [s]
+        # 정지 임계 거리 [m]. 150mm 이내를 장애물로 본다 — obstacle_min_m(0.10) 아래는 로봇 자체
+        #  반사로 버리므로 실제 검출 밴드는 100~150mm(50mm). 밴드가 좁으면 통과해 버린다.
+        self.declare_parameter('obstacle_stop_m', 0.15)
+        # (미사용) 예전엔 장애물이 이 시간 지속되면 ABORT 했다. 08-06 부터는 감지 즉시
+        #  중단·실패이므로 기다리지 않는다. 파라미터는 런치/설정 호환을 위해 남겨 둔다.
+        self.declare_parameter('obstacle_timeout', 5.0)
         # 스캔 프레임서 로봇 전방 각 [deg]. 이 로봇은 180° 뒤집힌 장착(카메라 rotate_180)이라
         #  라이다 0°가 뒤를 향함 → 전방=180°. (실측: 정면 물체 → rear 섹터 반응으로 확인)
         self.declare_parameter('lidar_front_deg', 180.0)
@@ -188,8 +195,8 @@ class FloorDockServer(Node):
         # ADVANCE(반복 후퇴 전진) 중 전방 장애물 정지 거리 [m]. 안쪽이면 조기 정지·완료(다음 진행).
         self.declare_parameter('advance_obstacle_m', 0.17)
         # PLAN 후진 중 후방 장애물 정지 거리 [m]. 안쪽이면 후진 중지 → ALIGN 폴백.
-        #  하한(0.10)보다 충분히 커야 무시영역 진입 전에 멈춘다(1cm 밴드면 통과·충돌 → 0.13).
-        self.declare_parameter('plan_obstacle_m', 0.13)
+        #  하한(0.10)보다 충분히 커야 무시영역 진입 전에 멈춘다(1cm 밴드면 통과·충돌 → 0.15).
+        self.declare_parameter('plan_obstacle_m', 0.15)
 
         self._robot_id = self.get_parameter('robot_id').value
         self._rotate_180 = bool(self.get_parameter('rotate_180').value)
@@ -507,8 +514,18 @@ class FloorDockServer(Node):
 
     def _obstacle_gate(self, state, v, w, sec):
         """진행방향(+회전 시 측면) 섹터에 물체 근접이면 (방향, 거리) 반환, 아니면 None.
-        후진-투-벽(TURN/REVERSE/HOLD)·ADVANCE(자체 조기완료 처리)는 제외한다."""
-        if state in ('TURN', 'REVERSE', 'HOLD', 'ADVANCE'):
+
+        **REVERSE 만 제외한다**(사용자 지시). 후진 접붙임은 목표 갭이 25~30mm 라 벽이
+        곧 목표다 — 장애물로 보면 도킹이 완료 직전에 매번 중단된다. 게다가 그 거리는
+        obstacle_min_m(자체 반사 무시 하한) 아래라 라이다가 원리적으로 재지도 못한다.
+        REVERSE 구간 보호는 STAGED 사전 검증·후진량 산출로 따로 한다.
+
+        TURN(제자리 180° 회전)은 **제외하지 않는다** — 회전 방향에 물체가 있으면 스쳐서
+        부딪힌다. 회전 시엔 좌우 섹터를 본다(v≈0 이면 앞뒤도).
+        HOLD 는 v=w=0 이라 검사 대상이 없고, ADVANCE 는 advance_obstacle_m 로 먼저
+        조기완료 처리되므로 이 게이트까지 오는 일이 드물다.
+        """
+        if state == 'REVERSE':
             return None
         if sec is None:
             return None
@@ -543,12 +560,19 @@ class FloorDockServer(Node):
             self._cmd_pub.publish(m)
 
     # --- 액션 실행 ----------------------------------------------------- #
+    # ⚠️⚠️ 종료(abort/succeed/canceled)는 **반드시 result 를 인자로 넘겨서** 부른다.
+    #   로봇의 rclpy 7.1.9 는 인자 없는 abort() 에서 곧바로 **빈 Result()** 를 클라이언트로
+    #   보내버리고, 그 뒤의 `return result` 는 버린다(노트북 7.1.11 은 가드가 있어 정상 →
+    #   로컬 테스트로는 절대 재현되지 않는다). 08-05 실기에서 로봇은 '실패(1)' 을 찍었는데
+    #   DCS 는 code=0(=성공) 을 받아 E3 게이트가 열렸다.
+    #   그래서 순서도 중요하다: **필드를 다 채운 뒤에** 종료 호출. 두 rclpy 버전 모두에서
+    #   안전하다(Future.set_result 는 이중 호출을 허용하고 콜백은 첫 호출에서 비워진다).
     def _execute(self, goal_handle):
         result = FloorDock.Result()
         if not self._busy.acquire(blocking=False):
-            goal_handle.abort()
             result.result_code = RC_ALIGN_FAILED
             result.message = '다른 도킹이 진행 중이다'
+            goal_handle.abort(result)
             return result
         with self._manual_lock:
             self._manual = (0.0, 0.0, 0.0)   # 도킹 시작 → 원격 조그 무효화
@@ -561,15 +585,15 @@ class FloorDockServer(Node):
     def _run(self, goal_handle, goal, result):
         log = self.get_logger()
         if self._mapper is None:
-            goal_handle.abort()
             result.result_code = RC_MARKER_NOT_FOUND
             result.message = '바닥 캘리브 없음 — floor_calib_file 확인 (%s)' % self._calib_path
+            goal_handle.abort(result)
             log.error(result.message)
             return result
         if self._camera_wedged:
-            goal_handle.abort()
             result.result_code = RC_ALIGN_FAILED
             result.message = '이전 도킹서 카메라 프리즈 — 도킹 비활성(노드 재시작 필요)'
+            goal_handle.abort(result)
             log.error(result.message)
             return result
 
@@ -599,7 +623,6 @@ class FloorDockServer(Node):
         fb = FloorDock.Feedback()
         last_fb = last_dbg = 0.0
         prev_phase = None
-        obstacle_since = None
         gate_cnt = adv_cnt = plan_cnt = 0    # 라이다 디바운스(연속 프레임 카운터)
         fresh_t = time.monotonic()
         try:
@@ -607,9 +630,9 @@ class FloorDockServer(Node):
                 t0 = time.monotonic()
                 if goal_handle.is_cancel_requested:
                     self._stop()
-                    goal_handle.canceled()
                     result.result_code = RC_CANCELLED
                     result.message = '취소됨'
+                    goal_handle.canceled(result)
                     log.warn('[floor_dock] 취소 — 정지')
                     return result
 
@@ -618,11 +641,11 @@ class FloorDockServer(Node):
                 if frame is None or (now - frame_t) > STALL_STOP_SEC:
                     self._stop()
                     if self._camera_wedged or (now - fresh_t) > CAPTURE_TIMEOUT + 2.0:
-                        goal_handle.abort()
                         result.result_code = RC_ALIGN_FAILED
                         result.message = ('카메라 프레임 정지 — 도킹 중단'
                                           + ('(프리즈, 노드 재시작 필요)'
                                              if self._camera_wedged else ''))
+                        goal_handle.abort(result)
                         log.error('[floor_dock] %s' % result.message)
                         return result
                     time.sleep(0.03)
@@ -673,27 +696,23 @@ class FloorDockServer(Node):
                                   plan=plan, odom_xy=odom_xy,
                                   read_enable=read_enable, station_ok=station_ok)
 
-                # 라이다 장애물 게이트: 진행방향 근접 시 정지, 지속되면 ABORT
-                #  (TURN/REVERSE/HOLD/ADVANCE 제외). 디바운스: 연속 프레임이라야 정지(스파이크 무시).
+                # 라이다 장애물 게이트: **진행 방향·회전 방향에 물체가 있으면 즉시 중단·실패**
+                #  (REVERSE 만 제외 — 벽이 곧 목표다. _obstacle_gate 주석 참고).
+                #  기다렸다 재개하지 않는다(사용자 지시): 도킹은 좁은 자리에서 개루프 기동이
+                #  섞여 있어, 장애물이 치워지길 기다리는 사이 상황이 바뀌면 위험하다.
+                #  재시도 여부는 ACS 가 정한다(DG·DdaGo 는 판단하지 않는다).
+                #  디바운스만 유지: 연속 OBSTACLE_DEBOUNCE 프레임이라야 인정(경계 스파이크 무시).
                 if self._obstacle_avoid:
                     obs = self._obstacle_gate(fsm.state, v, w, sec)
                     gate_cnt = gate_cnt + 1 if obs is not None else 0
                     if obs is not None and gate_cnt >= OBSTACLE_DEBOUNCE:
-                        v, w = 0.0, 0.0
-                        if obstacle_since is None:
-                            obstacle_since = now
-                            log.warn('[floor_dock] 장애물 %s %.2fm — 정지(진행방향)' % obs)
-                        elif now - obstacle_since > self._obstacle_timeout:
-                            self._stop()
-                            goal_handle.abort()
-                            result.result_code = RC_OBSTACLE
-                            result.message = ('장애물(%s %.2fm) %.0f초 지속 — 도킹 중단'
-                                              % (obs[0], obs[1], self._obstacle_timeout))
-                            log.error('[floor_dock] %s' % result.message)
-                            return result
-                    elif obstacle_since is not None:
-                        obstacle_since = None
-                        log.info('[floor_dock] 장애물 해제 — 재개')
+                        self._stop()
+                        result.result_code = RC_OBSTACLE
+                        result.message = ('장애물(%s %.2fm, phase=%s) — 도킹 중단'
+                                          % (obs[0], obs[1], self._phase(fsm)))
+                        goal_handle.abort(result)
+                        log.error('[floor_dock] %s' % result.message)
+                        return result
                 self._publish(v, w)
 
                 phase = self._phase(fsm)
@@ -735,16 +754,16 @@ class FloorDockServer(Node):
 
                 if fsm.state in ('DONE', 'ABORT'):
                     self._stop()
-                    self._fill_result(result, fsm)
+                    self._fill_result(result, fsm)      # ← 종료 호출 전에 필드를 다 채운다
                     if fsm.result_code == RC_OK:
-                        goal_handle.succeed()
+                        goal_handle.succeed(result)
                         rv = ('  [REVERSE %s trav=%.1fcm]'
                               % ('ODOM' if fsm.reverse_odom_used else '⚠️TIME(폴백)',
                                  fsm.reverse_trav * 100)
                               ) if fsm.reverse_odom_used is not None else ''
                         log.info('[floor_dock] 완료: %s%s' % (result.message, rv))
                     else:
-                        goal_handle.abort()
+                        goal_handle.abort(result)
                         log.error('[floor_dock] 실패(%d): %s'
                                   % (fsm.result_code, result.message))
                     return result
@@ -752,9 +771,9 @@ class FloorDockServer(Node):
                 time.sleep(max(0.0, period - (time.monotonic() - t0)))
 
             self._stop()
-            goal_handle.abort()
             result.result_code = RC_CANCELLED
             result.message = '노드 종료'
+            goal_handle.abort(result)
             return result
         finally:
             self._cam_release()
