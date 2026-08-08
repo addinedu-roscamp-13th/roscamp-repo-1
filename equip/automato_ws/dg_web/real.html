@@ -69,6 +69,57 @@
   .mask.open { display: flex; }
   .modal { background: #332c27; border: 1px solid #5c5045; border-radius: 12px; padding: 18px;
            width: 100%; max-width: 780px; }
+  /* 닫기는 **모달 우측 상단 고정**. 예전엔 본문 중간(정보칸 버튼줄)에 있어서, 지도·웨이포인트
+     패널이 길어진 뒤로는 화면 한가운데에 놓여 찾기 어려웠다. */
+  .modal { position: relative; }
+  .modal-x { position: absolute; top: 12px; right: 14px; z-index: 2;
+             background: #3a322c; color: #e3d6c5; border: 1px solid #5c5045;
+             border-radius: 7px; padding: 4px 10px; font-size: 13px; cursor: pointer; }
+  .modal-x:hover { background: #4a4038; }
+  /* 웨이포인트 패널 */
+  .wp-panel { margin-top: 12px; border-top: 1px solid #4b4038; padding-top: 10px; }
+  .wp-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .wp-head b { color: #e3d6c5; }
+  .wpbtn { background: #3a322c; color: #e3d6c5; border: 1px solid #5c5045;
+           border-radius: 7px; padding: 4px 10px; font-size: 13px; cursor: pointer; }
+  .wpbtn.on { background: #2f6b3a; border-color: #4e9c5c; color: #fff; }
+  .wp-hint { color: #b9a695; font-size: 12.5px; margin: 6px 0; line-height: 1.5; }
+  .wp-list { max-height: 26vh; overflow-y: auto; overflow-x: hidden; margin-top: 6px; }
+  .wp-row { display: flex; align-items: center; gap: 6px; padding: 4px 2px;
+            border-bottom: 1px solid #3a322c; font-size: 13px; flex-wrap: wrap; }
+  .wp-row .ord { width: 22px; text-align: center; color: #7ee081; font-weight: bold; }
+  .wp-row input[type=text] { width: 78px; background: #262120; color: #e3d6c5;
+            border: 1px solid #5c5045; border-radius: 5px; padding: 2px 5px; font-size: 12.5px; }
+  .wp-row select { background: #262120; color: #e3d6c5; border: 1px solid #5c5045;
+            border-radius: 5px; padding: 2px 4px; font-size: 12.5px; }
+  .wp-row .xy { color: #a4907f; font-family: ui-monospace, monospace; font-size: 12px; }
+  .wp-row input.yaw { width: 52px; text-align: right; }
+  .wp-row .deg { color: #a4907f; font-size: 12px; margin-left: -2px; }
+  .wpbtn.tiny { padding: 2px 7px; font-size: 12px; }
+  .wp-row .del { margin-left: auto; background: none; border: 0; color: #e07a5f;
+            cursor: pointer; font-size: 15px; }
+  /* 접근점 도착 확인 — 놓치면 안 되는 결정이라 눈에 띄게. */
+  .ret-ask { background: #3a2f1c; border: 1px solid #a8791f; border-radius: 10px;
+             padding: 12px 14px; margin: 12px 0; }
+  .ret-ask b { color: #ffcf6b; font-size: 15px; }
+  .ret-ask .sub { color: #d8c6ac; font-size: 13px; margin: 6px 0 10px; line-height: 1.5; }
+  .ret-ask .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  /* 복귀 진행 로그: 기본 .log(280px)는 너무 짧아 스크롤할 게 거의 없다.
+     실패 원인은 앞쪽 줄에 있는 경우가 많아 충분히 보여야 한다. */
+  .log.ret { max-height: 48vh; }
+  #ret-logbar { display: flex; align-items: center; gap: 10px; margin-top: 10px;
+                font-size: 13px; color: #b9a695; }
+  #ret-logbar select { background: #262120; color: #e3d6c5; border: 1px solid #5c5045;
+                       border-radius: 6px; padding: 3px 6px; margin-left: 4px; }
+  /* 로그 팝업은 화면을 거의 다 쓴다 — 로그는 한 줄이 길고 많이 봐야 원인이 보인다. */
+  .modal.wide { max-width: 96vw; }
+  /* 복귀 모달은 지도 + 웨이포인트 목록이 나란히 들어가 기본 780px 로는 좁다.
+     목록 행(이름·좌표·도킹·task_point_id·각도·버튼)이 넘쳐 가로 스크롤이 생겼다 → 30% 확대. */
+  .modal.ret { max-width: 1014px; }
+  .modal.wide .log { height: 74vh; max-height: none; }
+  .modal.wide .log-split > div { flex: 1 1 480px; }
+  .log-follow { margin-left: auto; display: flex; align-items: center; gap: 6px;
+                font-size: 13px; color: #a4907f; }
   .modal h3 { margin: 0 0 4px; font-size: 19px; }
   .modal .key { color: #a4907f; font-family: ui-monospace, monospace; font-size: 13px; }
   .modal-foot { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
@@ -264,7 +315,8 @@ const STAT_SLOTS = [
   ['wifi', 'WiFi'], ['band', '실효 대역'],
   ['domain', 'ROS_DOMAIN_ID'], ['rmw', 'RMW'], ['fastdds', 'FastDDS 프로파일'],
 ];
-const SYS_SLOTS = ['batt', 'cpu', 'mem', 'temp', 'power', 'wifi', 'band', 'domain', 'rmw', 'fastdds'];
+// batt 는 빠져 있다 — 배터리는 에이전트가 아니라 토픽에서 오므로 로봇 미도달과 무관하다.
+const SYS_SLOTS = ['cpu', 'mem', 'temp', 'power', 'wifi', 'band', 'domain', 'rmw', 'fastdds'];
 
 function buildStatGrid() {
   document.getElementById('sysgrid').innerHTML = STAT_SLOTS.map(([id, label]) =>
@@ -310,16 +362,7 @@ async function loadSystem(name) {
   try { s = await (await fetch('/api/system?host=' + encodeURIComponent(name))).json(); }
   catch (e) { return; }
   if (s.error) return;
-  // 배터리 — 정본은 ROS 토픽(/battery/percent·voltage), 스택이 내려가 있으면 I2C 직접 읽기.
-  const b = s.battery || {};
-  if (b.percent == null) {
-    setStat('batt', b.error ? '읽기 실패' : (b.note ? '대기' : '-'), b.error ? 'warn' : '');
-  } else {
-    const v = (b.voltage != null) ? b.voltage.toFixed(2) + ' V' : '-';
-    const src = b.source === 'topic' ? '토픽' : b.source === 'i2c' ? '직접' : '';
-    setStat('batt', Math.round(b.percent) + ' % · ' + v + (src ? ' (' + src + ')' : ''),
-            b.percent < 20 ? 'bad' : b.percent < 40 ? 'warn' : '');
-  }
+  // 배터리는 여기서 다루지 않는다 — /battery/* 토픽을 rosbridge 로 직접 구독한다(onBattery).
   const th = s.throttled;
   setStat('cpu', s.cpu_pct == null ? '-' : s.cpu_pct + ' %',
           s.cpu_pct > 85 ? 'bad' : s.cpu_pct > 65 ? 'warn' : '');
@@ -435,6 +478,8 @@ async function svcAct(key, act) {
 /* ===== 팝업(모달) ===== */
 function closeModal() {
   document.getElementById('mask').classList.remove('open');
+  document.getElementById('modal').classList.remove('wide', 'ret');
+  logFollowStop();   // tail -f 타이머가 닫은 뒤에도 계속 돌지 않게
   retTeardown();   // 여닫을 때마다 rosbridge 구독이 쌓이지 않게 반드시 정리
 }
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
@@ -536,23 +581,66 @@ async function agentRestart() {
   loadStatus();
 }
 
+/* 로그 팝업은 tail -f 처럼 동작한다 — 서비스를 띄워 놓고 흘러가는 로그를 지켜보는 게
+   이 화면의 주 용도라, 매번 '다시 읽기'를 누르게 하면 쓸모가 없다.
+   ① 주기적으로 다시 읽고 ② 맨 아래를 보고 있을 때만 자동으로 따라 내린다.
+   ②가 중요하다: 위로 스크롤해 뭔가 읽는 중에 화면이 끌려 내려가면 아무것도 못 읽는다. */
+const LOG_FOLLOW_MS = 1500;
+let LOGF = { key: null, timer: null, on: true, panes: 0 };
+
+function logFollowStop() {
+  if (LOGF.timer) clearInterval(LOGF.timer);
+  LOGF.timer = null; LOGF.key = null;
+}
+
+function logFollowToggle() {
+  LOGF.on = !LOGF.on;
+  const b = document.getElementById('btn-follow');
+  if (b) b.textContent = LOGF.on ? '⏸ 자동 갱신 끄기' : '▶ 자동 갱신 켜기';
+  const s = document.getElementById('follow-state');
+  if (s) s.textContent = LOGF.on ? `따라가는 중 (${LOG_FOLLOW_MS / 1000}초 간격)` : '멈춤';
+}
+
+function _atBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 24; }
+
+// 내용만 갈아끼운다(모달을 다시 그리면 스크롤 위치와 선택이 날아간다).
+function fillLogPanes(text, extra) {
+  const set = (id, t) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const stick = _atBottom(el);       // 갱신 **전에** 판정해야 한다
+    if (el.textContent !== t) el.textContent = t;
+    if (stick) el.scrollTop = el.scrollHeight;
+  };
+  set('mlog', text);
+  (extra || []).forEach((x, i) => set('mlog' + i, (x.lines || []).join('\n') || '(비어 있음)'));
+}
+
 function openLogModal(key, text, extra) {
   const cmd = CMDS.find(c => c.key === key) || { label: key };
   const panes = [{ title: '실행 출력 (stdout·stderr)', text: text, id: 'mlog' }];
   (extra || []).forEach((x, i) => panes.push({
     title: x.title, text: (x.lines || []).join('\n') || '(비어 있음)', id: 'mlog' + i,
   }));
+  LOGF.panes = panes.length;
+  document.getElementById('modal').classList.add('wide');
   document.getElementById('modal').innerHTML = `
     <h3>${escapeHtml(cmd.label)} 로그 <span class="key">${escapeHtml(key)}</span></h3>
     <div class="log-split">
       ${panes.map(p => `<div>
          <div class="log-title">${escapeHtml(p.title)}</div>
-         <pre class="log" id="${p.id}" style="max-height:56vh;margin-top:4px">${escapeHtml(p.text)}</pre>
+         <pre class="log" id="${p.id}" style="margin-top:4px">${escapeHtml(p.text)}</pre>
        </div>`).join('')}
     </div>
     <div class="modal-foot">
-      <button onclick="openLog('${key}')">↻ 다시 읽기</button>
+      <button id="btn-follow" onclick="logFollowToggle()">${
+        LOGF.on ? '⏸ 자동 갱신 끄기' : '▶ 자동 갱신 켜기'}</button>
+      <button onclick="openLog('${key}')">↻ 지금 읽기</button>
       <button onclick="closeModal()">닫기</button>
+      <span class="log-follow">
+        <span id="follow-state">${LOGF.on ? `따라가는 중 (${LOG_FOLLOW_MS / 1000}초 간격)`
+                                          : '멈춤'}</span>
+      </span>
     </div>`;
   document.getElementById('mask').classList.add('open');
   for (const p of panes) {
@@ -561,12 +649,34 @@ function openLogModal(key, text, extra) {
   }
 }
 
+async function fetchLog(key) {
+  const j = await (await fetch('/api/svc/' + key + '/log')).json();
+  return { text: (j.lines || []).join('\n') || '(로그 없음)', extra: j.extra };
+}
+
 async function openLog(key) {
+  logFollowStop();
   openLogModal(key, '읽는 중…');
   try {
-    const j = await (await fetch('/api/svc/' + key + '/log')).json();
-    openLogModal(key, (j.lines || []).join('\n') || '(로그 없음)', j.extra);
-  } catch (e) { openLogModal(key, '(로그를 읽지 못했습니다)'); }
+    const d = await fetchLog(key);
+    openLogModal(key, d.text, d.extra);
+  } catch (e) {
+    openLogModal(key, '(로그를 읽지 못했습니다)');
+  }
+  LOGF.key = key;
+  LOGF.timer = setInterval(async () => {
+    // 팝업이 닫혔거나 다른 팝업으로 바뀌었으면 스스로 멈춘다(타이머 누수 방지).
+    if (!document.getElementById('mask').classList.contains('open')
+        || !document.getElementById('mlog')) { logFollowStop(); return; }
+    if (!LOGF.on) return;
+    try {
+      const d = await fetchLog(LOGF.key);
+      const n = 1 + ((d.extra || []).length);
+      // 창 개수가 달라졌으면 구조부터 다시 그린다(내용만 갈면 빈 칸이 생긴다).
+      if (n !== LOGF.panes) openLogModal(LOGF.key, d.text, d.extra);
+      else fillLogPanes(d.text, d.extra);
+    } catch (e) { /* 일시적 실패는 무시하고 다음 주기에 다시 시도 */ }
+  }, LOG_FOLLOW_MS);
 }
 
 /* ===== 전체 제어 ===== */
@@ -597,17 +707,16 @@ async function stack(act) {
    ACS 가 죽었을 때 사람이 직접 로봇을 충전소로 보낸다.
    ⚠ Nav2 는 노트북에서 돈다 — 로봇 단독 자율 복귀가 아니라 노트북이 살아 있어야 한다. */
 const RET = { map: null, home: null, pose: null, live: false, updates: 0,
-              ws: null, subId: null, poll: null, running: false, S: 8 };
+              ws: null, subId: null, poll: null, running: false, S: 8,
+              // 복귀 진행 로그 줄 수(기본 500). 브라우저에 기억시켜 다음에도 유지한다.
+              wps: [], selIds: [], wpMode: false,   // 지도에서 찍은 점 / 선택 순서 / 찍기 모드
+              logLines: (function () {
+                try { return parseInt(localStorage.getItem('retLogLines'), 10) || 500; }
+                catch (e) { return 500; }
+              })() };
 
 function retTeardown() {
-  if (RET.ws) {
-    try {
-      if (RET.subId) RET.ws.send(JSON.stringify(
-        { op: 'unsubscribe', id: RET.subId, topic: '/amcl_pose' }));
-      RET.ws.close();
-    } catch (e) {}
-  }
-  RET.ws = null; RET.subId = null;
+  rbUnsub('/amcl_pose');   // 배터리 구독은 그대로 두고 이것만 뗀다
   if (RET.poll) { clearInterval(RET.poll); RET.poll = null; }
 }
 
@@ -616,6 +725,13 @@ function w2c(x, y) {
   const m = RET.map, S = RET.S;
   return { cx: (x - m.origin[0]) / m.resolution * S,
            cy: (m.height - (y - m.origin[1]) / m.resolution) * S };
+}
+
+// 캔버스 → 세계좌표. w2c 의 역이다(지도를 클릭해 점을 찍으려면 반드시 필요).
+function c2w(cx, cy) {
+  const m = RET.map, S = RET.S;
+  return { x: cx / S * m.resolution + m.origin[0],
+           y: (m.height - cy / S) * m.resolution + m.origin[1] };
 }
 
 function drawMap() {
@@ -669,9 +785,45 @@ function drawMap() {
     return q;
   };
 
+  // 끄는 중이면 방향 미리보기 — 놓기 전에 어느 쪽을 향할지 눈으로 확인할 수 있어야 한다.
+  if (RET.drag && RET.drag.to) {
+    const f = RET.drag.from, t = RET.drag.to;
+    const far = Math.hypot(t.cx - f.cx, t.cy - f.cy) >= WP_DRAG_MIN_PX;
+    ctx.strokeStyle = far ? '#7ee081' : 'rgba(255,255,255,.4)';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(f.cx, f.cy, 6, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(f.cx, f.cy); ctx.lineTo(t.cx, t.cy); ctx.stroke();
+    if (!far) {   // 아직 짧다 = 놓으면 방향 자동
+      ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.font = '11px ui-monospace, monospace';
+      ctx.fillText('더 끌면 방향 지정', f.cx + 10, f.cy + 16);
+    }
+  }
+
+  // 웨이포인트: 선택된 것은 순서대로 선으로 잇는다. dock='floor' 는 H 마커 지점이다.
+  const sel = (RET.wps || []).filter(p => RET.selIds.includes(p.id))
+                             .sort((a, b) => RET.selIds.indexOf(a.id) - RET.selIds.indexOf(b.id));
+  if (sel.length > 1) {
+    ctx.strokeStyle = '#7ee081'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    sel.forEach((p, i) => { const q = w2c(p.x, p.y); i ? ctx.lineTo(q.cx, q.cy) : ctx.moveTo(q.cx, q.cy); });
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+  for (const p of (RET.wps || [])) {
+    const on = RET.selIds.includes(p.id);
+    const q = w2c(p.x, p.y);
+    const col = p.dock === 'floor' ? '#ffd166' : (p.dock === 'reflective' ? '#c792ea' : '#7ee081');
+    arrow(p.x, p.y, p.yaw, on ? col : 'rgba(255,255,255,.35)', on ? 7 : 5);
+    ctx.fillStyle = on ? col : 'rgba(255,255,255,.45)';
+    ctx.font = 'bold 11px ui-monospace, monospace';
+    // H 마커 지점은 글자로 바로 알아보게 — 지도에서 도킹 자리를 눈으로 찾는 게 목적이다
+    const tag = (p.dock === 'floor' ? 'H ' : '') + p.name
+              + (on ? ' #' + (RET.selIds.indexOf(p.id) + 1) : '');
+    ctx.fillText(tag, q.cx + 9, q.cy - 7);
+  }
+
   if (RET.home) {
     const h = RET.home;
-    arrow(h.x, h.y, h.yaw, '#6ab0ff', 7);                     // 충전소
+    arrow(h.x, h.y, h.yaw, '#6ab0ff', 7);                     // 충전소 진입점
     if (RET.target) {
       const t = RET.target, q = w2c(t.x, t.y), hq = w2c(h.x, h.y);
       ctx.strokeStyle = '#6ab0ff'; ctx.setLineDash([4, 4]); ctx.lineWidth = 1.5;
@@ -716,10 +868,9 @@ function renderRet() {
        · 갱신 ${RET.updates}회</span>`
     : '<b>로봇</b> 위치 확인 중…');
   set('ret-home', RET.home
-    ? `<b>충전소</b> (${RET.home.x.toFixed(3)}, ${RET.home.y.toFixed(3)})
-       yaw ${RET.home.yaw.toFixed(3)} · ${escapeHtml(RET.home.task_point_id || '')}
-       <span style="color:#a4907f">· 접근 ${RET.home.approach_offset_m} m</span>`
-    : '<b>충전소</b> 저장된 위치가 없습니다 — 로봇을 충전소에 도킹시킨 뒤 저장하세요');
+    ? `<b>충전소 진입점</b> (${RET.home.x.toFixed(3)}, ${RET.home.y.toFixed(3)})
+       yaw ${RET.home.yaw.toFixed(3)} · ${escapeHtml(RET.home.task_point_id || '')}`
+    : '<b>충전소 진입점</b> 저장된 위치가 없습니다 — 도킹을 시작할 자리에 로봇을 세우고 저장하세요');
 
   const warns = poseWarnings();
   if (RET.mapChanged) warns.unshift('맵이 <b>바뀌었습니다</b> — 저장된 좌표는 딴 곳을 가리킵니다. 다시 저장하세요.');
@@ -752,30 +903,97 @@ function onAmclPose(msg) {
   renderRet();
 }
 
+/* ===== rosbridge 공용 연결 =====
+   소켓 하나로 여러 토픽을 다룬다. 배터리는 화면이 떠 있는 동안 계속, /amcl_pose 는
+   복귀 모달이 열려 있는 동안만 구독한다. 구독 목록을 들고 있다가 재접속 때 다시 건다 —
+   모달을 여닫을 때마다 구독이 쌓이지 않게 해제도 여기서 관리한다. */
+const RB = { ws: null, subs: {}, retry: null, ok: false };
+
+function rbSend(o) {
+  try { if (RB.ws && RB.ws.readyState === 1) RB.ws.send(JSON.stringify(o)); } catch (e) {}
+}
+
+function rbSub(topic, type, cb, throttle) {
+  RB.subs[topic] = { type: type, cb: cb, throttle: throttle || 200,
+                     id: 'sub_' + topic.replace(/\W/g, '_') };
+  rbSend({ op: 'subscribe', id: RB.subs[topic].id, topic: topic, type: type,
+           throttle_rate: throttle || 200, queue_length: 1, compression: 'none' });
+  rbConnect();
+}
+
+function rbUnsub(topic) {
+  const su = RB.subs[topic];
+  if (!su) return;
+  rbSend({ op: 'unsubscribe', id: su.id, topic: topic });
+  delete RB.subs[topic];
+}
+
 function rbConnect() {
-  let url;
-  try { url = 'ws://' + (location.hostname || '127.0.0.1') + ':9090'; } catch (e) { return; }
+  if (RB.ws && (RB.ws.readyState === 0 || RB.ws.readyState === 1)) return;
   let ws;
-  try { ws = new WebSocket(url); } catch (e) { return; }
-  RET.ws = ws;
+  try { ws = new WebSocket('ws://' + (location.hostname || '127.0.0.1') + ':9090'); }
+  catch (e) { return; }
+  RB.ws = ws;
   ws.onopen = () => {
-    RET.subId = 'sub_amcl_' + Date.now();
-    ws.send(JSON.stringify({ op: 'subscribe', id: RET.subId, topic: '/amcl_pose',
-      type: 'geometry_msgs/PoseWithCovarianceStamped',
-      throttle_rate: 200, queue_length: 1, compression: 'none' }));
+    RB.ok = true;
+    for (const t in RB.subs) {                 // 재접속 시 구독을 다시 건다
+      const su = RB.subs[t];
+      rbSend({ op: 'subscribe', id: su.id, topic: t, type: su.type,
+               throttle_rate: su.throttle, queue_length: 1, compression: 'none' });
+    }
   };
   ws.onmessage = ev => {
     let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
-    if (m.op === 'publish' && m.topic === '/amcl_pose') onAmclPose(m.msg);
+    if (m.op !== 'publish') return;
+    const su = RB.subs[m.topic];
+    if (su) su.cb(m.msg);
   };
   ws.onerror = ws.onclose = () => {
-    if (RET.ws === ws) RET.ws = null;
-    if (!RET.live) banner('rosbridge(:9090)에 못 붙었습니다 — 서비스에서 real-rosbridge 를 켜세요');
+    if (RB.ws === ws) { RB.ws = null; RB.ok = false; }
+    if (Object.keys(RB.subs).length && !RB.retry) {
+      RB.retry = setTimeout(() => { RB.retry = null; rbConnect(); }, 3000);
+    }
   };
 }
 
+/* ===== 배터리 — /battery/percent · /battery/voltage (정본) =====
+   bringup 의 battery_publisher 가 I2C 를 읽어 5초마다 발행한다. 중계를 거칠수록 값이
+   늦고 갈리므로 토픽을 그대로 구독한다. */
+const BATT = { percent: null, voltage: null, ts: 0 };
+
+function onBattery() {
+  const age = BATT.ts ? (Date.now() / 1000 - BATT.ts) : null;
+  if (BATT.percent == null) {
+    setStat('batt', RB.ok ? '수신 대기' : 'rosbridge 끊김', RB.ok ? '' : 'warn');
+    return;
+  }
+  // 발행이 5초 주기라 그보다 한참 지나면 살아 있는 값이 아니다.
+  if (age !== null && age > 30) {
+    setStat('batt', Math.round(BATT.percent) + ' % (' + Math.round(age) + '초 전)', 'warn');
+    return;
+  }
+  const v = (BATT.voltage != null) ? BATT.voltage.toFixed(2) + ' V' : '-';
+  setStat('batt', Math.round(BATT.percent) + ' % · ' + v,
+          BATT.percent < 20 ? 'bad' : BATT.percent < 40 ? 'warn' : '');
+}
+
+function battSubscribe() {
+  rbSub('/battery/percent', 'std_msgs/Float32', m => {
+    BATT.percent = m && typeof m.data === 'number' ? m.data : null;
+    BATT.ts = Date.now() / 1000; onBattery();
+  }, 1000);
+  rbSub('/battery/voltage', 'std_msgs/Float32', m => {
+    BATT.voltage = m && typeof m.data === 'number' ? m.data : null;
+    BATT.ts = Date.now() / 1000; onBattery();
+  }, 1000);
+  onBattery();                       // 첫 메시지 전에도 '수신 대기'를 보여준다
+  setInterval(onBattery, 5000);      // 값이 끊기면 '몇 초 전'으로 바뀌게
+}
+
 async function openReturn() {
+  document.getElementById('modal').classList.add('ret');
   document.getElementById('modal').innerHTML = `
+    <button class="modal-x" onclick="closeModal()" title="닫기 (Esc)">✕ 닫기</button>
     <h3>충전 스테이션 복귀 <span class="key" id="ret-rid">${escapeHtml(RID)}</span></h3>
     <div class="note">ACS 없이 사람이 직접 복귀시킵니다. 주행은 <b>DCS 경유 Navigate</b>(도착
       waypoint 하나), 도킹은 <b>ReflectiveDock</b> 입니다.<br>
@@ -788,19 +1006,52 @@ async function openReturn() {
         <div class="ret-line" id="ret-home"></div>
         <div class="ret-warn" id="ret-warn" style="display:none"></div>
         <div class="modal-foot">
-          <button id="ret-save" onclick="saveHome()" disabled>현재 위치를 충전소로 저장</button>
+          <button id="ret-save" onclick="saveHome()" disabled>현재 위치를 충전소 진입점으로 저장</button>
           <button id="ret-go" class="on" onclick="startReturn()" disabled>복귀 실행</button>
           <button id="ret-stop" class="off" onclick="stopReturn()">■ 정지</button>
-          <button onclick="closeModal()">닫기</button>
         </div>
         <label style="display:block;margin-top:8px;color:#b9a695;font-size:13px;cursor:pointer">
           <input type="checkbox" id="ret-force"> 위치를 눈으로 확인했습니다(경고 무시)</label>
-        <div class="ret-legend">🟠 로봇 · 🔵 충전소 · ⚪ 점선 = 접근점(도킹 시작 위치)</div>
+        <div class="ret-legend">🟠 로봇 · 🔵 충전소 진입점 · 🟢 웨이포인트 · 🟡 H마커 도킹점</div>
+
+        <div class="wp-panel">
+          <div class="wp-head">
+            <b>웨이포인트</b>
+            <button id="wp-mode" class="wpbtn" onclick="toggleWpMode()">＋ 지도에서 찍기</button>
+            <button class="wpbtn" onclick="saveWps()">저장</button>
+            <button class="wpbtn" onclick="clearSel()">선택 해제</button>
+          </div>
+          <div id="wp-hint" class="wp-hint" style="display:none">
+            <b>클릭</b>하면 그 자리에 점이 찍히고 방향은 <b>다음 점을 바라보게</b> 자동 계산됩니다.<br>
+            <b>누른 채 끌면</b> 끄는 방향이 그대로 그 지점의 방향이 됩니다(RViz 2D Pose Estimate 와 같은 조작).
+            도킹 지점은 마커를 정면에서 봐야 시작되므로 이렇게 방향까지 정해 두세요.<br>
+            나중에 고칠 때는 목록의 <b>각도(°)</b> 입력이나 <b>현재</b>(로봇 자세 복사) 를 쓰면 됩니다.</div>
+          <div id="wp-list" class="wp-list"></div>
+          <div class="modal-foot">
+            <button id="wp-go" class="on" onclick="startRoute()" disabled>선택 순서대로 주행</button>
+          </div>
+        </div>
       </div>
     </div>
+    <div id="ret-confirm" style="display:none"></div>
     <div id="ret-steps"></div>
-    <pre class="log" id="ret-log" style="display:none"></pre>`;
+    <div id="ret-logbar" style="display:none">
+      <label>로그 줄 수
+        <select id="ret-lines" onchange="setRetLines(this.value)">
+          <option value="200">200</option>
+          <option value="500">500</option>
+          <option value="1000">1000</option>
+          <option value="2000">2000</option>
+          <option value="3000">3000</option>
+        </select>
+      </label>
+      <span id="ret-lines-info"></span>
+    </div>
+    <pre class="log ret" id="ret-log" style="display:none"></pre>`;
   document.getElementById('mask').classList.add('open');
+  // 기억해 둔 줄 수를 select 에 반영(모달을 다시 그릴 때마다 기본값으로 돌아가지 않게).
+  const _sel = document.getElementById('ret-lines');
+  if (_sel) _sel.value = String(RET.logLines);
 
   RET.pose = null; RET.live = false; RET.updates = 0; RET._off = null;
   try {
@@ -814,8 +1065,20 @@ async function openReturn() {
     RET.home = h.home; RET.target = h.target; RET.mapChanged = h.map_changed;
   } catch (e) {}
 
+  // 지도 클릭으로 웨이포인트를 찍는다(찍기 모드일 때만 반응).
+  const _cv = document.getElementById('ret-canvas');
+  if (_cv) {
+    _cv.onmousedown = onMapDown;
+    _cv.onmousemove = onMapMove;
+    _cv.onmouseup = onMapUp;
+    _cv.onmouseleave = () => { RET.drag = null; drawMap(); };   // 밖으로 나가면 취소
+  }
+  RET.wpMode = false;
+  await loadWps();
+
   renderRet();
-  rbConnect();                                  // 라이브 구독
+  rbSub('/amcl_pose', 'geometry_msgs/PoseWithCovarianceStamped',
+        onAmclPose, 200);                       // 모달이 열려 있는 동안만
   try {                                          // latched 마지막 값(서 있는 로봇 대비)
     const o = await (await fetch('/api/pose/once')).json();
     if (o.ok && !RET.live) {
@@ -842,6 +1105,26 @@ async function saveHome() {
 }
 
 function renderSteps(st) {
+  // 접근점 도착 → 도킹 확인 대기. 후진 도킹은 되돌릴 수 없는 기동이라 자동으로 잇지 않는다
+  //  (08-05 에 벽 충돌로 로봇을 손으로 집어낸 적이 있다). 눈으로 보고 누르게 한다.
+  const cf = document.getElementById('ret-confirm');
+  if (cf) {
+    if (st && st.await_dock) {
+      const left = st.await_left_s != null ? ` · ${st.await_left_s}초 안에 결정` : '';
+      cf.innerHTML = `<div class="ret-ask">
+          <b>🅿 진입점 도착 — 도킹을 시작할까요?</b>
+          <div class="sub">로봇이 충전소 진입점에 섰습니다. 위치가 맞는지 눈으로 확인한 뒤
+            진행하세요. 후진 도킹은 시작하면 되돌릴 수 없습니다.${left}</div>
+          <div class="btns">
+            <button class="on" onclick="confirmDock()">도킹 실행</button>
+            <button class="off" onclick="stopReturn()">■ 취소</button>
+          </div></div>`;
+      cf.style.display = 'block';
+    } else {
+      cf.style.display = 'none';
+      cf.innerHTML = '';
+    }
+  }
   const box = document.getElementById('ret-steps');
   if (!box || !st) return;
   const mark = { pending: '·', running: '▶', ok: '✅', fail: '❌', canceled: '⏹' };
@@ -854,14 +1137,241 @@ function renderSteps(st) {
   const log = document.getElementById('ret-log');
   if (log) {
     const cur = (st.steps || []).filter(x => x.state !== 'pending').pop();
-    const txt = cur ? (cur.lines || []).join('\n') : '';
+    const lines = cur ? (cur.lines || []) : [];
+    const txt = lines.join('\n');
     log.style.display = txt ? 'block' : 'none';
+    const bar = document.getElementById('ret-logbar');
+    if (bar) bar.style.display = txt ? 'flex' : 'none';
+    const info = document.getElementById('ret-lines-info');
+    // 요청한 만큼 꽉 찼으면 그 앞은 잘린 것이다 — 조용히 자르면 원인을 앞줄에서 찾다 헛수고한다.
+    if (info) info.textContent = txt
+      ? `${lines.length}줄 표시${lines.length >= RET.logLines ? ' (더 있음 — 줄 수를 늘리세요)' : ''}`
+      : '';
     if (txt && log.textContent !== txt) {
+      // 맨 아래를 보고 있을 때만 따라 내린다(위로 올려 읽는 중이면 끌어내리지 않는다).
       const bottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
       log.textContent = txt;
       if (bottom) log.scrollTop = log.scrollHeight;
     }
   }
+}
+
+// 로그 줄 수는 브라우저에 기억시킨다 — 매번 다시 고르게 하면 안 쓰게 된다.
+function setRetLines(n) {
+  RET.logLines = Math.max(50, parseInt(n, 10) || 500);
+  try { localStorage.setItem('retLogLines', String(RET.logLines)); } catch (e) { /* 사생활 모드 */ }
+  pollReturn();   // 바로 다시 읽어 즉시 반영
+}
+
+async function confirmDock() {
+  try {
+    const r = await fetch('/api/return/confirm', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!j.ok) banner('도킹 확인 실패: ' + (j.error || respText(j)));
+    else banner('');
+    pollReturn();   // 상태를 곧바로 갱신해 버튼이 남아 있지 않게
+  } catch (e) { banner('도킹 확인 요청 실패'); }
+}
+
+
+/* ===== 웨이포인트 ===== */
+// 지도를 클릭해 점을 찍고, 선택한 순서대로 주행한다.
+// yaw 는 서버가 '다음 점을 바라보게' 계산한다 — 화면에서는 방향을 따로 잡지 않는다.
+// 다만 **도킹이 걸린 점은 저장된 yaw 를 쓴다**(마커를 정면에서 봐야 도킹이 시작되므로).
+async function loadWps() {
+  try {
+    const j = await (await fetch('/api/waypoints')).json();
+    RET.wps = j.points || [];
+    RET.selIds = RET.selIds.filter(id => RET.wps.some(p => p.id === id));
+  } catch (e) { RET.wps = []; }
+  renderWps();
+}
+
+function toggleWpMode() {
+  RET.wpMode = !RET.wpMode;
+  const b = document.getElementById('wp-mode');
+  if (b) { b.textContent = RET.wpMode ? '✓ 찍는 중 (끄기)' : '＋ 지도에서 찍기'; b.classList.toggle('on', RET.wpMode); }
+  const h = document.getElementById('wp-hint');
+  if (h) h.style.display = RET.wpMode ? 'block' : 'none';
+  const cv = document.getElementById('ret-canvas');
+  if (cv) cv.style.cursor = RET.wpMode ? 'crosshair' : '';
+}
+
+// 찍기: **누른 자리가 위치, 끌어서 놓은 방향이 yaw** (RViz 2D Pose Estimate 와 같은 조작).
+//  그냥 클릭(끌지 않음)하면 방향은 '다음 점을 바라보게' 자동 계산에 맡긴다.
+//  도킹 지점은 마커를 정면에서 봐야 시작되므로 찍는 순간 방향까지 정할 수 있어야 한다.
+const WP_DRAG_MIN_PX = 10;      // 이보다 짧으면 '그냥 클릭'으로 본다(손떨림 무시)
+
+function _evCanvas(ev) {
+  const cv = ev.currentTarget, r = cv.getBoundingClientRect();
+  // 캔버스가 CSS 로 늘어나 있을 수 있어 실제 픽셀로 환산한다(안 하면 점이 밀린다).
+  return { cx: (ev.clientX - r.left) * cv.width / r.width,
+           cy: (ev.clientY - r.top) * cv.height / r.height };
+}
+
+function onMapDown(ev) {
+  if (!RET.wpMode || !RET.map) return;
+  ev.preventDefault();
+  RET.drag = { from: _evCanvas(ev), to: null };
+}
+
+function onMapMove(ev) {
+  if (!RET.drag) return;
+  RET.drag.to = _evCanvas(ev);
+  drawMap();                    // 끄는 동안 방향 미리보기
+}
+
+function onMapUp(ev) {
+  const d = RET.drag;
+  RET.drag = null;
+  if (!d) return;
+  const up = _evCanvas(ev);
+  const dx = up.cx - d.from.cx, dy = up.cy - d.from.cy;
+  const dragged = Math.hypot(dx, dy) >= WP_DRAG_MIN_PX;
+  // 캔버스 y 는 아래로 증가 → 세계 yaw 는 -dy 로 계산한다
+  const yaw = dragged ? Math.atan2(-dy, dx) : 0;
+  const w = c2w(d.from.cx, d.from.cy);
+  const id = RET.wps.reduce((mx, p) => Math.max(mx, p.id), 0) + 1;
+  RET.wps.push({ id, name: 'WP' + id, x: +w.x.toFixed(4), y: +w.y.toFixed(4),
+                 yaw: +yaw.toFixed(4), yaw_fixed: dragged,
+                 dock: 'none', task_point_id: '' });
+  RET.selIds.push(id);          // 찍자마자 경로에 들어가는 게 자연스럽다
+  renderWps(); drawMap();
+}
+
+function toggleSel(id) {
+  const i = RET.selIds.indexOf(id);
+  if (i >= 0) RET.selIds.splice(i, 1); else RET.selIds.push(id);   // 누른 순서 = 주행 순서
+  renderWps(); drawMap();
+}
+
+function clearSel() { RET.selIds = []; renderWps(); drawMap(); }
+
+function delWp(id) {
+  RET.wps = RET.wps.filter(p => p.id !== id);
+  RET.selIds = RET.selIds.filter(x => x !== id);
+  renderWps(); drawMap();
+}
+
+function editWp(id, field, val) {
+  const p = RET.wps.find(q => q.id === id);
+  if (!p) return;
+  p[field] = val;
+  if (field === 'dock') renderWps();   // 도킹을 켜면 task_point_id 칸이 필요해진다
+  drawMap();
+}
+
+// 도킹 지점만 yaw 를 사람이 정한다. 통과 노드는 '다음 점을 바라보게' 자동이라 건드릴 게 없다.
+//  도킹은 마커를 **정면에서** 봐야 시작되므로(비스듬하면 '마커 없음'으로 실패) 방향이 위치만큼 중요하다.
+// 자동(다음 점 바라보기) → 수동으로 전환. 현재 로봇 방향을 초기값으로 넣어 준다.
+function fixYaw(id) {
+  const p = RET.wps.find(q => q.id === id);
+  if (!p) return;
+  p.yaw_fixed = true;
+  if (RET.pose) p.yaw = RET.pose.yaw;
+  renderWps(); drawMap();
+}
+
+function editWpYawDeg(id, deg) {
+  const p = RET.wps.find(q => q.id === id);
+  const d = parseFloat(deg);
+  if (!p || !isFinite(d)) return;
+  p.yaw = d * Math.PI / 180;
+  p.yaw_fixed = true;      // 손으로 정한 값은 자동 계산이 덮지 않게
+  drawMap();
+}
+
+// 로봇을 실제로 마커 정면에 세워 두고 그 자세를 그대로 복사한다.
+//  눈금으로 각도를 맞추는 것보다 정확하다(충전소 진입점을 저장하는 방식과 같은 발상).
+function yawFromRobot(id) {
+  if (!RET.pose) { banner('로봇 위치를 아직 못 받았습니다'); return; }
+  const p = RET.wps.find(q => q.id === id);
+  if (!p) return;
+  p.yaw = RET.pose.yaw;
+  p.yaw_fixed = true;
+  banner('');
+  renderWps(); drawMap();
+}
+
+function renderWps() {
+  const box = document.getElementById('wp-list');
+  if (!box) return;
+  box.innerHTML = RET.wps.length ? RET.wps.map(p => {
+    const ord = RET.selIds.indexOf(p.id);
+    return `<div class="wp-row">
+      <input type="checkbox" ${ord >= 0 ? 'checked' : ''} onchange="toggleSel(${p.id})">
+      <span class="ord">${ord >= 0 ? ord + 1 : ''}</span>
+      <input type="text" value="${escapeHtml(p.name)}"
+             onchange="editWp(${p.id},'name',this.value)">
+      <span class="xy">(${p.x.toFixed(2)}, ${p.y.toFixed(2)})</span>
+      <select onchange="editWp(${p.id},'dock',this.value)">
+        <option value="none" ${p.dock === 'none' ? 'selected' : ''}>도킹 없음</option>
+        <option value="floor" ${p.dock === 'floor' ? 'selected' : ''}>H마커</option>
+        <option value="reflective" ${p.dock === 'reflective' ? 'selected' : ''}>반사테이프</option>
+      </select>
+      ${p.dock !== 'none'
+        ? `<input type="text" placeholder="task_point_id" value="${escapeHtml(p.task_point_id || '')}"
+                  onchange="editWp(${p.id},'task_point_id',this.value)">` : ''}
+      ${(p.dock !== 'none' || p.yaw_fixed)
+        ? `<input type="number" class="yaw" step="1" title="이 지점에서 향할 방향(도)"
+                  value="${(p.yaw * 180 / Math.PI).toFixed(0)}"
+                  onchange="editWpYawDeg(${p.id}, this.value)"><span class="deg">°</span>
+           <button class="wpbtn tiny" onclick="yawFromRobot(${p.id})"
+                   title="로봇을 원하는 방향으로 세운 뒤 누르세요">현재</button>`
+        : `<button class="wpbtn tiny" onclick="fixYaw(${p.id})"
+                   title="방향을 직접 지정합니다(지금은 자동)">방향 지정</button>`}
+      <button class="del" onclick="delWp(${p.id})" title="삭제">✕</button>
+    </div>`;
+  }).join('') : '<div class="wp-hint">아직 없습니다 — 「지도에서 찍기」로 추가하세요.</div>';
+  const go = document.getElementById('wp-go');
+  if (go) go.disabled = !RET.selIds.length || RET.running;
+}
+
+async function saveWps() {
+  try {
+    const r = await fetch('/api/waypoints', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ points: RET.wps }) });
+    const j = await r.json();
+    if (!j.ok) { banner('웨이포인트 저장 실패: ' + (j.error || '')); return; }
+    RET.wps = j.points || RET.wps;
+    banner('');
+    renderWps(); drawMap();
+  } catch (e) { banner('웨이포인트 저장 요청 실패'); }
+}
+
+async function startRoute() {
+  if (!RET.selIds.length) return;
+  const last = RET.wps.find(p => p.id === RET.selIds[RET.selIds.length - 1]);
+  const willDock = !!(last && last.dock !== 'none');
+  const kind = willDock ? (last.dock === 'floor' ? 'H마커' : '반사테이프') : '';
+  if (!confirm(`${RET.selIds.length}개 지점을 순서대로 주행합니다.`
+      + (willDock ? `\n마지막 '${last.name}' 은 ${kind} 도킹 지점입니다.` : ''))) return;
+
+  // 마지막이 도킹 지점이면 **시작할 때** 자동 진행 여부를 정한다(사용자 지시).
+  //  확인: 도착하면 곧바로 도킹 / 취소: 도착 후 다시 물어본다(기존 방식).
+  //  어느 쪽이든 '확인 없이 도킹'은 없다 — 결정 시점만 앞당기는 것이다.
+  let autoDock = false;
+  if (willDock) {
+    autoDock = confirm(`도착하면 ${kind} 도킹까지 자동으로 진행할까요?\n\n`
+      + `확인 = 도착 즉시 도킹 시작\n`
+      + `취소 = 도착 후 화면에서 한 번 더 확인받고 도킹`);
+  }
+  try {
+    const r = await fetch('/api/route/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: RET.selIds, auto_dock: autoDock }) });
+    const j = await r.json();
+    if (!j.ok) { banner('주행 시작 불가: ' + (j.error || respText(j))); return; }
+    banner('');
+    RET.running = true;
+    renderWps();          // 버튼을 바로 잠근다(첫 폴링까지 기다리면 두 번 눌린다)
+    if (!RET.poll) RET.poll = setInterval(pollReturn, 1000);
+    await pollReturn();
+    // 지도·웨이포인트 패널이 길어 로그가 화면 밖으로 밀린다 — 시작하면 그리로 데려간다.
+    const box = document.getElementById('ret-steps');
+    if (box) box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) { banner('주행 시작 요청 실패'); }
 }
 
 async function startReturn() {
@@ -888,7 +1398,7 @@ async function startReturn() {
 
 async function pollReturn() {
   try {
-    const st = await (await fetch('/api/return/status')).json();
+    const st = await (await fetch('/api/return/status?lines=' + RET.logLines)).json();
     renderSteps(st);
     RET.running = !!st.active;
     if (!st.active && RET.poll) { clearInterval(RET.poll); RET.poll = null; }
@@ -1199,6 +1709,7 @@ if (_limitInput) {
 }
 
 buildStatGrid();
+battSubscribe();     // 배터리는 화면이 떠 있는 동안 계속 받는다
 loadCommands(true);
 loadStatus();
 refreshWire();

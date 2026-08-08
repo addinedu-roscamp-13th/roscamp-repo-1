@@ -40,16 +40,19 @@
 # DCS·시뮬의 robot_id 파라미터로 함께 주입해 토픽/액션 이름(/{robot_id}/...)이 어긋나지 않게 한다.
 ROBOT_ID="${ROBOT_ID:-dg_01}"
 export ROBOT_ID   # 명령 정의 안의 ${ROBOT_ID} 를 실행 시점에 펼치기 위해 export 한다
-WS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 2026-08-06: 이 스크립트가 dg_web/ 안으로 들어왔다(팀 요청). 따라서 워크스페이스는
+#  스크립트 위치가 아니라 **그 상위 폴더**다. WEB 은 스크립트가 있는 폴더 자신.
+WEB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WS="$(dirname "$WEB")"
 export WS   # 실서버 명령 정의(real-ai 의 ${WS}/.venv)가 실행 시점에 펼친다
 SRC="source /home/ane/dev_ws/.venv/bin/activate; source /opt/ros/jazzy/setup.bash; cd $WS; source install/setup.bash"
-TARGET="$WS/dg_web/dg_ai_target.json"
+TARGET="$WEB/dg_ai_target.json"
 
 # 실행할 명령줄은 dg_web/cmdcfg.py 가 만든다(대시보드 화면에서 편집 가능).
 # 여기에 명령을 직접 쓰지 않는 이유: 웹과 CLI 가 서로 다른 명령을 돌리면 안 된다.
 # 되돌리기는 대시보드의 '기본값' 버튼 또는 dg_web/commands.local.json 삭제.
 CMD() {
-  python3 "$WS/dg_web/cmdcfg.py" "$1" || {
+  python3 "$WEB/cmdcfg.py" "$1" || {
     echo "  ✗ 명령 정의를 읽지 못했습니다: $1" >&2
     return 1
   }
@@ -127,7 +130,7 @@ start_one() {
       if [ "$n" = dg_ai ]; then set_ai_active sim; fi ;;
     # web 은 이 스크립트가 아니라 대시보드 서버 자신이라 편집 대상에서 뺀다
     # (자기가 실행하는 명령을 자기 화면에서 고치면 되살릴 길이 없어진다).
-    web)       setsid bash -c "exec python3 $WS/dg_web/control_server.py"  >/tmp/dash_http.log 2>&1 & disown ;;
+    web)       setsid bash -c "exec python3 $WEB/control_server.py"  >/tmp/dash_http.log 2>&1 & disown ;;
     *) echo "  알 수 없는 노드: '$n' (dcs|acs|ddago|ddagi|dg_ai|rosbridge|web)"; return 1 ;;
   esac
   echo "  '$n' 기동"
@@ -258,7 +261,7 @@ start_key() {
   c="$(CMD "$k")" || return 1
   # 로그 파일 이름은 cmdcfg 가 정한다. 시뮬과 같은 프로세스를 쓰는 항목(real-dcs)은
   # 같은 파일에 쌓아야 메시지 시계열이 갈라지지 않는다.
-  tag="$(python3 "$WS/dg_web/cmdcfg.py" --log "$k" 2>/dev/null)" || tag="$k"
+  tag="$(python3 "$WEB/cmdcfg.py" --log "$k" 2>/dev/null)" || tag="$k"
   [ -z "$tag" ] && tag="$k"
   setsid bash -c "$SRC; $c" >"/tmp/dash_$tag.log" 2>&1 & disown
   echo "  '$k' 기동 (로그: /tmp/dash_$tag.log)"

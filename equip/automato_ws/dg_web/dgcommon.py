@@ -12,7 +12,9 @@ import subprocess
 
 WEB_DIR = os.path.dirname(os.path.abspath(__file__))
 WS_DIR = os.path.dirname(WEB_DIR)
-DASH = os.path.join(WS_DIR, 'dashboard.sh')
+# 2026-08-06: dashboard.sh·realboard.sh 가 워크스페이스 루트에서 **dg_web/ 안으로** 옮겨졌다
+#  (팀 요청). 즉 스크립트는 이 파일과 같은 폴더에 있다.
+DASH = os.path.join(WEB_DIR, 'dashboard.sh')
 
 
 def robot_id():
@@ -350,3 +352,21 @@ def read_home():
 
 def write_home(data):
     write_json(HOME_FILE, data)
+
+
+# ── 웨이포인트 (로봇별) ──────────────────────────────────────────────────
+# 화면에서 지도를 클릭해 찍어 두는 경로점. 충전소 진입점과 같은 이유로 노트북에 둔다.
+#   {robot_id: {'points': [{'id','name','x','y','yaw','dock','task_point_id'}, ...]}}
+#   dock: 'none' | 'floor'(H마커) | 'reflective'(반사테이프)
+#   H 마커는 별도 목록을 두지 않는다 — dock='floor' 인 점이 곧 H 마커 지점이다.
+#   따로 관리하면 지도 위 표시와 실제 도킹 대상이 어긋날 수 있다.
+WAYPOINTS_FILE = os.path.join(WEB_DIR, 'waypoints.local.json')
+
+
+def read_waypoints():
+    d = read_json(WAYPOINTS_FILE, None)
+    return d if isinstance(d, dict) else {}
+
+
+def write_waypoints(data):
+    write_json(WAYPOINTS_FILE, data)
