@@ -170,7 +170,6 @@ CONTROL_SERVICE_URL=http://127.0.0.1:7001 PORT=8899 python3 app.py   # ACS 연�
 | **이보연** | 주행·관제·반사 도킹 — 경로탐색·교통관제, 반사 테이프 도킹, ACS·DCS 구현, 설계문서 |
 | **김동현** | 수확 동작 — 자체 경로 생성(동작 분할), REAP, DDagi 수확 구현, 3D 프린터 토마토 베드 제작 |
 | **김희석** | 지도·도킹 — SLAM·주행 파라미터 조정, H 마커리스 도킹, DG Control Service |
-| **손민호** | 모션 플래닝·상태 — PQS 수확 후보 선별, DDagi 텔레메트리, Automato AI Service |
 | **이건수** | AI·캘리브레이션·앱 — YOLO 학습(숙도·병해충), 로봇팔 캘리브레이션, Farm Admin App·Web Service |
 
 ### 개발 방식
