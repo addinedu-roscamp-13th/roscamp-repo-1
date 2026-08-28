@@ -1,0 +1,1084 @@
+#!/usr/bin/env python3
+"""DG Control Service (DCS) — 시나리오1 순찰 오케스트레이터 본체.
+
+시퀀스 다이어그램(Confluence page 23691289, 2026-07-14 개정)의 DCS 역할을 구현한다.
+
+  E0 상시 모니터링:
+    - 구독  /ddago/telemetry (DdagoTelemetry)  ← ddago/ddagi 연동은 robot_id 미사용
+    - 구독  /ddagi/telemetry (DdagiTelemetry)  (상대가 필드를 채워 보내도 읽지 않는다)
+    - 발행  /{robot_id}/telemetry  (RobotTelemetry, 1Hz — 자기 세트분)
+  E1/E2 순찰(경로 하달):
+    - 액션 서버      /{robot_id}/navigate        (Navigate, Waypoint[]) ← Automato Control Service
+    - 액션 클라이언트 /ddago/navigate            (Navigate, Waypoint[]) → DdaGo Control Service
+  E4-6/E2 22-1 정밀 도킹(중계) — 지점마다 마커가 달라 방식이 셋이다(RP-131):
+    - 액션 서버      /{robot_id}/dock            (Dock)           ← ACS  ┐ charuco  (휴면)
+    - 액션 클라이언트 /ddago/dock                 (Dock)           → DdaGo┘
+    - 액션 서버      /{robot_id}/floor_dock      (FloorDock)      ← ACS  ┐ 바닥 H 마커
+    - 액션 클라이언트 /ddago/floor_dock           (FloorDock)      → DdaGo┘ (수확지·예냉실)
+    - 액션 서버      /{robot_id}/reflective_dock (ReflectiveDock) ← ACS  ┐ 반사테이프
+    - 액션 클라이언트 /ddago/reflective_dock      (ReflectiveDock) → DdaGo┘ (충전소)
+      어느 방식을 쓸지는 **ACS 가 액션 이름으로 고른다**(ACS docking.method_for 가 단일 출처).
+      DCS 는 판단하지 않고 셋 다 열어 두고 온 것을 그대로 넘긴다.
+  S2 E2→E3 핸드오프 게이트:
+    - 수확 위치 도킹 성공(result_code==0)한 task 만 E3 진입 허용 → is_docked() 로 판정.
+      새 주행이 시작되면(도크에서 떠남) 해제. 아래 Harvest 서버가 goal 수락 조건으로 읽는다.
+  S2 E3~E5 수확(Harvest 중계):
+    - 액션 서버      /{robot_id}/harvest         (Harvest) ← Automato Control Service
+    - 액션 클라이언트 /ddagi/harvest              (Harvest) → Ddagi Control Service
+    - 수확 루프 주관은 Ddagi(관측·검출·제외목록·라운드·파지). DG 는 goal 하달 + feedback/
+      result 중계만 한다. 도킹 성공 task 만 accept(게이트), 취소 전파, Feedback 무수신 워치독.
+  S2 E6 예냉실 하역(Unload 중계):
+    - 액션 서버      /{robot_id}/unload          (Unload) ← Automato Control Service
+    - 액션 클라이언트 /ddagi/unload               (Unload) → Ddagi Control Service
+    - 하역 시퀀스(손잡이 파지→들기→대기→흔들기→복귀) 주관은 Ddagi. DG 는 goal 하달 +
+      feedback(phase)/result 중계만 한다. 예냉실 도킹 성공 task 만 accept(게이트), 취소
+      전파, Feedback 무수신 워치독. 하역 실패도 result_code 를 가공 없이 그대로 올린다
+      (task FAILED 판정은 ACS 몫 — 하역은 보너스라 실패해도 수확 실적을 지우지 않는다).
+  E2 촬영·분석·저장:
+    - 서비스 서버    /dg/analyze_frame           (AnalyzeFrame) ← DdaGo (capture 노드 도착 후)
+    - TCP 클라이언트  DG AI Service               (4B len+JSON)  → 분석 위임
+    - 서비스 클라이언트 /automato/save_detection  (SaveDetection)→ Automato Control Service
+
+DCS 는 **중계자**다(다이어그램 E2-6: "DG는 중계만 한다").
+  ACS 가 예약 확보된 구간을 Waypoint[] 로 하달 → DCS 가 그대로 DdaGo 에 넘김
+  → DdaGo 의 feedback(current_waypoint_id, waypoint_index, x, y, yaw)·result(result_code,
+    last_waypoint_id)를 **그대로 즉시 ACS 로 중계** → ACS 가 재계획 후 다음 구간 하달.
+  통로 예약/해제·BFS·막힘 판정·복귀는 전부 ACS 몫이라 DCS 에는 없다.
+  ACS 의 취소(cancel goal)도 DdaGo 로 중계한다(E2 22-1).
+
+  [병렬] capture==true 노드에 도착한 DdaGo 가 AnalyzeFrame 호출 → DCS 가 AI(TCP) 자문
+        → 결과(percent + 병해충 라벨 이미지)를 SaveDetection 으로 ACS 에 전달.
+        라벨 이미지 **파일 저장은 ACS 몫**이라 DCS 는 저장하지 않고 전달만 한다.
+
+AI 접속 대상은 dg_web/dg_ai_target.json 의 active("real"|"sim")를 따른다(대시보드에서 전환).
+
+실행:
+  source /opt/ros/jazzy/setup.bash
+  source install/setup.bash
+  ros2 run dg_control dcs_node
+"""
+import base64
+import functools
+import io
+import json
+import os
+import threading
+import time
+
+import rclpy
+from action_msgs.msg import GoalStatus
+from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+
+from automato_interfaces.action import Dock, FloorDock, Harvest, Navigate, ReflectiveDock, Unload
+from automato_interfaces.msg import RobotTelemetry
+from automato_interfaces.srv import AnalyzeFrame, SaveDetection
+from sensor_msgs.msg import Image
+
+from dg_control.ai_client import AiTcpClient
+
+
+# 액션 goal 의 종료 상태를 사람이 읽을 수 있게. 로그·@@WIRE@@ 에 code 와 함께 남겨야
+#  '결과 내용은 0인데 실제로는 ABORTED' 같은 상황을 나중에 로그만 보고 분간할 수 있다.
+_GOAL_STATUS_NAME = {
+    GoalStatus.STATUS_UNKNOWN: 'UNKNOWN',
+    GoalStatus.STATUS_ACCEPTED: 'ACCEPTED',
+    GoalStatus.STATUS_EXECUTING: 'EXECUTING',
+    GoalStatus.STATUS_CANCELING: 'CANCELING',
+    GoalStatus.STATUS_SUCCEEDED: 'SUCCEEDED',
+    GoalStatus.STATUS_CANCELED: 'CANCELED',
+    GoalStatus.STATUS_ABORTED: 'ABORTED',
+}
+
+
+def _status_name(st):
+    return _GOAL_STATUS_NAME.get(st, '?(%s)' % st)
+
+
+def _find_ai_target_file():
+    """dg_web/dg_ai_target.json(대시보드가 실/시뮬 IP·active 를 저장하는 파일)을
+    이 모듈 위치에서 상위로 거슬러 올라가며 찾는다.
+
+    src 직접 실행/colcon install/symlink-install 어느 쪽이든 automato_ws 아래에
+    있으므로 같은 워크스페이스의 파일이 잡힌다. 경로를 하드코딩하면 dashboard.sh 가
+    쓰는 파일($WS/dg_web/...)과 DCS 가 읽는 파일이 어긋나 active=real 로 바꿔도
+    반영되지 않는다(=실 AI 서비스에 영영 접속 못 함).
+
+    못 찾으면 빈 문자열 -> ai_client 가 ai_default_endpoint 로 폴백.
+    """
+    d = os.path.dirname(os.path.realpath(__file__))
+    while True:
+        cand = os.path.join(d, 'dg_web', 'dg_ai_target.json')
+        if os.path.isfile(cand):
+            return cand
+        parent = os.path.dirname(d)
+        if parent == d:            # 루트까지 올라감
+            return ''
+        d = parent
+
+
+class DcsNode(Node):
+    # 정밀 도킹 3종 — (방식, 액션 타입, 액션 이름). 이름은 ACS 쪽 /{robot_id}/{이름},
+    # 로봇 쪽 /ddago/{이름} 로 그대로 쓰인다(ACS docking._ACTION_SPEC 의 suffix 와 같은 값).
+    #   charuco    : 전면 카메라 + ChArUco 보드 — 현재 어느 지점도 쓰지 않는다(휴면)
+    #   floor      : 전면 카메라 + 바닥 청색 H 마커(마커리스) — 수확지·예냉실
+    #   reflective : 2D 라이다 + 재귀반사테이프 코너 마커(마커리스) — 충전소
+    # 세 Result 는 result_code·final_lateral_m·final_yaw_error·message 를 공통으로 갖고,
+    # 앞뒤 오차 필드 이름만 다르다(final_error_m / final_wall_gap_m / final_gap_m).
+    # 중계는 필드를 통째로 복사하므로 그 차이를 알 필요가 없다(_copy_fields).
+    DOCK_KINDS = (
+        ('charuco', Dock, 'dock'),
+        ('floor', FloorDock, 'floor_dock'),
+        ('reflective', ReflectiveDock, 'reflective_dock'),
+    )
+
+    def __init__(self, **kwargs):
+        super().__init__('dg_control_dcs', **kwargs)
+
+        self.declare_parameter('robot_id', 'dg_01')
+        self.declare_parameter('fleet_hz', 1.0)
+        self.declare_parameter('ai_target_file', _find_ai_target_file())
+        self.declare_parameter('ai_default_endpoint', '127.0.0.1:9100')
+        # 신선한 로봇 텔레메트리가 이 시간(초) 넘게 안 오면 RobotTelemetry 발행 중지
+        self.declare_parameter('fleet_stale_sec', 3.0)
+        # DdaGo 가 구간(Waypoint[]) 하나를 끝낼 때까지 기다리는 상한(초)
+        self.declare_parameter('ddago_result_timeout_sec', 180.0)
+        # DdaGo 도킹 한 번의 상한(초). 탐색 1.1바퀴(~35s)+중심선 기동+접근+회전+후진.
+        # 도킹 3종(charuco/floor/reflective)이 이 값 하나를 함께 쓴다. 방식마다 기동이
+        # 달라도 '한 번의 도킹'이라는 크기는 같은 자릿수이고, 무엇보다 이 값은 로봇이
+        # 멎었는지 보는 안전망이지 방식별 성능 지표가 아니다. 방식별로 쪼개면 셋 다
+        # 따로 튜닝해야 하는데 그럴 근거가 아직 없다(실기 계측 후 필요해지면 나눈다).
+        self.declare_parameter('dock_result_timeout_sec', 180.0)
+        # Harvest 는 여러 라운드로 오래 도는 액션이라 총 시간 상한 대신 **Feedback 무수신
+        # 워치독**으로 감시한다. 마지막 Feedback(또는 goal 수락) 이후 이 시간(초) 넘게
+        # 진행 소식이 없으면 Ddagi 가 멎은 것으로 보고 취소·실패 처리한다.
+        self.declare_parameter('harvest_feedback_timeout_sec', 30.0)
+        # 하역(Unload)도 phase 진행 소식이 이 시간(초) 넘게 없으면 멎은 것으로 보고 실패
+        # 처리한다. 시퀀스에 shake_delay(기본 3초) 대기가 있으므로 그보다 넉넉해야 한다.
+        self.declare_parameter('unload_feedback_timeout_sec', 15.0)
+
+        self.robot_id = self.get_parameter('robot_id').value
+        fleet_hz = float(self.get_parameter('fleet_hz').value)
+        self._fleet_stale = float(self.get_parameter('fleet_stale_sec').value)
+        self._ddago_timeout = float(self.get_parameter('ddago_result_timeout_sec').value)
+        self._dock_timeout = float(self.get_parameter('dock_result_timeout_sec').value)
+        self._harvest_fb_timeout = float(
+            self.get_parameter('harvest_feedback_timeout_sec').value)
+        self._unload_fb_timeout = float(
+            self.get_parameter('unload_feedback_timeout_sec').value)
+
+        # 콜백 그룹: 서비스/타이머는 동시 처리(Reentrant), 액션 클라이언트는 순차(Exclusive).
+        self._cb_re = ReentrantCallbackGroup()
+        self._cb_client = MutuallyExclusiveCallbackGroup()
+
+        # ---- E0 텔레메트리 ----
+        # ddago/ddagi 연동에는 robot_id 를 쓰지 않는다(물리망 분리). DG 는 자기 세트의
+        # 것만 받으므로 최신값 한 벌만 들고 있으면 된다(메시지의 robot_id 필드도 안 읽는다).
+        self._ddago_tel = None   # 최신 DdagoTelemetry
+        self._ddagi_tel = None   # 최신 DdagiTelemetry
+        self._ddago_rx = 0.0     # 마지막 수신 시각
+        self._ddagi_rx = 0.0
+        from automato_interfaces.msg import DdagiTelemetry, DdagoTelemetry
+        self.create_subscription(
+            DdagoTelemetry, '/ddago/telemetry',
+            self._on_ddago_tel, 10, callback_group=self._cb_re)
+        self.create_subscription(
+            DdagiTelemetry, '/ddagi/telemetry',
+            self._on_ddagi_tel, 10, callback_group=self._cb_re)
+        # DG -> ACS 는 자기 세트분(RobotTelemetry)을 /{robot_id}/telemetry 로 보낸다.
+        # 어느 로봇인지는 네임스페이스가 말해준다(이 구간만 robot_id 사용).
+        self._fleet_pub = self.create_publisher(
+            RobotTelemetry, '/%s/telemetry' % self.robot_id, 10)
+        self.create_timer(1.0 / fleet_hz, self._publish_fleet,
+                          callback_group=self._cb_re)
+
+        # ---- E1/E2 Navigate 액션 서버 (ACS ← ) ----
+        self._navigate_srv = ActionServer(
+            self, Navigate, '/%s/navigate' % self.robot_id,
+            execute_callback=self._navigate_execute,
+            cancel_callback=lambda _gh: CancelResponse.ACCEPT,
+            callback_group=self._cb_re)
+
+        # ---- E1/E2 Navigate 액션 클라이언트 (→ DdaGo, 경로 배열 그대로 중계) ----
+        self._ddago_client = ActionClient(
+            self, Navigate, '/ddago/navigate',   # 로봇 쪽은 robot_id 미사용
+            callback_group=self._cb_client)
+
+        # ---- E4-6 / E2 22-1 정밀 도킹 3종: 액션 서버 (ACS ← ) / 클라이언트 (→ DdaGo) ----
+        # 방식은 셋이지만 중계 절차는 완전히 같다(goal 을 그대로 하달 → feedback·result 를
+        # 그대로 되돌림 → 취소 전파). 그래서 방식별로 코드를 복사하지 않고 DOCK_KINDS 표
+        # 하나를 돌며 서버·클라이언트를 만든다. 복사해 두면 나중에 한쪽만 고치고 다른 쪽을
+        # 빠뜨리기 쉽다(중계는 '필드 누락 없이 그대로'가 전부인 코드라 더 그렇다).
+        #
+        # 주행과 도킹은 같은 로봇(DdaGo)을 쓰므로 Navigate 와 _ddago_lock 을 공유한다.
+        # 도킹 3종끼리도 같은 락이라, 두 방식이 겹쳐 하달돼도 하나씩 순서대로 나간다.
+        self._dock_srv = {}
+        self._dock_client = {}
+        self._dock_act = {}          # 방식 -> 액션 타입 (Result/Feedback 을 만들 때 쓴다)
+        for kind, act, name in self.DOCK_KINDS:
+            self._dock_act[kind] = act
+            self._dock_srv[kind] = ActionServer(
+                self, act, '/%s/%s' % (self.robot_id, name),
+                execute_callback=functools.partial(self._dock_execute, kind),
+                cancel_callback=lambda _gh: CancelResponse.ACCEPT,
+                callback_group=self._cb_re)
+            self._dock_client[kind] = ActionClient(
+                self, act, '/ddago/%s' % name,   # 로봇 쪽은 robot_id 미사용
+                callback_group=self._cb_client)
+
+        # ---- S2 E3~E5 Harvest 액션 서버 (ACS ← ) / 클라이언트 (→ Ddagi) ----
+        # 수확 루프 주관은 Ddagi 다. DG 는 Harvest 를 **중계**만 한다(goal 하달 + feedback/
+        # result 되돌림). goal 수락은 도킹 성공(is_docked)한 task 로 제한한다(goal_callback).
+        # Harvest 는 팔(Ddagi) 대상이라 주행/도킹(DdaGo)의 _ddago_lock 과는 별개 자원이다.
+        self._harvest_srv = ActionServer(
+            self, Harvest, '/%s/harvest' % self.robot_id,
+            goal_callback=self._harvest_goal_cb,
+            execute_callback=self._harvest_execute,
+            cancel_callback=lambda _gh: CancelResponse.ACCEPT,
+            callback_group=self._cb_re)
+        self._harvest_client = ActionClient(
+            self, Harvest, '/ddagi/harvest',   # 로봇 쪽은 robot_id 미사용
+            callback_group=self._cb_client)
+        # 수확(Harvest)과 하역(Unload)은 같은 팔(Ddagi)을 쓰므로 _ddagi_lock 을 공유한다
+        # — 수확 중 하역 goal 이 겹쳐 들어가면 팔이 두 명령을 동시에 받게 된다(E3~E6 는
+        # 시간상 겹치지 않지만, 겹쳐 하달되는 비정상 상황에서도 순서를 지키도록 직렬화).
+        self._ddagi_lock = threading.Lock()   # 동시에 뜬 Harvest/Unload goal 은 하나뿐
+
+        # ---- S2 E6 Unload 액션 서버 (ACS ← ) / 클라이언트 (→ Ddagi) ----
+        # 하역 시퀀스(손잡이 파지→들기→대기→흔들기→복귀) 주관은 Ddagi 다. DG 는 Unload 를
+        # **중계**만 한다(goal 하달 + feedback/result 되돌림). goal 수락은 예냉실 도킹 성공
+        # (is_docked)한 task 로 제한한다(goal_callback).
+        self._unload_srv = ActionServer(
+            self, Unload, '/%s/unload' % self.robot_id,
+            goal_callback=self._unload_goal_cb,
+            execute_callback=self._unload_execute,
+            cancel_callback=lambda _gh: CancelResponse.ACCEPT,
+            callback_group=self._cb_re)
+        self._unload_client = ActionClient(
+            self, Unload, '/ddagi/unload',   # 로봇 쪽은 robot_id 미사용
+            callback_group=self._cb_client)
+
+        # ---- E2 AnalyzeFrame 서비스 서버 (DdaGo ← ) ----
+        self.create_service(
+            AnalyzeFrame, '/dg/analyze_frame', self._on_analyze_frame,
+            callback_group=self._cb_re)
+
+        # ---- E2 SaveDetection 서비스 클라이언트 (→ ACS) ----
+        self._save_client = self.create_client(
+            SaveDetection, '/automato/save_detection', callback_group=self._cb_re)
+
+        # ---- E2 AI Service TCP 클라이언트 ----
+        self.ai = AiTcpClient(
+            target_file=self.get_parameter('ai_target_file').value,
+            default_endpoint=self.get_parameter('ai_default_endpoint').value,
+            logger=self.get_logger())
+
+        self._req_seq = 0
+        # 로봇 1대에 동시에 떠 있는 Navigate goal 은 하나뿐이어야 한다. 여러 goal 을 한
+        # 액션 클라이언트로 겹쳐 보내면 rclpy 가 goal UUID 를 재사용해 결과가 뒤섞인다.
+        # (ACS 가 겹쳐 하달하는 비정상 상황에서도 순서를 지키도록 DCS 에서 직렬화한다.)
+        self._ddago_lock = threading.Lock()
+
+        # ---- S2 E2→E3 핸드오프 게이트 ----
+        # 수확 위치에 **도킹이 성공한 task 만** E3(수확 대상 인식)로 진입할 수 있다.
+        # 팔이 잘못된 위치에서 동작하는 것을 막는 안전 조건이다(도킹 실패/취소면 진입 금지).
+        # 이 값은 Harvest 액션 서버(RP-99)가 goal 수락 여부를 판정할 때 is_docked() 로 읽는다.
+        # DCS 는 상태만 관리하고, 실제 Harvest 서버는 RP-99 범위다.
+        #   set   : Dock result_code==0 (취소 아님) 일 때 그 task_id
+        #   clear : 새 주행(Navigate)이 시작되면 — 로봇이 도크에서 떠났다는 뜻
+        self._docked_lock = threading.Lock()
+        self._docked_task = None
+
+        # ---- AI Service 접속 감시 ----
+        # AiTcpClient 는 첫 분석 요청 때 붙는(lazy) 구조라, 순찰을 돌리기 전에는
+        # 실서버/시뮬 어디에 붙는지 알 수 없었다. 기동 직후 한 번 실제로 붙어보고
+        # 그 뒤로도 대상(active real/sim)·연결 상태가 바뀌면 로그 + @@WIRE@@ 로 남긴다.
+        # (probe 가 만든 연결은 그대로 유지돼 첫 analyze 요청이 재사용한다.)
+        self._ai_status = None    # 마지막으로 로그한 (endpoint, ok)
+        threading.Thread(target=self._ai_watch_loop, daemon=True).start()
+
+        self.get_logger().info(
+            'DCS 준비: robot_id=%s | Navigate서버 /%s/navigate | 도킹서버 /%s/{%s} '
+            '| Harvest서버 /%s/harvest | Unload서버 /%s/unload | AI target=%s'
+            % (self.robot_id, self.robot_id, self.robot_id,
+               ','.join(n for _k, _a, n in self.DOCK_KINDS),
+               self.robot_id, self.robot_id,
+               self.get_parameter('ai_target_file').value
+               or '(dg_ai_target.json 못 찾음 -> %s 고정)'
+                  % self.get_parameter('ai_default_endpoint').value))
+
+    AI_WATCH_SEC = 5.0        # AI 접속 확인 주기 [s]
+
+    def _ai_watch_loop(self):
+        """기동 직후 1회 + 이후 주기적으로 AI Service 접속을 확인한다.
+        매번 찍으면 로그가 묻히므로 (엔드포인트, 성공여부)가 바뀔 때만 남긴다."""
+        while rclpy.ok():
+            try:
+                st = self.ai.probe()
+            except Exception as e:            # 감시 스레드는 어떤 경우도 죽지 않게
+                st = {'endpoint': '?', 'active': '?', 'ok': False, 'error': str(e)}
+            key = (st['endpoint'], st['ok'])
+            if key != self._ai_status:
+                where = '실서버' if st['active'] == 'real' else (
+                    '시뮬' if st['active'] == 'sim' else '기본값(target 파일 못읽음)')
+                if st['ok']:
+                    self.get_logger().info(
+                        'AI 서비스 접속: OK %s (%s)' % (st['endpoint'], where))
+                else:
+                    self.get_logger().warn(
+                        'AI 서비스 접속: 실패 %s (%s) — %s'
+                        % (st['endpoint'], where, st['error']))
+                self._wire('from_dcs', 'ai_connect',
+                           {'endpoint': st['endpoint'], 'active': st['active'],
+                            'status': 'UP' if st['ok'] else 'DOWN',
+                            'error': st['error']})
+                self._ai_status = key
+            time.sleep(self.AI_WATCH_SEC)
+
+    # 실제 오간 메시지 내용을 한 줄 JSON(@@WIRE@@)으로 남긴다. 대시보드가 읽어 표시.
+    #   direction: 'to_dcs'(상대→DCS) | 'from_dcs'(DCS→상대)
+    def _wire(self, direction, iface, payload):
+        try:
+            print('@@WIRE@@ ' + json.dumps(
+                {'ts': time.time(), 'dir': direction, 'iface': iface, 'payload': payload},
+                ensure_ascii=False, default=float), flush=True)
+        except (TypeError, ValueError):
+            pass
+
+    @staticmethod
+    def _msg_to_dict(msg):
+        """ROS 메시지를 있는 그대로 dict 로 (필드 누락·반올림 없이, 실제 발행값 그대로).
+
+        예외는 하나 — 이미지 픽셀(uint8[] data)처럼 아주 긴 배열은 원소를 전부 찍으면
+        로그가 수십 MB 가 되므로 '<uint8[N]>' 요약으로 바꾼다."""
+        def conv(v):
+            if hasattr(v, 'get_fields_and_field_types'):           # 중첩 ROS 메시지
+                return {f: conv(getattr(v, f)) for f in v.get_fields_and_field_types()}
+            if isinstance(v, (bytes, bytearray)):
+                return '<uint8[%d]>' % len(v)
+            if isinstance(v, str) or isinstance(v, bool):
+                return v
+            if hasattr(v, '__len__') and not isinstance(v, dict):  # 배열(list/array/ndarray)
+                if len(v) > 64:                                    # 이미지 픽셀 등
+                    return '<uint8[%d]>' % len(v)
+                return [conv(x) for x in v]
+            if isinstance(v, int):
+                return v
+            if isinstance(v, float):
+                return v
+            try:                                                   # numpy float32/int32 등
+                return float(v) if 'float' in type(v).__name__ else int(v)
+            except (TypeError, ValueError):
+                return str(v)
+        return conv(msg)
+
+    # ===== S2 E2→E3 핸드오프 게이트 (도킹 성공 task 만 수확 진입 허용) =====
+    def _mark_docked(self, task_id):
+        """수확 위치 도킹 성공 → 이 task 를 E3 진입 가능 상태로 보관."""
+        with self._docked_lock:
+            self._docked_task = int(task_id)
+        self.get_logger().info('E3 진입 가능(도킹 성공): task=%d' % int(task_id))
+
+    def _clear_docked(self, reason=''):
+        """도크에서 떠남(새 주행 시작) → 진입 가능 상태 해제."""
+        with self._docked_lock:
+            prev = self._docked_task
+            self._docked_task = None
+        if prev is not None:
+            self.get_logger().info('E3 진입 가능 해제: task=%s (%s)' % (prev, reason))
+
+    def is_docked(self, task_id):
+        """이 task 가 수확 위치에 도킹된 상태인가(=E3 진입 허용). Harvest 서버(RP-99)가 읽는다."""
+        with self._docked_lock:
+            return self._docked_task == int(task_id)
+
+    # ============================ E0 텔레메트리 ============================
+    # ddago/ddagi 연동에는 robot_id 가 없다(물리망이 로봇별로 분리되어 DG 는 자기 세트의
+    # 것만 받는다). 메시지에 robot_id 필드가 있어도 읽지 않는다 — 어느 로봇인지는 DG 자신이
+    # 안다(self.robot_id). 그래서 세트당 최신값 한 벌만 보관한다.
+    def _on_ddago_tel(self, msg):
+        self._ddago_tel = msg
+        self._ddago_rx = time.time()
+        self._wire('to_dcs', 'DdagoTelemetry', self._msg_to_dict(msg))
+
+    def _on_ddagi_tel(self, msg):
+        self._ddagi_tel = msg
+        self._ddagi_rx = time.time()
+        self._wire('to_dcs', 'DdagiTelemetry', self._msg_to_dict(msg))
+
+    def _publish_fleet(self):
+        # 신선한(최근 fleet_stale 초 이내 수신) 것만 싣는다.
+        # 배열이지만 길이는 0 또는 1 — 세트에 주행로봇/팔이 각각 하나뿐(옵셔널 표현).
+        now = time.time()
+        ddagos = ([self._ddago_tel] if self._ddago_tel is not None
+                  and now - self._ddago_rx < self._fleet_stale else [])
+        ddagis = ([self._ddagi_tel] if self._ddagi_tel is not None
+                  and now - self._ddagi_rx < self._fleet_stale else [])
+        if not ddagos and not ddagis:
+            return   # 신선한 텔레메트리 없음(E0 중지 등) → DCS→ACS 발행 중지
+        msg = RobotTelemetry()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.ddagos = ddagos
+        msg.ddagis = ddagis
+        self._fleet_pub.publish(msg)
+        self._wire('from_dcs', 'RobotTelemetry', self._msg_to_dict(msg))
+
+    # ===== E1/E2 Navigate 중계 — ACS 가 하달한 경로(Waypoint[])를 DdaGo 에 그대로 =====
+    def _navigate_execute(self, goal_handle):
+        """ACS 가 하달한 구간(Waypoint[])을 DdaGo 로 중계하고, DdaGo 의 feedback·result 를
+        **그대로 즉시** ACS 로 전달한다. 촬영·분석·저장(E2)은 capture==true 노드에서 DdaGo 가
+        AnalyzeFrame 으로 별도(병렬) 요청하므로 이 result 반환을 막지 않는다."""
+        req = goal_handle.request
+        wps = list(req.waypoints)
+        task_id = req.task_id
+        # 경로 하달은 순찰·수확 이동 공용이다(같은 Navigate 인터페이스). DCS 는 goal 만으로
+        # 둘을 구분하지 않는다 — 촬영·AI 분석 분기는 capture==true 노드에 도착한 DdaGo 가
+        # AnalyzeFrame 을 호출할 때만 일어나므로, 수확 이동(전 구간 capture=false)은
+        # 자연히 분석 경로를 타지 않는다. 여기서 capture 목록을 로그로 남겨 그 사실을 드러낸다.
+        cap = [w.waypoint_id for w in wps if w.capture]
+        self.get_logger().info(
+            '경로 수신(ACS→DCS): task=%d waypoints=%d capture=%s'
+            % (task_id, len(wps), cap if cap else '없음(이동만)'))
+        # 새 주행이 시작되면 로봇이 도크에서 떠난 것이므로 E3 진입 게이트를 닫는다.
+        self._clear_docked('새 주행 시작 task=%d' % task_id)
+        self._wire('to_dcs', 'Navigate', self._msg_to_dict(req))
+
+        code, last_wp, msg = self._drive_ddago(task_id, wps, goal_handle)
+
+        result = Navigate.Result()
+        result.result_code = int(code)
+        result.last_waypoint_id = int(last_wp)
+        result.message = msg or ''
+        if code == 0:
+            goal_handle.succeed()
+        elif code == 2 and goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+        else:
+            goal_handle.abort()
+        # 구간 결과를 즉시 ACS 로 전달 → ACS 가 재계획·다음 구간 하달 (분석·저장은 병렬 진행)
+        self.get_logger().info('구간 결과 전달(DCS→ACS): task=%d code=%d last_wp=%d'
+                               % (task_id, code, last_wp))
+        self._wire('from_dcs', 'Navigate/result', self._msg_to_dict(result))
+        return result
+
+    def _drive_ddago(self, task_id, waypoints, up_gh):
+        """DdaGo 에 Navigate(경로 배열) 하달 → 피드백을 ACS로 중계 → (code, last_wp, msg) 반환.
+        goal 하나가 끝날 때까지 다음 goal 을 보내지 않는다(_ddago_lock)."""
+        with self._ddago_lock:
+            return self._drive_ddago_locked(task_id, waypoints, up_gh)
+
+    def _drive_ddago_locked(self, task_id, waypoints, up_gh):
+        last_wp = waypoints[0].waypoint_id if waypoints else -1
+        if not self._ddago_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('DdaGo 액션 서버 없음')
+            return 1, last_wp, 'DdaGo 서버 없음'
+
+        goal = Navigate.Goal(task_id=task_id, waypoints=waypoints)
+        self.get_logger().info('DdaGo 하달(DCS→DdaGo): task=%d waypoints=%d'
+                               % (task_id, len(waypoints)))
+        self._wire('from_dcs', 'Navigate(→DdaGo)', self._msg_to_dict(goal))
+
+        def on_fb(fb_msg):
+            fb = fb_msg.feedback
+            nf = Navigate.Feedback()
+            nf.current_waypoint_id = fb.current_waypoint_id
+            nf.waypoint_index = fb.waypoint_index
+            nf.current_x, nf.current_y, nf.current_yaw = fb.current_x, fb.current_y, fb.current_yaw
+            self._wire('to_dcs', 'Navigate(→DdaGo)/feedback', self._msg_to_dict(fb))
+            try:
+                up_gh.publish_feedback(nf)   # DdaGo 피드백(도착 보고) → ACS 로 중계
+                self._wire('from_dcs', 'Navigate/feedback', self._msg_to_dict(nf))
+            except Exception:   # noqa: BLE001
+                pass
+
+        # goal 하달 → 수락 대기
+        holder = {}
+        acc_ev = threading.Event()
+        sfut = self._ddago_client.send_goal_async(goal, feedback_callback=on_fb)
+        sfut.add_done_callback(lambda f: (holder.__setitem__('gh', f.result()), acc_ev.set()))
+        acc_ev.wait(timeout=5.0)
+        gh = holder.get('gh')
+        if gh is None or not gh.accepted:
+            self.get_logger().error('DdaGo goal 거부/무응답')
+            return 1, last_wp, 'DdaGo goal 거부'
+
+        # 결과 대기. 그 사이 ACS 가 취소하면(E2 22-1) DdaGo goal 도 취소 중계.
+        rholder = {}
+        res_ev = threading.Event()
+        gh.get_result_async().add_done_callback(
+            lambda f: (rholder.__setitem__('r', f.result().result), res_ev.set()))
+        waited = 0.0
+        while not res_ev.wait(0.5):
+            if up_gh.is_cancel_requested:
+                self.get_logger().warn('ACS 취소 요청 → DdaGo goal 취소 중계')
+                gh.cancel_goal_async()
+            waited += 0.5
+            if waited >= self._ddago_timeout:
+                self.get_logger().warn('DdaGo 결과 무응답(timeout)')
+                return 1, last_wp, 'DdaGo 결과 timeout'
+
+        r = rholder.get('r')
+        if r is None:
+            return 1, last_wp, 'DdaGo 결과 없음'
+        self.get_logger().info('DdaGo 구간 종료: result_code=%d last_wp=%d'
+                               % (r.result_code, r.last_waypoint_id))
+        self._wire('to_dcs', 'Navigate(→DdaGo)/result', self._msg_to_dict(r))
+        return r.result_code, r.last_waypoint_id, r.message
+
+    # ===== E4-6 / E2 22-1 정밀 도킹 중계 — ACS 의 도킹 지시를 DdaGo 로 그대로 =====
+    # 방식(charuco/floor/reflective)마다 액션 타입만 다르고 절차는 같아서 kind 를 받아
+    # 한 벌로 처리한다. 어느 방식을 쓸지는 ACS 가 액션 이름으로 고르고, DCS 는 받은 것을
+    # 같은 이름의 로봇 액션으로 넘길 뿐 방식의 내용(마커·기동)은 알지 못한다.
+    @staticmethod
+    def _copy_fields(src, dst):
+        """같은 타입의 ROS 메시지 필드를 통째로 복사한다(중계 전용).
+
+        ACS↔DCS 구간과 DCS↔DdaGo 구간은 **같은 액션 타입**을 쓰므로 필드를 하나씩 받아
+        적을 필요가 없다. 손으로 옮기면 방식이 늘 때마다 한둘씩 빠뜨리는데, 도킹 result 의
+        final_lateral_m(중심선/법선 이탈)·final_yaw_error(스큐)는 ACS 가 도킹 품질을
+        판정·기록하는 근거라 하나만 빠져도 어느 축이 문제였는지 알 수 없게 된다.
+        앞뒤 오차 필드는 방식마다 이름이 달라(final_error_m/final_wall_gap_m/final_gap_m)
+        더더욱 이름을 적어 넣지 않는 편이 안전하다.
+        """
+        for f in dst.get_fields_and_field_types():
+            setattr(dst, f, getattr(src, f))
+        return dst
+
+    def _dock_execute(self, kind, goal_handle):
+        """ACS 가 하달한 도킹 goal 을 DdaGo 로 중계하고, feedback·result 를 그대로 ACS 로.
+
+        실제 도킹 기동(마커 탐색 → 정렬 → 접근 → 회전 → 후진 접붙임)은 DdaGo 몫이다.
+        N_dock 재시도와 task_failed 알림은 ACS 몫이라 여기에는 없다
+        (DCS 는 중계자 — E2-6 "DG는 중계만 한다").
+        """
+        act = self._dock_act[kind]
+        req = goal_handle.request
+        self.get_logger().info(
+            '도킹 지시 수신(ACS→DCS): 방식=%s task=%d point=%s'
+            % (kind, req.task_id, req.task_point_id))
+        self._wire('to_dcs', act.__name__, self._msg_to_dict(req))
+
+        r, err = self._dock_ddago(kind, req, goal_handle)
+
+        result = act.Result()
+        if r is not None:
+            self._copy_fields(r, result)   # 값 손실 없이 그대로(축별 오차 포함)
+        if r is None or err:
+            # 실패 경로 두 가지가 여기로 모인다.
+            #   ① r is None  : 중계 자체가 실패(서버 없음/거부/무응답)
+            #   ② err 있음   : goal 이 SUCCEEDED 가 아닌 상태로 끝남(ABORTED/CANCELED/UNKNOWN)
+            # ②에서 result_code 가 0 으로 와 있을 수 있다(빈 결과). 그대로 두면 아래
+            # 게이트가 열려 도킹 안 된 자리에서 팔이 움직인다 → 반드시 0 이 아닌 값으로 덮는다.
+            # 도킹 result_code 에 인프라 실패용 값이 따로 없으므로 3(중단)을 쓴다.
+            if result.result_code == 0:
+                result.result_code = 3
+            result.message = err or '중계 실패'
+
+        # 취소 요청이 와 있으면 결과가 무엇이든 CANCELED 로 끝낸다. ROS2 goal 은
+        # CANCELING 상태에서 succeed() 로 넘어갈 수 없고, ACS 도 자기가 취소한 goal 이
+        # 성공으로 돌아오면 상태를 잘못 판단한다.
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+        elif result.result_code == 0:
+            goal_handle.succeed()
+            # 도킹 성공한 task 만 E3(수확) 진입을 허용한다(취소/실패면 게이트 안 열림).
+            # 방식은 따지지 않는다 — 수확지·예냉실은 floor 로 붙지만, '어느 방식으로
+            # 붙었나'가 아니라 '제 자리에 붙었나'가 팔을 움직여도 되는 조건이다.
+            self._mark_docked(req.task_id)
+        else:
+            goal_handle.abort()
+
+        self.get_logger().info('도킹 결과 전달(DCS→ACS): 방식=%s task=%d code=%d %s'
+                               % (kind, req.task_id, result.result_code, result.message))
+        self._wire('from_dcs', '%s/result' % act.__name__, self._msg_to_dict(result))
+        return result
+
+    def _dock_ddago(self, kind, req, up_gh):
+        """DdaGo 에 도킹 goal 하달 → 피드백 중계 → (DdaGo result | None, 실패사유).
+
+        주행(Navigate)과 같은 로봇이라 _ddago_lock 을 공유한다 — 주행 중에 도킹 goal 이
+        겹쳐 들어가면 로봇이 두 명령을 동시에 받게 된다. 도킹 3종도 이 락 하나를 함께
+        쓰므로 방식이 다른 도킹끼리도 겹치지 않는다.
+        """
+        with self._ddago_lock:
+            return self._dock_ddago_locked(kind, req, up_gh)
+
+    def _dock_ddago_locked(self, kind, req, up_gh):
+        act = self._dock_act[kind]
+        client = self._dock_client[kind]
+        if not client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('DdaGo %s 액션 서버 없음' % act.__name__)
+            return None, 'DdaGo %s 서버 없음' % act.__name__
+
+        self.get_logger().info('DdaGo 도킹 하달(DCS→DdaGo): 방식=%s task=%d point=%s'
+                               % (kind, req.task_id, req.task_point_id))
+        self._wire('from_dcs', '%s(→DdaGo)' % act.__name__, self._msg_to_dict(req))
+
+        def on_fb(fb_msg):
+            fb = fb_msg.feedback
+            # phase 값 집합은 방식마다 다르다(SEARCH/CENTERLINE/… vs SNAP/TURN1/…).
+            # DCS 는 해석하지 않고 문자열 그대로 올린다.
+            nf = self._copy_fields(fb, act.Feedback())
+            self._wire('to_dcs', '%s(→DdaGo)/feedback' % act.__name__, self._msg_to_dict(fb))
+            try:
+                up_gh.publish_feedback(nf)      # DdaGo 진행상황 → ACS 로 중계
+                self._wire('from_dcs', '%s/feedback' % act.__name__, self._msg_to_dict(nf))
+            except Exception:   # noqa: BLE001 - 상위가 이미 끝났으면 무시
+                pass
+
+        # goal 은 받은 것을 그대로 넘긴다(필드 복사 누락 방지). 목표 정차값이 0 이면
+        # '로봇 노드 기본값을 쓴다'는 뜻이라, DCS 가 임의로 채우지 않는 것이 중요하다.
+        holder = {}
+        acc_ev = threading.Event()
+        sfut = client.send_goal_async(req, feedback_callback=on_fb)
+        sfut.add_done_callback(lambda f: (holder.__setitem__('gh', f.result()), acc_ev.set()))
+        acc_ev.wait(timeout=5.0)
+        gh = holder.get('gh')
+        if gh is None or not gh.accepted:
+            self.get_logger().error('DdaGo %s goal 거부/무응답' % act.__name__)
+            return None, 'DdaGo %s goal 거부' % act.__name__
+
+        # 결과 대기. 그 사이 ACS 가 취소하면(E2 22-1) DdaGo goal 도 취소 중계한다.
+        #
+        # ⚠️ status 를 반드시 함께 본다. result 내용만 믿으면 안 된다 —
+        #    result_code 는 0 이 성공이라 **빈 결과(전 필드 0) = 성공**으로 읽힌다(fail-open).
+        #    08-05 실기에서 로봇이 '실패(1)' 로 abort 했는데 DCS 는 code=0 으로 받아
+        #    E3 게이트를 열었다(팔이 도킹 안 된 자리에서 동작). 원인은 로봇 rclpy 7.1.9 가
+        #    인자 없는 abort() 에서 빈 Result 를 먼저 보내버리는 것 → status 는 ABORTED 로
+        #    정확히 왔었다. 로봇 쪽을 고쳐도 통신 이상·서버 예외에서 같은 일이 나므로
+        #    중계자 입장에서 status 확인은 상시 안전장치다.
+        rholder = {}
+        res_ev = threading.Event()
+        gh.get_result_async().add_done_callback(
+            lambda f: (rholder.update(r=f.result().result, st=f.result().status),
+                       res_ev.set()))
+        waited = 0.0
+        cancel_sent = False
+        while not res_ev.wait(0.5):
+            # 취소는 한 번만 보낸다. 매 주기 재전송하면 같은 goal 에 취소 요청이
+            # 쌓이기만 하고 얻는 게 없다(DdaGo 는 이미 취소 처리 중이다).
+            if up_gh.is_cancel_requested and not cancel_sent:
+                cancel_sent = True
+                self.get_logger().warn('ACS 취소 요청 → DdaGo 도킹 취소 중계')
+                gh.cancel_goal_async()
+            waited += 0.5
+            if waited >= self._dock_timeout:
+                self.get_logger().warn('DdaGo 도킹 결과 무응답(timeout)')
+                return None, 'DdaGo 도킹 결과 timeout'
+
+        r = rholder.get('r')
+        if r is None:
+            return None, 'DdaGo 도킹 결과 없음'
+        st = rholder.get('st')
+        self.get_logger().info(
+            'DdaGo 도킹 종료: 방식=%s status=%s code=%d lateral=%.3fm yaw=%.3frad'
+            % (kind, _status_name(st), r.result_code, r.final_lateral_m, r.final_yaw_error))
+        self._wire('to_dcs', '%s(→DdaGo)/result' % act.__name__,
+                   dict(self._msg_to_dict(r), _status=_status_name(st)))
+        if st != GoalStatus.STATUS_SUCCEEDED:
+            # 성공이 아니면 result 내용과 무관하게 실패다(사유는 err 로 올린다).
+            #  단 result 자체는 그대로 돌려준다 — 축별 오차(final_lateral_m/final_yaw_error)는
+            #  ACS 가 실패 원인을 판정·기록하는 근거라, 실패라고 버리면 어느 축이 문제였는지
+            #  알 수 없게 된다. '실패로 처리하되 값은 보존' 이 맞다.
+            return r, 'DdaGo 도킹 %s (code=%d)' % (_status_name(st), r.result_code)
+        return r, ''
+
+    # ===== S2 E3~E5 Harvest 중계 — ACS 의 수확 지시를 Ddagi 로 그대로 =====
+    def _harvest_goal_cb(self, goal_request):
+        """수확 goal 수락 판정: 도킹 성공(is_docked)한 task 만 진입 허용.
+        도킹하지 않은 위치에서 팔이 수확을 시작하는 것을 막는 안전 조건(E2→E3 게이트)이다."""
+        if self.is_docked(goal_request.task_id):
+            return GoalResponse.ACCEPT
+        self.get_logger().warn(
+            '수확 goal 거부: task=%d 도킹 안 됨(E2 도킹 성공 필요)' % goal_request.task_id)
+        return GoalResponse.REJECT
+
+    def _harvest_execute(self, goal_handle):
+        """ACS 가 하달한 Harvest goal 을 Ddagi 로 중계하고, feedback·result 를 그대로 ACS 로.
+
+        라운드·검출(DetectTomatoes)·제외목록·파지는 Ddagi 몫이다(DG는 중계자). Feedback
+        무수신 워치독으로 멎음을 감지하고, ACS 취소는 Ddagi goal 취소로 전파한다.
+        """
+        req = goal_handle.request
+        self.get_logger().info('수확 시작 수신(ACS→DCS): task=%d max_capacity=%d'
+                               % (req.task_id, req.max_capacity))
+        self._wire('to_dcs', 'Harvest', self._msg_to_dict(req))
+
+        # 도킹 게이트 소비 — 이 도킹으로 열린 수확 진입 권한을 여기서 쓴다(재진입 방지).
+        self._clear_docked('수확 시작 task=%d' % req.task_id)
+
+        r, err = self._harvest_ddagi(req, goal_handle)
+
+        result = Harvest.Result()
+        if r is not None:
+            # 값 손실 없이 그대로. 누적 카운트·종료 사유는 ACS 가 실적을 기록·표시하는 근거다.
+            result.normal_count = int(r.normal_count)
+            result.discard_count = int(r.discard_count)
+            result.failed_count = int(r.failed_count)
+            result.exit_reason = r.exit_reason or ''
+            result.message = r.message or ''
+        else:
+            # 중계 자체 실패(서버 없음/거부/무응답/취소). exit_reason 은 비우고 사유는 message 로.
+            result.exit_reason = ''
+            result.message = err or '중계 실패'
+
+        # 취소가 와 있으면 결과가 무엇이든 CANCELED 로 끝낸다(ROS2 goal 은 CANCELING 에서
+        # succeed 로 못 넘어가고, ACS 도 자기가 취소한 goal 이 성공으로 오면 오판한다).
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+        elif r is not None:
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
+
+        self.get_logger().info(
+            '수확 결과 전달(DCS→ACS): task=%d exit=%s normal=%d discard=%d failed=%d'
+            % (req.task_id, result.exit_reason, result.normal_count,
+               result.discard_count, result.failed_count))
+        self._wire('from_dcs', 'Harvest/result', self._msg_to_dict(result))
+        return result
+
+    def _harvest_ddagi(self, req, up_gh):
+        with self._ddagi_lock:
+            return self._harvest_ddagi_locked(req, up_gh)
+
+    def _harvest_ddagi_locked(self, req, up_gh):
+        if not self._harvest_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('Ddagi Harvest 액션 서버 없음')
+            return None, 'Ddagi Harvest 서버 없음'
+
+        self.get_logger().info('Ddagi 수확 하달(DCS→Ddagi): task=%d' % req.task_id)
+        self._wire('from_dcs', 'Harvest(→Ddagi)', self._msg_to_dict(req))
+
+        last_fb = {'t': time.time()}   # 워치독 기준: 마지막 진행 소식(수락 시점부터 시작)
+
+        def on_fb(fb_msg):
+            fb = fb_msg.feedback
+            last_fb['t'] = time.time()
+            nf = Harvest.Feedback()
+            nf.round = fb.round
+            nf.normal_count = fb.normal_count
+            nf.discard_count = fb.discard_count
+            nf.failed_count = fb.failed_count
+            nf.remaining_in_round = fb.remaining_in_round
+            self._wire('to_dcs', 'Harvest(→Ddagi)/feedback', self._msg_to_dict(fb))
+            try:
+                up_gh.publish_feedback(nf)      # Ddagi 진행상황 → ACS 로 중계
+                self._wire('from_dcs', 'Harvest/feedback', self._msg_to_dict(nf))
+            except Exception:   # noqa: BLE001 - 상위가 이미 끝났으면 무시
+                pass
+
+        # goal 은 받은 것을 그대로 넘긴다(필드 복사 누락 방지). 하달 → 수락 대기.
+        holder = {}
+        acc_ev = threading.Event()
+        sfut = self._harvest_client.send_goal_async(req, feedback_callback=on_fb)
+        sfut.add_done_callback(lambda f: (holder.__setitem__('gh', f.result()), acc_ev.set()))
+        acc_ev.wait(timeout=5.0)
+        gh = holder.get('gh')
+        if gh is None or not gh.accepted:
+            self.get_logger().error('Ddagi Harvest goal 거부/무응답')
+            return None, 'Ddagi Harvest goal 거부'
+
+        # 결과 대기. Feedback 무수신 워치독으로 멎음 감지 + ACS 취소 전파.
+        rholder = {}
+        res_ev = threading.Event()
+        gh.get_result_async().add_done_callback(
+            lambda f: (rholder.__setitem__('r', f.result().result), res_ev.set()))
+        cancel_sent = False
+        cancel_t = None
+        while not res_ev.wait(0.5):
+            now = time.time()
+            if up_gh.is_cancel_requested and not cancel_sent:
+                cancel_sent = True
+                cancel_t = now
+                self.get_logger().warn('ACS 취소 요청 → Ddagi 수확 취소 중계')
+                gh.cancel_goal_async()
+            if cancel_sent:
+                # 취소를 보냈으면 취소 응답(canceled result)까지만 기다린다.
+                if now - cancel_t > self._harvest_fb_timeout:
+                    self.get_logger().warn('Ddagi 수확 취소 응답 timeout')
+                    return None, 'Ddagi 수확 취소 응답 timeout'
+            elif now - last_fb['t'] > self._harvest_fb_timeout:
+                # 정상 수확 중엔 라운드마다 Feedback 이 온다 → 무소식이면 멎은 것.
+                self.get_logger().warn('Ddagi 수확 진행 무소식(watchdog) → 취소·실패')
+                gh.cancel_goal_async()
+                return None, 'Ddagi 수확 무응답(watchdog)'
+
+        r = rholder.get('r')
+        if r is None:
+            return None, 'Ddagi 수확 결과 없음'
+        self.get_logger().info('Ddagi 수확 종료: exit=%s normal=%d discard=%d failed=%d'
+                               % (r.exit_reason, r.normal_count, r.discard_count, r.failed_count))
+        self._wire('to_dcs', 'Harvest(→Ddagi)/result', self._msg_to_dict(r))
+        return r, ''
+
+    # ===== S2 E6 Unload 중계 — ACS 의 하역 지시를 Ddagi 로 그대로 =====
+    def _unload_goal_cb(self, goal_request):
+        """하역 goal 수락 판정: 예냉실 도킹 성공(is_docked)한 task 만 진입 허용.
+        도킹하지 않은 위치에서 팔이 손잡이를 드는 것을 막는 안전 조건이다."""
+        if self.is_docked(goal_request.task_id):
+            return GoalResponse.ACCEPT
+        self.get_logger().warn(
+            '하역 goal 거부: task=%d 도킹 안 됨(예냉실 Dock 성공 필요)' % goal_request.task_id)
+        return GoalResponse.REJECT
+
+    def _unload_execute(self, goal_handle):
+        """ACS 가 하달한 Unload goal 을 Ddagi 로 중계하고, feedback·result 를 그대로 ACS 로.
+
+        하역 시퀀스(손잡이 파지→들기→대기→흔들기→복귀)는 Ddagi 몫이다(DG는 중계자). Feedback
+        무수신 워치독으로 멎음을 감지하고, ACS 취소는 Ddagi goal 취소로 전파한다. 하역 실패
+        (result_code!=0)도 값을 가공하지 않고 그대로 올린다 — task FAILED 판정은 ACS 몫이다.
+        """
+        req = goal_handle.request
+        self.get_logger().info('하역 시작 수신(ACS→DCS): task=%d shake_delay=%.1fs'
+                               % (req.task_id, req.shake_delay_sec))
+        self._wire('to_dcs', 'Unload', self._msg_to_dict(req))
+
+        # 예냉실 도킹 게이트 소비 — 이 도킹으로 열린 하역 진입 권한을 여기서 쓴다(재진입 방지).
+        self._clear_docked('하역 시작 task=%d' % req.task_id)
+
+        r, err = self._unload_ddagi(req, goal_handle)
+
+        result = Unload.Result()
+        if r is not None:
+            # 값 손실 없이 그대로. result_code(성공/파지실패/중단)는 ACS 가 하역 성공 여부를
+            # 판정·기록하는 근거다. DG 는 성공/실패를 재판정하지 않는다.
+            result.result_code = int(r.result_code)
+            result.message = r.message or ''
+        else:
+            # 중계 자체 실패(서버 없음/거부/무응답/취소). result_code 2(중단)로 보내고 사유는 message.
+            result.result_code = 2
+            result.message = err or '중계 실패'
+
+        # 취소가 와 있으면 결과가 무엇이든 CANCELED 로 끝낸다(ROS2 goal 은 CANCELING 에서
+        # succeed 로 못 넘어가고, ACS 도 자기가 취소한 goal 이 성공으로 오면 오판한다).
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+        elif r is not None and result.result_code == 0:
+            goal_handle.succeed()
+        else:
+            # 하역 실패(파지 실패 등)도 액션은 abort 로 끝나지만, ACS 는 이 result_code 를
+            # 보고 task 를 FAILED 로 되돌리지 않는다(하역은 보너스).
+            goal_handle.abort()
+
+        self.get_logger().info('하역 결과 전달(DCS→ACS): task=%d code=%d %s'
+                               % (req.task_id, result.result_code, result.message))
+        self._wire('from_dcs', 'Unload/result', self._msg_to_dict(result))
+        return result
+
+    def _unload_ddagi(self, req, up_gh):
+        # 하역은 수확과 같은 팔(Ddagi)이라 _ddagi_lock 을 공유한다(동시 하달 직렬화).
+        with self._ddagi_lock:
+            return self._unload_ddagi_locked(req, up_gh)
+
+    def _unload_ddagi_locked(self, req, up_gh):
+        if not self._unload_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('Ddagi Unload 액션 서버 없음')
+            return None, 'Ddagi Unload 서버 없음'
+
+        self.get_logger().info('Ddagi 하역 하달(DCS→Ddagi): task=%d' % req.task_id)
+        self._wire('from_dcs', 'Unload(→Ddagi)', self._msg_to_dict(req))
+
+        last_fb = {'t': time.time()}   # 워치독 기준: 마지막 진행 소식(수락 시점부터 시작)
+
+        def on_fb(fb_msg):
+            fb = fb_msg.feedback
+            last_fb['t'] = time.time()
+            nf = Unload.Feedback()
+            nf.phase = fb.phase
+            self._wire('to_dcs', 'Unload(→Ddagi)/feedback', self._msg_to_dict(fb))
+            try:
+                up_gh.publish_feedback(nf)      # Ddagi 진행상황(phase) → ACS 로 중계
+                self._wire('from_dcs', 'Unload/feedback', self._msg_to_dict(nf))
+            except Exception:   # noqa: BLE001 - 상위가 이미 끝났으면 무시
+                pass
+
+        # goal 은 받은 것을 그대로 넘긴다(필드 복사 누락 방지). 하달 → 수락 대기.
+        holder = {}
+        acc_ev = threading.Event()
+        sfut = self._unload_client.send_goal_async(req, feedback_callback=on_fb)
+        sfut.add_done_callback(lambda f: (holder.__setitem__('gh', f.result()), acc_ev.set()))
+        acc_ev.wait(timeout=5.0)
+        gh = holder.get('gh')
+        if gh is None or not gh.accepted:
+            self.get_logger().error('Ddagi Unload goal 거부/무응답')
+            return None, 'Ddagi Unload goal 거부'
+
+        # 결과 대기. Feedback 무수신 워치독으로 멎음 감지 + ACS 취소 전파.
+        rholder = {}
+        res_ev = threading.Event()
+        gh.get_result_async().add_done_callback(
+            lambda f: (rholder.__setitem__('r', f.result().result), res_ev.set()))
+        cancel_sent = False
+        cancel_t = None
+        while not res_ev.wait(0.5):
+            now = time.time()
+            if up_gh.is_cancel_requested and not cancel_sent:
+                cancel_sent = True
+                cancel_t = now
+                self.get_logger().warn('ACS 취소 요청 → Ddagi 하역 취소 중계')
+                gh.cancel_goal_async()
+            if cancel_sent:
+                # 취소를 보냈으면 취소 응답(canceled result)까지만 기다린다.
+                if now - cancel_t > self._unload_fb_timeout:
+                    self.get_logger().warn('Ddagi 하역 취소 응답 timeout')
+                    return None, 'Ddagi 하역 취소 응답 timeout'
+            elif now - last_fb['t'] > self._unload_fb_timeout:
+                # 정상 하역 중엔 phase 마다 Feedback 이 온다 → 무소식이면 멎은 것.
+                self.get_logger().warn('Ddagi 하역 진행 무소식(watchdog) → 취소·실패')
+                gh.cancel_goal_async()
+                return None, 'Ddagi 하역 무응답(watchdog)'
+
+        r = rholder.get('r')
+        if r is None:
+            return None, 'Ddagi 하역 결과 없음'
+        self.get_logger().info('Ddagi 하역 종료: code=%d msg=%s' % (r.result_code, r.message))
+        self._wire('to_dcs', 'Unload(→Ddagi)/result', self._msg_to_dict(r))
+        return r, ''
+
+    @staticmethod
+    def _image_to_jpeg_b64(img):
+        """sensor_msgs/Image(rgb8/bgr8/mono8) → JPEG base64. 실패 시 raw base64 폴백."""
+        try:
+            from PIL import Image as PILImage
+            raw = bytes(img.data)
+            if img.encoding == 'rgb8':
+                pil = PILImage.frombytes('RGB', (img.width, img.height), raw)
+            elif img.encoding == 'bgr8':
+                r, g, b = PILImage.frombytes('RGB', (img.width, img.height), raw).split()[::-1]
+                pil = PILImage.merge('RGB', (r, g, b))
+            elif img.encoding in ('mono8', '8UC1'):
+                pil = PILImage.frombytes('L', (img.width, img.height), raw)
+            else:
+                return base64.b64encode(raw).decode('ascii')   # 미지원 인코딩 → raw
+            buf = io.BytesIO()
+            pil.save(buf, format='JPEG', quality=85)
+            return base64.b64encode(buf.getvalue()).decode('ascii')
+        except Exception:   # noqa: BLE001
+            try:
+                return base64.b64encode(bytes(img.data)).decode('ascii')
+            except (TypeError, ValueError):
+                return ''
+
+    # ============================ E2 분석·저장 ============================
+    def _on_analyze_frame(self, request, response):
+        """capture 노드 도착 후 DdaGo 의 분석 요청 접수. 즉시 accepted 응답하고 뒷처리는 백그라운드."""
+        self._req_seq += 1
+        request_id = 'req_%d_wp%d_%03d' % (request.task_id, request.waypoint_id, self._req_seq)
+        response.accepted = True
+        response.request_id = request_id
+
+        # sensor_msgs/Image(raw) → JPEG base64 (스펙 image_encoding:"jpeg" 에 맞춤)
+        image_b64 = self._image_to_jpeg_b64(request.image)
+        wire = self._msg_to_dict(request)     # 이미지 픽셀(data)은 <uint8[N]> 로 요약됨
+        wire['request_id'] = request_id          # DCS 가 부여(AI TCP 요청과 짝)
+        wire['image_jpeg_b64_len'] = len(image_b64)
+        self._wire('to_dcs', 'AnalyzeFrame', wire)
+
+        threading.Thread(
+            target=self._process_waypoint,
+            args=(request.task_id, request.waypoint_id, request_id, image_b64),
+            daemon=True).start()
+        return response
+
+    def _process_waypoint(self, task_id, waypoint_id, request_id, image_b64):
+        # 3~4) DCS → AI(TCP) → 결과 (익음/덜익음/부패/병해 percent)
+        #      ※ AI Service 는 rotten 과 disease 를 구분하지 못해 합쳐서 rotten 으로 보낸다.
+        #        DCS 는 판정하지 않고 받은 4개 percent 를 그대로 ACS 로 전달한다.
+        pct = {'ripe_percent': 0, 'unripe_percent': 0, 'rotten_percent': 0, 'disease_percent': 0}
+        labeled = None   # AI 결과 라벨링 이미지(base64) — 있으면 SaveDetection.disease_image 로
+        self._wire('from_dcs', 'analyze_request', {
+            'message_type': 'analyze_frame_request', 'request_id': request_id,
+            'task_id': task_id, 'waypoint_id': waypoint_id, 'image_encoding': 'jpeg',
+            'image_data': '<base64 %d bytes>' % len(image_b64)})
+        try:
+            resp = self.ai.analyze(request_id, task_id, waypoint_id, image_data=image_b64)
+            result = resp.get('result', {}) if isinstance(resp, dict) else {}
+            pct.update({k: int(result.get(k, 0)) for k in pct})
+            self.get_logger().info('분석결과 wp=%d ripe=%d unripe=%d rotten=%d disease=%d'
+                                   % (waypoint_id, pct['ripe_percent'], pct['unripe_percent'],
+                                      pct['rotten_percent'], pct['disease_percent']))
+            # 라벨링 이미지: AI 가 disease_percent >= 5 일 때만 실어 보낸다(E3).
+            # 응답 최상위/result 어느 쪽에 오든 받아서 ACS 로 그대로 넘긴다(저장은 ACS 몫).
+            labeled = resp.get('labeled_image') or result.get('labeled_image')
+            lenc = (resp.get('labeled_image_encoding') or result.get('labeled_image_encoding')
+                    or 'jpeg')
+            self._wire('to_dcs', 'analyze_response', {
+                'message_type': 'analyze_frame_response', 'request_id': request_id,
+                'status': 'OK', 'result': dict(pct),
+                'labeled_image': ('<%s %d b64chars>' % (lenc, len(labeled))) if labeled else None})
+        except Exception as e:   # noqa: BLE001 — 분석 실패해도 순찰은 계속(0 저장)
+            self.get_logger().error('AI 분석 실패 wp=%d: %s' % (waypoint_id, e))
+            self._wire('to_dcs', 'analyze_response', {
+                'message_type': 'analyze_frame_response', 'request_id': request_id,
+                'status': 'ERROR', 'error': str(e)})
+
+        # 5) DCS → ACS SaveDetection (응답 대기 안 함). 라벨 이미지 있으면 함께.
+        self._call_save_detection(task_id, waypoint_id, pct, labeled)
+
+    @staticmethod
+    def _jpeg_b64_to_image(b64):
+        """base64 JPEG → sensor_msgs/Image(rgb8). 실패 시 None."""
+        try:
+            from PIL import Image as PILImage
+            im = PILImage.open(io.BytesIO(base64.b64decode(b64))).convert('RGB')
+            w, h = im.size
+            img = Image()
+            img.header.frame_id = 'labeled'
+            img.height, img.width = h, w
+            img.encoding = 'rgb8'
+            img.is_bigendian = 0
+            img.step = w * 3
+            img.data = list(im.tobytes())
+            return img
+        except Exception:   # noqa: BLE001
+            return None
+
+    def _call_save_detection(self, task_id, waypoint_id, pct, labeled_b64=None):
+        if not self._save_client.service_is_ready():
+            self._save_client.wait_for_service(timeout_sec=2.0)
+        req = SaveDetection.Request()
+        req.task_id = int(task_id)
+        req.waypoint_id = int(waypoint_id)
+        req.robot_id = self.robot_id
+        req.ripe_percent = pct['ripe_percent']
+        req.unripe_percent = pct['unripe_percent']
+        req.rotten_percent = pct['rotten_percent']
+        req.disease_percent = pct['disease_percent']
+        # AI 가 라벨 이미지를 보냈으면(disease_percent>=5) JPEG→Image 로 풀어 그대로 전달.
+        # 없으면 빈 Image(height=0) → ACS 는 image_path 없이 저장.
+        img = self._jpeg_b64_to_image(labeled_b64) if labeled_b64 else None
+        img_wh = None
+        if img is not None:
+            req.disease_image = img
+            img_wh = '%dx%d' % (img.width, img.height)
+        wire = self._msg_to_dict(req)        # disease_image.data 는 <uint8[N]> 로 요약됨
+        wire['disease_image_size'] = img_wh   # 없으면 None(=disease_percent<5)
+        self._wire('from_dcs', 'SaveDetection', wire)
+        self._save_client.call_async(req)   # fire-and-forget
+
+    def destroy_node(self):
+        try:
+            self.ai.close()
+        finally:
+            super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DcsNode()
+    executor = MultiThreadedExecutor(num_threads=6)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

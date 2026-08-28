@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""ACS 순찰 노드 설정값 — 토픽/서비스 이름(코드 상수) + 타이밍 튜닝값(.env → 환경변수).
+
+왜 이렇게 나눴나:
+  * 토픽/서비스 이름은 시스템 '구조'라 배포마다 바뀌지 않는다 → 코드 상수로 고정.
+  * 타이밍(대기·타임아웃·TTL)은 현장/시뮬마다 조정하고 싶은 '튜닝값'이라 .env 로 외부화.
+    코드를 안 건드리고 값만 바꿔 재기동할 수 있고, dev/sim/실물마다 .env 를 달리 둘 수 있다.
+
+로딩 규칙:
+  * import 시 .env 를 한 번 읽어 os.environ 에 넣는다(이미 설정된 값은 '덮지 않음').
+    → 셸 export 나 ROS launch 가 넣은 값이 .env 보다 우선(운영 오버라이드 가능).
+  * .env 를 못 찾아도 조용히 넘어가고 아래 _envf 기본값이 쓰인다(파일은 필수 아님).
+  * 이 모듈은 '순수 설정'이라 로그를 두지 않는다(로깅 규칙: 순수 모듈은 비우고 호출부에서).
+"""
+import os
+
+
+def _load_dotenv_once() -> None:
+    """가장 가까운 .env 를 찾아 KEY=VALUE 를 os.environ 에 채운다(이미 있으면 유지).
+
+    탐색 순서(먼저 찾은 것 하나만 사용):
+      1) 환경변수 ACS_ENV_FILE 이 가리키는 파일(명시적 지정, 최우선)
+      2) 현재 작업 디렉터리(CWD)에서 위로 올라가며 .env
+      3) 이 소스 파일 위치에서 위로 올라가며 .env (colcon symlink-install 대비)
+    단순 KEY=VALUE 만 해석한다(따옴표/치환 없음 — 우리 값은 숫자뿐이라 충분).
+    """
+    def _walk_up(start):
+        d = os.path.abspath(start)
+        while True:
+            yield os.path.join(d, ".env")
+            parent = os.path.dirname(d)
+            if parent == d:      # 루트('/')에 도달
+                return
+            d = parent
+
+    candidates = []
+    explicit = os.environ.get("ACS_ENV_FILE")
+    if explicit:
+        candidates.append(explicit)
+    candidates.extend(_walk_up(os.getcwd()))
+    candidates.extend(_walk_up(os.path.dirname(os.path.realpath(__file__))))
+
+    for path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                # setdefault: 이미 설정돼 있으면 안 덮음 → 셸/launch 값이 우선
+                os.environ.setdefault(key.strip(), val.strip())
+        return                    # 첫 번째로 찾은 .env 만 사용
+
+
+_load_dotenv_once()
+
+
+def _envf(name: str, default: float) -> float:
+    """환경변수를 float 로 읽되, 없거나 이상하면 기본값."""
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _envi(name: str, default: int) -> int:
+    """환경변수를 int 로 읽되, 없거나 이상하면 기본값."""
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# ── 토픽/서비스 이름 (구조적 상수, .env 대상 아님) ─────────────────────────── #
+# RP-114 로 텔레메트리 입력이 로봇별 /{robot_id}/telemetry 로 바뀌었다.
+# 토픽 이름·로봇 목록·구독 배선은 fleet_collector 가 소유한다
+# (DEFAULT_ROBOT_IDS / robot_telemetry_topic() / LEGACY_FLEET_TOPIC).
+# RP-79: DG 가 waypoint 마다 탐지 결과를 넘기는 ROS2 Service (ACS 가 서버).
+SAVE_DETECTION_SRV = "/automato/save_detection"
+
+# ── 타이밍 튜닝값 (.env 로 외부화, 아래 숫자는 기본값) ─────────────────────── #
+# 액션 서버 접속 대기 / Goal 수락 대기 / 세그먼트(1 waypoint) 결과 대기(초)
+SERVER_WAIT_SEC = _envf("ACS_SERVER_WAIT_SEC", 5.0)
+GOAL_ACCEPT_TIMEOUT_SEC = _envf("ACS_GOAL_ACCEPT_TIMEOUT_SEC", 30.0)
+# 순찰은 로봇 Nav2가 자체 재시도(2분×3=6분)를 하므로 그보다 넉넉히 기다린다.
+SEGMENT_TIMEOUT_SEC = _envf("ACS_SEGMENT_TIMEOUT_SEC", 420.0)
+# 자원(통로·자리) 예약 대기(양보 전) / 예약 폴링 간격.
+#   시나리오 1 문서 E2 21번의 T_wait(기본 10초) · 재시도 주기(0.5초)에 해당한다.
+#   문서는 '통로' 예약만 말하지만 구현은 홉을 (통로, 도착 자리) 쌍으로 잡으므로
+#   둘 각각에 이 대기가 걸린다(한 홉 최악 2×T_wait). 자리 예약은 문서에 없는
+#   구현 보강이라 문서값을 통로 기준으로 그대로 쓴다.
+RESERVE_WAIT_SEC = _envf("ACS_RESERVE_WAIT_SEC", 10.0)      # 문서 T_wait
+RESERVE_POLL_SEC = _envf("ACS_RESERVE_POLL_SEC", 0.5)       # 문서 재시도 주기
+# 막힘 통로를 재계획에서 제외해 둘 시간(N초 블랙리스트).
+# 문서에 대응 항목이 없는 구현 세부값이다 — 문서 22(a)는 '막힌 통로를 제외하고
+# 재탐색'만 말하고 언제 다시 후보로 넣을지는 정하지 않는다. 영구 제외하면 통로가
+# 풀린 뒤에도 계속 우회하므로 시간으로 만료시킨다. T_wait/T_block 과는 다른 값이다.
+BLOCK_TTL_SEC = _envf("ACS_BLOCK_TTL_SEC", 30.0)
+# 양보(남이 쥐고 있어 비켜 준 자원)를 회피 목록에 둘 시간. 위 BLOCK_TTL_SEC 과 **다른**
+# 값인 이유가 핵심이다:
+#   · 막힘(BLOCK_TTL_SEC) = 물리적 장애물. 사람이 치우기 전엔 그대로라 길게 피해야 한다.
+#   · 양보(이 값)        = '지금 남이 쓰는 중'. 그 로봇이 지나가면 몇 초 만에 풀린다.
+# 둘을 같은 30초로 묶었더니, 잠깐 스쳐 지나갈 자원을 30초씩 지도에서 지워 놓고 그 사이
+# 재시도가 전부 '경로 없음'으로 헛돌았다. 특히 작업 지점(충전소·수확지·예냉실)은 전부
+# 출구가 하나뿐인 막다른 길이라, 그 출구 하나가 회피 목록에 있으면 우회로가 아예 없다
+# → 30초 내내 못 나간다(2026-08-05 3대 동시 시뮬: 출발 3.5초 만에 수확 task 사망).
+# RESERVE_WAIT_SEC(10초)보다 짧아야 '기다렸다 양보 → 잠깐 쉬고 재시도'가 성립한다.
+# 너무 짧으면(1초 미만) 양보하자마자 같은 자원으로 다시 달려들어 왕복만 한다.
+YIELD_TTL_SEC = _envf("ACS_YIELD_TTL_SEC", 5.0)
+# 주행이 '포기(skipped)'로 끝났을 때 호출부가 다시 시도하며 버티는 최대 시간.
+# 목적지가 하나뿐인 주행(수확 이송·충전소 복귀)을 위한 값이다. 순찰은 목표가 12곳이라
+# 한 곳을 포기해도 다음 지점으로 넘어가면 되지만, 목적지가 하나면 포기가 곧 작업 실패다
+# — 실제로 예냉실에 남이 도킹해 있으면 10초 뒤 토마토를 실은 채 task 가 FAILED 로 끝났다.
+# 그 사이에 앞 로봇이 볼일을 마치고 비켜 주므로, 바로 실패로 접지 말고 이만큼은 버틴다.
+# BLOCK_GIVEUP_SEC(T_block, 60초)과 목적이 겹치지만 값이 다르다 — 저쪽은 순찰이 '갇혔는지'
+# 판정하는 시간이고, 이쪽은 한 번의 주행을 다시 시도하는 시간이다. 맵이 작아(1.17×1.92m)
+# 로봇이 자리를 비우는 데 오래 걸리지 않으므로 60초는 과하다.
+DRIVE_RETRY_SEC = _envf("ACS_DRIVE_RETRY_SEC", 30.0)
+# 실패 응답을 '통로가 막혔다'는 증거로 인정하는 최소 경과 시간(초).
+# 이보다 빨리 온 실패는 로봇이 그 통로를 **시도해 볼 시간조차 없었다**는 뜻이라
+# 물리적 막힘일 수 없다 — 하달이 로봇에 닿지 않았거나(중계 노드 중복·이름 불일치),
+# 액션 응답이 어긋난 통신 사고다. 그런 실패를 막힘으로 믿고 블랙리스트에 넣으면
+# 멀쩡한 통로가 지도에서 하나씩 지워지고, 결국 '경로 없음'이 연쇄해 순찰이 통째로
+# 무너진다(2026-08-03 실사고: 중계 서버가 둘이라 5초마다 가짜 실패 → 110초 만에
+# 12지점 중 6곳만 찍고 조기 종료).
+#   실측 근거: 가짜 실패 5.0~5.3초 고정 / 정상 노드 간 이동 6~40초 /
+#   진짜 막힘은 로봇 Nav2 자체 재시도(2분×3)를 거치므로 훨씬 늦게 온다.
+# 이 시간 안에 온 실패는 '통로당 1회'만 봐주고 그대로 재시도한다(route_runner.drive).
+# 두 번째도 빠르게 실패하면 그때는 정상 경로로 처리한다 — 안 그러면 무한 재시도가 된다.
+MIN_BLOCK_ELAPSED_SEC = _envf("ACS_MIN_BLOCK_ELAPSED_SEC", 10.0)
+# 이동 대기 중 예약 유지용 하트비트 간격 / 엔진 예약 TTL(하트비트보다 커야 함)
+HEARTBEAT_SEC = _envf("ACS_HEARTBEAT_SEC", 5.0)
+RESERVATION_TTL_SEC = _envf("ACS_RESERVATION_TTL_SEC", 15.0)
+# 죽은 예약(TTL 초과)을 훑어 회수하는 주기.
+# 회수는 try_reserve 가 들어올 때도 일어나지만(그때만 TTL 을 판정한다), 아무도 그 자원을
+# 원하지 않으면 예약표에 유령으로 남는다 → 관측 API(holder_of/reserved_corridors)와
+# 데드락 사슬 검사가 죽은 로봇을 살아있는 것으로 취급한다. 그래서 주기 청소가 따로 필요하다.
+REAP_INTERVAL_SEC = _envf("ACS_REAP_INTERVAL_SEC", 5.0)
+
+# ── 복귀·도킹 (E4 순찰 종료 복귀 / 22-1 막힘 실패 복귀) ───────────────────── #
+# T_block: 통로가 막혀 우회로도 없을 때 '0.5초 주기 예약 재시도 + 우회로 재탐색'을
+#   반복하며 버티는 최대 시간. 이 시간을 넘기면 막힘을 확정하고 작업을 실패 처리한 뒤
+#   충전소로 복귀시킨다(문서 22(b) → 22-1). 이름이 비슷한 아래 두 값과 '다른' 값이다:
+#     · RESERVE_WAIT_SEC(T_wait, 10s)  : 한 홉에서 자원을 양보하며 기다리는 시간
+#     · BLOCK_TTL_SEC(30s)             : 막힌 통로를 재계획에서 빼 두는 블랙리스트 만료
+#   셋을 섞어 쓰면 조용한 버그가 나므로 주석으로 못 박아 둔다.
+BLOCK_GIVEUP_SEC = _envf("ACS_BLOCK_GIVEUP_SEC", 60.0)      # 문서 T_block
+# N_dock: 도킹(마커 탐색·정렬·후진 접붙임)이 실패했을 때 재시도하는 최대 횟수.
+#   이 횟수를 다 쓰고도 실패하면 task_failed(reason=DOCK_FAILED)로 알린다.
+#   시간(초)이 아니라 '횟수'다 — T_* 접두(시간)와 구분해 단위 혼동을 막는다.
+DOCK_RETRY_MAX = _envi("ACS_DOCK_RETRY_MAX", 3)             # 문서 N_dock
+# Dock 액션 결과(성공/실패)를 기다리는 최대 시간. 도킹은 주행(Navigate)과 타이밍이
+#   달라(마커 탐색 회전 → 접근 → 회전 → 후진 접붙임) 세그먼트 타임아웃을 그대로 쓰지
+#   않고 별도 상수를 둔다. 아래 숫자는 자리표시자이며, 실장비 도킹 시간을 재고 그
+#   여유배로 확정한다.
+DOCK_RESULT_TIMEOUT_SEC = _envf("ACS_DOCK_RESULT_TIMEOUT_SEC", 120.0)
+
+# --- 시나리오2 수확 (RP-123) ---
+# 바구니 만차 기준(문서 E3~E4). Harvest Goal 로 로봇에 내려보내고, 로봇은 이 개수를
+#   채우면 exit_reason=FULL 로 스스로 종료한다. ACS 는 개수를 세지 않는다.
+HARVEST_MAX_CAPACITY = _envi("ACS_HARVEST_MAX_CAPACITY", 7)
+# Harvest 액션 결과를 기다리는 최대 시간. 수확은 '라운드 × 토마토 개수'만큼 반복해
+#   주행·도킹과 시간 규모가 다르다(분 단위). 넉넉히 잡는 쪽이 안전하다 — 짧으면 정상
+#   수확을 중간에 실패로 끊어버리지만, 길어도 로봇이 죽으면 액션 서버 쪽에서 먼저
+#   끊기므로 이 값이 실제로 걸리는 일은 드물다.
+HARVEST_RESULT_TIMEOUT_SEC = _envf("ACS_HARVEST_RESULT_TIMEOUT_SEC", 1800.0)
+# 하역 시 '들어올린 뒤 흔들기 전까지' 로봇이 멈춰 있는 시간(문서 E6 shake_delay).
+#   들자마자 흔들면 바구니가 출렁여 내용물이 튄다. Unload Goal 로 내려보내는
+#   '로봇에게 주는 지시'이지, ACS 가 기다리는 시간이 아니다(아래 타임아웃과 다른 것).
+UNLOAD_SHAKE_DELAY_SEC = _envf("ACS_UNLOAD_SHAKE_DELAY_SEC", 3.0)
+# Unload 액션 결과를 기다리는 최대 시간 = ACS 의 인내심. 하역 전체 동작(파지→들기→
+#   대기→흔들기→복귀)이 30초 안팎이라 그 4배로 잡는다. 딱 맞게 잡으면 로봇이 조금만
+#   굼떠도(손잡이 재시도·통신 지연) 정상 하역 중에 ACS 가 먼저 포기한다.
+UNLOAD_RESULT_TIMEOUT_SEC = _envf("ACS_UNLOAD_RESULT_TIMEOUT_SEC", 120.0)
+# 예냉실 자리가 비기를 '수확지에 도킹한 채로' 기다리는 최대 시간(E5 출발 전).
+# 예냉실은 전 로봇이 공유하는 단 하나의 지점이고, 들어가는 길이 wp17 하나뿐인 막다른
+# 길이다. 자리가 찼는지 보러 wp17 까지 가면 **그 순간 안에 있는 로봇의 퇴로를 막아**
+# 서로 기다리는 교착이 된다(실측: 양쪽 다 재시도 시간을 다 쓰고 한쪽이 FAILED).
+# 그래서 아직 자기 수확지(남이 지나지 않는 막다른 길)에 있을 때 자리를 맡고 출발한다.
+# 값의 근거 — 앞 로봇이 자리를 쥐는 시간 ≈ 도킹 30s + 하역 30s + 언도킹 15s + 탈출 15s
+# = 90초. 그 두 배를 상한으로 둔다. 이보다 오래 걸리면 앞 로봇이 도킹에 실패해 재시도
+# 중(N_dock 3회 = 최악 360초)이라는 뜻이고, 그건 사람이 봐야 할 상황이라 더 기다리지
+# 않고 FAILED 로 알린다. 재시도 주기는 다른 자원 대기와 같은 RESERVE_POLL_SEC(0.5초)다.
+PRECOOL_WAIT_SEC = _envf("ACS_PRECOOL_WAIT_SEC", 180.0)
+
+# ── 순찰 시작(정적) 노드 ─────────────────────────────────────────────────── #
+# 순찰은 항상 로봇이 충전소에 있을 때 시작한다(시작 위치 고정). 라우터는 waypoint_id 로만
+# 경로를 계산하는데, 충전소(task_points)와 그래프 노드(waypoints)는 FK 로 안 이어져 있어
+# '어느 waypoint 가 시작점인지'를 여기서 정적으로 지정한다. 지금은 순찰이 전역 1대뿐이라
+# 전역 상수 하나로 충분하다. (향후: task_points↔waypoints 연결이 생기면 로봇별
+# charge_point_id 로 시작 노드를 유도하도록 대체 예정.)
+# 이 값이 그래프(wp_meta)에 없으면 디스패처가 옛 동작(첫 지점 예약 없이 직행)으로 폴백한다.
+PATROL_START_WAYPOINT_ID = _envi("ACS_PATROL_START_WAYPOINT_ID", 15)
+
+# 순찰 진입 노드 — 첫 촬영 목표로 가기 전에 반드시 한 번 거치는 노드.
+# 없으면(0) 곧장 첫 목표로 간다. 왜 필요한가: ACS 는 목표 사이를 '최단 거리'로 잇는데,
+# 충전소 위치에 따라 최단 경로가 첫 촬영 지점에 '반대 방향'으로 접근할 수 있다. 그러면
+# 방향 게이트가 촬영을 막아(180° 회전 불가) 그 지점을 영영 못 찍는다. 지정 노드를 먼저
+# 거치면 의도한 열(첫 지점을 올바른 방향으로 지나는 열)로 진입한다. 이 노드에서의 촬영은
+# 게이트가 알아서 거른다(반대 방향이면 안 찍고 지나감). 그래프 시뮬레이션으로 dg_03
+# 충전소(24)에서 이 노드를 거치면 12/12 방향이 맞음을 확인했다.
+PATROL_ENTRY_WAYPOINT_ID = _envi("ACS_PATROL_ENTRY_WAYPOINT_ID", 9)
+
+# 촬영 방향 게이트 — '지금 지나는 방향'과 '찍어야 할 방향'의 차이가 이 각(도) 이내일 때만
+# 촬영한다. 목적은 딱 하나: 물리적으로 불가능한 '제자리 180° 뒤돌아 찍기'를 막는 것.
+# 카메라가 로봇 옆 한쪽에 고정돼 있어, 통로를 어느 방향으로 지나느냐가 곧 어느 베드를
+# 찍느냐다. 같은 자리의 반대 방향 촬영(짝)은 반대로 지날 때 찍힌다. 코너의 90° 회전
+# 촬영은 도착 후 정밀조준이 감속하며 할 수 있으므로 허용한다(그래서 90 이 아니라 120).
+CAPTURE_DIR_GATE_DEG = _envf("ACS_CAPTURE_DIR_GATE_DEG", 120.0)

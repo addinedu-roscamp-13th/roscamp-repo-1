@@ -1,0 +1,13 @@
+# ddago03 반사테이프 후진 도킹 파라미터
+# (reflective_dock_server 액션 서버 + reflective_dock 디버그 노드 공용)
+#
+# rear_offset_m : 라이다 → 로봇 뒤 최돌출부 거리 [m] (로봇 물리값).
+#                 정지 목표 라이다거리 = rear_offset_m + stop_gap_m.
+# stop_gap_m    : 도킹 완료 시 로봇 뒤 끝과 마커 사이 목표 여유 [m].
+#
+# ddago03 실측(2026-07-28): rear_offset_m 0.068 → 뒤 간격 정확히 2cm.
+# /** = 모든 노드에 적용(노드명 무관). 서버·디버그 노드가 노드명이 달라 /** 로 둔다.
+/**:
+  ros__parameters:
+    rear_offset_m: 0.068
+    stop_gap_m: 0.02

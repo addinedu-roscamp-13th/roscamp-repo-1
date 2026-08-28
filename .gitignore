@@ -1,3 +1,8 @@
+# automato_ws 런타임 수신 이미지 폴더 (커밋 제외)
+equip/automato_ws/acs_recv/
+equip/automato_ws/dg_ai_recv/
+equip/automato_ws/labeled_recv/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -5,6 +10,10 @@ __pycache__/
 
 # C extensions
 *.so
+
+# ROS2 colcon 산출물
+install/
+log/
 
 # Distribution / packaging
 .Python
@@ -151,6 +160,8 @@ activemq-data/
 .env
 .envrc
 .venv
+# ACS 전용 venv (RP-78/79 실물 검증용) — 커밋 제외
+.venv-acs/
 env/
 venv/
 ENV/
@@ -216,3 +227,37 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# automato_web_service 런타임 산출물(서버가 생성, 커밋 제외)
+services/automato_web_service/relay.json
+services/automato_web_service/relay.lock
+services/automato_web_service/*.log
+services/automato_web_service/patrol.json
+services/automato_web_service/command.json
+services/automato_web_service/heat.json
+services/automato_web_service/harvest.json
+services/automato_web_service/robots.json
+services/automato_web_service/detections/
+# 텔레그램 봇 토큰 — 커밋 금지 (TELEGRAM_CONFIG 또는 ~/.config/automato/telegram.json 사용)
+services/automato_web_service/telegram.json
+# 작업 중 남는 타임스탬프 백업본 (app.py.bak_20260729_1810 등)
+*.bak_*
+# YOLO 학습 가중치 — git push 금지, DG_AI_MODEL_PATH 로 로컬 경로만 참조
+*.pt
+*.onnx
+# Claude Code 로컬 설정/세션 폴더
+.claude/
+
+# 대시보드에서 고친 실행 명령(로봇·장비마다 다른 값). 기본값은 dg_web/cmdcfg.py 가 갖는다.
+equip/automato_ws/dg_web/commands.local.json
+# 실서버 대시보드의 로봇 인벤토리 — 주소·에이전트 토큰이 들어가므로 올리지 않는다.
+equip/automato_ws/dg_web/agents.local.json
+# 충전소 복귀 좌표 — 맵·장비마다 다른 값이라 커밋 대상이 아니다.
+equip/automato_ws/dg_web/home.local.json
+# 지도에서 찍은 웨이포인트(+저장 직전 백업) — 맵·장비마다 다른 값.
+equip/automato_ws/dg_web/waypoints.local.json
+equip/automato_ws/dg_web/waypoints.local.bak.json
+
+# 개인/로컬 파일 — 저장소에 올리지 않음
+/roscamp-repo-1.code-workspace
+/client/system_admin_app/maps/automato_map_legacy.pgm

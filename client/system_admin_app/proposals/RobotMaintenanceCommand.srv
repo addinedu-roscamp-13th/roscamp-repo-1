@@ -1,0 +1,21 @@
+# automato_interfaces/srv/RobotMaintenanceCommand
+# [제안/예시] System Admin APP(QT) → Automato Control Service(ACS) 유지보수 명령.
+# ACS가 받아 HQ(DG Control Service)로 하달하는 것을 전제로 한다(QT -> ACS -> HQ).
+# 아직 팀 합의 전 초안이며, 필드/명령 집합은 협의 후 확정한다.
+#
+# command 값:
+#   ESTOP    : 비상 정지
+#   RESUME   : 정지/일시정지 해제
+#   TELEOP   : 수동 미세 이동(정비 위치 이동). linear_x / angular_z 사용
+#   DOCK     : 충전 스테이션 복귀
+#   RESTART  : 로봇 노드/센서 재시작(진단)
+#   ENABLE   : 운영 활성(배차 대상 포함)
+#   DISABLE  : 운영 비활성(배차에서 제외)
+string   robot_id
+string   command
+float32  linear_x     # TELEOP 전/후 속도 (m/s), 그 외 명령에선 0
+float32  angular_z    # TELEOP 좌/우 회전 (rad/s), 그 외 명령에선 0
+---
+bool     accepted
+string   status        # ACCEPTED | REJECTED
+string   message

@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>system_admin_app</name>
+  <version>0.0.1</version>
+  <description>
+    Automato System Admin APP (QT). E0 상시 모니터링 루프의 최종 수신자.
+    /automato/dashboard/fleet_telemetry(FleetTelemetry, 1Hz)를 구독해
+    주행(Ddago)/로봇팔(Ddagi) 상태를 실시간 진단 표시하고, 유지보수 명령을 낸다.
+  </description>
+  <maintainer email="kdhkjh@gmail.com">kdh</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>automato_interfaces</exec_depend>
+  <!-- GUI 런타임 의존: 시스템 패키지로 설치 (apt: python3-pyqt6 python3-pyqtgraph) -->
+  <exec_depend>python3-pyqt6</exec_depend>
+  <exec_depend>python3-pyqtgraph</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

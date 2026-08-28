@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""RP-78 ③ DB 저장 계층 — 순찰 접수/조회/종료의 모든 SQL을 여기 모은다.
+
+이 파일은 "DB에 무엇을 어떻게 쓰고 읽는가"만 담당한다(순수 데이터 계층).
+가용 판정/로봇 선정 같은 '판단'은 API 계층(patrol_api.py)이,
+로봇에 명령을 내리는 '동작'은 노드(automato_node.py)가 맡는다.
+
+배경 지식(왜 이렇게 나눴나):
+  - ROS2/로봇 코드와 DB 코드가 한 파일에 섞이면 테스트·디버깅이 어렵다.
+  - DB 계층을 분리하면 "SQL만" 따로 검증할 수 있고, 나중에 드라이버를 바꿔도
+    여기만 고치면 된다.
+
+드라이버: psycopg v3 (RP-82 database 서비스와 동일). 접속은 DATABASE_URL(env).
+  - SQLAlchemy 표기(postgresql+psycopg://)는 libpq 표기(postgresql://)로 정규화해서 쓴다.
+  - 커넥션 풀(psycopg_pool)을 써서 요청마다 새 연결을 만드는 비용을 줄인다.
+
+핵심: 순찰 접수(①~③)는 '하나의 트랜잭션'으로 묶는다.
+  중간에 실패하면 전부 롤백돼 '반쯤 만들어진 task'가 남지 않는다(원자성).
+"""
+import os
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+
+class RobotBusyError(Exception):
+    """대상 로봇에 이미 활성(WAITING/IN_PROGRESS) task가 있어 배정할 수 없음.
+
+    DB의 부분 유니크 인덱스(ux_tasks_active_robot) 위반을 애플리케이션 예외로
+    바꿔 던진다. API 계층이 이걸 잡아 409(NO_AVAILABLE_ROBOT)로 응답한다.
+    (GUI가 1차로 막더라도, 처리 시점 상태 변동을 DB 인덱스로 최종 방어)
+    """
+
+
+class PatrolInProgressError(Exception):
+    """이미 활성(WAITING/IN_PROGRESS) PATROL task가 있어 새 순찰을 받을 수 없음.
+
+    순찰은 전역에서 동시에 1건만 허용한다(운영 원칙). DB의 부분 유니크 인덱스
+    (ux_tasks_single_active_patrol) 위반을 애플리케이션 예외로 바꿔 던진다.
+    API 계층이 이걸 잡아 409(PATROL_IN_PROGRESS)로 응답한다. 로봇별 제약
+    (RobotBusyError)과 달리 '어느 로봇이든 순찰이 이미 돌고 있으면' 거부한다.
+    """
+
+
+class HarvestInProgressError(Exception):
+    """요청한 수확 위치에 이미 활성(WAITING/IN_PROGRESS) HARVEST task가 있어 거부.
+
+    수확은 순찰과 달리 여러 대가 '서로 다른 수확 위치'에서 동시에 가능하다. 그래서 전역
+    1건이 아니라 '수확 위치(task_point_id)별 1건'을 강제한다. DB의 부분 유니크 인덱스
+    (ux_tasks_active_harvest_location) 위반을 예외로 바꿔 던지고, API 계층이 409
+    (HARVEST_IN_PROGRESS)로 응답한다. (로봇당 활성 1건은 RobotBusyError가 별도 담당)
+    """
+
+
+# --------------------------------------------------------------------------- #
+# 접속 정보(DSN) 로딩
+# --------------------------------------------------------------------------- #
+def _find_env_file():
+    """현재 작업 디렉터리(CWD)부터 위로 올라가며 services/database/.env 를 찾는다.
+
+    왜 CWD 기준 상위 탐색인가:
+      과거엔 이 파일(__file__) 기준 상대경로로 .env 를 찾았는데, colcon 이 코드를
+      install/ 트리로 복사하면 그 상대경로가 깨져(.env 없는 곳을 가리켜) 조용히
+      실패했다. 반면 개발자는 보통 리포 안에서 명령을 실행하므로, CWD 에서 위로
+      올라가며 찾으면 소스/설치 트리 어디서 ros2 run 하든 리포 안이기만 하면
+      .env 를 안정적으로 발견한다.
+    """
+    d = os.getcwd()
+    while True:
+        cand = os.path.join(d, "services", "database", ".env")
+        if os.path.isfile(cand):
+            return cand
+        parent = os.path.dirname(d)
+        if parent == d:          # 파일시스템 루트까지 갔는데 못 찾음
+            return None
+        d = parent
+
+
+def _load_dsn() -> str:
+    """실행 시 DATABASE_URL 환경변수로 접속한다(12-factor 관례: 설정은 환경에서).
+
+    순서:
+      ① 환경변수 DATABASE_URL 이 있으면 그대로 쓴다(운영/CI/명시 export 우선).
+      ② 없으면 개발 편의로 리포의 services/database/.env 를 찾아 환경에 주입한다.
+      ③ 그래도 없으면 '조용히 틀린 기본값으로 접속'하지 않고 명확한 에러로 죽는다.
+         (과거엔 automato/automato 로 폴백해 엉뚱한 인증 실패의 원인 파악이 어려웠다.)
+
+    SQLAlchemy 표기(postgresql+psycopg://)는 libpq 표기(postgresql://)로 정규화한다.
+    """
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        env_file = _find_env_file()
+        if env_file:
+            try:
+                from dotenv import load_dotenv
+                load_dotenv(env_file)
+            except Exception:  # noqa: BLE001  (dotenv 미설치 등은 무시)
+                pass
+        url = os.environ.get("DATABASE_URL")
+
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL 환경변수가 필요합니다. 리포 안에서 실행하거나"
+            "(services/database/.env 자동 탐색), 직접 주입하세요: "
+            "set -a; source services/database/.env; set +a")
+
+    # SQLAlchemy 표기 -> libpq 표기 (psycopg 직접 연결용)
+    return url.replace("postgresql+psycopg://", "postgresql://", 1)
+
+
+def create_pool() -> ConnectionPool:
+    """커넥션 풀 생성. row_factory=dict_row 라 결과를 컬럼명으로 접근한다.
+
+    open(wait=False): DB가 아직 안 떠 있어도 서비스 자체는 기동된다.
+    실제 연결 실패는 쿼리 시점(pool.connection())에 드러난다.
+    """
+    dsn = _load_dsn()
+    pool = ConnectionPool(
+        conninfo=dsn,
+        min_size=1,
+        max_size=4,
+        kwargs={"row_factory": dict_row},
+        open=False,
+    )
+    pool.open(wait=False)
+    return pool
+
+
+# --------------------------------------------------------------------------- #
+# 가용 판정 입력 조회 (available API / 접수 API 공통)
+# --------------------------------------------------------------------------- #
+# operation_battery_thresholds 행이 없을 때의 방어용 기본값
+# (ERD 명시 기본값: PATROL 70 / HARVEST·TRANSFER 50)
+_DEFAULT_BATTERY_THRESHOLD = {"PATROL": 70, "HARVEST": 50, "TRANSFER": 50}
+
+
+def get_availability_snapshot(pool: ConnectionPool, task_type: str = "PATROL") -> dict:
+    """가용 판정에 필요한 'DB쪽' 입력을 한 번에 모아 온다.
+
+    task_type: 배터리 임계값을 어느 기능 기준으로 볼지 (PATROL/HARVEST/TRANSFER).
+               기본 PATROL 이라 기존 순찰 호출부는 그대로 동작한다.
+
+    반환:
+      robots      : 전체 로봇 id 목록(robots 테이블, 정렬됨)
+      active      : 지금 활성 task를 가진 robot_id 집합(WAITING/IN_PROGRESS)
+      threshold   : task_type 배터리 임계값(operation_battery_thresholds, 없으면 기본값 맵)
+      operational : robot_id -> operational_status('NORMAL'|'IMMOBILIZED'|'MAINTENANCE')
+
+    캐시(nav_status/battery/staleness)는 노드가 들고 있으므로 여기선 안 읽는다.
+    operational_status 는 캐시가 아니라 DB 에 두는 값이다 — 정의상 사람이 손으로
+    풀어줘야 하는 상태라, ACS 가 재기동돼도 남아 있어야 한다(0007 마이그레이션 참고).
+    """
+    with pool.connection() as conn:
+        operational = {
+            r["robot_id"]: r["operational_status"]
+            for r in conn.execute(
+                "SELECT robot_id, operational_status FROM robots ORDER BY robot_id"
+            ).fetchall()
+        }
+        robots = list(operational.keys())   # dict 는 삽입 순서를 지킨다 → ORDER BY 유지
+        active = {
+            r["assigned_robot_id"]
+            for r in conn.execute(
+                "SELECT assigned_robot_id FROM tasks "
+                "WHERE assigned_robot_id IS NOT NULL "
+                "AND status IN ('WAITING','IN_PROGRESS')"
+            ).fetchall()
+        }
+        row = conn.execute(
+            "SELECT min_battery_percent FROM operation_battery_thresholds "
+            "WHERE task_type = %s",
+            (task_type,),
+        ).fetchone()
+        threshold = (row["min_battery_percent"] if row
+                     else _DEFAULT_BATTERY_THRESHOLD.get(task_type, 50))
+    return {"robots": robots, "active": active, "threshold": threshold,
+            "operational": operational}
+
+
+# --------------------------------------------------------------------------- #
+# RP-90 텔레메트리 방송용 DB 사실 (1Hz 로 호출) — 활성 task 종류 + 배터리 임계값
+# --------------------------------------------------------------------------- #
+def get_telemetry_state(pool: ConnectionPool) -> tuple:
+    """RP-90 방송에 필요한 'DB쪽' 사실을 한 번에 모아 온다.
+
+    반환: (active_types, threshold, operational)
+      active_types : {robot_id: task_type}. 활성(WAITING/IN_PROGRESS) task 가 있는 로봇만.
+                     값이 그 로봇의 진행 중 task 종류(PATROL/HARVEST/TRANSFER)다 →
+                     여기 있으면 ROBOT_BUSY 이고, 그 종류가 그대로 응답 task_type 이 된다.
+                     (부분 유니크 인덱스로 로봇당 활성 task 는 최대 1건이라 dict 로 충분.)
+      threshold    : 배터리 임계값(operation_battery_thresholds, 기본 70). BATTERY_TOO_LOW
+                     기준. 여러 task_type 이 있으나 여기선 PATROL 기준을 '가용 표시용 단일
+                     임계값'으로 쓴다(가용 조회 API 와 동일 관례).
+      operational  : {robot_id: operational_status}. 전 로봇. NORMAL 이 아니면 IMMOBILIZED
+                     사유가 된다. E1 가용 판정(get_availability_snapshot)과 같은 사실을
+                     보게 해 방송 화면과 배정 결과가 어긋나지 않도록 한다.
+
+    가벼운 SELECT 세 번뿐이라 1Hz 호출에도 부담이 없다(커넥션 풀 재사용, 로봇 3대).
+    """
+    with pool.connection() as conn:
+        active_types = {
+            r["assigned_robot_id"]: r["task_type"]
+            for r in conn.execute(
+                "SELECT assigned_robot_id, task_type FROM tasks "
+                "WHERE assigned_robot_id IS NOT NULL "
+                "AND status IN ('WAITING','IN_PROGRESS')"
+            ).fetchall()
+        }
+        row = conn.execute(
+            "SELECT min_battery_percent FROM operation_battery_thresholds "
+            "WHERE task_type = 'PATROL'"
+        ).fetchone()
+        threshold = row["min_battery_percent"] if row else 70
+        operational = {
+            r["robot_id"]: r["operational_status"]
+            for r in conn.execute(
+                "SELECT robot_id, operational_status FROM robots"
+            ).fetchall()
+        }
+    return active_types, threshold, operational
+
+
+# --------------------------------------------------------------------------- #
+# 순찰 접수 트랜잭션 (①~④를 하나로 묶음, 예외 시 전체 롤백)
+# --------------------------------------------------------------------------- #
+_INSERT_TASK = (
+    "INSERT INTO tasks (task_type, status, assigned_robot_id, created_at, updated_at) "
+    "VALUES ('PATROL', 'WAITING', %s, NOW(), NOW()) RETURNING task_id"
+)
+
+# robot_state_snapshot: 앱에서 JSON 직렬화한 문자열을 %s로 바인딩 후 ::jsonb 캐스팅.
+_INSERT_SNAPSHOT = (
+    "INSERT INTO task_assignment_snapshot (task_id, robot_id, robot_state_snapshot, assigned_at) "
+    "VALUES (%s, %s, %s::jsonb, NOW())"
+)
+
+_UPDATE_INPROGRESS = (
+    "UPDATE tasks SET status = 'IN_PROGRESS', started_at = NOW(), updated_at = NOW() "
+    "WHERE task_id = %s"
+)
+
+# 접수 후 디스패치용으로 순서대로 방문할 순찰 waypoint(좌표 포함)를 뽑는다.
+# RP-88: 경로는 휘발성(실행 중 재계획)이라 task_paths 에 저장하지 않고,
+# 순찰점(is_patrol_point)을 patrol_order 순으로 매번 직접 조회한다.
+# point_index 는 0부터 '연속' 재부여(ROW_NUMBER-1) — patrol_order 에 구멍이 있어도 촘촘히.
+#
+# ⚠️ 짝(pair) 지점도 목표에 포함한다(RP-EX). 예전에는 pair_waypoint_id IS NULL 로 짝을
+#   제외하고 '부모 도착 직후 제자리 회전으로 끼워 넣기'로 처리했으나, 그 제자리 180° 회전이
+#   좁은 통로에서 물리적으로 불가능함이 확인됐다. 이제 짝은 부모와 좌표가 6~8cm 갈라진
+#   '반대 방향으로 지날 때 찍는' 독립 목표다(각자 patrol_order 를 가진다).
+#   짝은 corridors 에 없어 find_path(current, 짝) 이 실패하므로, 디스패처가 경로 탐색만은
+#   부모 노드로 돌린다(_visit 의 _parent_of). 촬영은 '지나는 방향에 맞을 때'만 한다(방향 게이트).
+_SELECT_PATROL_WAYPOINTS = (
+    "SELECT ROW_NUMBER() OVER (ORDER BY patrol_order) - 1 AS point_index, "
+    "       waypoint_id, x_coord, y_coord "
+    "  FROM waypoints "
+    " WHERE is_patrol_point = TRUE "
+    "   AND patrol_order IS NOT NULL "
+    " ORDER BY patrol_order"
+)
+
+
+def accept_patrol_task(pool: ConnectionPool, robot_id: str,
+                       snapshot_json: str) -> tuple:
+    """순찰 task를 접수한다. ①~③을 하나의 트랜잭션으로 실행.
+
+    ① tasks INSERT (PATROL/WAITING) -> task_id 확보
+    ② task_assignment_snapshot INSERT (명령 직전 로봇 상태 전체 JSONB)
+    ③ tasks 를 IN_PROGRESS 로 전환
+    커밋 후, 방문할 순찰 waypoint 목록을 waypoints 에서 직접 조회해 반환한다
+    (RP-88: 경로는 휘발성이라 task_paths 로 저장하지 않음).
+
+    반환: (task_id, waypoints)
+      waypoints = [{"point_index", "waypoint_id", "x", "y"}, ...]  (디스패치용)
+
+    예외:
+      RobotBusyError  — 동일 로봇 활성 task 중복(부분 유니크 인덱스 위반).
+                        트랜잭션은 자동 롤백된다.
+    """
+    try:
+        with pool.connection() as conn:
+            with conn.transaction():   # BEGIN ~ COMMIT/ROLLBACK 자동 관리
+                task_id = conn.execute(_INSERT_TASK, (robot_id,)).fetchone()["task_id"]
+                conn.execute(_INSERT_SNAPSHOT, (task_id, robot_id, snapshot_json))
+                conn.execute(_UPDATE_INPROGRESS, (task_id,))
+            # 커밋 후, 방문할 순찰점을 waypoints 에서 직접 조회(경로는 저장 안 함)
+            rows = conn.execute(_SELECT_PATROL_WAYPOINTS).fetchall()
+        waypoints = [
+            {
+                "point_index": r["point_index"],
+                "waypoint_id": r["waypoint_id"],
+                "x": r["x_coord"],
+                "y": r["y_coord"],
+            }
+            for r in rows
+        ]
+        return task_id, waypoints
+    except psycopg.errors.UniqueViolation as exc:
+        # ①의 INSERT 가 '어느' 부분 유니크 인덱스를 위반했는지로 사유를 구분한다.
+        #   ux_tasks_single_active_patrol → 이미 순찰 진행 중(전역 1건 제약)
+        #   ux_tasks_active_robot         → 그 로봇이 이미 활성 task 보유
+        # psycopg 는 위반한 인덱스명을 exc.diag.constraint_name 으로 알려준다.
+        if getattr(exc.diag, "constraint_name", None) == "ux_tasks_single_active_patrol":
+            raise PatrolInProgressError(str(exc)) from exc
+        raise RobotBusyError(str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- #
+# 수확 접수 트랜잭션 (RP-123) — 순찰과 동일 골격, task_point_id(수확 위치)만 추가
+# --------------------------------------------------------------------------- #
+_INSERT_HARVEST_TASK = (
+    "INSERT INTO tasks (task_type, status, assigned_robot_id, task_point_id, "
+    "created_at, updated_at) "
+    "VALUES ('HARVEST', 'WAITING', %s, %s, NOW(), NOW()) RETURNING task_id"
+)
+
+
+def accept_harvest_task(pool: ConnectionPool, robot_id: str,
+                        harvest_location: str, snapshot_json: str) -> int:
+    """수확 task 를 접수한다. ①~③을 하나의 트랜잭션으로 실행(예외 시 전체 롤백).
+
+    ① tasks INSERT (HARVEST/WAITING, task_point_id=harvest_location) -> task_id 확보
+    ② task_assignment_snapshot INSERT (명령 직전 로봇 상태 JSONB) — 순찰과 공용 상수
+    ③ tasks 를 IN_PROGRESS 로 전환 — 순찰과 공용 상수
+
+    경로(수확지 진입노드)는 여기서 뽑지 않는다. 디스패처가 get_task_point 로 진입노드를
+    조회해 Dijkstra 로 계산한다(예냉실 이송도 같은 조회를 재사용하므로 접수와 분리).
+
+    반환: task_id
+
+    예외(둘 다 INSERT 시 부분 유니크 인덱스 위반 → 트랜잭션 자동 롤백):
+      HarvestInProgressError — 그 수확 위치에 이미 활성 HARVEST 존재
+                               (ux_tasks_active_harvest_location).
+      RobotBusyError         — 그 로봇이 이미 활성 task 보유(ux_tasks_active_robot).
+    """
+    try:
+        with pool.connection() as conn:
+            with conn.transaction():   # BEGIN ~ COMMIT/ROLLBACK 자동 관리
+                task_id = conn.execute(
+                    _INSERT_HARVEST_TASK, (robot_id, harvest_location)
+                ).fetchone()["task_id"]
+                conn.execute(_INSERT_SNAPSHOT, (task_id, robot_id, snapshot_json))
+                conn.execute(_UPDATE_INPROGRESS, (task_id,))
+        return task_id
+    except psycopg.errors.UniqueViolation as exc:
+        # 위반한 인덱스명으로 사유를 구분한다(psycopg: exc.diag.constraint_name).
+        if getattr(exc.diag, "constraint_name", None) == "ux_tasks_active_harvest_location":
+            raise HarvestInProgressError(str(exc)) from exc
+        raise RobotBusyError(str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- #
+# 순찰 종료 반영
+# --------------------------------------------------------------------------- #
+_VALID_END_STATUS = ("COMPLETED", "FAILED", "COMPLETED_PARTIAL")
+
+
+def set_task_status(pool: ConnectionPool, task_id: int, status: str) -> None:
+    """(Phase 2) tasks 를 명시 상태(COMPLETED/COMPLETED_PARTIAL/FAILED)로 마감한다.
+
+    순찰 지점 일부만 방문(우회 실패로 건너뜀)한 경우 COMPLETED_PARTIAL 을 쓴다.
+    tasks.status CHECK 제약이 이 세 값을 허용한다(스키마 0001).
+    """
+    if status not in _VALID_END_STATUS:
+        raise ValueError(f"허용되지 않은 종료 상태: {status}")
+    sql = (
+        "UPDATE tasks "
+        "   SET status = %s, ended_at = NOW(), updated_at = NOW() "
+        " WHERE task_id = %s"
+    )
+    with pool.connection() as conn:
+        conn.execute(sql, (status, int(task_id)))
+
+
+# --------------------------------------------------------------------------- #
+# 로봇 운영 상태 쓰기 (22-2 현장 정지 시 IMMOBILIZED)
+# --------------------------------------------------------------------------- #
+_VALID_OPERATIONAL_STATUS = ("NORMAL", "IMMOBILIZED", "MAINTENANCE")
+
+
+def set_operational_status(pool: ConnectionPool, robot_id: str,
+                           status: str) -> None:
+    """robots.operational_status 를 설정한다(22-2 복귀 실패 시 IMMOBILIZED 로).
+
+    이 값은 '일을 줘도 되는가' 축이라 nav_status(주행 중인가)와 별개다. NORMAL 이 아닌
+    로봇은 E1 가용 판정 1)에서 배정 후보에서 빠진다. IMMOBILIZED 는 정의상 사람이 손으로
+    NORMAL 로 되돌려야 풀리므로 메모리가 아니라 DB 에 남긴다(서비스 재기동에도 보존, 0007).
+
+    updated_at 은 set_task_status 와 같은 관례로 명시 갱신한다.
+    예외: 허용되지 않은 status 면 ValueError(0007 CHECK 제약과 같은 값을 코드에서 먼저 건다).
+    """
+    if status not in _VALID_OPERATIONAL_STATUS:
+        raise ValueError(f"허용되지 않은 operational_status: {status}")
+    sql = ("UPDATE robots SET operational_status = %s, updated_at = NOW() "
+           "WHERE robot_id = %s")
+    with pool.connection() as conn:
+        conn.execute(sql, (status, robot_id))
+
+
+# --------------------------------------------------------------------------- #
+# 예외 이벤트 기록 (시나리오 1 E2 통신 규격 12번)
+# --------------------------------------------------------------------------- #
+# 왜 알림과 별도로 DB 에 남기나: WebSocket 알림은 그 순간 앱을 보고 있는 사람에게만
+# 닿는 휘발성 메시지다. event_logs 는 영구 기록이라 나중에 "지난주에 막힘이 몇 번
+# 있었나" 를 셀 수 있다. 둘 다 필요하다(문서 12번 각주).
+_INSERT_EVENT_LOG = (
+    "INSERT INTO event_logs "
+    "  (robot_id, task_id, event_type, severity, message, created_at) "
+    "VALUES (%s, %s, %s, %s, %s, %s) "
+    "RETURNING event_id"
+)
+
+# 0001 스키마의 CHECK 제약과 같은 값. 앱에서 먼저 걸러 '어떤 값이 틀렸는지'를
+# psycopg 의 제약 위반 메시지보다 읽기 쉬운 형태로 드러낸다.
+_EVENT_TYPES = ("BATTERY_LOW", "OBSTACLE_STOP", "TRAFFIC_CONTROL", "HARDWARE_ERROR")
+_SEVERITIES = ("INFO", "WARN", "CRITICAL")
+
+
+def save_event_log(pool: ConnectionPool, *, robot_id, task_id,
+                   event_type: str, severity: str, message: str,
+                   created_at) -> int:
+    """예외 이벤트 한 건을 event_logs 에 남기고 event_id 를 반환한다.
+
+    created_at 을 파라미터로 받는 이유는 detection_db 와 같다 — 호출부가 한 번 캡처한
+    시각을 DB·알림이 함께 써야 "이 알림이 어느 기록인지" 를 나중에 맞출 수 있다.
+    그래서 SQL 안에서 NOW() 를 쓰지 않는다.
+
+    robot_id / task_id 는 NULL 을 허용한다(FK 가 있을 뿐 NOT NULL 이 아니다).
+    예외: 허용되지 않은 event_type/severity 면 ValueError.
+    """
+    if event_type not in _EVENT_TYPES:
+        raise ValueError(f"허용되지 않은 event_type: {event_type}")
+    if severity not in _SEVERITIES:
+        raise ValueError(f"허용되지 않은 severity: {severity}")
+    with pool.connection() as conn:
+        row = conn.execute(
+            _INSERT_EVENT_LOG,
+            (robot_id, task_id if task_id is None else int(task_id),
+             event_type, severity, message, created_at),
+        ).fetchone()
+    return row["event_id"]
+
+
+# --------------------------------------------------------------------------- #
+# 순찰 종료 요약 (E2 통신 규격 9-1번의 summary)
+# --------------------------------------------------------------------------- #
+# 문서: "이번 task 의 탐지 기록을 집계한 평균치". 순찰 한 번에 지점 수만큼 행이
+# 쌓이므로 평균을 DB 에서 계산해 한 행으로 받는다(전 행을 앱으로 끌어오지 않는다).
+_SELECT_DETECTION_SUMMARY = (
+    "SELECT COALESCE(ROUND(AVG(ripe_percent)), 0)    AS ripe_percent, "
+    "       COALESCE(ROUND(AVG(unripe_percent)), 0)  AS unripe_percent, "
+    "       COALESCE(ROUND(AVG(rotten_percent)), 0)  AS rotten_percent, "
+    "       COALESCE(ROUND(AVG(disease_percent)), 0) AS disease_percent "
+    "  FROM detection_logs "
+    " WHERE task_id = %s"
+)
+
+
+def get_detection_summary(pool: ConnectionPool, task_id: int) -> dict:
+    """이 task 의 탐지 기록 평균치(4개 percent)를 돌려준다.
+
+    탐지 기록이 하나도 없으면(한 지점도 못 찍은 순찰) AVG 가 NULL 이라 COALESCE 로
+    0 을 채운다 — 수신측이 null 을 따로 다루지 않아도 되게 한다.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(_SELECT_DETECTION_SUMMARY, (int(task_id),)).fetchone()
+    return {k: int(v) for k, v in row.items()}
+
+
+# --------------------------------------------------------------------------- #
+# 라우팅 그래프 로드 (Phase 2) — corridors + waypoints 를 메모리 그래프 재료로 반환
+# --------------------------------------------------------------------------- #
+def load_graph(pool: ConnectionPool) -> dict:
+    """토폴로지 그래프(노드=waypoints, 간선=corridors)를 읽어온다.
+
+    반환:
+      waypoints: [{"waypoint_id","x","y","yaw","is_patrol_point","pair_of"}, ...]
+                  (하달 Waypoint 용. yaw=지점 방향(rad, 통로 경유점은 None),
+                   is_patrol_point → Waypoint.capture 판정에 사용,
+                   pair_of=이 행이 짝이면 부모 waypoint_id, 아니면 None)
+      corridors: [{"corridor_id","a","b","length"}, ...]  (무방향 간선; a<b 관례.
+                  length = 간선 비용(두 waypoint 유클리드 거리, m). Dijkstra 가 사용)
+
+    RoutingEngine 은 이 두 리스트만으로 그래프를 구성한다(엔진은 DB를 모른다).
+    corridors 가 비어 있으면(시드 미보강) 순찰 이동이 모두 skip 될 수 있다.
+
+    짝 관계(pair_of)는 사실상 정적이라 기동 시 이 한 번의 조회로 메모리에 올린다
+    (Goal 을 만들 때마다 조회하면 경로 길이만큼 DB 왕복이 생긴다).
+    → DB 에서 짝 관계를 고치면 ACS 재기동이 필요하다.
+    """
+    with pool.connection() as conn:
+        waypoints = [
+            {"waypoint_id": r["waypoint_id"], "x": r["x_coord"], "y": r["y_coord"],
+             "yaw": r["yaw_coord"], "is_patrol_point": r["is_patrol_point"],
+             "pair_of": r["pair_waypoint_id"]}
+            for r in conn.execute(
+                "SELECT waypoint_id, x_coord, y_coord, yaw_coord, is_patrol_point, "
+                "       pair_waypoint_id "
+                "FROM waypoints"
+            ).fetchall()
+        ]
+        corridors = [
+            {"corridor_id": r["corridor_id"],
+             "a": r["waypoint_a_id"], "b": r["waypoint_b_id"],
+             "length": r["length"]}
+            for r in conn.execute(
+                "SELECT corridor_id, waypoint_a_id, waypoint_b_id, length FROM corridors"
+            ).fetchall()
+        ]
+    return {"waypoints": waypoints, "corridors": corridors}
+
+
+# --------------------------------------------------------------------------- #
+# 순찰 시작 노드 — 로봇 전용 충전소의 '진입 노드'
+# --------------------------------------------------------------------------- #
+# 순찰은 항상 로봇이 자기 충전소에 도킹해 있는 상태에서 시작한다. 라우터는 waypoint_id
+# 로만 경로를 계산하므로, '그 로봇이 지금 서 있는 노드'가 어디인지 알아야 첫 구간부터
+# 통로를 예약하며 움직일 수 있다.
+#   robots.charge_point_id → task_points.task_point_id → task_points.waypoint_id
+# 예전에는 이 FK 사슬이 없어 전역 상수(ACS_PATROL_START_WAYPOINT_ID)로 한 점을 찍어
+# 뒀지만, 이제 로봇마다 다른 충전소(dg_01→22, dg_02→23, dg_03→24)를 유도할 수 있다.
+_SELECT_PATROL_START_WAYPOINT = (
+    "SELECT t.waypoint_id "
+    "  FROM robots r "
+    "  JOIN task_points t ON t.task_point_id = r.charge_point_id "
+    " WHERE r.robot_id = %s"
+)
+
+
+def get_patrol_start_waypoint(pool: ConnectionPool, robot_id: str):
+    """robot_id 의 전용 충전소 진입 노드(waypoint_id)를 돌려준다. 없으면 None.
+
+    None 이 나오는 경우: 그런 로봇이 없거나, charge_point_id 가 비어 있음.
+    호출부(automato_node)는 None 이면 설정 상수 PATROL_START_WAYPOINT_ID 로 폴백한다
+    — 충전소가 아직 등록되지 않은 로봇 때문에 순찰 전체가 막히지는 않게 한다.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(_SELECT_PATROL_START_WAYPOINT, (robot_id,)).fetchone()
+    return row["waypoint_id"] if row else None
+
+
+# --------------------------------------------------------------------------- #
+# 작업 지점(수확지/예냉실) 진입노드 조회 (RP-123) — task_points ⋈ waypoints
+#   수확지는 요청이 준 id 로, 예냉실은 point_type 으로 찾는다.
+# --------------------------------------------------------------------------- #
+_TASK_POINT_COLS = (
+    "SELECT tp.task_point_id, tp.point_type, tp.waypoint_id, "
+    "       w.x_coord, w.y_coord, w.yaw_coord "
+    "  FROM task_points tp "
+    "  JOIN waypoints w ON w.waypoint_id = tp.waypoint_id "
+)
+_SELECT_TASK_POINT = _TASK_POINT_COLS + " WHERE tp.task_point_id = %s"
+_SELECT_PRECOOL_POINT = (
+    _TASK_POINT_COLS + " WHERE tp.point_type = 'PRECOOL' "
+    " ORDER BY tp.task_point_id LIMIT 1"
+)
+
+
+def _row_to_task_point(row):
+    """task_points ⋈ waypoints 한 행을 디스패처용 dict 로. row 가 None 이면 None."""
+    if row is None:
+        return None
+    return {
+        "task_point_id": row["task_point_id"],
+        "point_type": row["point_type"],
+        "waypoint_id": row["waypoint_id"],
+        "x": row["x_coord"],
+        "y": row["y_coord"],
+        "yaw": row["yaw_coord"],
+    }
+
+
+def get_task_point(pool: ConnectionPool, task_point_id: str):
+    """task_point_id(예: HARVEST_01)의 진입노드+좌표+종류를 dict 로. 없으면 None.
+
+    반환: {"task_point_id","point_type","waypoint_id","x","y","yaw"}
+    point_type 검증(HARVEST 가 맞는지)은 호출부(API)가 한다 — 여기선 있는 그대로 돌려준다.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(_SELECT_TASK_POINT, (task_point_id,)).fetchone()
+    return _row_to_task_point(row)
+
+
+def get_precool_point(pool: ConnectionPool):
+    """예냉실 진입노드+좌표를 dict 로. 없으면 None. (현재 PRECOOL_01 1곳 — ERD/charuco 시드 기준)
+
+    LIMIT 1: 예냉실이 하나라는 전제. 여러 개가 되면 이 함수를 '어느 예냉실로 갈지' 선택
+    로직으로 확장한다(수확지처럼 id 로 특정하거나 최단거리 선택 등).
+    """
+    with pool.connection() as conn:
+        row = conn.execute(_SELECT_PRECOOL_POINT).fetchone()
+    return _row_to_task_point(row)
+
+
+# --------------------------------------------------------------------------- #
+# 수확 결과 영속화 (RP-123) — 집계만 남긴다(개별 토마토 좌표·등급은 DB에 저장 안 함)
+# --------------------------------------------------------------------------- #
+_INSERT_HARVEST_BATCH = (
+    "INSERT INTO harvest_batches "
+    "(task_id, robot_id, normal_count, discard_count, failed_count, exit_reason, "
+    "created_at, updated_at) "
+    "VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW()) RETURNING batch_id"
+)
+
+
+def save_harvest_batch(pool: ConnectionPool, task_id: int, robot_id: str,
+                       normal_count: int, discard_count: int,
+                       failed_count: int, exit_reason: str) -> int:
+    """수확 배치 실적 1행을 저장하고 batch_id 를 반환한다.
+
+    E5(수확 종료 직후) 호출 — 예냉실 도착이 아니라 여기서 저장한다. 이송 중 로봇이
+    멈춰도 이미 딴 실적은 사실로 남아야 하기 때문(Harvest.Result 값을 그대로 옮김).
+    """
+    with pool.connection() as conn:
+        return conn.execute(
+            _INSERT_HARVEST_BATCH,
+            (task_id, robot_id, normal_count, discard_count,
+             failed_count, exit_reason),
+        ).fetchone()["batch_id"]
+
+
+# unload_logs 는 created_at 만 있고 updated_at 이 없다(ERD 그대로) — INSERT 컬럼이 다르다.
+_INSERT_UNLOAD_LOG = (
+    "INSERT INTO unload_logs (task_id, robot_id, normal_qty, discard_qty, created_at) "
+    "VALUES (%s, %s, %s, %s, NOW()) RETURNING unload_id"
+)
+
+
+def save_unload_log(pool: ConnectionPool, task_id: int, robot_id: str,
+                    normal_qty: int, discard_qty: int) -> int:
+    """하역 입고 1행을 저장하고 unload_id 를 반환한다.
+
+    E6 하역 동작이 '성공했을 때만' 호출한다(실패 시 행 없음 — 하지만 수확 실적은 이미
+    harvest_batches 에 있어 유실 안 됨). 수량은 그 task 의 harvest_batches 집계값을
+    그대로 옮긴다. 바구니 2개가 붙어 있어 한 번에 normal/discard 가 동시 입고된다.
+    """
+    with pool.connection() as conn:
+        return conn.execute(
+            _INSERT_UNLOAD_LOG,
+            (task_id, robot_id, normal_qty, discard_qty),
+        ).fetchone()["unload_id"]
+
+
+# --------------------------------------------------------------------------- #
+# 복귀·도킹 조회 (E4 순찰 종료 복귀 / 22-1 막힘 실패 복귀 공통)
+# --------------------------------------------------------------------------- #
+# 순찰이 끝나거나(E4) 통로 막힘으로 실패한(22-1) 로봇은 '자기 전용 충전소'로 복귀해
+# 도킹한다. 복귀 주행의 목적지는 충전소의 '진입 노드'(waypoint_id)이고, 도착 후
+# Dock 액션에는 그 지점의 ChArUco 보드 정보를 실어 내려보낸다. 이 두 사실을 읽는다.
+#
+# get_patrol_start_waypoint 와의 차이: 그 함수는 '순찰을 어느 노드에서 시작하나'만
+# 알면 돼 waypoint_id 하나만 돌려준다. 복귀·도킹은 Dock Goal 의 task_point_id 필드와
+# 마커 조회 키로 task_point_id('CHARGE_01' 등)까지 필요해 함께 돌려준다.
+_SELECT_CHARGE_POINT = (
+    "SELECT t.task_point_id, t.waypoint_id "
+    "  FROM robots r "
+    "  JOIN task_points t ON t.task_point_id = r.charge_point_id "
+    " WHERE r.robot_id = %s"
+)
+
+
+def get_charge_point(pool: ConnectionPool, robot_id: str):
+    """robot_id 의 전용 충전소를 {task_point_id, 진입 노드 waypoint_id} 로 돌려준다.
+
+    반환: {"task_point_id": "CHARGE_01", "waypoint_id": 22} · 없으면 None.
+    None 인 경우: 그런 로봇이 없거나 charge_point_id 가 비어 있음(충전소 미등록).
+
+    좌표(x/y/yaw)는 여기서 다시 읽지 않는다 — waypoint_id 만 있으면 디스패처가 이미
+    메모리에 올려둔 그래프(load_graph 의 wp_meta)에서 얻는다. 같은 좌표를 두 곳에서
+    읽으면 지도를 고칠 때 한쪽만 바뀌어 어긋나므로, 좌표의 단일 출처는 waypoints 다.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(_SELECT_CHARGE_POINT, (robot_id,)).fetchone()
+    return dict(row) if row else None
+
+
+# 도킹 마커는 충전소뿐 아니라 수확/예냉실 지점에도 붙으므로 robot 이 아니라
+# task_point_id 로 조회한다(범용). Dock Goal 의 마커 관련 필드가 이 한 행에서 다 나온다.
+_SELECT_DOCK_MARKER = (
+    "SELECT marker_id, dictionary, squares_x, squares_y, "
+    "       square_size_m, marker_size_m, "
+    "       dock_offset_x, dock_offset_y, dock_offset_yaw "
+    "  FROM charuco_boards "
+    " WHERE task_point_id = %s"
+)
+
+
+def get_dock_marker(pool: ConnectionPool, task_point_id: str):
+    """task_point_id 의 ChArUco 보드/도킹 오프셋 한 행을 dict 로 돌려준다. 없으면 None.
+
+    반환 키: marker_id, dictionary, squares_x, squares_y, square_size_m,
+             marker_size_m, dock_offset_x, dock_offset_y, dock_offset_yaw
+    이 값들이 Dock 액션 Goal 의 마커 관련 필드로 그대로 실린다.
+
+    None 인 경우: 그 지점에 보드가 아직 시드되지 않음. 마커 실측값은 도킹 튜닝이
+    끝난 뒤 채워지므로(현 단계 미시드), 호출부(Dock 클라이언트)가 None 을 '도킹 불가'로
+    처리한다 — 없는 마커로 Goal 을 만들어 로봇이 엉뚱하게 움직이지 않게 한다.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(_SELECT_DOCK_MARKER, (task_point_id,)).fetchone()
+    return dict(row) if row else None

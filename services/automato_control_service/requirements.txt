@@ -1,0 +1,9 @@
+# Automato Control Service — 순찰(RP-78) 런타임 의존 (pip 설치)
+# 설치:  pip install -r requirements.txt
+#   (ROS2 환경 파이썬에 설치. rosdep 키가 아니라 순수 PyPI 패키지라 여기서 관리)
+fastapi>=0.110         # ① HTTP API 프레임워크
+uvicorn[standard]>=0.29  # ASGI 서버(FastAPI 실행)
+pydantic>=2            # 요청/응답 모델 검증(FastAPI 의존이지만 명시)
+psycopg[binary]>=3.1   # ③ PostgreSQL 드라이버(v3) — RP-82 DB와 동일
+psycopg_pool>=3.2      # 커넥션 풀
+python-dotenv>=1.0     # services/database/.env 공유 로딩(best-effort)

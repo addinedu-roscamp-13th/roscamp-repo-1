@@ -1,0 +1,69 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: ddagi_base
+    Frame Rate: 30
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 0.1
+      Plane: XY
+      Plane Cell Count: 12
+      Color: 160; 160; 164
+      Alpha: 0.5
+      Line Style:
+        Line Width: 0.0299999993
+        Value: Lines
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/Axes
+      Name: Axes
+      Enabled: true
+      Length: 0.1
+      Radius: 0.005
+      Reference Frame: ddagi_base
+    - Class: rviz_default_plugins/MarkerArray
+      Name: MarkerArray
+      Enabled: true
+      Namespaces: {}
+      Topic:
+        Value: /ddagi/markers
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: false
+      Marker Scale: 0.1
+      Show Names: true
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 0.9
+      Focal Point:
+        X: 0.256
+        Y: 0.065
+        Z: 0.294
+      Yaw: 2.35
+      Pitch: 0.45
+      Target Frame: ddagi_base
+      Near Clip Distance: 0.00999999978
+      Invert Z Axis: false
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1400
+  Displays:
+    collapsed: false
+  Views:
+    collapsed: false

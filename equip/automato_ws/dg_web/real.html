@@ -1,0 +1,1720 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DG 실서버 대시보드</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #241f1b; color: #e6e6e6; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  .sub { color: #b9a695; font-size: 16px; margin-bottom: 18px; }
+  /* 시뮬 화면(파랑 계열)과 한눈에 구분되도록 실서버는 주황 계열로 간다.
+     화면을 잘못 보고 버튼을 누르는 사고가 이 분리의 목적이다. */
+  .realbar { background: #4a2a1c; border: 1px solid #8a4c2c; color: #ffb787;
+             border-radius: 8px; padding: 10px 14px; margin-bottom: 16px;
+             font-size: 16px; font-weight: 700; display: flex; justify-content: space-between;
+             align-items: center; gap: 12px; flex-wrap: wrap; }
+  .realbar a { color: #9fb0d0; font-weight: 600; font-size: 14px; }
+  .panel { background: #332c27; border: 1px solid #463d35; border-radius: 10px;
+           padding: 16px; margin-top: 18px; }
+  .panel h2 { font-size: 19px; margin: 0 0 10px; }
+  .note { color: #b9a695; font-size: 14px; line-height: 1.55; }
+  button { border: 1px solid #5c5045; background: #443b33; color: #e6e6e6; border-radius: 7px;
+           padding: 5px 12px; font-size: 15px; cursor: pointer; }
+  button:hover { background: #524740; }
+  button.on { border-color: #2ecc71; } button.off { border-color: #e74c3c; }
+  button:disabled { opacity: .4; cursor: default; }
+  .dot { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; font-size: 15px; }
+  .dot i { width: 10px; height: 10px; border-radius: 50%; background: #555; }
+  .up i { background: #2ecc71; } .up { color: #2ecc71; }
+  .down i { background: #e74c3c; } .down { color: #e74c3c; }
+  .unknown i { background: #a4907f; } .unknown { color: #b9a695; }
+  .log { background: #1d1917; border: 1px solid #463d35; border-radius: 8px; padding: 11px;
+         font-family: ui-monospace, monospace; font-size: 13px; line-height: 1.5; color: #e3d6c5;
+         max-height: 280px; overflow: auto; white-space: pre-wrap; margin-top: 10px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+  .stat { background: #3b332d; border: 1px solid #463d35; border-radius: 8px; padding: 10px 12px; }
+  .stat .k { color: #b9a695; font-size: 13px; }
+  .stat .v { font-size: 19px; font-weight: 700; margin-top: 2px; }
+  .stat.warn { border-color: #8a4a22; } .stat.warn .v { color: #f0894a; }
+  .stat.bad  { border-color: #a33; }    .stat.bad .v  { color: #e74c3c; }
+  .banner { background: #4a2a1c; color: #f0894a; border: 1px solid #7d4728; border-radius: 8px;
+            padding: 9px 13px; margin-bottom: 12px; font-size: 15px; font-weight: 600; }
+
+  /* 패널 헤더: 제목 좌측, 전체 제어 버튼 우측 상단 */
+  .panel-head { display: flex; align-items: center; justify-content: space-between;
+                gap: 12px; flex-wrap: wrap; }
+  .panel-head h2 { margin: 0; }
+  .head-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  /* 서비스 카드 — 서비스당 버튼 1개(토글) */
+  .svc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+  .card { background: #3b332d; border: 1px solid #463d35; border-radius: 10px; padding: 13px; }
+  .card h3 { margin: 0 0 2px; font-size: 17px; }
+  .card .key { color: #a4907f; font-family: ui-monospace, monospace; font-size: 12px; }
+  .where { font-size: 12px; padding: 1px 8px; border-radius: 10px; background: #443b33; color: #e0cdb8; }
+  .where.robot { background: #14361f; color: #46d17e; }
+  .card-row { display: flex; align-items: center; justify-content: space-between;
+              gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .card-btns { display: flex; gap: 6px; }
+  .card-btns button { padding: 4px 10px; font-size: 14px; }
+  .edited-badge { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 20px;
+                  background: #4d3d1c; color: #f0b45a; margin-left: 4px; }
+  .why { color: #a4907f; font-size: 12px; margin-top: 6px; min-height: 15px; }
+
+  /* 팝업(모달) */
+  .mask { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none;
+          align-items: flex-start; justify-content: center; padding: 40px 16px; z-index: 50; overflow: auto; }
+  .mask.open { display: flex; }
+  .modal { background: #332c27; border: 1px solid #5c5045; border-radius: 12px; padding: 18px;
+           width: 100%; max-width: 780px; }
+  /* 닫기는 **모달 우측 상단 고정**. 예전엔 본문 중간(정보칸 버튼줄)에 있어서, 지도·웨이포인트
+     패널이 길어진 뒤로는 화면 한가운데에 놓여 찾기 어려웠다. */
+  .modal { position: relative; }
+  .modal-x { position: absolute; top: 12px; right: 14px; z-index: 2;
+             background: #3a322c; color: #e3d6c5; border: 1px solid #5c5045;
+             border-radius: 7px; padding: 4px 10px; font-size: 13px; cursor: pointer; }
+  .modal-x:hover { background: #4a4038; }
+  /* 웨이포인트 패널 */
+  .wp-panel { margin-top: 12px; border-top: 1px solid #4b4038; padding-top: 10px; }
+  .wp-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .wp-head b { color: #e3d6c5; }
+  .wpbtn { background: #3a322c; color: #e3d6c5; border: 1px solid #5c5045;
+           border-radius: 7px; padding: 4px 10px; font-size: 13px; cursor: pointer; }
+  .wpbtn.on { background: #2f6b3a; border-color: #4e9c5c; color: #fff; }
+  .wp-hint { color: #b9a695; font-size: 12.5px; margin: 6px 0; line-height: 1.5; }
+  .wp-list { max-height: 26vh; overflow-y: auto; overflow-x: hidden; margin-top: 6px; }
+  .wp-row { display: flex; align-items: center; gap: 6px; padding: 4px 2px;
+            border-bottom: 1px solid #3a322c; font-size: 13px; flex-wrap: wrap; }
+  .wp-row .ord { width: 22px; text-align: center; color: #7ee081; font-weight: bold; }
+  .wp-row input[type=text] { width: 78px; background: #262120; color: #e3d6c5;
+            border: 1px solid #5c5045; border-radius: 5px; padding: 2px 5px; font-size: 12.5px; }
+  .wp-row select { background: #262120; color: #e3d6c5; border: 1px solid #5c5045;
+            border-radius: 5px; padding: 2px 4px; font-size: 12.5px; }
+  .wp-row .xy { color: #a4907f; font-family: ui-monospace, monospace; font-size: 12px; }
+  .wp-row input.yaw { width: 52px; text-align: right; }
+  .wp-row .deg { color: #a4907f; font-size: 12px; margin-left: -2px; }
+  .wpbtn.tiny { padding: 2px 7px; font-size: 12px; }
+  .wp-row .del { margin-left: auto; background: none; border: 0; color: #e07a5f;
+            cursor: pointer; font-size: 15px; }
+  /* 접근점 도착 확인 — 놓치면 안 되는 결정이라 눈에 띄게. */
+  .ret-ask { background: #3a2f1c; border: 1px solid #a8791f; border-radius: 10px;
+             padding: 12px 14px; margin: 12px 0; }
+  .ret-ask b { color: #ffcf6b; font-size: 15px; }
+  .ret-ask .sub { color: #d8c6ac; font-size: 13px; margin: 6px 0 10px; line-height: 1.5; }
+  .ret-ask .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  /* 복귀 진행 로그: 기본 .log(280px)는 너무 짧아 스크롤할 게 거의 없다.
+     실패 원인은 앞쪽 줄에 있는 경우가 많아 충분히 보여야 한다. */
+  .log.ret { max-height: 48vh; }
+  #ret-logbar { display: flex; align-items: center; gap: 10px; margin-top: 10px;
+                font-size: 13px; color: #b9a695; }
+  #ret-logbar select { background: #262120; color: #e3d6c5; border: 1px solid #5c5045;
+                       border-radius: 6px; padding: 3px 6px; margin-left: 4px; }
+  /* 로그 팝업은 화면을 거의 다 쓴다 — 로그는 한 줄이 길고 많이 봐야 원인이 보인다. */
+  .modal.wide { max-width: 96vw; }
+  /* 복귀 모달은 지도 + 웨이포인트 목록이 나란히 들어가 기본 780px 로는 좁다.
+     목록 행(이름·좌표·도킹·task_point_id·각도·버튼)이 넘쳐 가로 스크롤이 생겼다 → 30% 확대. */
+  .modal.ret { max-width: 1014px; }
+  .modal.wide .log { height: 74vh; max-height: none; }
+  .modal.wide .log-split > div { flex: 1 1 480px; }
+  .log-follow { margin-left: auto; display: flex; align-items: center; gap: 6px;
+                font-size: 13px; color: #a4907f; }
+  .modal h3 { margin: 0 0 4px; font-size: 19px; }
+  .modal .key { color: #a4907f; font-family: ui-monospace, monospace; font-size: 13px; }
+  .modal-foot { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+  .params { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; }
+  .param { display: flex; align-items: center; gap: 6px; }
+  .param label { color: #d8c6b2; font-size: 14px; font-family: ui-monospace, monospace; }
+  .param input { background: #262120; border: 1px solid #463d35; color: #e6e6e6; border-radius: 6px;
+                 padding: 5px 8px; font-size: 14px; width: 210px; font-family: ui-monospace, monospace; }
+  .modal textarea { width: 100%; box-sizing: border-box; min-height: 70px; background: #262120;
+                    border: 1px solid #5c5045; color: #e6e6e6; border-radius: 6px; padding: 8px;
+                    font-family: ui-monospace, monospace; font-size: 13px; line-height: 1.5; margin-top: 10px; }
+  .prev { font-family: ui-monospace, monospace; font-size: 13px; color: #dcc9ae;
+          background: #262120; border: 1px solid #463d35; border-radius: 6px;
+          padding: 8px; margin-top: 10px; white-space: pre-wrap; word-break: break-all; }
+
+  /* 인터페이스 맵 */
+  .topo { width: 100%; max-width: 900px; height: auto; display: block; margin: 0 auto; }
+  .topo text { fill: #f0e6da; font-family: system-ui, sans-serif; }
+  .topo .nlabel { font-size: 19px; font-weight: 700; }
+  .topo .nsub { font-size: 13px; fill: #b9a695; }
+  .topo .link-label { font-size: 15px; font-weight: 700; fill: #eaff66; opacity: 0;
+                      paint-order: stroke; stroke: #241f1b; stroke-width: 3px; }
+
+  /* 로그 팝업 — 실행 출력과 별도 로그 파일을 나란히 */
+  .log-split { display: flex; gap: 10px; flex-wrap: wrap; }
+  .log-split > div { flex: 1 1 320px; min-width: 0; }
+  .log-title { color: #d8c6b2; font-size: 13px; font-family: ui-monospace, monospace; margin-top: 10px; }
+
+  /* 충전소 복귀 모달 */
+  .ret-wrap { display: flex; gap: 14px; margin-top: 12px; flex-wrap: wrap; }
+  .ret-map { flex: 0 0 auto; background: #1d1917; border: 1px solid #463d35;
+             border-radius: 8px; padding: 8px; }
+  .ret-map canvas { display: block; image-rendering: pixelated; }
+  .ret-info { flex: 1 1 260px; min-width: 240px; }
+  .ret-line { font-size: 14px; color: #d8c6b2; margin: 4px 0;
+              font-family: ui-monospace, monospace; }
+  .ret-line b { color: #f0e6da; }
+  .ret-warn { background: #4a2a1c; color: #ffb787; border: 1px solid #7d4728;
+              border-radius: 8px; padding: 8px 10px; margin: 8px 0;
+              font-size: 13px; line-height: 1.5; }
+  .ret-legend { font-size: 12px; color: #a4907f; margin-top: 6px; }
+  .retstep { border-top: 1px solid #463d35; padding: 8px 0; font-size: 14px; }
+  .retstep:first-child { border-top: none; }
+  .retstep .st { font-weight: 700; }
+  .retstep .prog { color: #b9a695; font-family: ui-monospace, monospace; font-size: 13px; }
+
+  /* 메시지 시계열 */
+  .msg-timeline { max-height: 60vh; min-height: 260px; overflow-y: auto;
+                  border-top: 1px solid #423830; padding-top: 4px; margin-top: 8px; }
+  .tl-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding: 3px 0;
+            border-bottom: 1px solid #3d352f; font-family: ui-monospace, monospace; font-size: 13px; }
+  .tl-time { color: #a4907f; flex: 0 0 auto; }
+  .tl-dir { color: #f0894a; font-weight: 700; flex: 0 0 auto; }
+  .tl-iface { color: #f0e6da; font-weight: 700; flex: 0 0 auto; }
+  .tl-pl { color: #bcd0a0; word-break: break-all; flex: 1 1 100%; padding-left: 2px; }
+  .wempty { color: #a4907f; font-size: 12px; padding: 3px 0; font-family: ui-monospace, monospace; }
+  .tag { font-size: 12px; padding: 1px 7px; border-radius: 10px; background: #443b33; color: #d8c6b2; }
+  .tag.action { color: #f0b45a; } .tag.service { color: #6ab0ff; }
+  .tag.topic { color: #46d17e; } .tag.TCP { color: #d08bff; }
+  .toast { color: #46d17e; font-size: 15px; }
+</style>
+</head>
+<body>
+  <h1>DG 실서버 대시보드</h1>
+
+  <div class="realbar">
+    <span>로봇 <b id="robot-name">-</b> · robot_id <b id="rid">-</b></span>
+    <div class="head-btns">
+      <button id="btn-return" class="on" onclick="openReturn()">충전소 복귀</button>
+    </div>
+  </div>
+
+  <div id="banner" class="banner" style="display:none"></div>
+
+  <div class="panel">
+    <div class="panel-head">
+      <h2>로봇 상태</h2>
+      <div class="head-btns">
+        <button id="btn-agent" onclick="agentRestart()">에이전트 배포·기동</button>
+      </div>
+    </div>
+    <div class="note">로봇 온보드 에이전트(dg_agent)가 보고합니다. ROS·DDS를 거치지 않으므로
+      <b>ROS가 안 떠 있어도</b> 보입니다 — 그래야 안 뜨는 이유를 볼 수 있습니다.<br>
+      에이전트가 죽어 있으면(로봇 재부팅 등) <b>배포·기동</b>으로 되살립니다 —
+      이때만 SSH를 씁니다(에이전트 자신이 통신 채널이라 에이전트로는 살릴 수 없습니다).</div>
+    <div class="grid" id="sysgrid" style="margin-top:12px"></div>
+    <div class="note" id="wifi-errors" style="margin-top:10px"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head">
+      <h2>서비스</h2>
+      <div class="head-btns">
+        <button class="on" id="btn-up" onclick="stack('up')">▶ 전체 기동</button>
+        <button class="off" id="btn-down" onclick="stack('down')">■ 전체 종료</button>
+        <button onclick="loadStatus()">↻</button>
+      </div>
+    </div>
+    <div class="note">버튼 하나로 켜고 끕니다(<b>UP이면 끄기, DOWN이면 켜기</b>).
+      명령 편집은 <b>설정</b>, 실행 출력은 <b>로그</b>에서 팝업으로 엽니다.<br>
+      전체 기동 순서: <b id="order-txt">-</b> (종료는 역순)</div>
+    <div class="svc-grid" id="svc-cards" style="margin-top:12px"></div>
+    <pre class="log" id="stack-log" style="display:none"></pre>
+  </div>
+
+  <div class="panel">
+    <h2>인터페이스 맵 <span class="where" id="rid-badge">-</span></h2>
+    <div class="note">DCS가 주고받는 상대들입니다. 메시지가 흐르면 해당 선이 반짝입니다.
+      <b>ACS</b>는 연동 상대이지만 이 화면에서 켜고 끄지 않습니다(외부).
+      <b>Ddagi</b>는 인터페이스가 아직 정의되지 않아 자리만 표시합니다.<br>
+      테두리·선 색 = <span style="color:#46d17e">연결됨</span> ·
+      <span style="color:#e05a4a">꺼짐</span> ·
+      <span style="color:#a4907f">불명</span>.
+      ACS는 프로세스를 볼 수 없어 <b>최근 10초 내 메시지</b>가 오갔는지로 추정합니다.</div>
+    <svg class="topo" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="flash-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#eaff66"/>
+        </marker>
+      </defs>
+      <line id="link-acs"   x1="190" y1="140" x2="380" y2="140" stroke="#5c5045" stroke-width="2"/>
+      <line id="link-ddago" x1="520" y1="126" x2="710" y2="67"  stroke="#5c5045" stroke-width="2"/>
+      <line id="link-ddagi" x1="520" y1="154" x2="710" y2="213" stroke="#5c5045" stroke-width="2" stroke-dasharray="6 5"/>
+      <line id="link-dg_ai" x1="450" y1="170" x2="450" y2="205" stroke="#5c5045" stroke-width="2"/>
+
+      <rect id="node-dcs"   x="380" y="110" width="140" height="60" rx="12" fill="#423830" stroke="#7a6552" stroke-width="2"/>
+      <text class="nlabel" x="450" y="136" text-anchor="middle">DCS</text>
+      <text class="nsub"   x="450" y="155" text-anchor="middle">실 DG Control</text>
+
+      <rect id="node-acs"   x="40"  y="110" width="150" height="60" rx="12" fill="#3b332d" stroke="#5c5045" stroke-width="2" stroke-dasharray="5 4"/>
+      <text class="nlabel" x="115" y="136" text-anchor="middle">ACS</text>
+      <text class="nsub"   x="115" y="155" text-anchor="middle">외부 · 관리 대상 아님</text>
+
+      <rect id="node-ddago" x="710" y="40"  width="150" height="54" rx="12" fill="#3b332d" stroke="#5c5045" stroke-width="2"/>
+      <text class="nlabel" x="785" y="64"  text-anchor="middle">DdaGo</text>
+      <text class="nsub"   x="785" y="82"  text-anchor="middle" id="ddago-sub">로봇 온보드</text>
+
+      <rect id="node-ddagi" x="710" y="186" width="150" height="54" rx="12" fill="#322c28" stroke="#5c5045" stroke-width="2" stroke-dasharray="5 4"/>
+      <text class="nlabel" x="785" y="210" text-anchor="middle" fill="#6b5c4e">Ddagi</text>
+      <text class="nsub"   x="785" y="228" text-anchor="middle" fill="#6b5c4e">미정의</text>
+
+      <rect id="node-dg_ai" x="380" y="205" width="140" height="54" rx="12" fill="#3b332d" stroke="#5c5045" stroke-width="2"/>
+      <text class="nlabel" x="450" y="229" text-anchor="middle">DG AI</text>
+      <text class="nsub"   x="450" y="246" text-anchor="middle" id="dgai-sub">실서버 TCP :9100</text>
+
+      <text class="link-label" id="lbl-acs"   x="285" y="128" text-anchor="middle"></text>
+      <text class="link-label" id="lbl-ddago" x="632" y="84"  text-anchor="middle"></text>
+      <text class="link-label" id="lbl-ddagi" x="632" y="205" text-anchor="middle"></text>
+      <text class="link-label" id="lbl-dg_ai" x="565" y="192" text-anchor="middle"></text>
+    </svg>
+  </div>
+
+  <div class="panel">
+    <h2>메시지 로그 (DCS 시점)</h2>
+    <div class="note">DCS가 주고받은 모든 메시지를 <b>시각순 하나의 스크롤</b>로 표시(1.5초 갱신).
+      보관 <input id="msg-limit" type="number" min="1" max="5000" value="500" style="width:64px">건.
+      <button onclick="copyMessages()">📋 전체 복사</button>
+      <button onclick="clearWireLog()">🗑 지우기</button>
+      <button id="scroll-btn" onclick="toggleScrollLock()">⏸ 스크롤 고정</button>
+      <span class="toast" id="scroll-state" style="color:#f0894a"></span>
+      <label style="margin-left:8px;user-select:none;cursor:pointer">
+        <input type="checkbox" id="hide-tel" checked onchange="onHideTelChange()"> 텔레메트리 숨김</label>
+      <span class="toast" id="copy-toast"></span>
+    </div>
+    <div class="msg-timeline" id="msg-timeline"><div class="wempty">(아직 없음)</div></div>
+  </div>
+
+  <div class="mask" id="mask" onclick="if(event.target===this) closeModal()">
+    <div class="modal" id="modal"></div>
+  </div>
+
+<script>
+function escapeHtml(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+function escAttr(s) { return escapeHtml(s).replace(/"/g, '&quot;'); }
+
+let CMDS = [], STATUS = {}, ROBOTS = {};
+let RID = 'dg_01';
+let _netPrev = null;   // 네트워크 누적 바이트 — 차분으로 실효 대역폭을 낸다
+
+function banner(msg) {
+  const b = document.getElementById('banner');
+  if (!msg) { b.style.display = 'none'; return; }
+  b.style.display = 'block'; b.textContent = msg;
+}
+
+/* ===== 로봇 상태 카드 =====
+   자리를 미리 만들어 두고 값만 갈아 끼운다. 폴링마다 innerHTML 을 새로 쓰면 카드 개수가
+   달라져 그리드 높이가 바뀌고, 그 아래 패널이 계속 위아래로 튄다. */
+const STAT_SLOTS = [
+  ['conn', '연결'], ['batt', '배터리'], ['skew', '시계 편차'], ['rtt', '응답'], ['uptime', '가동'],
+  ['cpu', 'CPU'], ['mem', '메모리'], ['temp', '온도'], ['power', '전원/스로틀'],
+  ['wifi', 'WiFi'], ['band', '실효 대역'],
+  ['domain', 'ROS_DOMAIN_ID'], ['rmw', 'RMW'], ['fastdds', 'FastDDS 프로파일'],
+];
+// batt 는 빠져 있다 — 배터리는 에이전트가 아니라 토픽에서 오므로 로봇 미도달과 무관하다.
+const SYS_SLOTS = ['cpu', 'mem', 'temp', 'power', 'wifi', 'band', 'domain', 'rmw', 'fastdds'];
+
+function buildStatGrid() {
+  document.getElementById('sysgrid').innerHTML = STAT_SLOTS.map(([id, label]) =>
+    `<div class="stat" id="st-${id}"><div class="k">${escapeHtml(label)}</div>
+     <div class="v" id="stv-${id}">-</div></div>`).join('');
+}
+function setStat(id, value, cls) {
+  const box = document.getElementById('st-' + id), v = document.getElementById('stv-' + id);
+  if (!box || !v) return;
+  const text = (value === null || value === undefined || value === '') ? '-' : String(value);
+  if (v.textContent !== text) v.textContent = text;   // 같으면 안 건드린다(깜빡임 방지)
+  const klass = 'stat' + (cls ? ' ' + cls : '');
+  if (box.className !== klass) box.className = klass;
+}
+function robotNote(html) {
+  const el = document.getElementById('wifi-errors');
+  if (el && el.innerHTML !== html) el.innerHTML = html;
+}
+
+function renderRobot() {
+  const name = Object.keys(ROBOTS)[0];
+  const r = name ? ROBOTS[name] : null;
+  if (!r || !r.reachable) {
+    setStat('conn', '끊김', 'bad');
+    for (const id of ['skew', 'rtt', 'uptime']) setStat(id, '-');
+    for (const id of SYS_SLOTS) setStat(id, '-');
+    robotNote('<b>로봇에 닿지 않습니다</b><br>' +
+              escapeHtml((r && r.error) ? r.error : '로봇이 인벤토리에 없습니다'));
+    return;
+  }
+  // 시계 편차: ROS2 는 양쪽 시각이 맞아야 돈다. 0.2초만 넘어도 주행이 어그러진 적이 있다.
+  const skew = r.clock_skew_s, askew = Math.abs(skew || 0);
+  setStat('conn', r.host || name);
+  setStat('skew', (skew > 0 ? '+' : '') + skew + ' s',
+          askew > 1 ? 'bad' : askew > 0.2 ? 'warn' : '');
+  setStat('rtt', r.rtt_ms + ' ms', r.rtt_ms > 500 ? 'warn' : '');
+  setStat('uptime', r.uptime_s ? Math.floor(r.uptime_s / 3600) + ' h' : '-');
+  loadSystem(name);
+}
+
+async function loadSystem(name) {
+  let s;
+  try { s = await (await fetch('/api/system?host=' + encodeURIComponent(name))).json(); }
+  catch (e) { return; }
+  if (s.error) return;
+  // 배터리는 여기서 다루지 않는다 — /battery/* 토픽을 rosbridge 로 직접 구독한다(onBattery).
+  const th = s.throttled;
+  setStat('cpu', s.cpu_pct == null ? '-' : s.cpu_pct + ' %',
+          s.cpu_pct > 85 ? 'bad' : s.cpu_pct > 65 ? 'warn' : '');
+  setStat('mem', s.mem ? s.mem.used_pct + ' % (여유 ' + s.mem.available_mb + ' MB)' : '-',
+          s.mem && s.mem.used_pct > 90 ? 'bad' : s.mem && s.mem.used_pct > 75 ? 'warn' : '');
+  setStat('temp', s.temp_c == null ? '-' : s.temp_c + ' ℃',
+          s.temp_c > 75 ? 'bad' : s.temp_c > 65 ? 'warn' : '');
+  setStat('power', th ? (th.ok ? '정상' : th.raw) : '-',
+          !th ? '' : th.ok ? '' : (th.under_voltage_now || th.throttled_now) ? 'bad' : 'warn');
+  setStat('wifi', s.wifi
+          ? (s.wifi.signal_dbm != null ? s.wifi.signal_dbm + ' dBm' : '-')
+            + (s.wifi.tx_bitrate_mbps ? ' / ' + s.wifi.tx_bitrate_mbps + ' Mbps' : '')
+          : '-',
+          !s.wifi ? '' : s.wifi.signal_dbm < -75 ? 'bad' : s.wifi.signal_dbm < -65 ? 'warn' : '');
+  // 실효 대역폭 — 카메라 스트림이 링크를 밀어내는지 여기서 드러난다(차분이라 첫 회는 없음).
+  if (s.net && s.wifi && s.net[s.wifi.iface]) {
+    const cur = { t: Date.now() / 1000, v: s.net[s.wifi.iface] };
+    if (_netPrev && cur.t > _netPrev.t) {
+      const dt = cur.t - _netPrev.t;
+      const tx = (cur.v.tx - _netPrev.v.tx) * 8 / dt / 1e6;
+      const rx = (cur.v.rx - _netPrev.v.rx) * 8 / dt / 1e6;
+      setStat('band', '↑' + tx.toFixed(1) + ' / ↓' + rx.toFixed(1) + ' Mbps');
+    } else setStat('band', '측정 중…');
+    _netPrev = cur;
+  } else setStat('band', '-');
+  // DDS 정합성: 하나만 어긋나도 서로 안 보인다.
+  const ros = s.ros || {};
+  setStat('domain', ros.ROS_DOMAIN_ID || '(미설정)', ros.ROS_DOMAIN_ID ? '' : 'warn');
+  setStat('rmw', (ros.RMW_IMPLEMENTATION || '(기본)').replace('rmw_', ''),
+          ros.RMW_IMPLEMENTATION ? '' : 'warn');
+  setStat('fastdds', ros.FASTRTPS_DEFAULT_PROFILES_FILE ? '설정됨' : '없음',
+          ros.FASTRTPS_DEFAULT_PROFILES_FILE ? '' : 'warn');
+  robotNote((s.wifi_errors && s.wifi_errors.length)
+    ? '<b>WiFi 드라이버 최근 경고·에러</b><br>' + s.wifi_errors.map(escapeHtml).join('<br>')
+    : '');
+}
+
+/* ===== 서비스 카드 =====
+   구조는 명령 목록이 바뀔 때만 다시 그리고, 평소에는 상태와 버튼 문구만 제자리에서 바꾼다. */
+let _cardSig = '';
+function renderCards(force) {
+  const c = document.getElementById('svc-cards');
+  if (!c || !CMDS.length) return;
+  const list = CMDS.filter(x => !x.oneshot);   // oneshot(1회 동작)은 카드로 안 띄운다
+  const sig = list.map(x => x.key + ':' + (x.edited ? 1 : 0)).join('|');
+  if (!force && sig === _cardSig) { updateCards(); return; }
+  _cardSig = sig;
+  c.innerHTML = list.map(cmd => `
+    <div class="card">
+      <h3>${escapeHtml(cmd.label)}${cmd.edited ? '<span class="edited-badge">편집됨</span>' : ''}</h3>
+      <div class="key">${escapeHtml(cmd.key)}
+        <span class="where ${cmd.host === 'robot' ? 'robot' : ''}">${cmd.host === 'robot' ? '로봇 온보드' : '노트북'}</span></div>
+      <div class="card-row">
+        <span class="dot unknown" id="dot-${cmd.key}"><i></i>-</span>
+        <span class="card-btns">
+          <button id="tg-${cmd.key}" onclick="svcToggle('${cmd.key}')">-</button>
+          <button onclick="openCfg('${cmd.key}')">설정</button>
+          <button onclick="openLog('${cmd.key}')">로그</button>
+        </span>
+      </div>
+      <div class="why" id="why-${cmd.key}"></div>
+    </div>`).join('');
+  updateCards();
+}
+
+function updateCards() {
+  for (const cmd of CMDS.filter(x => !x.oneshot)) {
+    const st = STATUS[cmd.key] || 'unknown';
+    const dot = document.getElementById('dot-' + cmd.key);
+    const btn = document.getElementById('tg-' + cmd.key);
+    const why = document.getElementById('why-' + cmd.key);
+    if (!dot || !btn) continue;
+    if (dot.dataset.st !== st) {
+      dot.dataset.st = st;
+      dot.className = 'dot ' + st;
+      dot.innerHTML = '<i></i>' + (st === 'up' ? 'UP' : st === 'down' ? 'DOWN' : '확인불가');
+    }
+    // 버튼 하나로 토글. 상태를 모를 때(로봇 미도달) 누르면 무슨 일이 날지 알 수 없으니 막는다.
+    const label = st === 'up' ? '끄기' : st === 'down' ? '켜기' : '확인불가';
+    const cls = st === 'up' ? 'off' : st === 'down' ? 'on' : '';
+    if (btn.dataset.st !== st) {
+      btn.dataset.st = st;
+      btn.textContent = label;
+      btn.className = cls;
+      btn.disabled = (st === 'unknown');
+    }
+    const reason = st !== 'unknown' ? ''
+      : (cmd.host === 'robot' ? '로봇에 닿지 않아 상태를 알 수 없습니다' : '상태 확인 실패');
+    if (why && why.textContent !== reason) why.textContent = reason;
+  }
+}
+
+function svcToggle(key) {
+  const st = STATUS[key];
+  if (st !== 'up' && st !== 'down') return;
+  svcAct(key, st === 'up' ? 'stop' : 'start');
+}
+
+async function svcAct(key, act) {
+  const btn = document.getElementById('tg-' + key);
+  if (btn) { btn.disabled = true; btn.dataset.st = ''; btn.textContent = act === 'start' ? '기동중…' : '종료중…'; }
+  banner('');
+  try {
+    const j = await (await fetch('/api/svc/' + key + '/' + act, { method: 'POST' })).json();
+    if (j.error) banner(key + ': ' + j.error);
+    openLogModal(key, respText(j), j.extra);
+  } catch (e) {
+    banner(key + ': 요청 실패 — 실서버 대시보드(:8010) 연결 확인');
+  }
+  await loadStatus();
+}
+
+/* ===== 팝업(모달) ===== */
+function closeModal() {
+  document.getElementById('mask').classList.remove('open');
+  document.getElementById('modal').classList.remove('wide', 'ret');
+  logFollowStop();   // tail -f 타이머가 닫은 뒤에도 계속 돌지 않게
+  retTeardown();   // 여닫을 때마다 rosbridge 구독이 쌓이지 않게 반드시 정리
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+function openCfg(key) {
+  const cmd = CMDS.find(c => c.key === key);
+  if (!cmd) return;
+  const names = Object.keys(cmd.params);
+  document.getElementById('modal').innerHTML = `
+    <h3>${escapeHtml(cmd.label)} <span class="key">${escapeHtml(cmd.key)}</span></h3>
+    <div class="note">${cmd.host === 'robot'
+      ? '이 명령은 <b>로봇 온보드</b>에서 실행됩니다. 고친 그대로 실장비에 전달됩니다.'
+      : '이 명령은 <b>노트북</b>에서 실행됩니다.'}</div>
+    ${names.length ? `<div class="params">${names.map(p => `
+      <div class="param"><label>${escapeHtml(p)}</label>
+        <input id="mp-${p}" value="${escAttr(cmd.params[p])}"></div>`).join('')}</div>`
+      : '<div class="note" style="margin-top:10px">(파라미터 없음 — 아래에서 명령줄 전체를 고칩니다)</div>'}
+    <textarea id="mcmd" spellcheck="false"
+      placeholder="비워 두면 위 파라미터로 명령을 만듭니다. 채우면 이 줄을 그대로 실행합니다."
+      >${escapeHtml(cmd.cmdline)}</textarea>
+    <div class="prev">${escapeHtml(cmd.effective)}</div>
+    <div class="modal-foot">
+      <button class="on" onclick="saveCfg('${key}')">저장</button>
+      <button ${cmd.edited ? '' : 'disabled'} onclick="resetCfg('${key}')">기본값</button>
+      <button onclick="closeModal()">닫기</button>
+    </div>`;
+  document.getElementById('mask').classList.add('open');
+}
+
+async function saveCfg(key) {
+  const cmd = CMDS.find(c => c.key === key);
+  if (!cmd) return;
+  const params = {};
+  for (const p of Object.keys(cmd.params)) {
+    const el = document.getElementById('mp-' + p);
+    if (el) params[p] = el.value;
+  }
+  const ta = document.getElementById('mcmd');
+  try {
+    await fetch('/api/commands/' + key, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ params: params, cmdline: ta ? ta.value : '' }),
+    });
+    await loadCommands(true);
+    openCfg(key);   // 갱신된 최종 명령을 그 자리에서 보여준다
+  } catch (e) { banner('저장 실패'); }
+}
+
+async function resetCfg(key) {
+  try {
+    await fetch('/api/commands/' + key + '/reset', { method: 'POST' });
+    await loadCommands(true);
+    openCfg(key);
+  } catch (e) { banner('되돌리기 실패'); }
+}
+
+// extra: 서비스가 따로 남기는 로그 파일들(nav.sh 처럼 백그라운드로 띄우는 경우).
+// 실행 출력만 보면 스크립트가 찍은 몇 줄뿐이라, 두 개를 한 화면에 나눠 보여준다.
+// 응답에서 사람이 읽을 내용을 뽑는다. lines 가 비어도 error/원문을 버리지 않는다 —
+// '(출력 없음)' 으로 덮어 버리면 진짜 원인(예: 서버가 옛 코드라 404/400)이 사라진다.
+function respText(j, empty) {
+  const lines = (j && j.lines) || [];
+  if (lines.length) return lines.join('\n');
+  if (j && j.error) return '오류: ' + j.error;
+  if (j && Object.keys(j).length) return JSON.stringify(j, null, 2);
+  return empty || '(출력 없음)';
+}
+
+function openTextModal(title, text) {
+  document.getElementById('modal').innerHTML = `
+    <h3>${escapeHtml(title)}</h3>
+    <pre class="log" id="mtxt" style="max-height:60vh">${escapeHtml(text)}</pre>
+    <div class="modal-foot"><button onclick="closeModal()">닫기</button></div>`;
+  document.getElementById('mask').classList.add('open');
+  const pre = document.getElementById('mtxt');
+  if (pre) pre.scrollTop = pre.scrollHeight;
+}
+
+// 에이전트 배포·기동 — SSH 라 수십 초 걸릴 수 있다. 끝날 때까지 버튼을 막는다.
+async function agentRestart() {
+  const btn = document.getElementById('btn-agent');
+  if (btn) { btn.disabled = true; btn.textContent = '배포 중…'; }
+  openTextModal('로봇 에이전트 배포·기동', 'scp + ssh 진행 중…');
+  try {
+    const r = await fetch('/api/agent/restart', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    let txt = respText(j);
+    if (!r.ok) {
+      txt += '\n\n(HTTP ' + r.status + ')';
+      if (r.status === 400 || r.status === 404) {
+        txt += '\n실서버 대시보드가 이 기능을 모르는 옛 코드일 수 있습니다 — :8010 을 재기동하세요.';
+      }
+    }
+    openTextModal('로봇 에이전트 배포·기동' + (j.ok ? ' — 성공' : ' — 실패'), txt);
+  } catch (e) {
+    openTextModal('로봇 에이전트 배포·기동 — 실패', '(요청 실패 — 실서버 대시보드 연결 확인)');
+  }
+  if (btn) { btn.disabled = false; btn.textContent = '에이전트 배포·기동'; }
+  loadStatus();
+}
+
+/* 로그 팝업은 tail -f 처럼 동작한다 — 서비스를 띄워 놓고 흘러가는 로그를 지켜보는 게
+   이 화면의 주 용도라, 매번 '다시 읽기'를 누르게 하면 쓸모가 없다.
+   ① 주기적으로 다시 읽고 ② 맨 아래를 보고 있을 때만 자동으로 따라 내린다.
+   ②가 중요하다: 위로 스크롤해 뭔가 읽는 중에 화면이 끌려 내려가면 아무것도 못 읽는다. */
+const LOG_FOLLOW_MS = 1500;
+let LOGF = { key: null, timer: null, on: true, panes: 0 };
+
+function logFollowStop() {
+  if (LOGF.timer) clearInterval(LOGF.timer);
+  LOGF.timer = null; LOGF.key = null;
+}
+
+function logFollowToggle() {
+  LOGF.on = !LOGF.on;
+  const b = document.getElementById('btn-follow');
+  if (b) b.textContent = LOGF.on ? '⏸ 자동 갱신 끄기' : '▶ 자동 갱신 켜기';
+  const s = document.getElementById('follow-state');
+  if (s) s.textContent = LOGF.on ? `따라가는 중 (${LOG_FOLLOW_MS / 1000}초 간격)` : '멈춤';
+}
+
+function _atBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 24; }
+
+// 내용만 갈아끼운다(모달을 다시 그리면 스크롤 위치와 선택이 날아간다).
+function fillLogPanes(text, extra) {
+  const set = (id, t) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const stick = _atBottom(el);       // 갱신 **전에** 판정해야 한다
+    if (el.textContent !== t) el.textContent = t;
+    if (stick) el.scrollTop = el.scrollHeight;
+  };
+  set('mlog', text);
+  (extra || []).forEach((x, i) => set('mlog' + i, (x.lines || []).join('\n') || '(비어 있음)'));
+}
+
+function openLogModal(key, text, extra) {
+  const cmd = CMDS.find(c => c.key === key) || { label: key };
+  const panes = [{ title: '실행 출력 (stdout·stderr)', text: text, id: 'mlog' }];
+  (extra || []).forEach((x, i) => panes.push({
+    title: x.title, text: (x.lines || []).join('\n') || '(비어 있음)', id: 'mlog' + i,
+  }));
+  LOGF.panes = panes.length;
+  document.getElementById('modal').classList.add('wide');
+  document.getElementById('modal').innerHTML = `
+    <h3>${escapeHtml(cmd.label)} 로그 <span class="key">${escapeHtml(key)}</span></h3>
+    <div class="log-split">
+      ${panes.map(p => `<div>
+         <div class="log-title">${escapeHtml(p.title)}</div>
+         <pre class="log" id="${p.id}" style="margin-top:4px">${escapeHtml(p.text)}</pre>
+       </div>`).join('')}
+    </div>
+    <div class="modal-foot">
+      <button id="btn-follow" onclick="logFollowToggle()">${
+        LOGF.on ? '⏸ 자동 갱신 끄기' : '▶ 자동 갱신 켜기'}</button>
+      <button onclick="openLog('${key}')">↻ 지금 읽기</button>
+      <button onclick="closeModal()">닫기</button>
+      <span class="log-follow">
+        <span id="follow-state">${LOGF.on ? `따라가는 중 (${LOG_FOLLOW_MS / 1000}초 간격)`
+                                          : '멈춤'}</span>
+      </span>
+    </div>`;
+  document.getElementById('mask').classList.add('open');
+  for (const p of panes) {
+    const el = document.getElementById(p.id);
+    if (el) el.scrollTop = el.scrollHeight;
+  }
+}
+
+async function fetchLog(key) {
+  const j = await (await fetch('/api/svc/' + key + '/log')).json();
+  return { text: (j.lines || []).join('\n') || '(로그 없음)', extra: j.extra };
+}
+
+async function openLog(key) {
+  logFollowStop();
+  openLogModal(key, '읽는 중…');
+  try {
+    const d = await fetchLog(key);
+    openLogModal(key, d.text, d.extra);
+  } catch (e) {
+    openLogModal(key, '(로그를 읽지 못했습니다)');
+  }
+  LOGF.key = key;
+  LOGF.timer = setInterval(async () => {
+    // 팝업이 닫혔거나 다른 팝업으로 바뀌었으면 스스로 멈춘다(타이머 누수 방지).
+    if (!document.getElementById('mask').classList.contains('open')
+        || !document.getElementById('mlog')) { logFollowStop(); return; }
+    if (!LOGF.on) return;
+    try {
+      const d = await fetchLog(LOGF.key);
+      const n = 1 + ((d.extra || []).length);
+      // 창 개수가 달라졌으면 구조부터 다시 그린다(내용만 갈면 빈 칸이 생긴다).
+      if (n !== LOGF.panes) openLogModal(LOGF.key, d.text, d.extra);
+      else fillLogPanes(d.text, d.extra);
+    } catch (e) { /* 일시적 실패는 무시하고 다음 주기에 다시 시도 */ }
+  }, LOG_FOLLOW_MS);
+}
+
+/* ===== 전체 제어 ===== */
+async function stack(act) {
+  const up = document.getElementById('btn-up'), dn = document.getElementById('btn-down');
+  const pre = document.getElementById('stack-log');
+  up.disabled = dn.disabled = true;
+  pre.style.display = 'block';
+  pre.textContent = (act === 'up' ? '전체 기동' : '전체 종료') + ' 중… (순서대로 진행, 시간이 걸립니다)';
+  banner('');
+  try {
+    const j = await (await fetch('/api/stack/' + act, { method: 'POST' })).json();
+    const out = [];
+    for (const s of (j.steps || [])) {
+      out.push((s.ok ? '✅' : '❌') + ' ' + s.key + '  [' + s.where + ']' + (s.error ? '  ' + s.error : ''));
+      for (const l of (s.tail || [])) out.push('     ' + l);
+    }
+    pre.textContent = out.join('\n') || '(결과 없음)';
+    pre.scrollTop = pre.scrollHeight;
+  } catch (e) {
+    pre.textContent = '(요청 실패 — 실서버 대시보드(:8010) 연결을 확인하세요)';
+  }
+  up.disabled = dn.disabled = false;
+  loadStatus();
+}
+
+/* ===== 충전 스테이션 복귀 =====
+   ACS 가 죽었을 때 사람이 직접 로봇을 충전소로 보낸다.
+   ⚠ Nav2 는 노트북에서 돈다 — 로봇 단독 자율 복귀가 아니라 노트북이 살아 있어야 한다. */
+const RET = { map: null, home: null, pose: null, live: false, updates: 0,
+              ws: null, subId: null, poll: null, running: false, S: 8,
+              // 복귀 진행 로그 줄 수(기본 500). 브라우저에 기억시켜 다음에도 유지한다.
+              wps: [], selIds: [], wpMode: false,   // 지도에서 찍은 점 / 선택 순서 / 찍기 모드
+              logLines: (function () {
+                try { return parseInt(localStorage.getItem('retLogLines'), 10) || 500; }
+                catch (e) { return 500; }
+              })() };
+
+function retTeardown() {
+  rbUnsub('/amcl_pose');   // 배터리 구독은 그대로 두고 이것만 뗀다
+  if (RET.poll) { clearInterval(RET.poll); RET.poll = null; }
+}
+
+// 월드 → 캔버스. origin 은 이미지 **왼쪽-아래** 모서리이고 PGM 0행은 **맨 위**라 y 를 뒤집는다.
+function w2c(x, y) {
+  const m = RET.map, S = RET.S;
+  return { cx: (x - m.origin[0]) / m.resolution * S,
+           cy: (m.height - (y - m.origin[1]) / m.resolution) * S };
+}
+
+// 캔버스 → 세계좌표. w2c 의 역이다(지도를 클릭해 점을 찍으려면 반드시 필요).
+function c2w(cx, cy) {
+  const m = RET.map, S = RET.S;
+  return { x: cx / S * m.resolution + m.origin[0],
+           y: (m.height - cy / S) * m.resolution + m.origin[1] };
+}
+
+function drawMap() {
+  const m = RET.map, S = RET.S;
+  const cv = document.getElementById('ret-canvas');
+  if (!cv || !m) return;
+  cv.width = m.width * S; cv.height = m.height * S;
+  const ctx = cv.getContext('2d');
+
+  // 오프스크린에 원본 해상도로 그린 뒤 확대(마커는 확대 후 그려야 안 뭉개진다)
+  if (!RET._off) {
+    const off = document.createElement('canvas');
+    off.width = m.width; off.height = m.height;
+    const octx = off.getContext('2d');
+    const img = octx.createImageData(m.width, m.height);
+    const bin = atob(m.data);
+    for (let i = 0; i < m.width * m.height; i++) {
+      const v = bin.charCodeAt(i);
+      const p = m.negate ? v / 255 : (255 - v) / 255;   // yaml 값을 실제로 반영
+      let r, g, b2;
+      if (p > m.occupied_thresh)      { r = 29;  g = 25;  b2 = 23;  }  // 점유
+      else if (p < m.free_thresh)     { r = 227; g = 214; b2 = 197; }  // 자유
+      else                            { r = 92;  g = 80;  b2 = 69;  }  // 미지
+      const o = i * 4;
+      img.data[o] = r; img.data[o + 1] = g; img.data[o + 2] = b2; img.data[o + 3] = 255;
+    }
+    octx.putImageData(img, 0, 0);
+    RET._off = off;
+  }
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.imageSmoothingEnabled = false;   // 3cm 격자가 뭉개지지 않게
+  ctx.drawImage(RET._off, 0, 0, m.width, m.height, 0, 0, cv.width, cv.height);
+
+  // 0.3 m 격자 — 해상도가 3cm 라 눈금이 없으면 거리 감이 안 잡힌다
+  ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 1;
+  for (let c = 0; c <= m.width; c += 10) {
+    ctx.beginPath(); ctx.moveTo(c * S, 0); ctx.lineTo(c * S, cv.height); ctx.stroke();
+  }
+  for (let r = 0; r <= m.height; r += 10) {
+    ctx.beginPath(); ctx.moveTo(0, r * S); ctx.lineTo(cv.width, r * S); ctx.stroke();
+  }
+
+  const arrow = (x, y, yaw, color, rad) => {
+    const q = w2c(x, y);
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(q.cx, q.cy, rad, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(q.cx, q.cy);
+    // 캔버스 y 는 아래로 증가 → 화면각은 -yaw
+    ctx.lineTo(q.cx + rad * 1.9 * Math.cos(yaw), q.cy - rad * 1.9 * Math.sin(yaw));
+    ctx.stroke();
+    return q;
+  };
+
+  // 끄는 중이면 방향 미리보기 — 놓기 전에 어느 쪽을 향할지 눈으로 확인할 수 있어야 한다.
+  if (RET.drag && RET.drag.to) {
+    const f = RET.drag.from, t = RET.drag.to;
+    const far = Math.hypot(t.cx - f.cx, t.cy - f.cy) >= WP_DRAG_MIN_PX;
+    ctx.strokeStyle = far ? '#7ee081' : 'rgba(255,255,255,.4)';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(f.cx, f.cy, 6, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(f.cx, f.cy); ctx.lineTo(t.cx, t.cy); ctx.stroke();
+    if (!far) {   // 아직 짧다 = 놓으면 방향 자동
+      ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.font = '11px ui-monospace, monospace';
+      ctx.fillText('더 끌면 방향 지정', f.cx + 10, f.cy + 16);
+    }
+  }
+
+  // 웨이포인트: 선택된 것은 순서대로 선으로 잇는다. dock='floor' 는 H 마커 지점이다.
+  const sel = (RET.wps || []).filter(p => RET.selIds.includes(p.id))
+                             .sort((a, b) => RET.selIds.indexOf(a.id) - RET.selIds.indexOf(b.id));
+  if (sel.length > 1) {
+    ctx.strokeStyle = '#7ee081'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    sel.forEach((p, i) => { const q = w2c(p.x, p.y); i ? ctx.lineTo(q.cx, q.cy) : ctx.moveTo(q.cx, q.cy); });
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+  for (const p of (RET.wps || [])) {
+    const on = RET.selIds.includes(p.id);
+    const q = w2c(p.x, p.y);
+    const col = p.dock === 'floor' ? '#ffd166' : (p.dock === 'reflective' ? '#c792ea' : '#7ee081');
+    arrow(p.x, p.y, p.yaw, on ? col : 'rgba(255,255,255,.35)', on ? 7 : 5);
+    ctx.fillStyle = on ? col : 'rgba(255,255,255,.45)';
+    ctx.font = 'bold 11px ui-monospace, monospace';
+    // H 마커 지점은 글자로 바로 알아보게 — 지도에서 도킹 자리를 눈으로 찾는 게 목적이다
+    const tag = (p.dock === 'floor' ? 'H ' : '') + p.name
+              + (on ? ' #' + (RET.selIds.indexOf(p.id) + 1) : '');
+    ctx.fillText(tag, q.cx + 9, q.cy - 7);
+  }
+
+  if (RET.home) {
+    const h = RET.home;
+    arrow(h.x, h.y, h.yaw, '#6ab0ff', 7);                     // 충전소 진입점
+    if (RET.target) {
+      const t = RET.target, q = w2c(t.x, t.y), hq = w2c(h.x, h.y);
+      ctx.strokeStyle = '#6ab0ff'; ctx.setLineDash([4, 4]); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(q.cx, q.cy, 6, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(q.cx, q.cy); ctx.lineTo(hq.cx, hq.cy); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+  if (RET.pose) arrow(RET.pose.x, RET.pose.y, RET.pose.yaw, '#f0894a', 9);  // 로봇
+}
+
+// 위치 신뢰도 판정 — 여기가 이 기능의 최대 위험 지점이다.
+// amcl 은 set_initial_pose 라 **로봇이 어디 있든 그럴듯한 값**을 낸다.
+function poseWarnings() {
+  const w = [];
+  if (!RET.pose) { w.push('로봇 위치를 아직 못 받았습니다.'); return w; }
+  const ip = RET.map && RET.map.initial_pose;
+  if (ip && Math.abs(RET.pose.x - ip.x) < 0.05 && Math.abs(RET.pose.y - ip.y) < 0.05) {
+    w.push('AMCL <b>초기 pose 그대로</b>입니다 — 실제 위치가 아닐 수 있습니다. '
+         + '로봇을 10cm 이상 움직여 수렴을 확인하거나 RViz 2D Pose Estimate 로 잡으세요.');
+  }
+  if (RET.updates === 0) {
+    w.push('구독 후 위치 갱신이 <b>0회</b>입니다 — amcl 은 10cm/3° 이상 움직여야 발행합니다.');
+  }
+  const c = RET.pose.cov;
+  if (c && (c.sx > 0.25 || c.sy > 0.25 || c.syaw > 0.35)) {
+    w.push('위치 불확실도가 큽니다(σ ' + c.sx.toFixed(2) + ', ' + c.sy.toFixed(2)
+         + ' m / ' + c.syaw.toFixed(2) + ' rad) — 아직 수렴 중일 수 있습니다.');
+  }
+  return w;
+}
+
+function renderRet() {
+  const set = (id, html) => {
+    const el = document.getElementById(id);
+    if (el && el.innerHTML !== html) el.innerHTML = html;
+  };
+  const p = RET.pose;
+  set('ret-pose', p
+    ? `<b>로봇</b> (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) yaw ${p.yaw.toFixed(3)}
+       <span style="color:#a4907f">${RET.live ? '· 라이브' : '· 마지막 값'}
+       · 갱신 ${RET.updates}회</span>`
+    : '<b>로봇</b> 위치 확인 중…');
+  set('ret-home', RET.home
+    ? `<b>충전소 진입점</b> (${RET.home.x.toFixed(3)}, ${RET.home.y.toFixed(3)})
+       yaw ${RET.home.yaw.toFixed(3)} · ${escapeHtml(RET.home.task_point_id || '')}`
+    : '<b>충전소 진입점</b> 저장된 위치가 없습니다 — 도킹을 시작할 자리에 로봇을 세우고 저장하세요');
+
+  const warns = poseWarnings();
+  if (RET.mapChanged) warns.unshift('맵이 <b>바뀌었습니다</b> — 저장된 좌표는 딴 곳을 가리킵니다. 다시 저장하세요.');
+  set('ret-warn', warns.length ? warns.map(x => '⚠ ' + x).join('<br>') : '');
+  const wb = document.getElementById('ret-warn');
+  if (wb) wb.style.display = warns.length ? 'block' : 'none';
+
+  const save = document.getElementById('ret-save');
+  const go = document.getElementById('ret-go');
+  if (save) save.disabled = !p || RET.running;
+  // 위치를 못 받았거나 저장된 충전소가 없으면 복귀는 잠근다.
+  if (go) go.disabled = !p || !RET.home || RET.running;
+  drawMap();
+}
+
+function onAmclPose(msg) {
+  if (!msg || !msg.pose || !msg.pose.pose) return;
+  if (msg.header && msg.header.frame_id && msg.header.frame_id !== 'map') return;
+  const q = msg.pose.pose.orientation, pos = msg.pose.pose.position;
+  const yaw = Math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z));
+  const cov = msg.pose.covariance || [];
+  const prev = RET.pose;
+  if (prev && (Math.abs(prev.x - pos.x) > 1e-4 || Math.abs(prev.y - pos.y) > 1e-4)) {
+    RET.updates++;      // 좌표가 실제로 바뀐 횟수 — 살아 있는 추정인지 가르는 신호
+  }
+  RET.pose = { x: pos.x, y: pos.y, yaw: yaw, frame_id: 'map', age_s: 0, ts: Date.now() / 1000,
+               cov: { sx: Math.sqrt(cov[0] || 0), sy: Math.sqrt(cov[7] || 0),
+                      syaw: Math.sqrt(cov[35] || 0) } };
+  RET.live = true;
+  renderRet();
+}
+
+/* ===== rosbridge 공용 연결 =====
+   소켓 하나로 여러 토픽을 다룬다. 배터리는 화면이 떠 있는 동안 계속, /amcl_pose 는
+   복귀 모달이 열려 있는 동안만 구독한다. 구독 목록을 들고 있다가 재접속 때 다시 건다 —
+   모달을 여닫을 때마다 구독이 쌓이지 않게 해제도 여기서 관리한다. */
+const RB = { ws: null, subs: {}, retry: null, ok: false };
+
+function rbSend(o) {
+  try { if (RB.ws && RB.ws.readyState === 1) RB.ws.send(JSON.stringify(o)); } catch (e) {}
+}
+
+function rbSub(topic, type, cb, throttle) {
+  RB.subs[topic] = { type: type, cb: cb, throttle: throttle || 200,
+                     id: 'sub_' + topic.replace(/\W/g, '_') };
+  rbSend({ op: 'subscribe', id: RB.subs[topic].id, topic: topic, type: type,
+           throttle_rate: throttle || 200, queue_length: 1, compression: 'none' });
+  rbConnect();
+}
+
+function rbUnsub(topic) {
+  const su = RB.subs[topic];
+  if (!su) return;
+  rbSend({ op: 'unsubscribe', id: su.id, topic: topic });
+  delete RB.subs[topic];
+}
+
+function rbConnect() {
+  if (RB.ws && (RB.ws.readyState === 0 || RB.ws.readyState === 1)) return;
+  let ws;
+  try { ws = new WebSocket('ws://' + (location.hostname || '127.0.0.1') + ':9090'); }
+  catch (e) { return; }
+  RB.ws = ws;
+  ws.onopen = () => {
+    RB.ok = true;
+    for (const t in RB.subs) {                 // 재접속 시 구독을 다시 건다
+      const su = RB.subs[t];
+      rbSend({ op: 'subscribe', id: su.id, topic: t, type: su.type,
+               throttle_rate: su.throttle, queue_length: 1, compression: 'none' });
+    }
+  };
+  ws.onmessage = ev => {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.op !== 'publish') return;
+    const su = RB.subs[m.topic];
+    if (su) su.cb(m.msg);
+  };
+  ws.onerror = ws.onclose = () => {
+    if (RB.ws === ws) { RB.ws = null; RB.ok = false; }
+    if (Object.keys(RB.subs).length && !RB.retry) {
+      RB.retry = setTimeout(() => { RB.retry = null; rbConnect(); }, 3000);
+    }
+  };
+}
+
+/* ===== 배터리 — /battery/percent · /battery/voltage (정본) =====
+   bringup 의 battery_publisher 가 I2C 를 읽어 5초마다 발행한다. 중계를 거칠수록 값이
+   늦고 갈리므로 토픽을 그대로 구독한다. */
+const BATT = { percent: null, voltage: null, ts: 0 };
+
+function onBattery() {
+  const age = BATT.ts ? (Date.now() / 1000 - BATT.ts) : null;
+  if (BATT.percent == null) {
+    setStat('batt', RB.ok ? '수신 대기' : 'rosbridge 끊김', RB.ok ? '' : 'warn');
+    return;
+  }
+  // 발행이 5초 주기라 그보다 한참 지나면 살아 있는 값이 아니다.
+  if (age !== null && age > 30) {
+    setStat('batt', Math.round(BATT.percent) + ' % (' + Math.round(age) + '초 전)', 'warn');
+    return;
+  }
+  const v = (BATT.voltage != null) ? BATT.voltage.toFixed(2) + ' V' : '-';
+  setStat('batt', Math.round(BATT.percent) + ' % · ' + v,
+          BATT.percent < 20 ? 'bad' : BATT.percent < 40 ? 'warn' : '');
+}
+
+function battSubscribe() {
+  rbSub('/battery/percent', 'std_msgs/Float32', m => {
+    BATT.percent = m && typeof m.data === 'number' ? m.data : null;
+    BATT.ts = Date.now() / 1000; onBattery();
+  }, 1000);
+  rbSub('/battery/voltage', 'std_msgs/Float32', m => {
+    BATT.voltage = m && typeof m.data === 'number' ? m.data : null;
+    BATT.ts = Date.now() / 1000; onBattery();
+  }, 1000);
+  onBattery();                       // 첫 메시지 전에도 '수신 대기'를 보여준다
+  setInterval(onBattery, 5000);      // 값이 끊기면 '몇 초 전'으로 바뀌게
+}
+
+async function openReturn() {
+  document.getElementById('modal').classList.add('ret');
+  document.getElementById('modal').innerHTML = `
+    <button class="modal-x" onclick="closeModal()" title="닫기 (Esc)">✕ 닫기</button>
+    <h3>충전 스테이션 복귀 <span class="key" id="ret-rid">${escapeHtml(RID)}</span></h3>
+    <div class="note">ACS 없이 사람이 직접 복귀시킵니다. 주행은 <b>DCS 경유 Navigate</b>(도착
+      waypoint 하나), 도킹은 <b>ReflectiveDock</b> 입니다.<br>
+      ⚠ Nav2 가 노트북에서 돌기 때문에 <b>로봇 단독 자율 복귀가 아닙니다</b> —
+      노트북·DCS 가 살아 있어야 동작합니다.</div>
+    <div class="ret-wrap">
+      <div class="ret-map"><canvas id="ret-canvas"></canvas></div>
+      <div class="ret-info">
+        <div class="ret-line" id="ret-pose">위치 확인 중…</div>
+        <div class="ret-line" id="ret-home"></div>
+        <div class="ret-warn" id="ret-warn" style="display:none"></div>
+        <div class="modal-foot">
+          <button id="ret-save" onclick="saveHome()" disabled>현재 위치를 충전소 진입점으로 저장</button>
+          <button id="ret-go" class="on" onclick="startReturn()" disabled>복귀 실행</button>
+          <button id="ret-stop" class="off" onclick="stopReturn()">■ 정지</button>
+        </div>
+        <label style="display:block;margin-top:8px;color:#b9a695;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="ret-force"> 위치를 눈으로 확인했습니다(경고 무시)</label>
+        <div class="ret-legend">🟠 로봇 · 🔵 충전소 진입점 · 🟢 웨이포인트 · 🟡 H마커 도킹점</div>
+
+        <div class="wp-panel">
+          <div class="wp-head">
+            <b>웨이포인트</b>
+            <button id="wp-mode" class="wpbtn" onclick="toggleWpMode()">＋ 지도에서 찍기</button>
+            <button class="wpbtn" onclick="saveWps()">저장</button>
+            <button class="wpbtn" onclick="clearSel()">선택 해제</button>
+          </div>
+          <div id="wp-hint" class="wp-hint" style="display:none">
+            <b>클릭</b>하면 그 자리에 점이 찍히고 방향은 <b>다음 점을 바라보게</b> 자동 계산됩니다.<br>
+            <b>누른 채 끌면</b> 끄는 방향이 그대로 그 지점의 방향이 됩니다(RViz 2D Pose Estimate 와 같은 조작).
+            도킹 지점은 마커를 정면에서 봐야 시작되므로 이렇게 방향까지 정해 두세요.<br>
+            나중에 고칠 때는 목록의 <b>각도(°)</b> 입력이나 <b>현재</b>(로봇 자세 복사) 를 쓰면 됩니다.</div>
+          <div id="wp-list" class="wp-list"></div>
+          <div class="modal-foot">
+            <button id="wp-go" class="on" onclick="startRoute()" disabled>선택 순서대로 주행</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="ret-confirm" style="display:none"></div>
+    <div id="ret-steps"></div>
+    <div id="ret-logbar" style="display:none">
+      <label>로그 줄 수
+        <select id="ret-lines" onchange="setRetLines(this.value)">
+          <option value="200">200</option>
+          <option value="500">500</option>
+          <option value="1000">1000</option>
+          <option value="2000">2000</option>
+          <option value="3000">3000</option>
+        </select>
+      </label>
+      <span id="ret-lines-info"></span>
+    </div>
+    <pre class="log ret" id="ret-log" style="display:none"></pre>`;
+  document.getElementById('mask').classList.add('open');
+  // 기억해 둔 줄 수를 select 에 반영(모달을 다시 그릴 때마다 기본값으로 돌아가지 않게).
+  const _sel = document.getElementById('ret-lines');
+  if (_sel) _sel.value = String(RET.logLines);
+
+  RET.pose = null; RET.live = false; RET.updates = 0; RET._off = null;
+  try {
+    RET.map = await (await fetch('/api/map')).json();
+    if (!RET.map.ok) { banner('맵을 읽지 못했습니다: ' + (RET.map.error || '')); return; }
+    RET.S = Math.max(4, Math.floor(Math.min(360 / RET.map.width, 520 / RET.map.height)));
+  } catch (e) { banner('맵 요청 실패'); return; }
+
+  try {
+    const h = await (await fetch('/api/home')).json();
+    RET.home = h.home; RET.target = h.target; RET.mapChanged = h.map_changed;
+  } catch (e) {}
+
+  // 지도 클릭으로 웨이포인트를 찍는다(찍기 모드일 때만 반응).
+  const _cv = document.getElementById('ret-canvas');
+  if (_cv) {
+    _cv.onmousedown = onMapDown;
+    _cv.onmousemove = onMapMove;
+    _cv.onmouseup = onMapUp;
+    _cv.onmouseleave = () => { RET.drag = null; drawMap(); };   // 밖으로 나가면 취소
+  }
+  RET.wpMode = false;
+  await loadWps();
+
+  renderRet();
+  rbSub('/amcl_pose', 'geometry_msgs/PoseWithCovarianceStamped',
+        onAmclPose, 200);                       // 모달이 열려 있는 동안만
+  try {                                          // latched 마지막 값(서 있는 로봇 대비)
+    const o = await (await fetch('/api/pose/once')).json();
+    if (o.ok && !RET.live) {
+      RET.pose = { x: o.x, y: o.y, yaw: o.yaw, frame_id: 'map',
+                   age_s: o.age_s || 0, ts: Date.now() / 1000, cov: null };
+      renderRet();
+    }
+  } catch (e) {}
+  setTimeout(() => { if (!RET.pose) banner('로봇 위치를 못 받았습니다 — Nav2(amcl)·rosbridge 확인'); }, 8000);
+}
+
+async function saveHome() {
+  if (!RET.pose) return;
+  const b = { x: RET.pose.x, y: RET.pose.y, yaw: RET.pose.yaw,
+              cov: RET.pose.cov || {}, source: RET.live ? 'amcl_live' : 'amcl_once' };
+  try {
+    const j = await (await fetch('/api/home', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) })).json();
+    if (!j.ok) { banner('저장 실패: ' + (j.error || '')); return; }
+    RET.home = j.home; RET.target = j.target; RET.mapChanged = false;
+    banner('');
+    renderRet();
+  } catch (e) { banner('저장 요청 실패'); }
+}
+
+function renderSteps(st) {
+  // 접근점 도착 → 도킹 확인 대기. 후진 도킹은 되돌릴 수 없는 기동이라 자동으로 잇지 않는다
+  //  (08-05 에 벽 충돌로 로봇을 손으로 집어낸 적이 있다). 눈으로 보고 누르게 한다.
+  const cf = document.getElementById('ret-confirm');
+  if (cf) {
+    if (st && st.await_dock) {
+      const left = st.await_left_s != null ? ` · ${st.await_left_s}초 안에 결정` : '';
+      cf.innerHTML = `<div class="ret-ask">
+          <b>🅿 진입점 도착 — 도킹을 시작할까요?</b>
+          <div class="sub">로봇이 충전소 진입점에 섰습니다. 위치가 맞는지 눈으로 확인한 뒤
+            진행하세요. 후진 도킹은 시작하면 되돌릴 수 없습니다.${left}</div>
+          <div class="btns">
+            <button class="on" onclick="confirmDock()">도킹 실행</button>
+            <button class="off" onclick="stopReturn()">■ 취소</button>
+          </div></div>`;
+      cf.style.display = 'block';
+    } else {
+      cf.style.display = 'none';
+      cf.innerHTML = '';
+    }
+  }
+  const box = document.getElementById('ret-steps');
+  if (!box || !st) return;
+  const mark = { pending: '·', running: '▶', ok: '✅', fail: '❌', canceled: '⏹' };
+  box.innerHTML = (st.steps || []).map(x => `
+    <div class="retstep">
+      <span class="st">${mark[x.state] || '·'} ${escapeHtml(x.title)}</span>
+      <span class="prog">${escapeHtml(x.progress || '')}${x.elapsed_s ? '  (' + x.elapsed_s + 's)' : ''}</span>
+      ${x.error ? '<div style="color:#e74c3c;font-size:13px">' + escapeHtml(x.error) + '</div>' : ''}
+    </div>`).join('');
+  const log = document.getElementById('ret-log');
+  if (log) {
+    const cur = (st.steps || []).filter(x => x.state !== 'pending').pop();
+    const lines = cur ? (cur.lines || []) : [];
+    const txt = lines.join('\n');
+    log.style.display = txt ? 'block' : 'none';
+    const bar = document.getElementById('ret-logbar');
+    if (bar) bar.style.display = txt ? 'flex' : 'none';
+    const info = document.getElementById('ret-lines-info');
+    // 요청한 만큼 꽉 찼으면 그 앞은 잘린 것이다 — 조용히 자르면 원인을 앞줄에서 찾다 헛수고한다.
+    if (info) info.textContent = txt
+      ? `${lines.length}줄 표시${lines.length >= RET.logLines ? ' (더 있음 — 줄 수를 늘리세요)' : ''}`
+      : '';
+    if (txt && log.textContent !== txt) {
+      // 맨 아래를 보고 있을 때만 따라 내린다(위로 올려 읽는 중이면 끌어내리지 않는다).
+      const bottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+      log.textContent = txt;
+      if (bottom) log.scrollTop = log.scrollHeight;
+    }
+  }
+}
+
+// 로그 줄 수는 브라우저에 기억시킨다 — 매번 다시 고르게 하면 안 쓰게 된다.
+function setRetLines(n) {
+  RET.logLines = Math.max(50, parseInt(n, 10) || 500);
+  try { localStorage.setItem('retLogLines', String(RET.logLines)); } catch (e) { /* 사생활 모드 */ }
+  pollReturn();   // 바로 다시 읽어 즉시 반영
+}
+
+async function confirmDock() {
+  try {
+    const r = await fetch('/api/return/confirm', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!j.ok) banner('도킹 확인 실패: ' + (j.error || respText(j)));
+    else banner('');
+    pollReturn();   // 상태를 곧바로 갱신해 버튼이 남아 있지 않게
+  } catch (e) { banner('도킹 확인 요청 실패'); }
+}
+
+
+/* ===== 웨이포인트 ===== */
+// 지도를 클릭해 점을 찍고, 선택한 순서대로 주행한다.
+// yaw 는 서버가 '다음 점을 바라보게' 계산한다 — 화면에서는 방향을 따로 잡지 않는다.
+// 다만 **도킹이 걸린 점은 저장된 yaw 를 쓴다**(마커를 정면에서 봐야 도킹이 시작되므로).
+async function loadWps() {
+  try {
+    const j = await (await fetch('/api/waypoints')).json();
+    RET.wps = j.points || [];
+    RET.selIds = RET.selIds.filter(id => RET.wps.some(p => p.id === id));
+  } catch (e) { RET.wps = []; }
+  renderWps();
+}
+
+function toggleWpMode() {
+  RET.wpMode = !RET.wpMode;
+  const b = document.getElementById('wp-mode');
+  if (b) { b.textContent = RET.wpMode ? '✓ 찍는 중 (끄기)' : '＋ 지도에서 찍기'; b.classList.toggle('on', RET.wpMode); }
+  const h = document.getElementById('wp-hint');
+  if (h) h.style.display = RET.wpMode ? 'block' : 'none';
+  const cv = document.getElementById('ret-canvas');
+  if (cv) cv.style.cursor = RET.wpMode ? 'crosshair' : '';
+}
+
+// 찍기: **누른 자리가 위치, 끌어서 놓은 방향이 yaw** (RViz 2D Pose Estimate 와 같은 조작).
+//  그냥 클릭(끌지 않음)하면 방향은 '다음 점을 바라보게' 자동 계산에 맡긴다.
+//  도킹 지점은 마커를 정면에서 봐야 시작되므로 찍는 순간 방향까지 정할 수 있어야 한다.
+const WP_DRAG_MIN_PX = 10;      // 이보다 짧으면 '그냥 클릭'으로 본다(손떨림 무시)
+
+function _evCanvas(ev) {
+  const cv = ev.currentTarget, r = cv.getBoundingClientRect();
+  // 캔버스가 CSS 로 늘어나 있을 수 있어 실제 픽셀로 환산한다(안 하면 점이 밀린다).
+  return { cx: (ev.clientX - r.left) * cv.width / r.width,
+           cy: (ev.clientY - r.top) * cv.height / r.height };
+}
+
+function onMapDown(ev) {
+  if (!RET.wpMode || !RET.map) return;
+  ev.preventDefault();
+  RET.drag = { from: _evCanvas(ev), to: null };
+}
+
+function onMapMove(ev) {
+  if (!RET.drag) return;
+  RET.drag.to = _evCanvas(ev);
+  drawMap();                    // 끄는 동안 방향 미리보기
+}
+
+function onMapUp(ev) {
+  const d = RET.drag;
+  RET.drag = null;
+  if (!d) return;
+  const up = _evCanvas(ev);
+  const dx = up.cx - d.from.cx, dy = up.cy - d.from.cy;
+  const dragged = Math.hypot(dx, dy) >= WP_DRAG_MIN_PX;
+  // 캔버스 y 는 아래로 증가 → 세계 yaw 는 -dy 로 계산한다
+  const yaw = dragged ? Math.atan2(-dy, dx) : 0;
+  const w = c2w(d.from.cx, d.from.cy);
+  const id = RET.wps.reduce((mx, p) => Math.max(mx, p.id), 0) + 1;
+  RET.wps.push({ id, name: 'WP' + id, x: +w.x.toFixed(4), y: +w.y.toFixed(4),
+                 yaw: +yaw.toFixed(4), yaw_fixed: dragged,
+                 dock: 'none', task_point_id: '' });
+  RET.selIds.push(id);          // 찍자마자 경로에 들어가는 게 자연스럽다
+  renderWps(); drawMap();
+}
+
+function toggleSel(id) {
+  const i = RET.selIds.indexOf(id);
+  if (i >= 0) RET.selIds.splice(i, 1); else RET.selIds.push(id);   // 누른 순서 = 주행 순서
+  renderWps(); drawMap();
+}
+
+function clearSel() { RET.selIds = []; renderWps(); drawMap(); }
+
+function delWp(id) {
+  RET.wps = RET.wps.filter(p => p.id !== id);
+  RET.selIds = RET.selIds.filter(x => x !== id);
+  renderWps(); drawMap();
+}
+
+function editWp(id, field, val) {
+  const p = RET.wps.find(q => q.id === id);
+  if (!p) return;
+  p[field] = val;
+  if (field === 'dock') renderWps();   // 도킹을 켜면 task_point_id 칸이 필요해진다
+  drawMap();
+}
+
+// 도킹 지점만 yaw 를 사람이 정한다. 통과 노드는 '다음 점을 바라보게' 자동이라 건드릴 게 없다.
+//  도킹은 마커를 **정면에서** 봐야 시작되므로(비스듬하면 '마커 없음'으로 실패) 방향이 위치만큼 중요하다.
+// 자동(다음 점 바라보기) → 수동으로 전환. 현재 로봇 방향을 초기값으로 넣어 준다.
+function fixYaw(id) {
+  const p = RET.wps.find(q => q.id === id);
+  if (!p) return;
+  p.yaw_fixed = true;
+  if (RET.pose) p.yaw = RET.pose.yaw;
+  renderWps(); drawMap();
+}
+
+function editWpYawDeg(id, deg) {
+  const p = RET.wps.find(q => q.id === id);
+  const d = parseFloat(deg);
+  if (!p || !isFinite(d)) return;
+  p.yaw = d * Math.PI / 180;
+  p.yaw_fixed = true;      // 손으로 정한 값은 자동 계산이 덮지 않게
+  drawMap();
+}
+
+// 로봇을 실제로 마커 정면에 세워 두고 그 자세를 그대로 복사한다.
+//  눈금으로 각도를 맞추는 것보다 정확하다(충전소 진입점을 저장하는 방식과 같은 발상).
+function yawFromRobot(id) {
+  if (!RET.pose) { banner('로봇 위치를 아직 못 받았습니다'); return; }
+  const p = RET.wps.find(q => q.id === id);
+  if (!p) return;
+  p.yaw = RET.pose.yaw;
+  p.yaw_fixed = true;
+  banner('');
+  renderWps(); drawMap();
+}
+
+function renderWps() {
+  const box = document.getElementById('wp-list');
+  if (!box) return;
+  box.innerHTML = RET.wps.length ? RET.wps.map(p => {
+    const ord = RET.selIds.indexOf(p.id);
+    return `<div class="wp-row">
+      <input type="checkbox" ${ord >= 0 ? 'checked' : ''} onchange="toggleSel(${p.id})">
+      <span class="ord">${ord >= 0 ? ord + 1 : ''}</span>
+      <input type="text" value="${escapeHtml(p.name)}"
+             onchange="editWp(${p.id},'name',this.value)">
+      <span class="xy">(${p.x.toFixed(2)}, ${p.y.toFixed(2)})</span>
+      <select onchange="editWp(${p.id},'dock',this.value)">
+        <option value="none" ${p.dock === 'none' ? 'selected' : ''}>도킹 없음</option>
+        <option value="floor" ${p.dock === 'floor' ? 'selected' : ''}>H마커</option>
+        <option value="reflective" ${p.dock === 'reflective' ? 'selected' : ''}>반사테이프</option>
+      </select>
+      ${p.dock !== 'none'
+        ? `<input type="text" placeholder="task_point_id" value="${escapeHtml(p.task_point_id || '')}"
+                  onchange="editWp(${p.id},'task_point_id',this.value)">` : ''}
+      ${(p.dock !== 'none' || p.yaw_fixed)
+        ? `<input type="number" class="yaw" step="1" title="이 지점에서 향할 방향(도)"
+                  value="${(p.yaw * 180 / Math.PI).toFixed(0)}"
+                  onchange="editWpYawDeg(${p.id}, this.value)"><span class="deg">°</span>
+           <button class="wpbtn tiny" onclick="yawFromRobot(${p.id})"
+                   title="로봇을 원하는 방향으로 세운 뒤 누르세요">현재</button>`
+        : `<button class="wpbtn tiny" onclick="fixYaw(${p.id})"
+                   title="방향을 직접 지정합니다(지금은 자동)">방향 지정</button>`}
+      <button class="del" onclick="delWp(${p.id})" title="삭제">✕</button>
+    </div>`;
+  }).join('') : '<div class="wp-hint">아직 없습니다 — 「지도에서 찍기」로 추가하세요.</div>';
+  const go = document.getElementById('wp-go');
+  if (go) go.disabled = !RET.selIds.length || RET.running;
+}
+
+async function saveWps() {
+  try {
+    const r = await fetch('/api/waypoints', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ points: RET.wps }) });
+    const j = await r.json();
+    if (!j.ok) { banner('웨이포인트 저장 실패: ' + (j.error || '')); return; }
+    RET.wps = j.points || RET.wps;
+    banner('');
+    renderWps(); drawMap();
+  } catch (e) { banner('웨이포인트 저장 요청 실패'); }
+}
+
+async function startRoute() {
+  if (!RET.selIds.length) return;
+  const last = RET.wps.find(p => p.id === RET.selIds[RET.selIds.length - 1]);
+  const willDock = !!(last && last.dock !== 'none');
+  const kind = willDock ? (last.dock === 'floor' ? 'H마커' : '반사테이프') : '';
+  if (!confirm(`${RET.selIds.length}개 지점을 순서대로 주행합니다.`
+      + (willDock ? `\n마지막 '${last.name}' 은 ${kind} 도킹 지점입니다.` : ''))) return;
+
+  // 마지막이 도킹 지점이면 **시작할 때** 자동 진행 여부를 정한다(사용자 지시).
+  //  확인: 도착하면 곧바로 도킹 / 취소: 도착 후 다시 물어본다(기존 방식).
+  //  어느 쪽이든 '확인 없이 도킹'은 없다 — 결정 시점만 앞당기는 것이다.
+  let autoDock = false;
+  if (willDock) {
+    autoDock = confirm(`도착하면 ${kind} 도킹까지 자동으로 진행할까요?\n\n`
+      + `확인 = 도착 즉시 도킹 시작\n`
+      + `취소 = 도착 후 화면에서 한 번 더 확인받고 도킹`);
+  }
+  try {
+    const r = await fetch('/api/route/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: RET.selIds, auto_dock: autoDock }) });
+    const j = await r.json();
+    if (!j.ok) { banner('주행 시작 불가: ' + (j.error || respText(j))); return; }
+    banner('');
+    RET.running = true;
+    renderWps();          // 버튼을 바로 잠근다(첫 폴링까지 기다리면 두 번 눌린다)
+    if (!RET.poll) RET.poll = setInterval(pollReturn, 1000);
+    await pollReturn();
+    // 지도·웨이포인트 패널이 길어 로그가 화면 밖으로 밀린다 — 시작하면 그리로 데려간다.
+    const box = document.getElementById('ret-steps');
+    if (box) box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) { banner('주행 시작 요청 실패'); }
+}
+
+async function startReturn() {
+  const force = document.getElementById('ret-force');
+  const body = { pose: RET.pose ? { x: RET.pose.x, y: RET.pose.y, frame_id: 'map',
+                                    age_s: RET.pose.age_s || 0 } : null,
+                 force_pose: !!(force && force.checked) };
+  RET.running = true; renderRet();
+  banner('');
+  try {
+    const r = await fetch('/api/return/start', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const j = await r.json();
+    if (!j.ok) {
+      RET.running = false; renderRet();
+      banner('복귀 시작 불가: ' + (j.error || respText(j)));
+      return;
+    }
+  } catch (e) { RET.running = false; renderRet(); banner('복귀 요청 실패'); return; }
+  if (RET.poll) clearInterval(RET.poll);
+  RET.poll = setInterval(pollReturn, 700);
+  pollReturn();
+}
+
+async function pollReturn() {
+  try {
+    const st = await (await fetch('/api/return/status?lines=' + RET.logLines)).json();
+    renderSteps(st);
+    RET.running = !!st.active;
+    if (!st.active && RET.poll) { clearInterval(RET.poll); RET.poll = null; }
+    renderRet();
+  } catch (e) {}
+}
+
+async function stopReturn() {
+  const b = document.getElementById('ret-stop');
+  if (b) { b.disabled = true; b.textContent = '정지 중…'; }
+  try {
+    const j = await (await fetch('/api/return/stop', { method: 'POST' })).json();
+    const log = document.getElementById('ret-log');
+    if (log) { log.style.display = 'block'; log.textContent = (j.lines || []).join('\n'); }
+  } catch (e) { banner('정지 요청 실패'); }
+  if (b) { b.disabled = false; b.textContent = '■ 정지'; }
+  RET.running = false;
+  renderRet();
+  pollReturn();
+}
+
+/* ===== 인터페이스 맵: 연결 여부 표시 =====
+   노드 색은 '그 상대가 살아 있는가', 선 색은 '양쪽이 다 살아 있는가'로 칠한다.
+   ACS 는 우리가 켜고 끄는 대상이 아니라 프로세스를 볼 수 없다 → **최근 메시지가
+   오갔는지**로만 추정한다(ACS_ALIVE_SEC). 추정이라 '연결됨/불명' 두 가지만 쓰고
+   '끊김(빨강)'으로는 단정하지 않는다. Ddagi 는 인터페이스가 아직 없어 항상 회색이다. */
+const TOPO_UP = '#46d17e', TOPO_DOWN = '#e05a4a', TOPO_NA = '#5c5045';
+const ACS_ALIVE_SEC = 10;          // 이 시간 안에 ACS 와 메시지가 오갔으면 연결된 것으로 본다
+const NODE_SVC = { dcs: 'real-dcs', ddago: 'robot-ddago', dg_ai: 'real-ai' };
+let _lastSeen = {};                // 서비스 그룹 key -> 마지막 메시지 시각(초)
+
+function acsAlive() {
+  const t = _lastSeen['acs'] || 0;
+  return t > 0 && (Date.now() / 1000 - t) < ACS_ALIVE_SEC;
+}
+// DCS 가 스스로 보고하는 AI 접속 상태(@@WIRE@@ 의 ai_connect). 프로세스가 떠 있는 것과
+// 실제로 붙은 것은 다르다 — 엔드포인트가 시뮬을 가리키고 있거나 접속이 거부될 수 있다.
+// 그래서 이 값이 있으면 프로세스 확인보다 **이쪽을 우선**한다.
+const AI_CONN_FRESH_SEC = 30;      // DCS 가 죽어 보고가 끊기면 다시 프로세스 확인으로 되돌아간다
+let _aiConn = null;                // {status:'UP'|'DOWN', ts, endpoint, active, error}
+
+function nodeColor(key) {
+  if (key === 'ddagi') return TOPO_NA;                    // 미정의
+  if (key === 'acs') return acsAlive() ? TOPO_UP : TOPO_NA;
+  if (key === 'dg_ai') {
+    if (_aiConn && (Date.now() / 1000 - _aiConn.ts) < AI_CONN_FRESH_SEC) {
+      return _aiConn.status === 'UP' ? TOPO_UP : TOPO_DOWN;
+    }
+    // ⚠ 보고가 낡았으면 **초록으로 칠하지 않는다**. 서비스 프로세스가 떠 있다는 것과
+    // DCS 가 설정된 엔드포인트에 실제로 붙었다는 것은 전혀 다르다 — 엔드포인트가
+    // 남의 IP 를 가리키고 있어도 프로세스는 멀쩡히 떠 있다.
+    return STATUS['real-ai'] === 'down' ? TOPO_DOWN : TOPO_NA;
+  }
+  const st = STATUS[NODE_SVC[key]];
+  return st === 'up' ? TOPO_UP : st === 'down' ? TOPO_DOWN : TOPO_NA;
+}
+function updateTopo() {
+  const col = {};
+  for (const k of ['dcs', 'acs', 'ddago', 'ddagi', 'dg_ai']) {
+    col[k] = nodeColor(k);
+    const n = document.getElementById('node-' + k);
+    if (n) n.setAttribute('stroke', col[k]);
+  }
+  // AI 노드 부제: 어디로 붙고 있는지(엔드포인트·real/sim)와 실패 사유를 그대로 보여준다.
+  const sub = document.getElementById('dgai-sub');
+  if (sub) {
+    let t = '실서버 TCP :9100';
+    if (_aiConn) {
+      const stale = (Date.now() / 1000 - _aiConn.ts) >= AI_CONN_FRESH_SEC;
+      t = (_aiConn.endpoint || '') + (_aiConn.active ? ' (' + _aiConn.active + ')' : '');
+      if (stale) t += ' — 보고 끊김';
+      else if (_aiConn.status !== 'UP' && _aiConn.error) t += ' — ' + _aiConn.error;
+    }
+    if (sub.textContent !== t) sub.textContent = t;
+  }
+  // 선은 DCS 와 상대가 모두 살아 있을 때만 이어진 것으로 본다.
+  for (const k of ['acs', 'ddago', 'ddagi', 'dg_ai']) {
+    const el = document.getElementById('link-' + k);
+    if (!el) continue;
+    const on = (col.dcs === TOPO_UP && col[k] === TOPO_UP);
+    el.setAttribute('stroke', on ? TOPO_UP : TOPO_NA);
+  }
+}
+
+/* ===== 인터페이스 맵 + 메시지 시계열 (DCS 시점) ===== */
+const SVC_GROUPS = [
+  { key: 'acs',   short: 'ACS' },
+  { key: 'ddago', short: 'DdaGo' },
+  { key: 'ddagi', short: 'Ddagi' },
+  { key: 'dg_ai', short: 'AI' },
+];
+const MSGS = [
+  { key: 'acs',   iface: 'Navigate',           type: 'action',  name: '/{rid}/navigate',            scen: 'E1' },
+  { key: 'acs',   iface: 'Navigate/feedback',  type: 'action',  name: '/{rid}/navigate (feedback)', scen: 'E1·E2' },
+  { key: 'acs',   iface: 'Navigate/result',    type: 'action',  name: '/{rid}/navigate (result)',   scen: 'E1·E2' },
+  { key: 'acs',   iface: 'RobotTelemetry',     type: 'topic',   name: '/{rid}/telemetry',           scen: 'E0' },
+  { key: 'acs',   iface: 'SaveDetection',      type: 'service', name: '/automato/save_detection',   scen: 'E2·E3' },
+  { key: 'ddago', iface: 'Navigate(→DdaGo)',   type: 'action',  name: '/ddago/navigate',            scen: 'E1·E2' },
+  { key: 'ddago', iface: 'Navigate(→DdaGo)/feedback', type: 'action', name: '/ddago/navigate (feedback)', scen: 'E1·E2' },
+  { key: 'ddago', iface: 'Navigate(→DdaGo)/result',   type: 'action', name: '/ddago/navigate (result)',   scen: 'E1·E2' },
+  { key: 'ddago', iface: 'DdagoTelemetry',     type: 'topic',   name: '/ddago/telemetry',           scen: 'E0' },
+  { key: 'ddago', iface: 'AnalyzeFrame',       type: 'service', name: '/dg/analyze_frame',          scen: 'E2' },
+  { key: 'ddagi', iface: 'DdagiTelemetry',     type: 'topic',   name: '/ddagi/telemetry',           scen: 'E0' },
+  { key: 'dg_ai', iface: 'ai_connect',         type: 'TCP',     name: 'AI 접속 상태 보고',            scen: '상시' },
+  { key: 'dg_ai', iface: 'analyze_request',    type: 'TCP',     name: '4B len + JSON',              scen: 'E2' },
+  { key: 'dg_ai', iface: 'analyze_response',   type: 'TCP',     name: '4B len + JSON',              scen: 'E2·E3' },
+];
+// 정밀 도킹 3종 — 액션 타입·이름만 다르고 goal/feedback/result 구조는 같아서 표를 돌려 만든다.
+for (const d of [
+  { iface: 'Dock',           act: 'dock',            scen: '휴면' },
+  { iface: 'FloorDock',      act: 'floor_dock',      scen: 'S2 E2·E5' },
+  { iface: 'ReflectiveDock', act: 'reflective_dock', scen: 'E4·22-1' },
+]) {
+  MSGS.push(
+    { key: 'acs',   iface: d.iface,                       type: 'action', name: `/{rid}/${d.act}`,            scen: d.scen },
+    { key: 'acs',   iface: `${d.iface}/feedback`,         type: 'action', name: `/{rid}/${d.act} (feedback)`, scen: d.scen },
+    { key: 'acs',   iface: `${d.iface}/result`,           type: 'action', name: `/{rid}/${d.act} (result)`,   scen: d.scen },
+    { key: 'ddago', iface: `${d.iface}(→DdaGo)`,          type: 'action', name: `/ddago/${d.act}`,            scen: d.scen },
+    { key: 'ddago', iface: `${d.iface}(→DdaGo)/feedback`, type: 'action', name: `/ddago/${d.act} (feedback)`, scen: d.scen },
+    { key: 'ddago', iface: `${d.iface}(→DdaGo)/result`,   type: 'action', name: `/ddago/${d.act} (result)`,   scen: d.scen },
+  );
+}
+const IFACE = {};
+for (const m of MSGS) {
+  const g = SVC_GROUPS.find(x => x.key === m.key);
+  IFACE[m.iface] = { key: m.key, type: m.type, short: g ? g.short : m.key, name: m.name, scen: m.scen };
+}
+function ifaceName(iface) {
+  const i = IFACE[iface];
+  return i ? (i.name || '').replace('{rid}', RID) + (i.scen ? '  [' + i.scen + ']' : '') : '';
+}
+let _ifaceTs = {}, _firstWire = true, msgLimit = 500, _lastList = [];
+
+// payload 표시 문자열: 서버(파이썬)가 만든 JSON 원문(text)을 그대로 쓴다.
+// JS 로 다시 JSON.stringify 하면 float 0.0 이 0 으로 바뀌어 소수점이 사라진다.
+function plText(e) { return (e.text !== undefined && e.text !== null) ? e.text : JSON.stringify(e.payload); }
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + '.' + p(d.getMilliseconds(), 3);
+}
+// 링크의 DCS 쪽 끝: 'start'=x1, 'end'=x2 (SVG line 정의 방향 기준)
+const DCS_END = { acs: 'end', ddago: 'start', ddagi: 'start', dg_ai: 'start' };
+function flashLink(key, iface, dir) {
+  const el = document.getElementById('link-' + key);
+  if (el) {
+    if (el.animate) {
+      const base = el.getAttribute('stroke') || '#5c5045';
+      el.animate([{ stroke: '#eaff66', strokeWidth: '5px' }, { stroke: base, strokeWidth: '2px' }],
+                 { duration: 1200, easing: 'ease-out' });
+    }
+    const dcsEnd = DCS_END[key] || 'end';
+    const targetEnd = (dir === 'to_dcs') ? dcsEnd : (dcsEnd === 'end' ? 'start' : 'end');
+    el.removeAttribute('marker-start'); el.removeAttribute('marker-end');
+    el.setAttribute(targetEnd === 'end' ? 'marker-end' : 'marker-start', 'url(#flash-arrow)');
+    clearTimeout(el._arrowT);
+    el._arrowT = setTimeout(() => {
+      el.removeAttribute('marker-start'); el.removeAttribute('marker-end');
+    }, 1300);
+  }
+  const lbl = document.getElementById('lbl-' + key);
+  if (lbl) {
+    lbl.textContent = iface;
+    lbl.animate([{ opacity: 1 }, { opacity: 1, offset: 0.6 }, { opacity: 0 }],
+                { duration: 1700, easing: 'ease-out' });
+  }
+}
+// 텔레메트리(1Hz 스트림)는 타임라인을 뒤덮어 '지우기'를 무력화 → 토글로 숨김
+const TEL_IFACES = new Set(['DdagoTelemetry', 'DdagiTelemetry', 'RobotTelemetry']);
+function hideTelOn() { const c = document.getElementById('hide-tel'); return !!(c && c.checked); }
+function applyTelFilter(list) {
+  return hideTelOn() ? (list || []).filter(e => !TEL_IFACES.has(e.iface)) : (list || []);
+}
+function onHideTelChange() { if (scrollLock) toggleScrollLock(); renderTimeline(_lastList || []); }
+
+// 스크롤 고정: 켜면 타임라인을 **다시 그리지 않는다**(화면 그대로 멈춤). 수신은 계속된다.
+let scrollLock = false;
+function toggleScrollLock() {
+  scrollLock = !scrollLock;
+  const b = document.getElementById('scroll-btn');
+  if (b) { b.textContent = scrollLock ? '▶ 스크롤 재개' : '⏸ 스크롤 고정'; b.classList.toggle('off', scrollLock); }
+  const s = document.getElementById('scroll-state');
+  if (s) s.textContent = scrollLock ? '고정됨 — 수신은 계속됨' : '';
+  if (!scrollLock) renderTimeline(_lastList || []);
+}
+function renderTimeline(list) {
+  const box = document.getElementById('msg-timeline');
+  if (!box || scrollLock) return;
+  list = applyTelFilter(list);
+  if (!list.length) { box.innerHTML = '<div class="wempty">(아직 없음)</div>'; return; }
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 50;
+  const prevTop = box.scrollTop;
+  box.innerHTML = list.map(e => {
+    const info = IFACE[e.iface] || { short: e.iface, type: '' };
+    const dir = e.dir === 'to_dcs' ? info.short + ' → DCS' : 'DCS → ' + info.short;
+    return '<div class="tl-row">' +
+      `<span class="tl-time">${fmtTime(e.ts)}</span>` +
+      `<span class="tl-dir">${dir}</span>` +
+      `<span class="tl-iface" title="${escAttr(ifaceName(e.iface))}">${escapeHtml(e.iface)}</span>` +
+      `<span class="tag ${info.type}">${info.type}</span>` +
+      `<span class="tl-pl">${escapeHtml(plText(e))}</span></div>`;
+  }).join('');
+  box.scrollTop = nearBottom ? box.scrollHeight : prevTop;
+}
+function copyMessages() {
+  const lines = applyTelFilter(_lastList).map(e => {
+    const info = IFACE[e.iface] || { short: e.iface };
+    const dir = e.dir === 'to_dcs' ? info.short + ' -> DCS' : 'DCS -> ' + info.short;
+    return fmtTime(e.ts) + '  ' + dir + '  ' + e.iface + '  ' + plText(e);
+  });
+  const text = lines.join('\n');
+  const toast = document.getElementById('copy-toast');
+  const done = (msg, ok) => { if (toast) { toast.style.color = ok ? '#46d17e' : '#e74c3c'; toast.textContent = msg; setTimeout(() => toast.textContent = '', 1500); } };
+  if (!text) { done('복사할 메시지 없음', false); return; }
+  (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject())
+    .then(() => done(lines.length + '줄 복사됨', true))
+    .catch(() => {
+      const ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); done(lines.length + '줄 복사됨', true); }
+      catch (e) { done('복사 실패', false); }
+      document.body.removeChild(ta);
+    });
+}
+async function clearWireLog() {
+  const toast = document.getElementById('copy-toast');
+  const done = (msg, ok) => { if (toast) { toast.style.color = ok ? '#46d17e' : '#e74c3c'; toast.textContent = msg; setTimeout(() => toast.textContent = '', 1500); } };
+  try {
+    const r = await fetch('/api/wire/clear', { method: 'POST' });
+    if (!r.ok) throw new Error();
+  } catch (e) { done('지우기 실패', false); return; }
+  _lastList = [];
+  const box = document.getElementById('msg-timeline');
+  if (box) box.innerHTML = '<div class="wempty">(아직 없음)</div>';
+  done('지움', true);
+}
+async function refreshWire() {
+  try {
+    const list = await (await fetch('/api/wire?limit=' + msgLimit)).json();
+    _lastList = list;
+    renderTimeline(list);
+    // 인터페이스별 최신 ts 증가 → 해당 링크 깜박임 + 라벨
+    const newest = {};
+    for (const e of list) if (!(e.iface in newest) || e.ts > newest[e.iface]) newest[e.iface] = e.ts;
+    for (const iface in newest) {
+      if (newest[iface] > (_ifaceTs[iface] || 0)) {
+        const info = IFACE[iface];
+        if (!_firstWire && info) {
+          let dir = 'from_dcs';
+          for (let i = list.length - 1; i >= 0; i--) {
+            if (list[i].iface === iface) { dir = list[i].dir; break; }
+          }
+          flashLink(info.key, iface, dir);
+        }
+        _ifaceTs[iface] = newest[iface];
+      }
+    }
+    _firstWire = false;
+    // DCS 가 보고한 AI 접속 상태 중 가장 최근 것
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].iface !== 'ai_connect') continue;
+      const pl = list[i].payload || {};
+      _aiConn = { status: pl.status, ts: list[i].ts, endpoint: pl.endpoint,
+                  active: pl.active, error: pl.error };
+      break;
+    }
+    // 상대별 마지막 메시지 시각 — ACS 처럼 프로세스를 못 보는 상대의 연결 추정에 쓴다.
+    for (const iface in newest) {
+      const info = IFACE[iface];
+      if (info && newest[iface] > (_lastSeen[info.key] || 0)) _lastSeen[info.key] = newest[iface];
+    }
+    updateTopo();
+  } catch (e) {}
+}
+
+/* ===== 데이터 로딩 ===== */
+async function loadCommands(force) {
+  try {
+    CMDS = await (await fetch('/api/commands')).json();
+    renderCards(force);
+  } catch (e) {}
+}
+async function loadStatus() {
+  try {
+    const j = await (await fetch('/api/status')).json();
+    STATUS = j.services || {}; ROBOTS = j.robots || {};
+    RID = j.robot_id || RID;
+    const ot = document.getElementById('order-txt');
+    if (ot && j.order) ot.textContent = j.order.join(' → ');
+    document.getElementById('rid').textContent = RID;
+    document.getElementById('rid-badge').textContent = RID;
+    const names = Object.keys(ROBOTS);
+    document.getElementById('robot-name').textContent = names[0] || '-';
+    const ds = document.getElementById('ddago-sub');
+    if (ds && names[0]) ds.textContent = names[0] + ' 온보드';
+    updateCards();
+    updateTopo();
+    renderRobot();
+  } catch (e) { banner('실서버 대시보드(:8010) 응답 없음'); }
+}
+
+const _limitInput = document.getElementById('msg-limit');
+if (_limitInput) {
+  _limitInput.addEventListener('change', () => {
+    const v = parseInt(_limitInput.value, 10);
+    if (!isNaN(v)) { msgLimit = Math.max(1, Math.min(5000, v)); _limitInput.value = msgLimit; refreshWire(); }
+  });
+}
+
+buildStatGrid();
+battSubscribe();     // 배터리는 화면이 떠 있는 동안 계속 받는다
+loadCommands(true);
+loadStatus();
+refreshWire();
+setInterval(loadStatus, 4000);
+setInterval(refreshWire, 1500);
+</script>
+</body>
+</html>

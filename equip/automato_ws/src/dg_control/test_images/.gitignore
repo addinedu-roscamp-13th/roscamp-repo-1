@@ -1,0 +1,7 @@
+# 테스트용으로 넣는 이미지/결과물은 git push 하지 않는다.
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.webp
+!README.md

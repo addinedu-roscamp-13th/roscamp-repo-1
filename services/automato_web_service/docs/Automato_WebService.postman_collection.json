@@ -1,0 +1,111 @@
+{
+  "info": {
+    "name": "Automato Web Service (이건수) - 시나리오1 통신테스트",
+    "_postman_id": "automato-webservice-scn1",
+    "description": "이건수 담당(Farm Admin App + Automato Web Service) 통신테스트.\nbase 변수: 로컬=http://localhost:8899 (내 Web, 가상 ACS 연결) / 라이브=https://geonsulee.pythonanywhere.com\n\n[테스트 순서]\n1) 순찰 가능 로봇 조회  2) 순찰 요청(→가상 ACS 자동 순찰 시작)  3) 이벤트 폴링으로 진행/병해충/완료 확인\n또는 '가상 ACS 콜백' 폴더로 내가 직접 ACS 역할을 해서 detections/notify·alerts/disease·completed 를 쏴보고, 이벤트/웹앱 배너 반응 확인.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base", "value": "http://localhost:8899" },
+    { "key": "task_id", "value": "1024" }
+  ],
+  "item": [
+    {
+      "name": "1. Farm Admin App -> Web (E1 순찰)",
+      "item": [
+        {
+          "name": "GET 순찰 가능 로봇 (available)",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{base}}/api/v1/robots/patrol/available", "host": ["{{base}}"], "path": ["api","v1","robots","patrol","available"] },
+            "description": "App->Web. CONTROL_SERVICE_URL 설정 시 가상 ACS로 중계 → dg_01/dg_02/dg_03 반환."
+          }
+        },
+        {
+          "name": "POST 순찰 요청 (patrol/requests)",
+          "request": {
+            "method": "POST",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": { "mode": "raw", "raw": "{\n  \"robot_selection\": \"auto\",\n  \"robot_id\": null\n}" },
+            "url": { "raw": "{{base}}/api/v1/patrol/requests", "host": ["{{base}}"], "path": ["api","v1","patrol","requests"] },
+            "description": "App->Web->가상 ACS. 200 ACCEPTED{task_id,assigned_robot_id} / 409 REJECTED. 가상 ACS가 순찰 시뮬 시작(검출/병해충/완료 콜백)."
+          }
+        },
+        {
+          "name": "POST 데모 초기화 (patrol/reset)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{base}}/api/v1/patrol/reset", "host": ["{{base}}"], "path": ["api","v1","patrol","reset"] },
+            "description": "로봇 상태·히트맵·실적·이벤트 큐 초기화."
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. (가상 ACS) -> Web 콜백 (E2/E3, 내가 직접 ACS 역할)",
+      "item": [
+        {
+          "name": "POST 검출 현황 notify (patrol_progress)",
+          "request": {
+            "method": "POST",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": { "mode": "raw", "raw": "{\n  \"task_id\": {{task_id}},\n  \"waypoint_id\": 2,\n  \"robot_id\": \"dg_01\",\n  \"detection_id\": 55001,\n  \"ripe_percent\": 60,\n  \"unripe_percent\": 33,\n  \"rotten_percent\": 7,\n  \"disease_percent\": 0,\n  \"detected_at\": \"2026-07-09T14:00:00Z\"\n}" },
+            "url": { "raw": "{{base}}/internal/v1/detections/notify", "host": ["{{base}}"], "path": ["internal","v1","detections","notify"] },
+            "description": "E2-9. 퍼센트 필드. Web이 App으로 patrol_progress 푸시."
+          }
+        },
+        {
+          "name": "POST 병해충 알림 alerts/disease (disease_alert)",
+          "request": {
+            "method": "POST",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": { "mode": "raw", "raw": "{\n  \"task_id\": {{task_id}},\n  \"waypoint_id\": 3,\n  \"robot_id\": \"dg_01\",\n  \"disease_percent\": 7,\n  \"image_path\": \"demo_label.jpg\",\n  \"detected_at\": \"2026-07-09T14:00:03Z\"\n}" },
+            "url": { "raw": "{{base}}/internal/v1/alerts/disease", "host": ["{{base}}"], "path": ["internal","v1","alerts","disease"] },
+            "description": "E3-1. disease_percent>=5 는 ACS가 판단해서 보냄. Web이 App으로 disease_alert 푸시(웹앱 배너) + (앱/서버가 텔레그램). 실사진은 image_data(base64)나 image_url 로도 첨부 가능."
+          }
+        },
+        {
+          "name": "POST 순찰 완료 patrol/completed",
+          "request": {
+            "method": "POST",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": { "mode": "raw", "raw": "{\n  \"task_id\": {{task_id}},\n  \"robot_id\": \"dg_01\",\n  \"completed_at\": \"2026-07-09T14:05:00Z\",\n  \"summary\": { \"ripe_percent\": 55, \"unripe_percent\": 40, \"rotten_percent\": 5, \"disease_percent\": 0 }\n}" },
+            "url": { "raw": "{{base}}/internal/v1/patrol/completed", "host": ["{{base}}"], "path": ["internal","v1","patrol","completed"] },
+            "description": "Web이 App으로 patrol_completed 푸시 + 로봇 IDLE 복귀."
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Web -> App 실시간/알림",
+      "item": [
+        {
+          "name": "GET 이벤트 폴링 (patrol/events)",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{base}}/api/v1/patrol/events?since=0", "host": ["{{base}}"], "path": ["api","v1","patrol","events"], "query": [ { "key": "since", "value": "0" } ] },
+            "description": "WebSocket 대체 폴링 피드. since=<seq> 이후 이벤트만. patrol_progress/patrol_completed/disease_alert 확인."
+          }
+        },
+        {
+          "name": "POST 텔레그램 발송(App-driven) notify/telegram",
+          "request": {
+            "method": "POST",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": { "mode": "raw", "raw": "{\n  \"event\": \"disease_alert\",\n  \"seq\": 999001,\n  \"task_id\": {{task_id}},\n  \"waypoint_id\": 3,\n  \"robot_id\": \"dg_01\",\n  \"disease_percent\": 7,\n  \"image_path\": \"demo_label.jpg\"\n}" },
+            "url": { "raw": "{{base}}/api/v1/notify/telegram", "host": ["{{base}}"], "path": ["api","v1","notify","telegram"] },
+            "description": "앱이 이벤트 수신 시 호출하는 텔레그램 릴레이. seq로 중복차단."
+          }
+        },
+        {
+          "name": "POST 텔레그램 연결 테스트 (telegram/test)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{base}}/api/v1/telegram/test", "host": ["{{base}}"], "path": ["api","v1","telegram","test"] },
+            "description": "설정된 봇/chat_id 로 테스트 메시지 발송."
+          }
+        }
+      ]
+    }
+  ]
+}

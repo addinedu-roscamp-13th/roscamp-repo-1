@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""RP-90  E0 텔레메트리 WebSocket 서버 — 로봇 텔레메트리를 1Hz로 웹서비스에 방송.
+
+ACS 가 로봇별로 구독한 상태를 WebSocket 클라이언트(Automato Web Service)에게
+1Hz 로 브로드캐스트한다. QT 로 가는 원본(④)과 달리 여기는 관리자 화면용 **축약본**이다.
+
+RP-114 로 입력이 /{robot_id}/telemetry(RobotTelemetry, 로봇 수만큼)로 바뀌었다.
+이 노드는 주행 로봇(ddago)만 방송하는데, DdagoTelemetry 에서 robot_id 가 제거되면서
+옛 /automato/telemetry/fleet 로 온 ddago 는 어느 로봇인지 특정할 수 없게 됐다.
+가를 수단이 없는 폴백은 남겨도 아무 일도 못 하므로 옛 경로 구독을 걷어냈다.
+
+실행 구조(기존 automato_node 와 동일한 골격 — 두 세계가 한 프로세스에 공존):
+  - [백그라운드 스레드]  rclpy 노드가 spin → fleet 구독 콜백이 FleetCache 에 최신 상태를 씀(writer)
+  - [메인 스레드]        uvicorn(FastAPI) 이벤트 루프 → 1Hz 방송 코루틴이 FleetCache 를 읽음(reader)
+  - FleetCache 는 두 세계를 잇는 다리. writer(스레드)와 reader(asyncio)가 서로 다른
+    OS 스레드에 살기 때문에 threading.Lock 으로 보호한다.
+
+이 파일은 여러 조각으로 나눠 만든다(RP-90 구현 순서):
+  ① FleetCache            ← 지금 이 조각(락으로 보호되는 로봇별 최신상태 저장소)
+  ⑥ TelemetryNode + main() ← 이후 조각(fleet 구독 노드 + 전체 조립)
+가용 판정/방송 루프/커넥션 매니저는 telemetry_ws.py 에 둔다(patrol 의 api/node 분리와 동일).
+"""
+import threading
+
+import rclpy
+from rclpy.node import Node
+
+from automato_control_service.fleet_collector import (
+    DEFAULT_ROBOT_IDS,
+    robot_telemetry_topic,
+    subscribe_per_robot,
+)
+
+# '텔레메트리가 흐르고 있다'를 알리는 요약 로그의 주기(초).
+# 1Hz 수신을 그대로 찍으면 순찰·수확 로그가 파묻히므로, 이 주기마다 '그동안 수신된
+# 로봇 목록'을 한 줄로만 낸다. 짧게 잡을수록 로그가 시끄러워진다.
+RX_REPORT_SEC = 30.0
+
+
+# --------------------------------------------------------------------------- #
+# 텔레메트리 캐시 — 로봇별 '그 로봇의 최신 상태' 1건을 메모리에 보관(수신마다 덮어씀).
+#
+# 왜 필요한가: ROS2 구독은 발행자가 밀어보낼 때(1Hz)마다 콜백이 실행되는 push 방식이다.
+# 반면 방송 루프는 자기 타이밍(1초마다)에 '지금의 최신값'을 읽고 싶다. 들어오는 타이밍과
+# 읽는 타이밍이 달라서, 그 사이에 '최신값을 놔두는 선반'이 필요하다 — 그게 이 캐시다.
+# DB 저장은 없다(실시간 현재상태 전용, 프로세스가 죽으면 사라져도 됨).
+# --------------------------------------------------------------------------- #
+class FleetCache:
+    def __init__(self):
+        # 콜백 스레드(쓰기) ↔ 방송 코루틴(읽기)이 동시에 이 dict 를 만지므로 락으로 보호.
+        # 서로 '다른 OS 스레드'라서 asyncio.Lock 이 아니라 threading.Lock 이다.
+        self._lock = threading.Lock()
+        self._robots = {}   # robot_id -> 최신 상태 dict
+
+    @staticmethod
+    def _entry(robot_id, d) -> dict:
+        """DdagoTelemetry 하나를 방송용 상태 dict 로.
+
+        stamp: 로봇이 직접 찍은 header.stamp(초 단위 epoch). '3초 미수신'(ROBOT_OFFLINE)
+          판정의 기준이다. 우리가 받은 시각이 아니라 로봇의 stamp 를 쓰는 이유 —
+          중간 계층이 죽은 로봇을 어떻게 다루든 stamp 는 로봇이 멈춘 순간 함께 얼어붙어,
+          now 와의 차이로 미수신을 정확히 드러내기 때문이다. 예컨대 마지막 값을 계속
+          재발행하는 구현에서는 '수신 시각'으로 재면 영영 신선해 보여 틀린다.
+          patrol_api 도 동일하게 ddago header.stamp 로 staleness 를 잰다(시스템 일관성).
+        """
+        return {
+            "robot_id": robot_id,
+            "nav_status": d.nav_status,
+            "is_charging": bool(d.is_charging),
+            "x": float(d.x),
+            "y": float(d.y),
+            "yaw": float(d.yaw),
+            "battery_percent": float(d.battery_percent),
+            "stamp": d.header.stamp.sec + d.header.stamp.nanosec * 1e-9,
+        }
+
+    def update_from_robot(self, robot_id: str, msg) -> None:
+        """RP-114 주 경로: 로봇 하나의 RobotTelemetry 로 최신 상태를 덮어쓴다(writer).
+
+        RP-90 은 주행 로봇(ddago)의 위치·배터리·주행상태만 방송하므로 msg.ddagos 만 본다
+        (로봇팔 ddagis 는 이 축약본과 무관 — QT 로 가는 원본 ④에는 그대로 실린다).
+        어느 로봇인지는 토픽 네임스페이스가 말해주므로 robot_id 를 인자로 받는다.
+        """
+        with self._lock:                       # 열쇠를 집는다(누가 쥐고 있으면 대기)
+            for d in msg.ddagos:
+                # 한 로봇의 전체 필드를 새 dict 로 만들어 통째로 교체 → '반쯤 바뀐' 상태가 없다.
+                # (그래도 dict 에 키를 더하며 순회 대상을 바꾸므로 락은 필요하다.)
+                self._robots[robot_id] = self._entry(robot_id, d)
+        # with 블록을 벗어나면 열쇠를 자동 반납(예외가 나도 반드시 반납).
+
+    def snapshot(self) -> list:
+        """지금 알고 있는 모든 로봇의 최신 상태 '복사본' 리스트를 반환(reader, 방송 코루틴).
+
+        복사본을 주는 이유: 호출자가 락 밖에서 느긋하게 읽는 동안 writer 가 원본을 바꿔도
+        안전하게. 락은 '복사만 하고 즉시 반납' — 그 짧은 순간만 이벤트 루프를 잡는다.
+        오프라인 로봇도 여기서 빠지지 않는다(수신이 끊겨도 마지막 값이 남아 있음 →
+        ROBOT_OFFLINE 판정은 이후 가용판정 단계가 stamp 로 내린다).
+        """
+        with self._lock:
+            return [dict(entry) for entry in self._robots.values()]
+
+
+# --------------------------------------------------------------------------- #
+# 텔레메트리 구독 노드 — /{robot_id}/telemetry 를 로봇 수만큼 구독해 FleetCache 를 채운다.
+# 이게 '실제로 데이터를 끌어오는' 부분. 이 노드가 없으면 캐시는 영영 비어 있다.
+# --------------------------------------------------------------------------- #
+class TelemetryNode(Node):
+    def __init__(self, **kwargs):
+        super().__init__("telemetry_ws_node", **kwargs)
+        self.cache = FleetCache()
+        # 로봇별 첫 수신을 1회만 INFO 로 알리기 위한 표시(이후엔 주기 요약으로만 로그).
+        self._first_rx_logged = set()
+        # 최근 보고 주기 동안 텔레메트리가 들어온 로봇들(_report_rx 가 비운다).
+        self._rx_since_report = set()
+
+        self.declare_parameter("robot_ids", DEFAULT_ROBOT_IDS)
+        robot_ids = list(self.get_parameter("robot_ids").value)
+        # 주기 요약에서 '와야 하는데 안 온 로봇'을 가려내려면 기대 목록이 필요하다.
+        self._robot_ids = robot_ids
+
+        # 1Hz 상시 구독. DG 발행자와 맞춰 기본 QoS(RELIABLE, depth 10).
+        subscribe_per_robot(self, robot_ids, self._on_robot_telemetry)
+        # 수신 요약 타이머 — 콜백마다 찍는 대신 이 타이머가 한 줄로 묶어 낸다.
+        self.create_timer(RX_REPORT_SEC, self._report_rx)
+
+        self.get_logger().info(
+            "텔레메트리 WS 노드 준비: 구독 %s → 캐시 갱신"
+            % ([robot_telemetry_topic(r) for r in robot_ids],))
+
+    def _on_robot_telemetry(self, robot_id, msg) -> None:
+        # 콜백(백그라운드 spin 스레드)에서 캐시에 쓴다(writer). 방송 루프(메인 스레드)가 읽는다.
+        # 두 스레드가 겹치지 않게 FleetCache 내부 threading.Lock 이 보호한다.
+        self.cache.update_from_robot(robot_id, msg)
+
+        # --- 흐름 가시화 로그 (수신 + 캐시 갱신 확인) ---
+        log = self.get_logger()
+        if robot_id not in self._first_rx_logged:   # 첫 수신은 로봇마다 1회 확실히 알림
+            self._first_rx_logged.add(robot_id)
+            log.info("%s 첫 수신: ddago %d → 캐시 갱신" % (robot_id, len(msg.ddagos)))
+        # 이후엔 여기서 찍지 않고 표시만 남긴다 → _report_rx 가 주기마다 한 줄로 요약.
+        # (콜백에서 throttle 로 찍으면 rclpy throttle 상태가 '호출 라인' 단위라 로봇을
+        #  구분하지 못한다. 3대가 같은 줄을 공유해 매번 한 대 이름만 번갈아 나온다.)
+        self._rx_since_report.add(robot_id)
+        # 값이 실제로 바뀌는지 검증용 상세는 DEBUG — 평소 숨김, --log-level debug 로만.
+        for d in msg.ddagos:
+            log.debug("  %s nav=%s batt=%.0f pos=(%.2f,%.2f)"
+                      % (robot_id, d.nav_status, d.battery_percent, d.x, d.y))
+
+    def _report_rx(self) -> None:
+        """RX_REPORT_SEC 마다 '그동안 텔레메트리가 들어온 로봇'을 한 줄로 요약한다.
+
+        set 을 비우지 않고 '통째로 갈아끼우는' 이유: 이 타이머와 구독 콜백이 서로 다른
+        스레드에서 돌 수 있어(MultiThreadedExecutor), 읽는 도중 콜백이 add 하면
+        순회가 깨진다. 참조 교체는 원자적이라 락 없이 안전하다.
+        """
+        received, self._rx_since_report = self._rx_since_report, set()
+        if not received:
+            return          # 아직 아무것도 안 들어옴(기동 직후) — 조용히 넘어간다.
+        missing = [r for r in self._robot_ids if r not in received]
+        self.get_logger().info(
+            "텔레메트리 수신 중: %s%s"
+            % (", ".join(sorted(received)),
+               " (미수신 %.0fs: %s)" % (RX_REPORT_SEC, ", ".join(missing))
+               if missing else ""))
+
+
+# --------------------------------------------------------------------------- #
+# 조립 루트 — rclpy 노드(백그라운드 spin) + uvicorn/FastAPI(메인, WebSocket)를 함께 띄운다.
+# automato_node.main() 과 동일한 골격: spin 은 백그라운드, uvicorn(이벤트 루프)은 메인.
+# --------------------------------------------------------------------------- #
+def main(args=None) -> None:
+    import os
+
+    import uvicorn
+    from rclpy.executors import MultiThreadedExecutor
+
+    from automato_control_service import automato_db
+    from automato_control_service.telemetry_ws import create_ws_app
+
+    rclpy.init(args=args)
+    node = TelemetryNode()
+
+    # DB 풀(활성 task 종류·배터리 임계값 조회용). DB 가 아직 안 떠 있어도 서비스는 기동된다.
+    pool = automato_db.create_pool()
+
+    # rclpy 는 백그라운드 스레드에서 상시 spin — 구독 콜백(writer)이 여기서 실행된다.
+    # uvicorn(이벤트 루프)은 메인 스레드에서 돌려야 하므로 spin 을 분리한다.
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    spin_thread = threading.Thread(
+        target=executor.spin, name="rclpy_spin", daemon=True)
+    spin_thread.start()
+
+    app = create_ws_app(node, pool)
+    port = int(os.environ.get("ACS_WS_PORT", "8000"))
+    node.get_logger().info(
+        "Automato Control Service (텔레메트리) WebSocket → "
+        "ws://0.0.0.0:%d/ws/telemetry" % port)
+
+    try:
+        # ws_ping_interval/timeout: 서버가 주기적으로 ping 을 보내 죽은 연결을 감지(keepalive).
+        # access_log=False: 요청별 접수 기록을 끈다(automato_node 와 같은 이유).
+        # 여기선 WS 접속/해제가 그 대상인데, 그 둘은 이미 한글 ROS 로그로 따로 남는다
+        # ("텔레메트리 WS 접속 (현재 N명)").
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
+                    ws_ping_interval=20.0, ws_ping_timeout=20.0,
+                    access_log=False)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+        try:
+            pool.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+if __name__ == "__main__":
+    main()

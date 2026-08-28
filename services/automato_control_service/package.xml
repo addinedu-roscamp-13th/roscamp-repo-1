@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>automato_control_service</name>
+  <version>0.1.0</version>
+  <description>Automato Control Service (SERVICES) — 순찰 로봇 선정·HQ 순찰 Action 요청(RP-78) 및 텔레메트리 중계(RP-77)</description>
+  <maintainer email="zkffkejr145@gmail.com">geonsulee</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>automato_interfaces</exec_depend>
+  <!-- 테스트 스탠드인(test_harness/patrol_bridge, nav2 모드)이 쓰는 메시지/액션.
+       로봇(Nav2 설치됨)에서 실행되므로 존재한다. sim 모드에선 미사용(지연 임포트). -->
+  <exec_depend>action_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <!-- save_detection: disease_image(sensor_msgs/Image, raw)를 파일 저장 전 JPEG 로 인코딩
+       (detection_service.image_msg_to_jpeg_bytes). cv_bridge/cv2 는 거기서만 지연 임포트. -->
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <!-- FastAPI/uvicorn/psycopg 등 순수 Python 런타임 의존은 rosdep 키가 아니라
+       requirements.txt 로 pip 설치한다(README 참고). -->
+
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
